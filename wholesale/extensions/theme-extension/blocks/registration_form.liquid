@@ -1,0 +1,20 @@
+{% assign bundle_url = 'react-app-bundle.js' | asset_url %}
+{% assign asset_base = bundle_url | split: 'react-app-bundle.js' | first %}
+
+<script>
+  window.__APP_EXT_ASSET_BASE__ = {{ asset_base | json }};
+</script>
+
+{{ 'react-app-bundle.css' | asset_url | stylesheet_tag }}
+
+<div id="react-root"></div>
+
+<script src="{{ 'react-app-bundle.js' | asset_url }}" type="module"></script>
+
+{% schema %}
+{
+  "name": "Registration Form",
+  "target": "section",
+  "settings": []
+}
+{% endschema %}
