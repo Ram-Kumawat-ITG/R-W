@@ -152,7 +152,7 @@ export default function Step1AboutYou({ control, errors, setValue }) {
       </div>
 
       <div className="rf-field">
-        <label className="rf-label">Business name <span className="rf-req">*</span></label>
+        <label className="rf-label">Business name <span className="rf-opt">Optional</span></label>
         <Controller
           name="businessName"
           control={control}
@@ -161,11 +161,10 @@ export default function Step1AboutYou({ control, errors, setValue }) {
               {...field}
               type="text"
               placeholder="Smith Wellness Clinic"
-              className={`rf-input ${errors.businessName ? 'error' : ''}`}
+              className="rf-input"
             />
           )}
         />
-        {errors.businessName && <p className="rf-help error">{errors.businessName.message}</p>}
       </div>
 
       <div className="rf-field">

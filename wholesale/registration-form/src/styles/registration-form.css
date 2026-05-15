@@ -65,28 +65,78 @@
   color: var(--color-text-muted);
 }
 .rf-progress-meta strong { color: var(--color-text); font-weight: 500; }
-.rf-progress-track { display: flex; gap: 6px; }
-.rf-progress-seg {
-  flex: 1;
-  height: 4px;
-  border-radius: 2px;
-  background: var(--color-border);
-  transition: background 0.4s ease;
-}
-.rf-progress-seg.done,
-.rf-progress-seg.active { background: var(--color-primary); }
-.rf-step-pills {
+
+/* Numbered-circle stepper */
+.rf-stepper {
   display: flex;
-  gap: 24px;
-  margin-top: 14px;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-top: 4px;
+}
+.rf-step-node {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 0;
+}
+.rf-step-circle-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+}
+.rf-step-circle {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #fff;
+  border: 1.5px solid var(--color-border);
+  color: var(--color-text-muted);
+  font-weight: 600;
+  font-size: 14px;
+  position: relative;
+  z-index: 1;
+  flex-shrink: 0;
+  transition: all 0.2s ease;
+}
+.rf-step-circle svg { width: 14px; height: 14px; }
+.rf-step-circle.active {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  color: #fff;
+  box-shadow: 0 0 0 4px rgba(200, 16, 46, 0.12);
+}
+.rf-step-circle.done {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  color: #fff;
+}
+.rf-step-line {
+  flex: 1;
+  height: 2px;
+  background: var(--color-border);
+  transition: background 0.3s ease;
+}
+.rf-step-line.done { background: var(--color-primary); }
+.rf-step-label {
+  margin-top: 10px;
   font-size: 12px;
   color: var(--color-text-muted);
+  text-align: center;
   letter-spacing: 0.02em;
+  line-height: 1.4;
+  padding: 0 4px;
 }
-.rf-step-pills span { flex: 1; text-align: left; }
-.rf-step-pills span.active { color: var(--color-primary); font-weight: 500; }
-@media (max-width: 540px) {
-  .rf-step-pills span:not(.active) { display: none; }
+.rf-step-label.active { color: var(--color-primary); font-weight: 600; }
+.rf-step-label.done   { color: var(--color-text); font-weight: 500; }
+@media (max-width: 480px) {
+  .rf-step-label { font-size: 11px; }
+  .rf-step-circle { width: 30px; height: 30px; font-size: 13px; }
 }
 
 /* Card / main */

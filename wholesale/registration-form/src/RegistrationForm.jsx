@@ -2,8 +2,8 @@ import { useEffect, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { yupResolver } from '@hookform/resolvers/yup'
 import { fullSchema } from './schema/full.schema'
-import { step1Schema, step1Fields } from './schema/step1.schema'
-import { step2Schema, step2Fields } from './schema/step2.schema'
+import { step1Fields } from './schema/step1.schema'
+import { step2Fields } from './schema/step2.schema'
 import { step3Fields } from './schema/step3.schema'
 import { buildFormData } from './utils/buildFormData'
 import ApiService from './services/ApiService'
@@ -134,21 +134,17 @@ function FormBody({ onBack }) {
   const [toast, setToast] = useState(null)
   const [successView, setSuccessView] = useState(false)
 
-  // Pick a per-step resolver so users only see errors for what's visible
-  const schemaForStep =
-    currentStep === 1 ? step1Schema :
-    currentStep === 2 ? step2Schema :
-    fullSchema
-
   const {
     control,
     handleSubmit,
-    formState: { errors },
+    formState: { errors, isSubmitted },
     setValue,
     trigger,
+    clearErrors,
   } = useForm({
-    mode: 'onBlur',
-    resolver: yupResolver(schemaForStep),
+    mode: 'onTouched',
+    reValidateMode: 'onChange',
+    resolver: yupResolver(fullSchema),
     defaultValues,
   })
 
@@ -183,11 +179,15 @@ function FormBody({ onBack }) {
       showToast('error', 'Please fix the highlighted fields.')
       return
     }
+    setToast(null)
+    clearErrors()
     setCurrentStep((s) => Math.min(s + 1, 3))
     if (typeof window !== 'undefined') window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
   const prev = () => {
+    setToast(null)
+    clearErrors()
     setCurrentStep((s) => Math.max(s - 1, 1))
     if (typeof window !== 'undefined') window.scrollTo({ top: 0, behavior: 'smooth' })
   }
@@ -253,19 +253,23 @@ function FormBody({ onBack }) {
             console.table(
               flattenErrors(errs).map(({ path, message, type }) => ({ path, message, type }))
             )
-            showToast('error', 'Please fix the highlighted fields.')
           })} noValidate>
             {currentStep === 1 && <Step1AboutYou control={control} errors={errors} setValue={setValue} />}
             {currentStep === 2 && <Step2AddressTax control={control} errors={errors} setValue={setValue} />}
             {currentStep === 3 && (
-              <Step3Payment control={control} errors={errors} setValue={setValue} onEditBilling={prev} />
+              <Step3Payment control={control} errors={errors} setValue={setValue} onEditBilling={prev} isSubmitted={isSubmitted} />
             )}
 
             <div className="rf-actions">
               {currentStep === 1 ? (
                 <span />
               ) : (
-                <button type="button" className="rf-btn rf-btn-secondary" onClick={prev}>
+                <button
+                  type="button"
+                  className="rf-btn rf-btn-secondary"
+                  onClick={prev}
+                  disabled={submitting}
+                >
                   <svg className="rf-icon-svg" viewBox="0 0 24 24">
                     <path d="M19 12H5M11 19l-7-7 7-7" />
                   </svg>

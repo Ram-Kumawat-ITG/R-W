@@ -49,16 +49,22 @@ export async function action({ request }) {
   }
 
   // Upload each file to Shopify Files API → get a permanent CDN URL → put it in payload.
-  for (const { key, file } of fileEntries) {
-    try {
-      const url = await uploadToShopifyFiles(admin, file)
-      setNested(payload, key, url)
-    } catch (e) {
-      console.error(`[proxy/submit] upload failed for ${key}:`, e?.message || e)
-      return sendResponse(502, 'error', 'File upload failed', {
-        detail: e?.message || String(e),
+  // Upload all files in parallel — sequential awaits would multiply round-trips.
+  try {
+    const results = await Promise.all(
+      fileEntries.map(async ({ key, file }) => {
+        const url = await uploadToShopifyFiles(admin, file)
+        return { key, url }
       })
+    )
+    for (const { key, url } of results) {
+      setNested(payload, key, url)
     }
+  } catch (e) {
+    console.error('[proxy/submit] upload failed:', e?.message || e)
+    return sendResponse(502, 'error', 'File upload failed', {
+      detail: e?.message || String(e),
+    })
   }
 
   // Hash password before storage
@@ -210,12 +216,17 @@ async function uploadToShopifyFiles(admin, file) {
   const created0 = createdJson?.data?.fileCreate?.files?.[0]
   if (!created0?.id) throw new Error('fileCreate returned no file')
 
-  // 4. Poll until READY so we can return a usable URL
+  // If fileCreate already returned a URL (often the case for direct uploads),
+  // skip the polling round-trip and use it.
+  const immediateUrl = created0?.url || created0?.image?.url
+  if (immediateUrl) return immediateUrl
+
+  // Otherwise poll — tight cadence so we don't drag out submit time.
   const url = await pollFileUntilReady(admin, created0.id)
   return url
 }
 
-async function pollFileUntilReady(admin, fileId, { tries = 10, delayMs = 1000 } = {}) {
+async function pollFileUntilReady(admin, fileId, { tries = 6, delayMs = 400 } = {}) {
   for (let i = 0; i < tries; i++) {
     const res = await admin.graphql(
       `#graphql
@@ -232,7 +243,7 @@ async function pollFileUntilReady(admin, fileId, { tries = 10, delayMs = 1000 } 
     const status = node?.fileStatus
     const url = node?.url || node?.image?.url
 
-    if (status === 'READY' && url) return url
+    if (url) return url
     if (status === 'FAILED') throw new Error('File processing failed')
 
     await new Promise((r) => setTimeout(r, delayMs))

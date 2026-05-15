@@ -1,5 +1,5 @@
 import { Controller, useWatch } from 'react-hook-form'
-import { US_STATES, PAYMENT_METHODS } from '../constants'
+import { getStatesForCountry, PAYMENT_METHODS } from '../constants'
 import PaymentCardForm from './PaymentCardForm'
 import SignaturePad from './SignaturePad'
 
@@ -11,7 +11,8 @@ function BillingSummary({ control, onEdit }) {
 
   const name = `${firstName} ${lastName}`.trim()
   const streetLine = [ba.line1, ba.line2].filter(Boolean).join(', ')
-  const stateName = US_STATES.find((s) => s.code === ba.state)?.name || ba.state || ''
+  const states = getStatesForCountry(ba.country) || []
+  const stateName = states.find((s) => s.code === ba.state)?.name || ba.state || ''
   const cityLine = [ba.city, [stateName, ba.zip].filter(Boolean).join(' ').trim()]
     .filter(Boolean)
     .join(', ')
@@ -50,7 +51,7 @@ function BillingSummary({ control, onEdit }) {
   )
 }
 
-export default function Step3Payment({ control, errors, setValue, onEditBilling }) {
+export default function Step3Payment({ control, errors, setValue, onEditBilling, isSubmitted }) {
   return (
     <section className="rf-step">
       <h1 className="rf-step-title">Payment &amp; authorization</h1>
@@ -106,7 +107,7 @@ export default function Step3Payment({ control, errors, setValue, onEditBilling 
         <span>Only the last 4 digits and card brand are stored. We never persist the full card number or CVV.</span>
       </div>
 
-      <PaymentCardForm control={control} errors={errors} setValue={setValue} />
+      <PaymentCardForm control={control} setValue={setValue} showAllErrors={isSubmitted} />
 
       <div className="rf-field" style={{ marginTop: 4 }}>
         <label className="rf-label">Card billing address</label>
@@ -147,11 +148,18 @@ export default function Step3Payment({ control, errors, setValue, onEditBilling 
         <Controller
           name="signature"
           control={control}
-          render={({ field }) => (
+          render={({ field, fieldState }) => (
             <SignaturePad
               value={field.value}
-              onChange={field.onChange}
-              error={errors.signature?.message}
+              onChange={(v) => {
+                field.onChange(v)
+                field.onBlur()
+              }}
+              error={
+                (fieldState.isTouched || isSubmitted) && fieldState.error
+                  ? fieldState.error.message
+                  : null
+              }
             />
           )}
         />
@@ -174,9 +182,6 @@ export default function Step3Payment({ control, errors, setValue, onEditBilling 
           <a href="#" target="_blank" rel="noreferrer">Privacy Policy</a>, and confirm the information above is accurate.
         </span>
       </label>
-      {errors.termsAccepted && (
-        <p className="rf-help error" style={{ marginTop: 6 }}>{errors.termsAccepted.message}</p>
-      )}
     </section>
   )
 }

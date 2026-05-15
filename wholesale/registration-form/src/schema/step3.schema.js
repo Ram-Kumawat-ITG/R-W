@@ -47,9 +47,7 @@ export const step3Schema = yup.object({
       if (s.type === 'type') return Boolean(s.typed && s.typed.trim())
       return false
     }),
-  termsAccepted: yup
-    .boolean()
-    .oneOf([true], 'You must agree to the Terms and Privacy Policy'),
+  termsAccepted: yup.boolean().notRequired(),
 })
 
 export const step3Fields = ['payment', 'signature', 'termsAccepted']

@@ -1,10 +1,10 @@
 import * as yup from 'yup'
 import { MAX_FILE_SIZE, ACCEPTED_MIME_TYPES, CREDENTIALS, REFERRALS } from '../constants'
 
-const fileTest = (selectedKey, message = 'File is required') =>
+const fileWhenSelected = (message = 'File is required') =>
   yup
     .mixed()
-    .when(selectedKey, {
+    .when('selected', {
       is: true,
       then: (s) =>
         s
@@ -14,28 +14,26 @@ const fileTest = (selectedKey, message = 'File is required') =>
       otherwise: (s) => s.nullable().notRequired(),
     })
 
-const reqWhen = (key, message = 'Required') =>
-  yup.string().when(key, {
+const reqWhenSelected = (message = 'Required') =>
+  yup.string().when('selected', {
     is: true,
     then: (s) => s.required(message),
     otherwise: (s) => s.notRequired(),
   })
 
-// Build the per-credential sub-field shape from the constants config
 const credentialShape = {}
 CREDENTIALS.forEach((cred) => {
   const fields = { selected: yup.boolean() }
   cred.docs.forEach((doc, i) => {
     if (doc.type === 'file') {
-      fields[`file${i}`] = fileTest(`credentials.${cred.id}.selected`)
+      fields[`file${i}`] = fileWhenSelected(`${doc.label} is required`)
     } else if (doc.type === 'text' || doc.type === 'select') {
-      fields[doc.key] = reqWhen(`credentials.${cred.id}.selected`, `${doc.label} required`)
+      fields[doc.key] = reqWhenSelected(`${doc.label} is required`)
     }
   })
   credentialShape[cred.id] = yup.object(fields)
 })
 
-// Referral shape with per-source follow-up text fields
 const referralShape = {}
 REFERRALS.forEach((ref) => {
   if (ref.exclusive) {
@@ -43,7 +41,7 @@ REFERRALS.forEach((ref) => {
   } else if (ref.field) {
     referralShape[ref.id] = yup.object({
       selected: yup.boolean(),
-      value: reqWhen(`referrals.${ref.id}.selected`, `${ref.name} detail required`),
+      value: reqWhenSelected(`${ref.name} detail is required`),
     })
   } else {
     referralShape[ref.id] = yup.object({ selected: yup.boolean() })
@@ -69,7 +67,7 @@ export const step1Schema = yup.object({
     .min(8, 'At least 8 characters')
     .matches(/[A-Za-z]/, 'Must include a letter')
     .matches(/\d/, 'Must include a number'),
-  businessName: yup.string().required('Business name is required'),
+  businessName: yup.string().notRequired(),
   credentials: yup
     .object(credentialShape)
     .test('one-selected', 'Select at least one credential', (c) =>
@@ -82,7 +80,6 @@ export const step1Schema = yup.object({
     ),
 })
 
-// Field paths react-hook-form trigger() needs for this step
 export const step1Fields = [
   'firstName',
   'lastName',

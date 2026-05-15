@@ -10,22 +10,37 @@ export default function StepIndicator({ currentStep }) {
         </span>
         <span>{TIME_ESTIMATES[currentStep - 1]}</span>
       </div>
-      <div className="rf-progress-track">
-        {STEPS.map((_, i) => {
+
+      <div className="rf-stepper">
+        {STEPS.map((label, i) => {
           const stepNum = i + 1
-          const className =
-            stepNum < currentStep ? 'rf-progress-seg done'
-            : stepNum === currentStep ? 'rf-progress-seg active'
-            : 'rf-progress-seg'
-          return <div key={i} className={className} />
+          const state =
+            stepNum < currentStep ? 'done'
+            : stepNum === currentStep ? 'active'
+            : 'pending'
+          return (
+            <div key={label} className="rf-step-node">
+              <div className="rf-step-circle-wrap">
+                {i > 0 && (
+                  <div className={`rf-step-line left ${stepNum <= currentStep ? 'done' : ''}`} />
+                )}
+                <div className={`rf-step-circle ${state}`}>
+                  {state === 'done' ? (
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M20 6L9 17l-5-5" />
+                    </svg>
+                  ) : (
+                    <span>{stepNum}</span>
+                  )}
+                </div>
+                {i < STEPS.length - 1 && (
+                  <div className={`rf-step-line right ${stepNum < currentStep ? 'done' : ''}`} />
+                )}
+              </div>
+              <div className={`rf-step-label ${state}`}>{label}</div>
+            </div>
+          )
         })}
-      </div>
-      <div className="rf-step-pills">
-        {STEPS.map((label, i) => (
-          <span key={label} className={i + 1 === currentStep ? 'active' : ''}>
-            {label}
-          </span>
-        ))}
       </div>
     </div>
   )
