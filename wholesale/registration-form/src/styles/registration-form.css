@@ -391,7 +391,6 @@
   border-radius: 10px;
   padding: 18px;
   margin-bottom: 12px;
-  animation: rfFadeUp 0.3s cubic-bezier(0.2, 0.7, 0.2, 1);
 }
 .rf-cred-head {
   display: flex;
@@ -444,7 +443,7 @@
   padding: 18px 14px;
   text-align: center;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition: border-color 0.18s ease, background-color 0.18s ease;
   background: #fafafa;
   position: relative;
 }
