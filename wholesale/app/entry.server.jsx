@@ -4,14 +4,19 @@ import { ServerRouter } from "react-router";
 import { createReadableStreamFromReadable } from "@react-router/node";
 import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
-import connectDB from "./db.server";
-import { getAgenda } from "./services/scheduler/agenda.server";
-import { config, assertSafeTestCardConfig } from "./services/config.server";
-import { createLogger } from "./services/logger.server";
+import connectDB from "./services/APIService/mongo.service";
+import { getAgenda } from "./services/scheduler/scheduler.service";
+import { assertSafeBootConfig } from "./configs";
+import { qboConfig } from "./services/qbo/qbo.config";
+import { nmiConfig } from "./services/nmi/nmi.config";
+import { paymentConfig } from "./services/payment/payment.config";
+import { schedulerConfig } from "./services/scheduler/scheduler.config";
+import { shopifyConfig } from "./services/shopify/shopify.config";
+import { createLogger } from "./utils/logger.utils";
 
 // Scrub NMI_TEST_* if accidentally set in a non-sandbox environment.
-// Runs at module load — before anything reads config.nmi.testCard.
-assertSafeTestCardConfig();
+// Runs at module load — before anything reads nmi.testCard.
+assertSafeBootConfig();
 
 export const streamTimeout = 5000;
 
@@ -23,37 +28,37 @@ function printBootBanner() {
   console.log("\n=========================================================");
   console.log("  Natural Solutions wholesale app — boot");
   console.log("=========================================================");
-  console.log(`  SHOPIFY_APP_URL           : ${config.shopify.appUrl || "(not set — webhooks will use shopify.app.toml's application_url)"}`);
-  console.log(`  Webhook endpoint          : ${(config.shopify.appUrl || "(app-url)").replace(/\/$/, "")}/webhooks/orders/create`);
-  console.log(`  MONGODB_URI               : ${mask(config.mongodbUri)}`);
+  console.log(`  SHOPIFY_APP_URL           : ${shopifyConfig.appUrl || "(not set — webhooks will use shopify.app.toml's application_url)"}`);
+  console.log(`  Webhook endpoint          : ${(shopifyConfig.appUrl || "(app-url)").replace(/\/$/, "")}/webhooks/orders/create`);
+  console.log(`  MONGODB_URI               : ${mask(process.env.MONGODB_URI)}`);
   console.log("  --- QBO ---");
-  console.log(`  QBO_ENVIRONMENT           : ${config.qbo.environment}`);
-  console.log(`  QBO_API_BASE_URL          : ${config.qbo.apiBaseUrl}`);
-  console.log(`  QBO_CLIENT_ID             : ${mask(config.qbo.clientId)}`);
-  console.log(`  QBO_CLIENT_SECRET         : ${mask(config.qbo.clientSecret)}`);
-  console.log(`  QBO_REALM_ID              : ${config.qbo.realmId || "MISSING"}`);
-  console.log(`  QBO_REFRESH_TOKEN (seed)  : ${mask(config.qbo.bootstrapRefreshToken)}`);
-  console.log(`  QBO_DEFAULT_ITEM_ID       : ${config.qbo.defaultItemId}`);
+  console.log(`  QBO_ENVIRONMENT           : ${qboConfig.environment}`);
+  console.log(`  QBO_API_BASE_URL          : ${qboConfig.apiBaseUrl}`);
+  console.log(`  QBO_CLIENT_ID             : ${mask(qboConfig.clientId)}`);
+  console.log(`  QBO_CLIENT_SECRET         : ${mask(qboConfig.clientSecret)}`);
+  console.log(`  QBO_REALM_ID              : ${qboConfig.realmId || "MISSING"}`);
+  console.log(`  QBO_REFRESH_TOKEN (seed)  : ${mask(qboConfig.bootstrapRefreshToken)}`);
+  console.log(`  QBO_DEFAULT_ITEM_ID       : ${qboConfig.defaultItemId}`);
   console.log("  --- NMI ---");
-  console.log(`  NMI_ENVIRONMENT           : ${config.nmi.environment}`);
-  console.log(`  NMI_API_URL               : ${config.nmi.apiUrl}`);
-  console.log(`  NMI_QUERY_URL             : ${config.nmi.queryUrl}`);
-  console.log(`  NMI_SECURITY_KEY          : ${mask(config.nmi.securityKey)}`);
-  const tc = config.nmi.testCard;
+  console.log(`  NMI_ENVIRONMENT           : ${nmiConfig.environment}`);
+  console.log(`  NMI_API_URL               : ${nmiConfig.apiUrl}`);
+  console.log(`  NMI_QUERY_URL             : ${nmiConfig.queryUrl}`);
+  console.log(`  NMI_SECURITY_KEY          : ${mask(nmiConfig.securityKey)}`);
+  const tc = nmiConfig.testCard;
   const tcStatus = tc.ccnumber && tc.ccexp
     ? `ACTIVE — last4 ${String(tc.ccnumber).slice(-4)} exp ${tc.ccexp}`
     : "(not set)";
   console.log(`  NMI test card (dev only)  : ${tcStatus}`);
   console.log("  --- Payments ---");
-  console.log(`  PAYMENT_CHARGE_IMMEDIATELY: ${config.payments.chargeImmediately}`);
-  console.log(`  PAYMENT_MAX_RETRY_ATTEMPTS: ${config.payments.maxRetryAttempts}`);
-  console.log(`  PAYMENT_RETRY_INTERVAL    : ${config.payments.retryIntervalOverride || "(unset — using cron)"}`);
-  console.log(`  PAYMENT_RETRY_CRON_PRIMARY: ${config.payments.retryCronPrimary}`);
-  console.log(`  PAYMENT_RETRY_CRON_SECONDARY: ${config.payments.retryCronSecondary}`);
-  console.log(`  PAYMENT_SCHEDULE_TZ       : ${config.payments.scheduleTimezone}`);
+  console.log(`  PAYMENT_CHARGE_IMMEDIATELY: ${paymentConfig.chargeImmediately}`);
+  console.log(`  PAYMENT_MAX_RETRY_ATTEMPTS: ${paymentConfig.maxRetryAttempts}`);
+  console.log(`  PAYMENT_RETRY_INTERVAL    : ${schedulerConfig.retryIntervalOverride || "(unset — using cron)"}`);
+  console.log(`  PAYMENT_RETRY_CRON_PRIMARY: ${schedulerConfig.retryCronPrimary}`);
+  console.log(`  PAYMENT_RETRY_CRON_SECONDARY: ${schedulerConfig.retryCronSecondary}`);
+  console.log(`  PAYMENT_SCHEDULE_TZ       : ${schedulerConfig.scheduleTimezone}`);
   console.log("  --- Logging ---");
-  console.log(`  LOG_PRETTY                : ${config.logging.pretty}`);
-  console.log(`  LOG_LEVEL                 : ${config.logging.level}`);
+  console.log(`  LOG_PRETTY                : ${process.env.LOG_PRETTY === "true"}`);
+  console.log(`  LOG_LEVEL                 : ${process.env.LOG_LEVEL || "info"}`);
   console.log("=========================================================\n");
 }
 

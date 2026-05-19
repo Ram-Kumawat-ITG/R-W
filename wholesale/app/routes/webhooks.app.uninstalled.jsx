@@ -1,5 +1,5 @@
 import { authenticate } from "../shopify.server";
-import db from "../db.server";
+import db from "../services/APIService/mongo.service";
 
 export const action = async ({ request }) => {
   const { shop, session, topic } = await authenticate.webhook(request);

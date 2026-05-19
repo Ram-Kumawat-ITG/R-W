@@ -1,8 +1,21 @@
+// Shopify orders/create webhook handler.
+//
+// Thin handler — does HMAC verification, request logging, and a
+// fire-and-forget call into the order orchestrator. Business logic
+// lives in services/order/order.service.js. Returns 200 to Shopify
+// BEFORE the orchestrator finishes so we never block on QBO/NMI
+// latency. The orchestrator's idempotency layers handle Shopify's
+// at-least-once retries.
+//
+// File-based routing: this file's dotted name maps to /webhooks/orders/create.
+// Sibling webhook routes (webhooks.app.uninstalled.jsx, etc.) use the
+// same convention.
+
 import { authenticate } from '../shopify.server'
-import connectDB from '../db.server'
-import { scheduleNow, JOB_NAMES } from '../services/scheduler/agenda.server'
-import { processShopifyOrder } from '../services/orders/processOrder.server'
-import { createLogger } from '../services/logger.server'
+import connectDB from '../services/APIService/mongo.service'
+import { scheduleNow, JOB_NAMES } from '../services/scheduler/scheduler.service'
+import { processShopifyOrder } from '../services/order/order.service'
+import { createLogger } from '../utils/logger.utils'
 
 const log = createLogger('webhook.orders_create')
 
@@ -26,13 +39,6 @@ export const loader = async () => {
   )
 }
 
-// Shopify orders/create webhook.
-//
-// Shopify-managed authenticate.webhook() handles HMAC verification, shop
-// identification, and JSON parsing. We immediately enqueue an Agenda job
-// and return 200 so we never block Shopify's webhook delivery on QBO/NMI
-// latency or transient failures. The Agenda job is the durable boundary
-// for retries — Shopify only retries ~3 times.
 export const action = async ({ request }) => {
   // Hard log BEFORE auth so we know the route was hit even if auth blows up.
   const webhookId = request.headers.get('x-shopify-webhook-id') || ''

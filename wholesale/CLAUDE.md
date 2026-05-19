@@ -35,19 +35,46 @@ Three external systems, one orchestrator. Failures isolated per side.
 
 ```
 wholesale/app/
-  routes/webhooks.orders.create.jsx   ← inbound webhook entrypoint
-  services/orders/processOrder...     ← orchestrator (idempotent + concurrency-safe)
-  services/qbo/                       ← all QBO HTTP calls
-  services/nmi/                       ← all NMI HTTP calls
-  services/shopify/                   ← Shopify Admin GraphQL (offline session)
-  services/customers/                 ← ensureCustomer + payment-details resolver
-  services/invoices/invoiceService    ← claim-first invoice creation + sync propagation
-  services/scheduler/                 ← Agenda lifecycle + jobs
-  services/config.server.js           ← ALL env access goes here (no process.env elsewhere)
+  api/                                ← INBOUND HTTP route handlers (thin), explicitly mapped in routes.js
+    registration-form.js                /api/registration-form
+    admin-*.js                          /api/admin/customers/...
+  services/                           ← All server-side logic, organized service-wise
+    APIService/                         ← Shared foundation
+      mongo.service.js                    MongoDB connection (was db.server.js)
+      api.service.js                      sendResponse + common response helpers
+      http.service.js                     fetch wrapper with retry + classify
+    shopify/                            shopify.service|apis|queries|mutations|utils|constants|config
+    qbo/                                qbo.service|apis|utils|constants|config
+    nmi/                                nmi.service|apis|utils|constants|config
+    payment/                            payment.service|config (charge orchestration on top of nmi)
+    customer/                           customer.service|utils + paymentDetails.service
+    invoice/                            invoice.service|utils (creation + propagateSuccessfulPayment)
+    order/                              order.service (orchestrator) + order.validator
+    scheduler/                          scheduler.service + scheduler.config + jobs/
+  utils/                              ← Global utilities (cross-service)
+    env.utils.js                        readEnv / readInt / readBool
+    logger.utils.js                     structured logger
+    retry.utils.js                      retry() + PermanentError / TransientError
+  configs/index.js                    ← Boot-time config aggregator (re-exports + assertions)
   models/                             ← Mongoose schemas only (no business logic)
+  routes/                             ← UI / admin pages + webhook handlers (file-based routing)
+    webhooks.orders.create.jsx        ← Shopify orders/create webhook (POST /webhooks/orders/create)
+    webhooks.app.uninstalled.jsx      ← Shopify app lifecycle (pre-existing template)
+    webhooks.app.scopes_update.jsx
 ```
 
-Section 2 of [INTEGRATIONS.md](./INTEGRATIONS.md) has the full file map.
+**Per-service file convention.** Each service folder under `services/<svc>/`
+uses a consistent file split:
+
+- `<svc>.service.js` — domain methods the rest of the app calls
+- `<svc>.apis.js` — HTTP plumbing for outbound integrations (auth, retry, error classification)
+- `<svc>.queries.js` / `<svc>.mutations.js` — GraphQL strings (Shopify only)
+- `<svc>.config.js` — service-specific env-driven config + asserts
+- `<svc>.utils.js` — pure helpers used only by this service
+- `<svc>.constants.js` — value constants for this service
+
+Anything that's cross-service is global (`app/utils/`). Section 2 of
+[INTEGRATIONS.md](./INTEGRATIONS.md) has the full file map.
 
 ## 4. Implementation status
 
@@ -82,14 +109,15 @@ Legend: ✅ complete · 🟡 partial · ⏳ pending · ❌ blocked
 
 These are project laws — bend code to fit them, not the other way around:
 
-1. **No direct `process.env.X` in business logic.** Add to `services/config.server.js` instead.
-2. **No QBO calls outside `services/qbo/`.** Same rule for NMI and Shopify.
-3. **Models are schema + indexes only.** Business logic lives in services.
-4. **Idempotency lives in the data layer.** Unique indexes and atomic `findOneAndUpdate` — not just application checks. The duplicate-invoice bug fix in §13.4 of INTEGRATIONS.md is the canonical example.
-5. **Webhook handler returns 200 immediately.** Downstream work is fire-and-forget; never block on it.
-6. **NMI sandbox key on production host (or vice versa) returns "Authentication Failed".** Always match `NMI_ENVIRONMENT` to the key. Same for QBO.
-7. **Test cards are sandbox-only.** `assertSafeTestCardConfig()` scrubs `NMI_TEST_*` env vars at boot if `NMI_ENVIRONMENT !== 'sandbox'`.
-8. **Never amend commits or force-push.** Create new commits; preserve history.
+1. **No direct `process.env.X` in business logic.** Add a key to the right per-service config (`services/<svc>/<svc>.config.js`) using helpers from `utils/env.utils.js`. The aggregator at `app/configs/index.js` exposes everything for boot validation.
+2. **No QBO calls outside `services/qbo/`.** Same rule for NMI (`services/nmi/`) and Shopify Admin GraphQL (`services/shopify/`). Each integration is internally split: `<svc>.apis.js` does I/O, `<svc>.service.js` exposes domain methods, GraphQL strings live in `<svc>.queries.js` / `<svc>.mutations.js`.
+3. **API handlers are thin.** Files under `app/api/` only do request validation, HMAC/auth, request/response shaping, and a single call into a service. All business logic lives in `services/`.
+4. **Models are schema + indexes only.** Business logic lives in services.
+5. **Idempotency lives in the data layer.** Unique indexes and atomic `findOneAndUpdate` — not just application checks. The duplicate-invoice bug fix in §13.4 of INTEGRATIONS.md is the canonical example.
+6. **Webhook handler returns 200 immediately.** Downstream work is fire-and-forget; never block on it.
+7. **NMI sandbox key on production host (or vice versa) returns "Authentication Failed".** Always match `NMI_ENVIRONMENT` to the key. Same for QBO.
+8. **Test cards are sandbox-only.** `assertSafeTestCardConfig()` scrubs `NMI_TEST_*` env vars at boot if `NMI_ENVIRONMENT !== 'sandbox'`.
+9. **Never amend commits or force-push.** Create new commits; preserve history.
 
 ## 6. Maintenance protocol — UPDATE THIS FILE ON EVERY MEANINGFUL CHANGE
 
@@ -140,8 +168,22 @@ without it — the test-card / sandbox-key combo is the most common foot-gun.
 
 Append-only. Newest at top. One-line summaries; link to section for detail.
 
+- **2026-05-19** — Moved the Shopify webhook handler back to `app/routes/webhooks.orders.create.jsx` (file-based routing), matching the sibling `webhooks.app.*.jsx` convention. Removed the explicit `route()` declaration from `app/routes.js`. `app/api/` is now reserved for non-webhook inbound REST endpoints (admin-* + registration-form). URL `/webhooks/orders/create` unchanged.
+- **2026-05-19** — Major service-oriented restructure. Each integration
+  service now has a consistent file split (`<svc>.service.js` /
+  `<svc>.apis.js` / `<svc>.queries.js` / `<svc>.mutations.js` /
+  `<svc>.config.js` / `<svc>.utils.js` / `<svc>.constants.js`).
+  Created `services/APIService/` shared foundation (mongo + http + api
+  helpers). New `services/payment/` extracted from the old invoice service
+  for charge orchestration. Renamed domain folders to singular
+  (`customers/` → `customer/`, `invoices/` → `invoice/`, `orders/` → `order/`).
+  Moved `routes/webhooks.orders.create.jsx` → `api/webhook/shopify-order-create.js`.
+  Global utils moved to `app/utils/` (`logger.utils.js`, `retry.utils.js`,
+  `env.utils.js`). Boot config aggregator at `app/configs/index.js`.
+  See §3 above for the new layout and §5 for updated project rules.
+  ~25 new files, 26 deletions, ~14 caller updates. All `node --check`
+  passes; zero stale path references in app code.
 - **2026-05-19** — Initial canonical spec consolidated into `CLAUDE.md`.
-  `INTEGRATIONS.md` (1,393 lines) remains the deep technical reference.
-  Implementation status snapshot taken from current branch `QBO_and_NMI`.
+  `INTEGRATIONS.md` remains the deep technical reference.
 - **(prior)** — See git log on branch `QBO_and_NMI` for the build-out of
-  the QBO + NMI + Shopify pipeline (commit `24959af` and earlier).
+  the QBO + NMI + Shopify pipeline.

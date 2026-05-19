@@ -1,11 +1,20 @@
 import crypto from 'node:crypto'
 import { authenticate } from '../shopify.server'
-import connectDB from '../db.server'
+import connectDB from '../services/APIService/mongo.service'
 import WholesaleApplication from '../models/wholesaleApplication.server'
-import { sendResponse } from '../utils/sendResponse'
-import { buildShopifyNote } from '../utils/buildShopifyNote'
-import { customerCreate, customerSendInvite } from '../utils/shopifyCustomer'
+import { sendResponse } from '../services/APIService/api.service'
+import { buildShopifyNote } from '../services/shopify/shopify.utils'
+import {
+  createCustomer,
+  sendCustomerInvite,
+  uploadFileToShopify,
+} from '../services/shopify/shopify.service'
 
+// POST /api/registration-form
+// Storefront-proxied wholesale application submit. Parses the multipart
+// form, uploads attached files to Shopify Files, hashes the card / password,
+// persists the application, then creates a Pending Shopify customer + sends
+// the "received" acknowledgement email.
 export async function action({ request }) {
   if (request.method !== 'POST') {
     return sendResponse(405, 'error', 'Method not allowed', null)
@@ -50,12 +59,13 @@ export async function action({ request }) {
     }
   }
 
-  // Upload each file to Shopify Files API → get a permanent CDN URL → put it in payload.
-  // Upload all files in parallel — sequential awaits would multiply round-trips.
+  // Upload each file to Shopify Files → get a permanent CDN URL → put it in
+  // payload. Files upload in parallel; sequential awaits would multiply
+  // round-trips.
   try {
     const results = await Promise.all(
       fileEntries.map(async ({ key, file }) => {
-        const url = await uploadToShopifyFiles(admin, file)
+        const url = await uploadFileToShopify(admin, file)
         return { key, url }
       })
     )
@@ -130,7 +140,7 @@ export async function action({ request }) {
   try {
     if (!admin) throw new Error('admin client unavailable from appProxy auth')
     const note = buildShopifyNote(payload)
-    customerId = await customerCreate(admin, {
+    customerId = await createCustomer(admin, {
       application: payload,
       note,
       tags: ['Pending'],
@@ -138,7 +148,7 @@ export async function action({ request }) {
     })
 
     try {
-      await customerSendInvite(admin, {
+      await sendCustomerInvite(admin, {
         customerId,
         subject: 'We received your wholesale application',
         message:
@@ -184,130 +194,7 @@ export async function loader() {
   return sendResponse(405, 'error', 'Method not allowed', null)
 }
 
-// ---- Shopify Files API helpers ----
-
-// Returns the permanent CDN URL once the file is READY (or throws on failure).
-async function uploadToShopifyFiles(admin, file) {
-  const isImage = (file.type || '').startsWith('image/')
-  const resourceKind = isImage ? 'IMAGE' : 'FILE'
-
-  // 1. Get a staged upload target
-  const staged = await admin.graphql(
-    `#graphql
-    mutation StagedUploadsCreate($input: [StagedUploadInput!]!) {
-      stagedUploadsCreate(input: $input) {
-        stagedTargets {
-          url
-          resourceUrl
-          parameters { name value }
-        }
-        userErrors { field message }
-      }
-    }`,
-    {
-      variables: {
-        input: [
-          {
-            filename: file.name || 'upload',
-            mimeType: file.type || 'application/octet-stream',
-            fileSize: String(file.size),
-            httpMethod: 'POST',
-            resource: resourceKind,
-          },
-        ],
-      },
-    }
-  )
-  const stagedJson = await staged.json()
-  const stagedErrors = stagedJson?.data?.stagedUploadsCreate?.userErrors
-  if (stagedErrors?.length) {
-    throw new Error(`stagedUploadsCreate: ${stagedErrors.map((e) => e.message).join('; ')}`)
-  }
-  const target = stagedJson?.data?.stagedUploadsCreate?.stagedTargets?.[0]
-  if (!target?.url) throw new Error('No staged target returned')
-
-  // 2. Upload the bytes to the staged target (Shopify-hosted S3-compatible bucket)
-  const upload = new FormData()
-  for (const p of target.parameters || []) upload.append(p.name, p.value)
-  // Shopify expects the file field to be named "file"
-  upload.append('file', file, file.name || 'upload')
-
-  const putRes = await fetch(target.url, { method: 'POST', body: upload })
-  if (!putRes.ok) {
-    const txt = await putRes.text().catch(() => '')
-    throw new Error(`Staged upload failed (${putRes.status}): ${txt.slice(0, 200)}`)
-  }
-
-  // 3. Register the uploaded resource as a Shopify File
-  const created = await admin.graphql(
-    `#graphql
-    mutation FileCreate($files: [FileCreateInput!]!) {
-      fileCreate(files: $files) {
-        files {
-          id
-          fileStatus
-          ... on MediaImage { image { url } }
-          ... on GenericFile { url }
-        }
-        userErrors { field message }
-      }
-    }`,
-    {
-      variables: {
-        files: [
-          {
-            originalSource: target.resourceUrl,
-            contentType: resourceKind,
-            alt: file.name || 'upload',
-          },
-        ],
-      },
-    }
-  )
-  const createdJson = await created.json()
-  const createErrors = createdJson?.data?.fileCreate?.userErrors
-  if (createErrors?.length) {
-    throw new Error(`fileCreate: ${createErrors.map((e) => e.message).join('; ')}`)
-  }
-  const created0 = createdJson?.data?.fileCreate?.files?.[0]
-  if (!created0?.id) throw new Error('fileCreate returned no file')
-
-  // If fileCreate already returned a URL (often the case for direct uploads),
-  // skip the polling round-trip and use it.
-  const immediateUrl = created0?.url || created0?.image?.url
-  if (immediateUrl) return immediateUrl
-
-  // Otherwise poll — tight cadence so we don't drag out submit time.
-  const url = await pollFileUntilReady(admin, created0.id)
-  return url
-}
-
-async function pollFileUntilReady(admin, fileId, { tries = 6, delayMs = 400 } = {}) {
-  for (let i = 0; i < tries; i++) {
-    const res = await admin.graphql(
-      `#graphql
-      query FileById($id: ID!) {
-        node(id: $id) {
-          ... on MediaImage { fileStatus image { url } }
-          ... on GenericFile { fileStatus url }
-        }
-      }`,
-      { variables: { id: fileId } }
-    )
-    const json = await res.json()
-    const node = json?.data?.node
-    const status = node?.fileStatus
-    const url = node?.url || node?.image?.url
-
-    if (url) return url
-    if (status === 'FAILED') throw new Error('File processing failed')
-
-    await new Promise((r) => setTimeout(r, delayMs))
-  }
-  throw new Error('File not READY after timeout')
-}
-
-// ---- nested-key helpers ----
+// ── Form-parsing helpers (not Shopify-specific) ──────────────────────
 
 function setNested(obj, path, value) {
   const keys = parsePath(path)

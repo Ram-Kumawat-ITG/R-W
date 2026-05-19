@@ -67,72 +67,128 @@ Stack: React Router 7 (Remix-style) + Node 20+ + Mongoose 9 + Agenda 5.
 
 ```
 app/
-├── routes/
-│   ├── webhooks.orders.create.jsx        # Shopify orders/create entrypoint
-│   ├── webhooks.app.uninstalled.jsx      # App lifecycle (pre-existing)
-│   ├── webhooks.app.scopes_update.jsx    # App lifecycle (pre-existing)
-│   └── app.webhooks.jsx                  # /app/webhooks diagnostic page
+├── api/                                  # INBOUND HTTP API handlers (thin: validate → call service → respond)
+│   ├── registration-form.js              #   POST /api/registration-form  (proxy submit)
+│   ├── admin-customers.js                #   GET  /api/admin/customers
+│   ├── admin-customer.js                 #   GET  /api/admin/customers/:id
+│   ├── admin-decline.js                  #   POST /api/admin/customers/:id/decline
+│   ├── admin-review.js                   #   POST /api/admin/customers/:id/review
+│   └── admin-unreview.js                 #   POST /api/admin/customers/:id/unreview
 │
-├── api/
-│   └── registration-form.js              # Wholesale application proxy
+│                                         # Note: webhook handlers live under routes/ (below),
+│                                         # using React Router's file-based routing convention.
 │
-├── models/                               # Mongoose schemas
-│   ├── customerMap.server.js             # Cross-system customer mapping
-│   ├── invoice.server.js                 # Local invoice mirror + sync flags
-│   ├── order.server.js                   # ShopifyOrder local mirror
-│   ├── paymentAttempt.server.js          # Append-only NMI charge ledger
-│   ├── qboToken.server.js                # QBO OAuth token store
-│   └── wholesaleApplication.server.js    # Pre-existing wholesale signups
-│
-├── services/
-│   ├── config.server.js                  # Centralized env config + asserts
-│   ├── logger.server.js                  # Structured logger (JSON or pretty)
-│   ├── retry.server.js                   # PermanentError / TransientError
+├── services/                             # Service-oriented, organized by domain
+│   ├── APIService/                       # Shared foundation
+│   │   ├── mongo.service.js              #   MongoDB connection (was db.server.js)
+│   │   ├── api.service.js                #   sendResponse + common response helpers
+│   │   └── http.service.js               #   fetch wrapper with retry + classification
 │   │
-│   ├── qbo/
-│   │   ├── client.server.js              # HTTP client + OAuth2 refresh
-│   │   ├── customer.server.js            # findCustomerByEmail / create
-│   │   └── invoice.server.js             # createInvoice / recordPayment
+│   ├── shopify/                          # Shopify Admin GraphQL
+│   │   ├── shopify.service.js            #   Domain: markOrderPaid, ensure/listWebhooks, customer ops
+│   │   ├── shopify.apis.js               #   Admin client wrappers (auth + unauthenticated)
+│   │   ├── shopify.queries.js            #   GraphQL query strings
+│   │   ├── shopify.mutations.js          #   GraphQL mutation strings
+│   │   ├── shopify.config.js             #   appUrl, appProxy
+│   │   ├── shopify.utils.js              #   toE164US, mapAddress, buildShopifyNote, toOrderGid
+│   │   └── shopify.constants.js          #   REQUIRED_SUBSCRIPTIONS, note maps (CRED/REFERRAL)
 │   │
-│   ├── nmi/
-│   │   ├── client.server.js              # Form-encoded transact / query
-│   │   ├── customer.server.js            # Customer Vault add / lookup
-│   │   └── payment.server.js             # Sale / refund / void
+│   ├── qbo/                              # QuickBooks Online
+│   │   ├── qbo.service.js                #   Domain: findOrCreateCustomer, createInvoice, recordPayment
+│   │   ├── qbo.apis.js                   #   OAuth2 + retry + 401-refresh + Fault classification
+│   │   ├── qbo.config.js                 #   QBO_* env (clientId/secret/realmId/refreshToken/etc.)
+│   │   ├── qbo.utils.js                  #   escapeQboQuery, truncate, toCustomerPayload, toInvoiceLine
+│   │   └── qbo.constants.js              #   QBO_BASE_URLS, OAUTH_TOKEN_URL, ACCESS_TOKEN_SAFETY_MS
 │   │
-│   ├── shopify/
-│   │   ├── orderUpdater.server.js        # orderMarkAsPaid via offline session
-│   │   └── registerWebhooks.server.js    # Programmatic webhook registration
+│   ├── nmi/                              # NMI gateway
+│   │   ├── nmi.service.js                #   Domain: findOrCreateCustomerVault, charge/refund/void
+│   │   ├── nmi.apis.js                   #   form-encoded transact.php + query.php transport
+│   │   ├── nmi.config.js                 #   NMI_* env + assertSafeTestCardConfig
+│   │   ├── nmi.utils.js                  #   encodeForm, parseResponseBody, classifyNmiResponse
+│   │   └── nmi.constants.js              #   NMI_BASE_URLS, RESPONSE_OUTCOME, NMI_SENSITIVE_PARAMS
 │   │
-│   ├── customers/
-│   │   ├── ensureCustomer.server.js      # QBO + NMI find-or-create + mapping
-│   │   └── paymentDetailsResolver.server.js  # Pluggable payment-details strategy
+│   ├── payment/                          # Payment orchestration (on top of nmi)
+│   │   ├── payment.service.js            #   chargeInvoice (was chargeInvoice)
+│   │   └── payment.config.js             #   maxRetryAttempts, chargeImmediately, httpRetry*
 │   │
-│   ├── invoices/
-│   │   └── invoiceService.server.js      # Claim-first creation + sync propagation
+│   ├── customer/                         # Cross-system customer mapping
+│   │   ├── customer.service.js           #   ensureCustomerForOrder
+│   │   ├── customer.utils.js             #   normalizeAddress, buildProfileFromShopifyOrder
+│   │   └── paymentDetails.service.js     #   Strategy registry for NMI payment details
 │   │
-│   ├── orders/
-│   │   ├── processOrder.server.js        # Top-level orchestrator
-│   │   └── validateOrder.server.js       # Pre-flight payload validation
+│   ├── invoice/                          # Local invoice lifecycle
+│   │   ├── invoice.service.js            #   createInvoiceForOrder, propagateSuccessfulPayment
+│   │   └── invoice.utils.js              #   shopifyLinesToQboLines, syncWithRetry
 │   │
-│   └── scheduler/
-│       ├── agenda.server.js              # Agenda lifecycle + cron registration
+│   ├── order/                            # Order processing orchestrator
+│   │   ├── order.service.js              #   processShopifyOrder (the top-level driver)
+│   │   └── order.validator.js            #   validateShopifyOrder (pre-flight checks)
+│   │
+│   └── scheduler/                        # Agenda lifecycle + recurring jobs
+│       ├── scheduler.service.js          #   getAgenda + scheduleNow + lifecycle
+│       ├── scheduler.config.js           #   cron/interval/timezone
 │       └── jobs/
-│           ├── index.server.js
-│           ├── processOrder.job.server.js
-│           └── processPendingPayments.job.server.js
+│           ├── index.js                  #   Job registry
+│           ├── processOrder.job.js
+│           └── processPendingPayments.job.js
 │
-├── entry.server.jsx                      # SSR + boot banner + scheduler bootstrap
-├── shopify.server.js                     # Pre-existing Shopify app config
-├── db.server.js                          # Mongoose connection
-└── routes.js                             # Route table
+├── routes/                               # UI / admin pages + inbound webhook handlers (file-based routing)
+│   ├── app.jsx, app._index.jsx           #   Embedded admin shell + dashboard
+│   ├── app.customers._index.jsx
+│   ├── app.customers.$id.jsx
+│   ├── app.webhooks.jsx                  #   /app/webhooks diagnostic page
+│   ├── webhooks.orders.create.jsx        #   POST /webhooks/orders/create (Shopify orders/create)
+│   ├── webhooks.app.uninstalled.jsx      #   App lifecycle (pre-existing, template)
+│   └── webhooks.app.scopes_update.jsx    #   App lifecycle (pre-existing, template)
+│
+├── models/                               # Mongoose schemas (no business logic)
+│   ├── customerMap.server.js
+│   ├── invoice.server.js
+│   ├── order.server.js
+│   ├── paymentAttempt.server.js
+│   ├── qboToken.server.js
+│   └── wholesaleApplication.server.js
+│
+├── utils/                                # Global utilities (cross-service)
+│   ├── env.utils.js                      #   readEnv / readInt / readBool
+│   ├── logger.utils.js                   #   structured logger
+│   └── retry.utils.js                    #   retry() + PermanentError / TransientError
+│
+├── configs/
+│   └── index.js                          #   Boot config aggregator + assertSafeBootConfig
+│
+├── entry.server.jsx                      #   SSR + boot banner + scheduler bootstrap
+├── shopify.server.js                     #   Pre-existing Shopify app config
+└── routes.js                             #   Route table (URL → file mapping)
 ```
 
 Design rules:
 
-- **One service module per integration boundary.** No QBO calls outside `services/qbo/`, no NMI calls outside `services/nmi/`, no Shopify Admin calls outside `services/shopify/`.
-- **No direct `process.env.X` in business logic.** All env access goes through `services/config.server.js` which validates at boot.
+- **Service-oriented file split per integration.** Each service folder
+  follows the same convention: `<svc>.service.js` (domain methods),
+  `<svc>.apis.js` (HTTP/I/O), `<svc>.queries.js` + `<svc>.mutations.js`
+  for GraphQL (Shopify only), `<svc>.config.js`, `<svc>.utils.js`,
+  `<svc>.constants.js`. Developers can navigate any service without
+  hunting across folders.
+- **Inbound HTTP handlers live in `app/api/`.** Each file is thin:
+  request validation, HMAC/auth, response shaping, single service call.
+  URL → file mapping is declared in [app/routes.js](app/routes.js) via
+  `route(urlPath, fileRelativeToApp)`.
+- **Outbound API calls live in `services/<svc>/<svc>.apis.js`.** No
+  `fetch()` calls outside an `.apis.js` file. Domain methods in
+  `<svc>.service.js` call into `.apis.js`, which calls into the shared
+  `APIService/http.service.js` (or owns its own transport quirks like
+  NMI's form encoding).
+- **Service-specific configs live with the service.** `services/qbo/qbo.config.js`,
+  `services/nmi/nmi.config.js`, etc. Only `process.env` access is via
+  `app/utils/env.utils.js`. The `app/configs/index.js` aggregator
+  exists for boot-time validation only.
+- **Service-specific helpers live with the service.** `<svc>.utils.js`
+  for pure transforms used only by that service. Cross-service helpers
+  go in `app/utils/` (logger, retry, env).
 - **Models hold schema + indexes only.** Business logic lives in services.
-- **Idempotency baked into the data layer.** Unique indexes and atomic `findOneAndUpdate` calls — not just application-level checks.
+- **Idempotency baked into the data layer.** Unique indexes and atomic
+  `findOneAndUpdate` calls — not just application-level checks.
 
 ---
 
@@ -146,7 +202,7 @@ Design rules:
                               ▼  POST /webhooks/orders/create
                                   (X-Shopify-Hmac-Sha256 + payload)
 ┌───────────────────────────────────────────────────────────────────────┐
-│ webhooks.orders.create.jsx                                            │
+│ routes/webhooks.orders.create.jsx                                     │
 │   - log all headers + webhook-id                                      │
 │   - authenticate.webhook(request)        ← HMAC verify                │
 │   - return 200 to Shopify FAST                                        │
@@ -162,7 +218,7 @@ Design rules:
 │   4. Pre-flight validation (validateShopifyOrder)                     │
 │   5. ensureCustomerForOrder        ──┐                                │
 │   6. createInvoiceForOrder         ──┤                                │
-│   7. (optional) attemptInvoiceCharge ┘  ← gated by chargeImmediately  │
+│   7. (optional) chargeInvoice ┘  ← gated by chargeImmediately  │
 │   8. Mark order 'scheduled' for retry pickup                          │
 └───────────────────────────────────────────────────────────────────────┘
                               │
@@ -173,7 +229,7 @@ Design rules:
 │ PASS 1 — pending invoices: NMI charge                                 │
 │   for each Invoice where paymentStatus='pending' and                  │
 │                          attemptCount < maxAttempts:                  │
-│     attemptInvoiceCharge → chargeCustomerVault                        │
+│     chargeInvoice → chargeCustomerVault                        │
 │     on approved: propagateSuccessfulPayment                           │
 │                                                                       │
 │ PASS 2 — paid invoices with broken downstream sync                    │
@@ -212,7 +268,7 @@ uri = "/webhooks/orders/create"
 topics = [ "orders/create" ]
 ```
 
-**B. Programmatic — `services/shopify/registerWebhooks.server.js`**
+**B. Programmatic — `services/shopify/shopify.service.js`**
 
 Called from `app/routes/app.jsx`'s loader (every authenticated admin
 page load). Idempotent: checks for an existing subscription pointing at
@@ -226,7 +282,15 @@ Failures are logged loudly but don't break the admin UI:
             Partners → your app → API access → Protected customer data
 ```
 
-### 4.2 Inbound delivery — `routes/webhooks.orders.create.jsx`
+### 4.2 Inbound delivery — `app/routes/webhooks.orders.create.jsx`
+
+URL mapping is via React Router's file-based routing: the dotted
+filename `webhooks.orders.create.jsx` resolves to `/webhooks/orders/create`.
+The other webhook routes (`webhooks.app.uninstalled.jsx`,
+`webhooks.app.scopes_update.jsx`) follow the same convention.
+
+The URL is what Shopify is configured to POST to — keep it stable across
+refactors. If you rename the file, the URL changes.
 
 ```
 1. Read headers BEFORE authenticate.webhook (so we can log even auth failures)
@@ -262,7 +326,7 @@ In both modes the webhook returns 200 before downstream calls finish.
 
 ## 5. Order processing orchestrator
 
-`services/orders/processOrder.server.js` is the only place that drives an order from "received" to "scheduled." It is **idempotent and concurrency-safe**.
+`services/order/order.service.js` is the only place that drives an order from "received" to "scheduled." It is **idempotent and concurrency-safe**.
 
 ### 5.1 Lifecycle states (`ShopifyOrder.processingStatus`)
 
@@ -299,7 +363,7 @@ allows a stale lock to be reclaimed if a process crashed mid-flight.
 
 ### 5.3 Pre-flight validation
 
-`services/orders/validateOrder.server.js` blocks bad payloads before any
+`services/order/order.validator.js` blocks bad payloads before any
 external call. Rejections are persisted with a `rejectionCode` instead
 of thrown:
 
@@ -337,7 +401,7 @@ of thrown:
 ```
 
 Unique index on `(shop, email)`. Atomic upsert via `findOneAndUpdate` in
-`services/customers/ensureCustomer.server.js`.
+`services/customer/customer.service.js`.
 
 ### 6.2 Address resolution
 
@@ -382,7 +446,7 @@ makes zero external calls.
 
 ### 6.4 Payment details resolver
 
-`services/customers/paymentDetailsResolver.server.js` implements a
+`services/customer/paymentDetails.service.js` implements a
 strategy registry so the source of customer payment data is pluggable.
 
 Currently registered strategies (tried in order, first non-null wins):
@@ -396,7 +460,7 @@ Adding a new source = one `registerPaymentDetailsStrategy(name, fn)` call. No ot
 
 ## 7. QBO integration
 
-### 7.1 OAuth2 token management — `services/qbo/client.server.js`
+### 7.1 OAuth2 token management — `services/qbo/qbo.apis.js`
 
 Intuit issues access tokens (1 hr) + refresh tokens (100 days, **rotated on every refresh**). Token state lives in the `qbo_tokens` collection (`models/qboToken.server.js`), keyed by `realmId`:
 
@@ -427,7 +491,7 @@ QBO token refresh failed: invalid_grant
 ```
 Resolution: re-fetch a fresh refresh token from the OAuth Playground and update the env var.
 
-### 7.3 Invoice creation — `services/qbo/invoice.server.js`
+### 7.3 Invoice creation — `services/qbo/qbo.service.js`
 
 ```
 POST /v3/company/{realmId}/invoice?minorversion=73
@@ -512,7 +576,7 @@ Sandbox accounts are rejected on production hosts and vice versa.
 
 Explicit `NMI_API_URL` / `NMI_QUERY_URL` overrides win if set.
 
-### 8.3 Customer Vault — `services/nmi/customer.server.js`
+### 8.3 Customer Vault — `services/nmi/nmi.service.js`
 
 `findOrCreateCustomerVault({ profile, paymentDetails })`:
 
@@ -533,7 +597,7 @@ NMI rejects `add_customer` without a billing address. The orchestrator
 pre-validates the five required fields (see §6.2) so a missing field
 produces a clear local error instead of a generic NMI rejection.
 
-### 8.4 Sale transaction — `services/nmi/payment.server.js`
+### 8.4 Sale transaction — `services/nmi/nmi.service.js`
 
 ```
 type=sale
@@ -587,9 +651,9 @@ NMI uses the stored ACH details automatically.
 
 **Current status**:
 
-- Vault add supports ACH via `paymentDetails.achAccount` (`services/nmi/customer.server.js:71-77`).
+- Vault add supports ACH via `paymentDetails.achAccount` (`services/nmi/nmi.service.js:71-77`).
 - The orchestrator does **not** currently differentiate ACH from card for charge attempts — both go through `chargeCustomerVault` with `type=sale`.
-- No paper-cheque (manual deposit / non-electronic) flow exists. If that's needed, the right shape is a new `paymentDetailsResolver` strategy that returns `{ method: 'manual-check' }` and a dedicated path in `attemptInvoiceCharge` that skips the NMI sale call and waits for a manual-mark-paid signal instead.
+- No paper-cheque (manual deposit / non-electronic) flow exists. If that's needed, the right shape is a new `paymentDetailsResolver` strategy that returns `{ method: 'manual-check' }` and a dedicated path in `chargeInvoice` that skips the NMI sale call and waits for a manual-mark-paid signal instead.
 
 ---
 
@@ -663,7 +727,7 @@ Invoice.find({
 For each invoice in the cursor:
 
 1. Load the linked `CustomerMap` (for the NMI vault id).
-2. Call `attemptInvoiceCharge({ invoice, customerMap })`.
+2. Call `chargeInvoice({ invoice, customerMap })`.
 3. Outcome counters: `processed / approved / declined / errored / skipped`.
 
 Skip reasons:
@@ -697,7 +761,7 @@ stops trying. Failed invoices need explicit operator action.
 ## 12. Status synchronization across QBO, Shopify, and local DB
 
 After NMI returns `response=1` (approved), `propagateSuccessfulPayment`
-(in `services/invoices/invoiceService.server.js`) mirrors the state into
+(in `services/invoice/invoice.service.js`) mirrors the state into
 three systems. Each side is independent:
 
 ```
@@ -833,7 +897,7 @@ in §22.4.
 
 ## 14. Error handling & retry strategy
 
-### 14.1 Error taxonomy — `services/retry.server.js`
+### 14.1 Error taxonomy — `app/utils/retry.utils.js`
 
 ```
 class PermanentError  - bypassed by retry; 4xx auth/validation
@@ -850,8 +914,8 @@ class TransientError  - retried with exponential backoff; 5xx / network / 429
 
 | Layer | Function | Attempts |
 |---|---|---|
-| QBO HTTP | `services/qbo/client.server.js` | `HTTP_RETRY_ATTEMPTS` (default 4) |
-| NMI HTTP | `services/nmi/client.server.js` | `HTTP_RETRY_ATTEMPTS` (default 4) |
+| QBO HTTP | `services/qbo/qbo.apis.js` | `HTTP_RETRY_ATTEMPTS` (default 4) |
+| NMI HTTP | `services/nmi/nmi.apis.js` | `HTTP_RETRY_ATTEMPTS` (default 4) |
 | Sync to QBO/Shopify after success | `syncWithRetry` in `invoiceService.server.js` | 3 |
 | NMI payment retry across days/ticks | scheduler | `PAYMENT_MAX_RETRY_ATTEMPTS` (default 6) |
 
@@ -872,7 +936,7 @@ QBO clients unwrap this — logs show the actual code (`ENOTFOUND`,
 
 ## 15. Logging & monitoring
 
-### 15.1 Logger — `services/logger.server.js`
+### 15.1 Logger — `app/utils/logger.utils.js`
 
 Two output modes selected by `LOG_PRETTY`:
 
@@ -949,7 +1013,7 @@ source of truth for any payment reconciliation.
 
 ## 16. Environment variables
 
-Read and validated at boot by `services/config.server.js`. Missing
+Read and validated at boot by `services/<svc>/<svc>.config.js (per-service) + app/configs/index.js (boot aggregator)`. Missing
 required values throw immediately.
 
 | Variable | Default | Purpose |
@@ -1280,7 +1344,7 @@ will succeed automatically once the merchant reinstalls.
 
 ### 22.7 Partial payment / split charge
 
-Currently `attemptInvoiceCharge` charges the full outstanding balance
+Currently `chargeInvoice` charges the full outstanding balance
 (`amountDue - amountPaid`) in one transaction. If NMI splits a charge
 into installments (e.g. partial capture), the invoice transitions to
 `paymentStatus: 'pending'` (not `paid`) until `amountPaid >=
@@ -1371,7 +1435,7 @@ the embedded admin once to trigger registration. Outcome is logged.
   `customer_vault_id` on the wholesale application would close the gap
   between registration and first invoice.
 - **Manual cheque flow** — a new strategy `{ method: 'manual-check' }`
-  plus a corresponding branch in `attemptInvoiceCharge` that records a
+  plus a corresponding branch in `chargeInvoice` that records a
   pending manual payment instead of calling NMI. Status flips to
   `paid` on operator action via a new admin route.
 - **Webhook idempotency table** — promote `seenWebhookIds[]` from an

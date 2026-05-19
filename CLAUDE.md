@@ -76,16 +76,16 @@ Deployed via `shopify app deploy` (along with the Shopify app and any other exte
 The Shopify app's reason for existing: turn new Shopify orders into paid QBO invoices via NMI.
 
 ```
-Shopify orders/create webhook  →  routes/webhooks.orders.create.jsx
-   → services/orders/processOrder.server.js  (idempotent orchestrator)
-       → services/customers/ensureCustomer.server.js   (QBO find-or-create + NMI vault find-or-create)
-       → services/invoices/invoiceService.server.js    (claim-first invoice creation)
+Shopify orders/create webhook  →  routes/webhooks.orders.create.jsx   (URL: /webhooks/orders/create, file-based)
+   → services/order/order.service.js     (idempotent orchestrator)
+       → services/customer/customer.service.js   (QBO find-or-create + NMI vault find-or-create)
+       → services/invoice/invoice.service.js     (claim-first invoice creation, calls services/qbo/qbo.service.createInvoice)
    → scheduler tick (Agenda 5; 30s in dev, cron 15th+last in prod)
-       → services/scheduler/jobs/processPendingPayments.job.server.js
-           PASS 1: NMI charge for pending invoices
-           PASS 2: re-sync paid invoices whose QBO/Shopify side failed
-   → services/invoices/invoiceService.propagateSuccessfulPayment
-       → QBO POST /payment + Shopify orderMarkAsPaid + DB update
+       → services/scheduler/jobs/processPendingPayments.job.js
+           PASS 1: services/payment/payment.service.chargeInvoice  (NMI charge for pending invoices)
+           PASS 2: services/invoice/invoice.service.propagateSuccessfulPayment  (re-sync paid invoices)
+   → propagateSuccessfulPayment
+       → services/qbo/qbo.service.recordPayment + services/shopify/shopify.service.markOrderPaid + DB update
 ```
 
 Three idempotency layers prevent duplicate invoices:
@@ -95,10 +95,11 @@ Three idempotency layers prevent duplicate invoices:
 
 ### Module boundaries (project laws)
 
-- No `process.env.X` outside [services/config.server.js](wholesale/app/services/config.server.js). Required values are asserted at boot.
-- No QBO calls outside `services/qbo/`. Same rule for `services/nmi/` and `services/shopify/`.
-- Models in `app/models/` are schema + indexes only. Business logic lives in services.
-- Errors are typed as `PermanentError` or `TransientError` ([services/retry.server.js](wholesale/app/services/retry.server.js)) so retry layers can decide. QBO + NMI clients retry transients up to `HTTP_RETRY_ATTEMPTS` (default 4); the scheduler retries NMI charges up to `PAYMENT_MAX_RETRY_ATTEMPTS` (default 6).
+- No `process.env.X` outside service config files. Add new env keys to the right per-service config in [services/<svc>/<svc>.config.js](wholesale/app/services), using `readEnv` / `readInt` / `readBool` from [utils/env.utils.js](wholesale/app/utils/env.utils.js). Boot aggregator lives at [app/configs/index.js](wholesale/app/configs/index.js).
+- No QBO calls outside `services/qbo/`. Same rule for `services/nmi/` and `services/shopify/`. Each integration is internally split: `<svc>.apis.js` owns I/O, `<svc>.service.js` exposes domain methods, GraphQL strings live in `<svc>.queries.js` / `<svc>.mutations.js`.
+- API handlers in [app/api/](wholesale/app/api) are thin: validate, auth, call a service, respond. All business logic lives in `services/`.
+- Models in `app/models/` are schema + indexes only.
+- Errors are typed as `PermanentError` or `TransientError` ([utils/retry.utils.js](wholesale/app/utils/retry.utils.js)) so retry layers can decide. QBO + NMI clients retry transients up to `HTTP_RETRY_ATTEMPTS` (default 4); the scheduler retries NMI charges up to `PAYMENT_MAX_RETRY_ATTEMPTS` (default 6).
 
 ### Boot sequence ([entry.server.jsx](wholesale/app/entry.server.jsx))
 
@@ -115,7 +116,7 @@ Note: `prisma/schema.prisma` is template residue. Active session storage is **Mo
 ### Webhook registration (two paths)
 
 - **Declarative** (preferred once approved) — `[[webhooks.subscriptions]]` blocks in the active `shopify.app.<config>.toml`. Pushed by `shopify app deploy`.
-- **Programmatic** — `services/shopify/registerWebhooks.server.js` runs from `app/routes/app.jsx`'s loader on every admin page load. Idempotent. Used when `orders/create` (a protected customer data topic) is awaiting Partners-dashboard approval.
+- **Programmatic** — `ensureProtectedWebhooks` from [services/shopify/shopify.service.js](wholesale/app/services/shopify/shopify.service.js) runs from `app/routes/app.jsx`'s loader on every admin page load. Idempotent. Used when `orders/create` (a protected customer data topic) is awaiting Partners-dashboard approval.
 
 ## Configuration profiles
 

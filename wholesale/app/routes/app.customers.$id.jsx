@@ -7,10 +7,10 @@ import {
 } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
-import connectDB from "../db.server";
+import connectDB from "../services/APIService/mongo.service";
 import WholesaleApplication from "../models/wholesaleApplication.server";
-import { buildShopifyNote } from "../utils/buildShopifyNote";
-import { CREDENTIAL_MAP, REFERRAL_MAP } from "../utils/shopifyNoteMap";
+import { buildShopifyNote } from "../services/shopify/shopify.utils";
+import { CREDENTIAL_MAP, REFERRAL_MAP } from "../services/shopify/shopify.constants";
 
 export const loader = async ({ request, params }) => {
   await authenticate.admin(request);

@@ -1,6 +1,6 @@
 import { useLoaderData } from 'react-router'
 import { authenticate } from '../shopify.server'
-import { listAllWebhookSubscriptions } from '../services/shopify/registerWebhooks.server'
+import { listAllWebhookSubscriptions } from '../services/shopify/shopify.service'
 
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request)

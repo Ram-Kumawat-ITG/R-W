@@ -1,7 +1,7 @@
 import { authenticate } from '../shopify.server'
-import connectDB from '../db.server'
+import connectDB from '../services/APIService/mongo.service'
 import WholesaleApplication from '../models/wholesaleApplication.server'
-import { sendResponse } from '../utils/sendResponse'
+import { sendResponse } from '../services/APIService/api.service'
 
 // GET /api/admin/customers?search=&status=
 // Returns a paginated list of applications for the embedded admin dashboard.
