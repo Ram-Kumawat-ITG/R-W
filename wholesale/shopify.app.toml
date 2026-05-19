@@ -19,9 +19,17 @@ api_version = "2026-07"
   topics = [ "app/scopes_update" ]
   uri = "/webhooks/app/scopes_update"
 
+  # NOTE: `orders/create` is a protected customer data topic and CANNOT
+  # be declared here until the app is approved in the Partners dashboard
+  # (Partners → App → API access → Protected customer data access).
+  # Until then it is registered programmatically after install — see
+  # app/services/shopify/registerWebhooks.server.js.
+
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_products,write_files"
+# NOTE: `read_customers` is protected customer data and requires Partners
+# dashboard approval before it can be requested. `read_orders` is unprotected.
+scopes = "read_orders,write_products,write_files"
 
 [auth]
 redirect_urls = [ "https://e630-182-70-242-149.ngrok-free.app/api/auth" ]
