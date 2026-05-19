@@ -196,25 +196,23 @@ export default function Step1AboutYou({ control, errors, setValue }) {
       </div>
 
       {selectedCreds.length > 0 && (
-        <div className="rf-conditional open">
-          <div style={{ marginTop: 20 }}>
-            <div className="rf-cred-docs-header">
-              <h3>Required documents &amp; details</h3>
-              <span className="rf-cred-counter">{selectedCreds.length} selected</span>
-            </div>
-            <p className="rf-section-hint" style={{ marginBottom: 14 }}>
-              A quick verification step for each credential. Files are encrypted and reviewed by our team only.
-            </p>
-            {selectedCreds.map((cred) => (
-              <CredentialCard
-                key={cred.id}
-                cred={cred}
-                control={control}
-                errors={errors}
-                onRemove={() => onToggleCredential(cred.id, false)}
-              />
-            ))}
+        <div style={{ marginTop: 20 }}>
+          <div className="rf-cred-docs-header">
+            <h3>Required documents &amp; details</h3>
+            <span className="rf-cred-counter">{selectedCreds.length} selected</span>
           </div>
+          <p className="rf-section-hint" style={{ marginBottom: 14 }}>
+            A quick verification step for each credential. Files are encrypted and reviewed by our team only.
+          </p>
+          {selectedCreds.map((cred) => (
+            <CredentialCard
+              key={cred.id}
+              cred={cred}
+              control={control}
+              errors={errors}
+              onRemove={() => onToggleCredential(cred.id, false)}
+            />
+          ))}
         </div>
       )}
 
