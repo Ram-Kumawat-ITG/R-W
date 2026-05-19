@@ -1,9 +1,9 @@
 import crypto from 'node:crypto'
 import { authenticate } from '../shopify.server'
-import connectDB from '../db.server'
+import connectDB from '../services/APIService/mongo.service'
 import WholesaleApplication from '../models/wholesaleApplication.server'
-import { sendResponse } from '../utils/sendResponse'
-import { buildShopifyNote } from '../utils/buildShopifyNote'
+import { sendResponse } from '../services/APIService/api.service'
+import { buildShopifyNote } from '../services/shopify/shopify.utils'
 import { customerUpdateNote } from '../utils/shopifyCustomer'
 
 // POST /api/update-profile
