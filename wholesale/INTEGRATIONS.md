@@ -69,11 +69,13 @@ Stack: React Router 7 (Remix-style) + Node 20+ + Mongoose 9 + Agenda 5.
 app/
 ├── api/                                  # INBOUND HTTP API handlers (thin: validate → call service → respond)
 │   ├── registration-form.js              #   POST /api/registration-form  (proxy submit)
-│   ├── admin-customers.js                #   GET  /api/admin/customers
-│   ├── admin-customer.js                 #   GET  /api/admin/customers/:id
-│   ├── admin-decline.js                  #   POST /api/admin/customers/:id/decline
-│   ├── admin-review.js                   #   POST /api/admin/customers/:id/review
-│   └── admin-unreview.js                 #   POST /api/admin/customers/:id/unreview
+│   └── admin/                            # Admin-authenticated endpoints (feature-grouped)
+│       ├── customers.js                  #   GET  /api/admin/customers
+│       ├── customer.js                   #   GET  /api/admin/customers/:id
+│       ├── decline.js                    #   POST /api/admin/customers/:id/decline
+│       ├── review.js                     #   POST /api/admin/customers/:id/review
+│       ├── unreview.js                   #   POST /api/admin/customers/:id/unreview
+│       └── index.js                      #   Barrel re-export (namespaced) for programmatic consumers
 │
 │                                         # Note: webhook handlers live under routes/ (below),
 │                                         # using React Router's file-based routing convention.

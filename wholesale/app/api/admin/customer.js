@@ -1,9 +1,9 @@
 import mongoose from 'mongoose'
-import { authenticate } from '../shopify.server'
-import connectDB from '../services/APIService/mongo.service'
-import WholesaleApplication from '../models/wholesaleApplication.server'
-import { sendResponse } from '../services/APIService/api.service'
-import { buildShopifyNote } from '../services/shopify/shopify.utils'
+import { authenticate } from '../../shopify.server'
+import connectDB from '../../services/APIService/mongo.service'
+import WholesaleApplication from '../../models/wholesaleApplication.server'
+import { sendResponse } from '../../services/APIService/api.service'
+import { buildShopifyNote } from '../../services/shopify/shopify.utils'
 
 // GET /api/admin/customers/:id
 // Returns the single application + the reconstructed Shopify note so the

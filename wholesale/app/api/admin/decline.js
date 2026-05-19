@@ -1,9 +1,9 @@
 import mongoose from 'mongoose'
-import { authenticate } from '../shopify.server'
-import connectDB from '../services/APIService/mongo.service'
-import WholesaleApplication from '../models/wholesaleApplication.server'
-import { sendResponse } from '../services/APIService/api.service'
-import { sendCustomerInvite as customerSendInvite, deleteCustomer as customerDelete } from '../services/shopify/shopify.service'
+import { authenticate } from '../../shopify.server'
+import connectDB from '../../services/APIService/mongo.service'
+import WholesaleApplication from '../../models/wholesaleApplication.server'
+import { sendResponse } from '../../services/APIService/api.service'
+import { sendCustomerInvite as customerSendInvite, deleteCustomer as customerDelete } from '../../services/shopify/shopify.service'
 
 // POST /api/admin/customers/:id/decline
 // Cascading decline: send a final email, delete in Shopify, delete from Mongo.
