@@ -167,6 +167,21 @@ export default function Step3Payment({ control, errors, setValue, onEditBilling,
 
       <label className="rf-tc-row">
         <Controller
+          name="subscribeNews"
+          control={control}
+          render={({ field }) => (
+            <input
+              type="checkbox"
+              checked={Boolean(field.value)}
+              onChange={(e) => field.onChange(e.target.checked)}
+            />
+          )}
+        />
+        <span>Send me updates &amp; upcoming news.</span>
+      </label>
+
+      <label className="rf-tc-row">
+        <Controller
           name="termsAccepted"
           control={control}
           render={({ field }) => (

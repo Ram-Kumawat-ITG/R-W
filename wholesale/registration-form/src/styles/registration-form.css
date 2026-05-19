@@ -4,6 +4,7 @@
    Layout/spacing ported from the prototype HTML.
    ============================================================ */
 
+
 .rf-page {
   background: var(--color-bg);
   color: var(--color-text);
@@ -446,6 +447,8 @@
   transition: border-color 0.18s ease, background-color 0.18s ease;
   background: #fafafa;
   position: relative;
+  box-sizing: border-box;
+  width: 100%;
 }
 .rf-dropzone:hover {
   border-color: var(--color-primary);
@@ -482,6 +485,8 @@
   gap: 12px;
   text-align: left;
   cursor: default;
+  width: 100%;
+  box-sizing: border-box;
 }
 .rf-dropzone.has-file:hover { background: #E7EDDF; }
 .rf-file-icon {
@@ -858,21 +863,24 @@
 .rf-sig-clear:disabled { opacity: 0.45; cursor: not-allowed; }
 .rf-sig-meta { display: flex; gap: 12px; font-size: 11px; color: var(--color-text-muted); }
 
-/* Terms row */
+/* Terms / subscribe rows */
 .rf-tc-row {
   display: flex;
   align-items: flex-start;
   gap: 10px;
-  margin-top: 18px;
+  margin-top: 12px;
   font-size: 13px;
   color: var(--color-text);
   line-height: 1.55;
+  cursor: pointer;
 }
-.rf-tc-row input {
+.rf-tc-row input[type="checkbox"] {
   accent-color: var(--color-primary);
-  margin-top: 3px;
-  width: 16px; height: 16px;
+  margin-top: 2px;
+  width: 16px;
+  height: 16px;
   flex-shrink: 0;
+  cursor: pointer;
 }
 .rf-tc-row a { color: var(--color-primary); }
 

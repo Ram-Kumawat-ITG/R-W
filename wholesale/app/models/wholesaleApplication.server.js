@@ -83,6 +83,12 @@ const wholesaleApplicationSchema = new mongoose.Schema(
       index: true,
     },
     submittedAt: { type: Date, default: Date.now },
+    reviewedAt: { type: Date, default: null },
+
+    customerId: { type: String, index: true },
+    customerInviteSentAt: { type: Date, default: null },
+    shopifyCreateFailed: { type: Boolean, default: false, index: true },
+    shopifyCreateError: { type: String, default: null },
   },
   { collection: "wholesale_applications", timestamps: true, strict: false },
 );

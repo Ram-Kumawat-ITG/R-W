@@ -3,7 +3,7 @@ import { Controller, useWatch } from 'react-hook-form'
 import { CREDENTIALS, REFERRALS } from '../constants'
 import CredentialCard from './CredentialCard'
 
-export default function Step1AboutYou({ control, errors, setValue }) {
+export default function Step1AboutYou({ control, errors, setValue, trigger }) {
   const [showPassword, setShowPassword] = useState(false)
   const credentials = useWatch({ control, name: 'credentials' }) || {}
   const referrals = useWatch({ control, name: 'referrals' }) || {}
@@ -11,11 +11,11 @@ export default function Step1AboutYou({ control, errors, setValue }) {
 
   const onToggleCredential = (id, checked) => {
     setValue(`credentials.${id}.selected`, checked, { shouldDirty: true })
+    trigger('credentials')
   }
 
   const onToggleReferral = (id, checked) => {
     if (id === 'none' && checked) {
-      // None is exclusive — clear everything else
       REFERRALS.forEach((r) => {
         if (r.id !== 'none') setValue(`referrals.${r.id}.selected`, false)
       })
@@ -23,6 +23,7 @@ export default function Step1AboutYou({ control, errors, setValue }) {
       setValue('referrals.none.selected', false)
     }
     setValue(`referrals.${id}.selected`, checked, { shouldDirty: true })
+    trigger('referrals')
   }
 
   return (

@@ -64,6 +64,7 @@ const defaultValues = {
     cardCvv: '',
   },
   signature: { type: 'draw', drawn: null, typed: '' },
+  subscribeNews: false,
   termsAccepted: false,
 }
 
@@ -240,7 +241,7 @@ function FormBody({ onBack }) {
             <span className="rf-brand">Natural Solutions</span>
             <span className="rf-brand-sub">Wholesale</span>
           </div>
-          <a href="#" className="rf-help-link">Need help?</a>
+          {/* <a href="#" className="rf-help-link">Need help?</a> */}
         </div>
       </header>
 
@@ -254,7 +255,7 @@ function FormBody({ onBack }) {
               flattenErrors(errs).map(({ path, message, type }) => ({ path, message, type }))
             )
           })} noValidate>
-            {currentStep === 1 && <Step1AboutYou control={control} errors={errors} setValue={setValue} />}
+            {currentStep === 1 && <Step1AboutYou control={control} errors={errors} setValue={setValue} trigger={trigger} />}
             {currentStep === 2 && <Step2AddressTax control={control} errors={errors} setValue={setValue} />}
             {currentStep === 3 && (
               <Step3Payment control={control} errors={errors} setValue={setValue} onEditBilling={prev} isSubmitted={isSubmitted} />

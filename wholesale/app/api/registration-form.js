@@ -3,6 +3,8 @@ import { authenticate } from '../shopify.server'
 import connectDB from '../db.server'
 import WholesaleApplication from '../models/wholesaleApplication.server'
 import { sendResponse } from '../utils/sendResponse'
+import { buildShopifyNote } from '../utils/buildShopifyNote'
+import { customerCreate, customerSendInvite } from '../utils/shopifyCustomer'
 
 export async function action({ request }) {
   if (request.method !== 'POST') {
@@ -111,17 +113,71 @@ export async function action({ request }) {
 
   payload.shop = shop
 
+  let app
   try {
-    const app = await WholesaleApplication.create(payload)
-    return sendResponse(200, 'success', 'Application submitted', {
-      id: app._id.toString(),
-    })
+    app = await WholesaleApplication.create(payload)
   } catch (e) {
     console.error('[proxy/submit] WholesaleApplication.create failed:', e)
     return sendResponse(500, 'error', 'Failed to save application', {
       detail: e.message,
     })
   }
+
+  // Create the customer in Shopify with the Pending tag and send the
+  // "received" acknowledgement email. Approval (Approved tag + invite email)
+  // happens later via the admin review action.
+  let customerId = null
+  try {
+    if (!admin) throw new Error('admin client unavailable from appProxy auth')
+    const note = buildShopifyNote(payload)
+    customerId = await customerCreate(admin, {
+      application: payload,
+      note,
+      tags: ['Pending'],
+      subscribeNews: Boolean(payload.subscribeNews),
+    })
+
+    try {
+      await customerSendInvite(admin, {
+        customerId,
+        subject: 'We received your wholesale application',
+        message:
+          "Thank you for applying to Natural Solutions Wholesale. Our team is reviewing your application and you'll hear back from us shortly.",
+      })
+      await WholesaleApplication.updateOne(
+        { _id: app._id },
+        {
+          $set: {
+            customerId,
+            shopifyCreateFailed: false,
+            shopifyCreateError: null,
+          },
+        }
+      )
+    } catch (inviteErr) {
+      console.error('[proxy/submit] received email failed:', inviteErr?.message || inviteErr)
+      await WholesaleApplication.updateOne(
+        { _id: app._id },
+        { $set: { customerId } }
+      )
+    }
+  } catch (e) {
+    console.error('[proxy/submit] customerCreate failed:', e?.message || e)
+    await WholesaleApplication.updateOne(
+      { _id: app._id },
+      {
+        $set: {
+          shopifyCreateFailed: true,
+          shopifyCreateError: e?.message || String(e),
+        },
+      }
+    )
+  }
+
+  return sendResponse(200, 'success', 'Application submitted', {
+    id: app._id.toString(),
+    customerId,
+  })
 }
 
 export async function loader() {

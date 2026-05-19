@@ -8,9 +8,13 @@ export default function SignaturePad({ value, onChange, error }) {
   const ctxRef = useRef(null)
   const drawingRef = useRef(false)
   const lastRef = useRef({ x: 0, y: 0 })
-  const [hasInk, setHasInk] = useState(Boolean(value?.drawn))
+  // Start false so a mouseleave on mount never triggers a toBlob on a blank canvas.
+  // setHasInk(true) is called after the existing blob is restored to the canvas.
+  const [hasInk, setHasInk] = useState(false)
+  // Capture the blob that existed when this component mounted so we can restore it.
+  const savedBlobRef = useRef(value?.drawn instanceof Blob ? value.drawn : null)
 
-  // Init canvas
+  // Init canvas — and restore any previously drawn signature on re-mount.
   useEffect(() => {
     if (mode !== 'draw') return
     const canvas = canvasRef.current
@@ -27,6 +31,20 @@ export default function SignaturePad({ value, onChange, error }) {
     ctx.lineJoin = 'round'
     ctx.strokeStyle = '#1F1B16'
     ctxRef.current = ctx
+
+    // If the user navigated back then forward, restore the saved signature.
+    if (savedBlobRef.current) {
+      const blob = savedBlobRef.current
+      savedBlobRef.current = null          // restore only once
+      const url = URL.createObjectURL(blob)
+      const img = new Image()
+      img.onload = () => {
+        ctx.drawImage(img, 0, 0, rect.width, rect.height)
+        URL.revokeObjectURL(url)
+        setHasInk(true)
+      }
+      img.src = url
+    }
   }, [mode])
 
   const getPos = (e) => {
@@ -61,6 +79,7 @@ export default function SignaturePad({ value, onChange, error }) {
   }
 
   const endDraw = () => {
+    if (!drawingRef.current) return
     drawingRef.current = false
     if (!hasInk) return
     canvasRef.current.toBlob((blob) => {
