@@ -18,7 +18,7 @@ export const loader = async ({ request }) => {
   const rows = await WholesaleApplication.find({})
     .sort({ submittedAt: -1 })
     .select(
-      "firstName lastName email phone submittedAt credentials customerId shopifyCreateFailed businessName status reviewedAt",
+      "firstName lastName email phone submittedAt customerId shopifyCreateFailed businessName status reviewedAt",
     )
     .lean();
 
@@ -31,7 +31,6 @@ export const loader = async ({ request }) => {
       phone: r.phone || "",
       businessName: r.businessName || "",
       submittedAt: r.submittedAt,
-      firstCredential: pickFirstCredential(r.credentials),
       customerId: r.customerId || null,
       shopifyCreateFailed: Boolean(r.shopifyCreateFailed),
       status: r.status || "pending",
@@ -40,28 +39,6 @@ export const loader = async ({ request }) => {
   };
 };
 
-function pickFirstCredential(credentials) {
-  if (!credentials || typeof credentials !== "object") return "";
-  const order = [
-    ["acupuncturist", "Acupuncturist"],
-    ["bio-energetic", "Bio-Energetic Practitioner"],
-    ["chiropractor", "Chiropractor"],
-    ["health-coach", "Health Coach"],
-    ["medical", "Licensed Medical Professional"],
-    ["massage", "Licensed Massage Therapist"],
-    ["naturopath-doctor", "Naturopathic Doctor"],
-    ["nutritionist", "Nutritionist"],
-    ["qest4", "QEST4 User"],
-    ["reflexologist", "Reflexologist"],
-    ["traditional-naturopath", "Traditional Naturopath"],
-    ["veterinarian", "Veterinarian"],
-    ["other", "Other"],
-  ];
-  for (const [id, label] of order) {
-    if (credentials[id]?.selected === true) return label;
-  }
-  return "";
-}
 
 const STATUS_FILTERS = [
   { id: "all", label: "All" },
@@ -134,7 +111,6 @@ export default function CustomersList() {
         r.email,
         r.phone,
         r.businessName,
-        r.firstCredential,
       ]
         .filter(Boolean)
         .join(" ")
@@ -283,7 +259,6 @@ export default function CustomersList() {
               <s-table-header>Email</s-table-header>
               <s-table-header>Phone</s-table-header>
               <s-table-header>Submitted</s-table-header>
-              <s-table-header>Credential</s-table-header>
               <s-table-header>Status</s-table-header>
               <s-table-header><s-stack alignItems="center">Actions</s-stack></s-table-header>
             </s-table-header-row>
@@ -303,7 +278,6 @@ export default function CustomersList() {
                     <s-table-cell>{r.email}</s-table-cell>
                     <s-table-cell>{r.phone || "—"}</s-table-cell>
                     <s-table-cell>{submitted}</s-table-cell>
-                    <s-table-cell>{r.firstCredential || "—"}</s-table-cell>
                     <s-table-cell>
                       {r.shopifyCreateFailed ? (
                         <s-badge tone="critical">Sync failed</s-badge>
