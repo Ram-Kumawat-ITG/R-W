@@ -19,6 +19,7 @@ if (webhookRoutes.length) {
 export default [
   ...fsRoutes,
   route("/api/registration-form", "api/registration-form.js"),
+  route("/api/update-profile",   "api/update-profile.js"),
   route("/api/admin/customers", "api/admin-customers.js"),
   route("/api/admin/customers/:id", "api/admin-customer.js"),
   route("/api/admin/customers/:id/decline", "api/admin-decline.js"),

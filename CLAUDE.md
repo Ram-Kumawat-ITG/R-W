@@ -93,13 +93,60 @@ Three idempotency layers prevent duplicate invoices:
 2. **Atomic claim** — `findOneAndUpdate({ processingStatus: { $in: claimable } }, $set: 'processing' })`. Loser exits.
 3. **Claim-first Invoice insert** — `Invoice.create({ qboInvoiceId: null, qboCreationStatus: 'claimed' })` fires the unique `(shop, shopifyOrderId)` index **before** the QBO POST. Losers `waitForClaimToComplete` (poll up to 30s). This is the structural fix for the user-reported duplicate-invoice bug — see [wholesale/INTEGRATIONS.md §13](wholesale/INTEGRATIONS.md).
 
+### Wholesale registration form feature
+
+A separate flow from the order pipeline. Storefront customers fill out a 3-step form embedded via the theme extension; approved applicants become Shopify wholesale customers.
+
+```
+Storefront Liquid block
+  → registration-form/ React SPA (Vite, 3-step react-hook-form + Yup)
+      Step 1 — name, email, phone, password, credentials (+ file uploads), referral
+      Step 2 — billing/shipping address, tax info
+      Step 3 — payment method, signature, terms
+  → POST /api/registration-form  (Shopify app proxy: authenticate.public.appProxy)
+      → uploads files to Shopify Files API (stagedUploadsCreate → fileCreate → poll)
+      → hashes password (scrypt) and card PAN (HMAC-SHA256 keyed by SHOPIFY_API_SECRET)
+      → WholesaleApplication.create() in MongoDB
+      → customerCreate() via Admin GraphQL → adds "Pending" tag, sends acknowledgment email
+  → Admin dashboard (app.customers._index.jsx + app.customers.$id.jsx)
+      → Review → adds "Approved" tag + sends invite via customerSendInvite
+      → Decline → deletes Shopify customer + MongoDB doc
+```
+
+**Key files:**
+
+| File | Role |
+|---|---|
+| `registration-form/src/RegistrationForm.jsx` | Form root; `useForm` with `mode:'onTouched'`, `reValidateMode:'onChange'`; step navigation |
+| `registration-form/src/schema/step*.schema.js` | Yup schemas per step; `step*Fields` arrays used for partial validation on "Continue" |
+| `registration-form/src/components/SignaturePad.jsx` | Draw (canvas + toBlob) or typed signature; blob stored via `savedBlobRef` and restored on remount |
+| `registration-form/src/components/Dropzone.jsx` | File picker; `has-file` state renders a green card |
+| `app/api/registration-form.js` | App proxy POST handler |
+| `app/utils/shopifyNoteMap.js` | Canonical map of credential IDs → Shopify customer note keys (source of truth for both form and note builder) |
+| `app/utils/buildShopifyNote.js` | Assembles the note string written to the Shopify customer record |
+| `app/utils/shopifyCustomer.js` | `customerCreate` + `customerSendInvite` Admin GraphQL helpers |
+| `app/routes/app.customers._index.jsx` | Admin list page (search, status filter chips, Review/Revoke/Decline actions) |
+| `app/routes/app.customers.$id.jsx` | Admin detail page (all fields, signature image/text, payment, credentials, license files) |
+
+**Registration form validation gotcha** — `credentials` and `referrals` use object-level `.test('one-selected', …)` in Yup. `reValidateMode:'onChange'` only re-validates the specific path that changed (e.g. `credentials.acupuncturist.selected`), not the parent object test. After any checkbox toggle, call `trigger('credentials')` / `trigger('referrals')` explicitly.
+
 ### Module boundaries (project laws)
 
+<<<<<<< Updated upstream
 - No `process.env.X` outside service config files. Add new env keys to the right per-service config in [services/<svc>/<svc>.config.js](wholesale/app/services), using `readEnv` / `readInt` / `readBool` from [utils/env.utils.js](wholesale/app/utils/env.utils.js). Boot aggregator lives at [app/configs/index.js](wholesale/app/configs/index.js).
 - No QBO calls outside `services/qbo/`. Same rule for `services/nmi/` and `services/shopify/`. Each integration is internally split: `<svc>.apis.js` owns I/O, `<svc>.service.js` exposes domain methods, GraphQL strings live in `<svc>.queries.js` / `<svc>.mutations.js`.
 - API handlers in [app/api/](wholesale/app/api) are thin: validate, auth, call a service, respond. All business logic lives in `services/`.
 - Models in `app/models/` are schema + indexes only.
 - Errors are typed as `PermanentError` or `TransientError` ([utils/retry.utils.js](wholesale/app/utils/retry.utils.js)) so retry layers can decide. QBO + NMI clients retry transients up to `HTTP_RETRY_ATTEMPTS` (default 4); the scheduler retries NMI charges up to `PAYMENT_MAX_RETRY_ATTEMPTS` (default 6).
+=======
+- No `process.env.X` outside [services/config.server.js](wholesale/app/services/config.server.js). Required values are asserted at boot.
+- No QBO calls outside `services/qbo/`. Same rule for `services/nmi/` and `services/shopify/`.
+- Models in `app/models/` are schema + indexes only. Business logic lives in services.
+- Errors are typed as `PermanentError` or `TransientError` ([services/retry.server.js](wholesale/app/services/retry.server.js)) so retry layers can decide. QBO + NMI clients retry transients up to `HTTP_RETRY_ATTEMPTS` (default 4); the scheduler retries NMI charges up to `PAYMENT_MAX_RETRY_ATTEMPTS` (default 6).
+- **CSS only in `registration-form/src/styles/registration-form.css`** — never add `style={{}}` props or CSS classes to admin routes (`app/routes/app.*.jsx`). Admin UI uses Polaris web components (`s-*` tags) styled through their own props.
+- **New admin API endpoints go in `app/api/`** and are registered manually in `app/routes.js` (not file-based routes). Follow the existing pattern: `route("/api/admin/customers/:id/action", "api/admin-action.js")`.
+- **After any change to `registration-form/src/`**, run `npm run build:theme` from `wholesale/` to regenerate `extensions/theme-extension/assets/react-app-bundle.*`. The storefront loads the bundle from there; changes are invisible until rebuilt.
+>>>>>>> Stashed changes
 
 ### Boot sequence ([entry.server.jsx](wholesale/app/entry.server.jsx))
 
@@ -140,6 +187,8 @@ These are pulled from [wholesale/README.md](wholesale/README.md) and the integra
 - **Webhook handler returns 200 immediately.** Downstream work is fire-and-forget. Never block the webhook response on QBO/NMI calls.
 - **`orders/create` is a protected customer data topic.** It requires Partners-dashboard approval. Until then, use synthetic webhook triggers and the programmatic registration path.
 - **Windows + Prisma ARM64 error** — if you hit `query_engine-windows.dll.node is not a valid Win32 application`, set `PRISMA_CLIENT_ENGINE_TYPE=binary`. (Mostly irrelevant since session storage is MongoDB now, but the Prisma client still initializes.)
+- **Polaris `s-button icon="…"` accepts only exact names from `privateIconArray`** — valid examples: `"check"`, `"undo"`, `"delete"`, `"arrow-left"`. `"checkmark"` is not valid and silently shows no icon. Check `node_modules/@shopify/polaris-types/dist/polaris.d.ts` line ~203 for the full list.
+- **React Router 7 auto-revalidates loaders after every fetcher action** — do not call `revalidator.revalidate()` manually inside a `useEffect` that has `revalidator` in its dep array; the reference changes on each state transition and causes an infinite loop. Remove the manual call and rely on auto-revalidation.
 
 ## When updating code, update the spec
 

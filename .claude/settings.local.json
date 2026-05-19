@@ -20,7 +20,10 @@
       "Bash(node --check app/services/shopify/orderUpdater.server.js app/services/invoices/invoiceService.server.js app/models/invoice.server.js app/models/order.server.js)",
       "Bash(node --check app/models/invoice.server.js app/models/order.server.js app/services/orders/processOrder.server.js app/services/invoices/invoiceService.server.js app/services/scheduler/jobs/processOrder.job.server.js)",
       "Bash(node --check app/services/shopify/orderUpdater.server.js)",
-      "Bash(node --check app/services/shopify/orderUpdater.server.js app/services/invoices/invoiceService.server.js app/services/scheduler/jobs/processPendingPayments.job.server.js)"
+      "Bash(node --check app/services/shopify/orderUpdater.server.js app/services/invoices/invoiceService.server.js app/services/scheduler/jobs/processPendingPayments.job.server.js)",
+      "Bash(Get-ChildItem -Path \"c:\\\\Apps\\\\Natural-solutions\" -Directory)",
+      "Bash(Select-Object Name)",
+      "PowerShell(ls -Path \"c:\\\\Apps\\\\Natural-solutions\\\\wholesale\\\\app\" -Recurse -Directory | ForEach-Object { $_.FullName -replace [regex]::Escape\\(\"c:\\\\Apps\\\\Natural-solutions\\\\wholesale\\\\app\"\\), \"\" } | Sort-Object)"
     ]
   }
 }
