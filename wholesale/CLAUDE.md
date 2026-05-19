@@ -1,189 +1,187 @@
-# Natural Solutions Wholesale App — Project Spec & Memory
+# CLAUDE.md
 
-> **Read this first.** This is the canonical project spec. Any developer
-> or AI agent joining this project must read this file before writing
-> code. For full technical detail, also read [INTEGRATIONS.md](./INTEGRATIONS.md)
-> — that file is the deep spec (architecture, flows, env, edge cases).
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
----
+## Repository layout
 
-## 1. What this app does
+This repository contains a single Shopify app workspace. All code lives under [wholesale/](wholesale/) — the repo root holds only this file and `.git`. Inside `wholesale/` are three independently-deployable pieces:
 
-Turns a new Shopify order into a paid QuickBooks Online (QBO) invoice
-via the NMI payment gateway, on a scheduled cadence.
-
-```
-Shopify orders/create webhook
-   → QBO invoice (pending)
-   → Scheduler tick (30s dev / 15th + last day of month in prod)
-   → NMI charge against stored Customer Vault
-   → on approved: QBO invoice marked Paid + Shopify order marked Paid
-   → on declined: retry next tick up to PAYMENT_MAX_RETRY_ATTEMPTS (6)
-```
-
-Three external systems, one orchestrator. Failures isolated per side.
-
-## 2. Stack
-
-- **App**: React Router 7 (Remix-style) on Node 20+
-- **DB**: MongoDB via Mongoose 9
-- **Scheduler**: Agenda 5 (MongoDB-backed cron + interval jobs)
-- **Auth**: Shopify offline sessions in MongoDB session storage
-- **Integrations**: QBO (OAuth2 + rotating refresh tokens), NMI (form-encoded REST + Customer Vault)
-
-## 3. Where things live
-
-```
-wholesale/app/
-  api/                                ← INBOUND HTTP route handlers (thin), explicitly mapped in routes.js
-    registration-form.js                /api/registration-form
-    admin-*.js                          /api/admin/customers/...
-  services/                           ← All server-side logic, organized service-wise
-    APIService/                         ← Shared foundation
-      mongo.service.js                    MongoDB connection (was db.server.js)
-      api.service.js                      sendResponse + common response helpers
-      http.service.js                     fetch wrapper with retry + classify
-    shopify/                            shopify.service|apis|queries|mutations|utils|constants|config
-    qbo/                                qbo.service|apis|utils|constants|config
-    nmi/                                nmi.service|apis|utils|constants|config
-    payment/                            payment.service|config (charge orchestration on top of nmi)
-    customer/                           customer.service|utils + paymentDetails.service
-    invoice/                            invoice.service|utils (creation + propagateSuccessfulPayment)
-    order/                              order.service (orchestrator) + order.validator
-    scheduler/                          scheduler.service + scheduler.config + jobs/
-  utils/                              ← Global utilities (cross-service)
-    env.utils.js                        readEnv / readInt / readBool
-    logger.utils.js                     structured logger
-    retry.utils.js                      retry() + PermanentError / TransientError
-  configs/index.js                    ← Boot-time config aggregator (re-exports + assertions)
-  models/                             ← Mongoose schemas only (no business logic)
-  routes/                             ← UI / admin pages + webhook handlers (file-based routing)
-    webhooks.orders.create.jsx        ← Shopify orders/create webhook (POST /webhooks/orders/create)
-    webhooks.app.uninstalled.jsx      ← Shopify app lifecycle (pre-existing template)
-    webhooks.app.scopes_update.jsx
-```
-
-**Per-service file convention.** Each service folder under `services/<svc>/`
-uses a consistent file split:
-
-- `<svc>.service.js` — domain methods the rest of the app calls
-- `<svc>.apis.js` — HTTP plumbing for outbound integrations (auth, retry, error classification)
-- `<svc>.queries.js` / `<svc>.mutations.js` — GraphQL strings (Shopify only)
-- `<svc>.config.js` — service-specific env-driven config + asserts
-- `<svc>.utils.js` — pure helpers used only by this service
-- `<svc>.constants.js` — value constants for this service
-
-Anything that's cross-service is global (`app/utils/`). Section 2 of
-[INTEGRATIONS.md](./INTEGRATIONS.md) has the full file map.
-
-## 4. Implementation status
-
-| Module | Status | Notes |
+| Piece | Path | Purpose |
 |---|---|---|
-| Shopify orders/create webhook handler | ✅ Complete | HMAC verified, 200 returned fast, fire-and-forget orchestrator |
-| Order processing orchestrator (idempotent, 3 dedup layers) | ✅ Complete | webhook-id dedup → terminal-status return → atomic claim |
-| Order payload validation (9 rejection codes) | ✅ Complete | PAYLOAD_INVALID, NO_EMAIL, NO_BILLING, ZERO_TOTAL, etc. |
-| QBO OAuth2 token rotation + refresh coalescing | ✅ Complete | tokens persisted in `qbo_tokens` keyed by realmId |
-| QBO customer find-or-create + invoice creation + payment recording | ✅ Complete | minor version 73 |
-| NMI Customer Vault find/create (card + ACH) | ✅ Complete | form-encoded; sandbox/prod host switching |
-| NMI sale transaction with vault id | ✅ Complete | response code parsing, full audit trail |
-| Customer mapping (Shopify email ↔ QBO id ↔ NMI vault id) | ✅ Complete | unique index on (shop, email) |
-| Claim-first invoice creation (duplicate-invoice fix) | ✅ Complete | unique index fires BEFORE QBO POST |
-| Scheduler with dev interval + prod cron (15th + last) | ✅ Complete | timezone-aware, singleton bootstrap |
-| Two-pass scheduler (charge pending + retry broken sync) | ✅ Complete | failure-isolated per side |
-| Shopify orderMarkAsPaid via unauthenticated.admin offline session | ✅ Complete | "already paid" treated as success |
-| Boot banner + critical-index verification | ✅ Complete | logs missing indexes loudly |
-| Structured logger (JSON or pretty) | ✅ Complete | LOG_LEVEL + LOG_PRETTY |
-| Payment-details resolver strategy registry | 🟡 Partial | `static-test-card` works; `wholesale-application` is a stub |
-| Wholesale-application → vault token capture (Collect.js) | ⏳ Pending | Section 24 of INTEGRATIONS.md |
-| Manual cheque / non-electronic payment flow | ⏳ Pending | Needs new resolver strategy + branch in attemptInvoiceCharge |
-| Refund / void (refunds/create webhook → NMI refund + QBO credit memo) | ⏳ Pending | — |
-| Per-shop QBO realms (multi-company support) | ⏳ Pending | Currently keyed on realmId only |
-| Admin reconciliation UI (list invoices with `lastSyncError`) | ⏳ Pending | — |
-| Backfill job (replay orders/list into pipeline) | ⏳ Pending | — |
-| Promote `seenWebhookIds[]` to dedicated `webhook_events` collection | ⏳ Pending | Would let us dedup webhooks for not-yet-seen orders |
+| **Shopify app** (server) | `wholesale/` | React Router 7 (Remix-style) Shopify embedded admin app + webhook handlers + scheduler |
+| **Registration form** (embedded) | `wholesale/registration-form/` | Standalone Vite + React 19 + MUI form, built into the theme extension's `assets/` |
+| **Theme extension** | `wholesale/extensions/theme-extension/` | Shopify theme app extension that exposes the registration form as a storefront block |
 
-Legend: ✅ complete · 🟡 partial · ⏳ pending · ❌ blocked
+Two `package.json` files; treat them as separate workspaces. Most work happens in `wholesale/`.
 
-## 5. Critical project rules
+## Primary spec — read first for non-trivial work
 
-These are project laws — bend code to fit them, not the other way around:
+[wholesale/CLAUDE.md](wholesale/CLAUDE.md) is the canonical project spec. It covers the wholesale app's purpose, stack, implementation status (✅ / 🟡 / ⏳), critical project rules, and the **maintenance protocol** that requires spec updates alongside meaningful code changes.
 
-1. **No direct `process.env.X` in business logic.** Add a key to the right per-service config (`services/<svc>/<svc>.config.js`) using helpers from `utils/env.utils.js`. The aggregator at `app/configs/index.js` exposes everything for boot validation.
-2. **No QBO calls outside `services/qbo/`.** Same rule for NMI (`services/nmi/`) and Shopify Admin GraphQL (`services/shopify/`). Each integration is internally split: `<svc>.apis.js` does I/O, `<svc>.service.js` exposes domain methods, GraphQL strings live in `<svc>.queries.js` / `<svc>.mutations.js`.
-3. **API handlers are thin.** Files under `app/api/` only do request validation, HMAC/auth, request/response shaping, and a single call into a service. All business logic lives in `services/`.
-4. **Models are schema + indexes only.** Business logic lives in services.
-5. **Idempotency lives in the data layer.** Unique indexes and atomic `findOneAndUpdate` — not just application checks. The duplicate-invoice bug fix in §13.4 of INTEGRATIONS.md is the canonical example.
-6. **Webhook handler returns 200 immediately.** Downstream work is fire-and-forget; never block on it.
-7. **NMI sandbox key on production host (or vice versa) returns "Authentication Failed".** Always match `NMI_ENVIRONMENT` to the key. Same for QBO.
-8. **Test cards are sandbox-only.** `assertSafeTestCardConfig()` scrubs `NMI_TEST_*` env vars at boot if `NMI_ENVIRONMENT !== 'sandbox'`.
-9. **Never amend commits or force-push.** Create new commits; preserve history.
+[wholesale/INTEGRATIONS.md](wholesale/INTEGRATIONS.md) is the deep technical reference (~1,400 lines, 24 sections) for the Shopify → QBO → NMI order-to-payment pipeline. Architecture, end-to-end flow, scheduler logic, error taxonomy, env vars, collections, edge cases, deployment.
 
-## 6. Maintenance protocol — UPDATE THIS FILE ON EVERY MEANINGFUL CHANGE
+Open both before touching webhook, orchestrator, integration, or scheduler code.
 
-Any change that affects future work — new flow, new env var, new integration,
-schema change, behavior change, new failure mode, lifted limitation — must
-ship with a doc update in the same change set. Specifically:
+## Commands
 
-- **New env var, integration, route, or schema field** → add it to the
-  relevant section of [INTEGRATIONS.md](./INTEGRATIONS.md).
-- **New module shipped or moved from 🟡/⏳ to ✅** → update the
-  Implementation Status table in §4 above.
-- **Behavior change in an existing flow** → edit the affected section of
-  [INTEGRATIONS.md](./INTEGRATIONS.md). Don't add a new section that
-  contradicts the old one.
-- **New edge case discovered + handled** → add to §22 of [INTEGRATIONS.md](./INTEGRATIONS.md).
-- **Always**: add a one-line entry to the Changelog (§8 below) — date,
-  short summary, link to affected sections.
+All commands run from `wholesale/` unless noted. Node 20.19+ / 22.12+ required (`engines` in `package.json`).
 
-If a change is too small to warrant a doc edit (whitespace, comment
-fix), skip the doc update. Use judgement.
+### Shopify app (wholesale/)
 
-## 7. Quick reference
-
-### Common dev commands
 ```bash
-npm install                          # one-time
-shopify app dev                      # local dev with tunnel
-shopify app deploy --config=<name>   # push webhook + scope changes
-npm run lint
-npm run typecheck
+npm install                      # install deps
+shopify app dev                  # local dev with auto-tunnel (preferred)
+npm run dev                      # alias for above
+npm run build                    # production build via react-router build
+npm run start                    # serve a prebuilt bundle (react-router-serve)
+npm run lint                     # ESLint over the app
+npm run typecheck                # react-router typegen + tsc --noEmit
+npm run deploy                   # shopify app deploy — pushes webhooks + scopes + extensions
+npm run config:use <config>      # switch between shopify.app.*.toml profiles
+npm run config:link              # link to a Partners app
+shopify app webhook trigger \    # synthetic webhook (useful while orders/create approval pending)
+  --topic=orders/create \
+  --api-version=2025-07 \
+  --address=https://<tunnel>/webhooks/orders/create
 ```
 
-### First-boot env minimum
-`MONGODB_URI`, `SHOPIFY_*` (CLI-managed), `QBO_CLIENT_ID`,
-`QBO_CLIENT_SECRET`, `QBO_REALM_ID`, `QBO_REFRESH_TOKEN`,
-`NMI_SECURITY_KEY`. Full table in §16 of [INTEGRATIONS.md](./INTEGRATIONS.md).
+`npm run predeploy` runs automatically before `deploy` and triggers `build:theme` (see below).
 
-### Boot-time health checks
-- Banner prints every relevant env var (secrets masked).
-- `[boot] index OK` lines confirm the two unique indexes built. `[boot] index MISSING` means cleanup needed — see §22.4.
-- Scheduler mode is printed on the last banner line (`DEV MODE — every 30 seconds` or cron expressions).
+### Registration form (wholesale/registration-form/)
 
-### Production deployment gate
-Checklist in §23.3 of [INTEGRATIONS.md](./INTEGRATIONS.md). Don't ship
-without it — the test-card / sandbox-key combo is the most common foot-gun.
+Driven by Vite. Build output lands in the theme extension's `assets/` so the storefront block can load it.
 
-## 8. Changelog
+```bash
+npm install                      # from inside registration-form/
+npm run dev                      # Vite dev server (port 5173)
+npm run build                    # production build → theme-extension/assets/
+npm run lint
+npm run preview                  # serve the built bundle locally
+```
 
-Append-only. Newest at top. One-line summaries; link to section for detail.
+Or, from `wholesale/`:
 
-- **2026-05-19** — Moved the Shopify webhook handler back to `app/routes/webhooks.orders.create.jsx` (file-based routing), matching the sibling `webhooks.app.*.jsx` convention. Removed the explicit `route()` declaration from `app/routes.js`. `app/api/` is now reserved for non-webhook inbound REST endpoints (admin-* + registration-form). URL `/webhooks/orders/create` unchanged.
-- **2026-05-19** — Major service-oriented restructure. Each integration
-  service now has a consistent file split (`<svc>.service.js` /
-  `<svc>.apis.js` / `<svc>.queries.js` / `<svc>.mutations.js` /
-  `<svc>.config.js` / `<svc>.utils.js` / `<svc>.constants.js`).
-  Created `services/APIService/` shared foundation (mongo + http + api
-  helpers). New `services/payment/` extracted from the old invoice service
-  for charge orchestration. Renamed domain folders to singular
-  (`customers/` → `customer/`, `invoices/` → `invoice/`, `orders/` → `order/`).
-  Moved `routes/webhooks.orders.create.jsx` → `api/webhook/shopify-order-create.js`.
-  Global utils moved to `app/utils/` (`logger.utils.js`, `retry.utils.js`,
-  `env.utils.js`). Boot config aggregator at `app/configs/index.js`.
-  See §3 above for the new layout and §5 for updated project rules.
-  ~25 new files, 26 deletions, ~14 caller updates. All `node --check`
-  passes; zero stale path references in app code.
-- **2026-05-19** — Initial canonical spec consolidated into `CLAUDE.md`.
-  `INTEGRATIONS.md` remains the deep technical reference.
-- **(prior)** — See git log on branch `QBO_and_NMI` for the build-out of
-  the QBO + NMI + Shopify pipeline.
+```bash
+npm run build:theme              # equivalent to `npm --prefix registration-form run build`
+```
+
+### Theme extension
+
+Deployed via `shopify app deploy` (along with the Shopify app and any other extensions).
+
+## Architecture — the big picture
+
+### Order-to-payment pipeline (the critical path)
+
+The Shopify app's reason for existing: turn new Shopify orders into paid QBO invoices via NMI.
+
+```
+Shopify orders/create webhook  →  routes/webhooks.orders.create.jsx   (URL: /webhooks/orders/create, file-based)
+   → services/order/order.service.js     (idempotent orchestrator)
+       → services/customer/customer.service.js   (QBO find-or-create + NMI vault find-or-create)
+       → services/invoice/invoice.service.js     (claim-first invoice creation, calls services/qbo/qbo.service.createInvoice)
+   → scheduler tick (Agenda 5; 30s in dev, cron 15th+last in prod)
+       → services/scheduler/jobs/processPendingPayments.job.js
+           PASS 1: services/payment/payment.service.chargeInvoice  (NMI charge for pending invoices)
+           PASS 2: services/invoice/invoice.service.propagateSuccessfulPayment  (re-sync paid invoices)
+   → propagateSuccessfulPayment
+       → services/qbo/qbo.service.recordPayment + services/shopify/shopify.service.markOrderPaid + DB update
+```
+
+Three idempotency layers prevent duplicate invoices:
+1. **Webhook-id dedup** — `seenWebhookIds[]` on the ShopifyOrder doc catches Shopify's at-least-once retries.
+2. **Atomic claim** — `findOneAndUpdate({ processingStatus: { $in: claimable } }, $set: 'processing' })`. Loser exits.
+3. **Claim-first Invoice insert** — `Invoice.create({ qboInvoiceId: null, qboCreationStatus: 'claimed' })` fires the unique `(shop, shopifyOrderId)` index **before** the QBO POST. Losers `waitForClaimToComplete` (poll up to 30s). This is the structural fix for the user-reported duplicate-invoice bug — see [wholesale/INTEGRATIONS.md §13](wholesale/INTEGRATIONS.md).
+
+### Wholesale registration form feature
+
+A separate flow from the order pipeline. Storefront customers fill out a 3-step form embedded via the theme extension; approved applicants become Shopify wholesale customers.
+
+```
+Storefront Liquid block
+  → registration-form/ React SPA (Vite, 3-step react-hook-form + Yup)
+      Step 1 — name, email, phone, password, credentials (+ file uploads), referral
+      Step 2 — billing/shipping address, tax info
+      Step 3 — payment method, signature, terms
+  → POST /api/registration-form  (Shopify app proxy: authenticate.public.appProxy)
+      → uploads files to Shopify Files API (stagedUploadsCreate → fileCreate → poll)
+      → hashes password (scrypt) and card PAN (HMAC-SHA256 keyed by SHOPIFY_API_SECRET)
+      → WholesaleApplication.create() in MongoDB
+      → customerCreate() via Admin GraphQL → adds "Pending" tag, sends acknowledgment email
+  → Admin dashboard (app.customers._index.jsx + app.customers.$id.jsx)
+      → Review → adds "Approved" tag + sends invite via customerSendInvite
+      → Decline → deletes Shopify customer + MongoDB doc
+```
+
+**Key files:**
+
+| File | Role |
+|---|---|
+| `registration-form/src/RegistrationForm.jsx` | Form root; `useForm` with `mode:'onTouched'`, `reValidateMode:'onChange'`; step navigation |
+| `registration-form/src/schema/step*.schema.js` | Yup schemas per step; `step*Fields` arrays used for partial validation on "Continue" |
+| `registration-form/src/components/SignaturePad.jsx` | Draw (canvas + toBlob) or typed signature; blob stored via `savedBlobRef` and restored on remount |
+| `registration-form/src/components/Dropzone.jsx` | File picker; `has-file` state renders a green card |
+| `app/api/registration-form.js` | App proxy POST handler |
+| `app/utils/shopifyNoteMap.js` | Canonical map of credential IDs → Shopify customer note keys (source of truth for both form and note builder) |
+| `app/utils/buildShopifyNote.js` | Assembles the note string written to the Shopify customer record |
+| `app/utils/shopifyCustomer.js` | `customerCreate` + `customerSendInvite` Admin GraphQL helpers |
+| `app/routes/app.customers._index.jsx` | Admin list page (search, status filter chips, Review/Revoke/Decline actions) |
+| `app/routes/app.customers.$id.jsx` | Admin detail page (all fields, signature image/text, payment, credentials, license files) |
+
+**Registration form validation gotcha** — `credentials` and `referrals` use object-level `.test('one-selected', …)` in Yup. `reValidateMode:'onChange'` only re-validates the specific path that changed (e.g. `credentials.acupuncturist.selected`), not the parent object test. After any checkbox toggle, call `trigger('credentials')` / `trigger('referrals')` explicitly.
+
+### Module boundaries (project laws)
+
+- No `process.env.X` outside [services/config.server.js](wholesale/app/services/config.server.js). Required values are asserted at boot.
+- No QBO calls outside `services/qbo/`. Same rule for `services/nmi/` and `services/shopify/`.
+- Models in `app/models/` are schema + indexes only. Business logic lives in services.
+- Errors are typed as `PermanentError` or `TransientError` ([services/retry.server.js](wholesale/app/services/retry.server.js)) so retry layers can decide. QBO + NMI clients retry transients up to `HTTP_RETRY_ATTEMPTS` (default 4); the scheduler retries NMI charges up to `PAYMENT_MAX_RETRY_ATTEMPTS` (default 6).
+- **CSS only in `registration-form/src/styles/registration-form.css`** — never add `style={{}}` props or CSS classes to admin routes (`app/routes/app.*.jsx`). Admin UI uses Polaris web components (`s-*` tags) styled through their own props.
+- **New admin API endpoints go in `app/api/`** and are registered manually in `app/routes.js` (not file-based routes). Follow the existing pattern: `route("/api/admin/customers/:id/action", "api/admin-action.js")`.
+- **After any change to `registration-form/src/`**, run `npm run build:theme` from `wholesale/` to regenerate `extensions/theme-extension/assets/react-app-bundle.*`. The storefront loads the bundle from there; changes are invisible until rebuilt.
+
+### Boot sequence ([entry.server.jsx](wholesale/app/entry.server.jsx))
+
+1. Mongo connect.
+2. `verifyCriticalIndexes` — logs `[boot] index OK` / `[boot] index MISSING` for the two unique `(shop, shopifyOrderId)` indexes. Missing means duplicate rows are blocking the index build; cleanup script in INTEGRATIONS.md §22.4.
+3. `assertSafeTestCardConfig` — scrubs `NMI_TEST_*` env vars if `NMI_ENVIRONMENT !== 'sandbox'`.
+4. Boot banner — prints every relevant env var (secrets masked), URLs in use, scheduler mode. Use this to confirm config when something behaves unexpectedly.
+5. `getAgenda()` — coalescing singleton; starts scheduler and registers `process-pending-payments` against current env (dev interval or prod cron).
+
+### Session storage
+
+Note: `prisma/schema.prisma` is template residue. Active session storage is **MongoDB** via `@shopify/shopify-app-session-storage-mongodb` (configured in [app/shopify.server.js](wholesale/app/shopify.server.js)), using the same `MONGODB_URI` as the app data. The Prisma session table is unused. The `npm run setup` script (`prisma generate && prisma migrate deploy`) is also legacy from the template — running it is harmless but doesn't affect production behavior.
+
+### Webhook registration (two paths)
+
+- **Declarative** (preferred once approved) — `[[webhooks.subscriptions]]` blocks in the active `shopify.app.<config>.toml`. Pushed by `shopify app deploy`.
+- **Programmatic** — `ensureProtectedWebhooks` from [services/shopify/shopify.service.js](wholesale/app/services/shopify/shopify.service.js) runs from `app/routes/app.jsx`'s loader on every admin page load. Idempotent. Used when `orders/create` (a protected customer data topic) is awaiting Partners-dashboard approval.
+
+## Configuration profiles
+
+Multiple `shopify.app.*.toml` files exist:
+- [shopify.app.toml](wholesale/shopify.app.toml) — default
+- [shopify.app.dev-rk.toml](wholesale/shopify.app.dev-rk.toml) — developer-specific dev profile
+
+Switch with `npm run config:use <name>`. The active profile drives `shopify app dev` / `shopify app deploy` and determines which Partners app is targeted.
+
+## MCP servers configured for this repo
+
+- [wholesale/.mcp.json](wholesale/.mcp.json) and [wholesale/.cursor/mcp.json](wholesale/.cursor/mcp.json) wire up the Shopify Dev MCP (used by Claude Code, Cursor, Copilot, Gemini CLI). Use the MCP's `search_docs_chunks`, `graphql_schema`, `validate_graphql_codeblocks` etc. when writing Shopify Admin GraphQL queries or mutations.
+
+## Gotchas worth knowing up front
+
+These are pulled from [wholesale/README.md](wholesale/README.md) and the integration-spec; they bite in non-obvious ways:
+
+- **Embedded-app navigation** — inside the admin iframe, use `Link` from `react-router` (not `<a>`), use the `redirect` returned from `authenticate.admin` (not `react-router`'s `redirect`), and use `useSubmit` from `react-router`.
+- **NMI sandbox vs production hosts** — sandbox keys are rejected on `secure.nmi.com` and vice versa. Always match `NMI_ENVIRONMENT` to the key. Same idea for QBO.
+- **QBO refresh tokens rotate on every refresh** — they're seeded once from `QBO_REFRESH_TOKEN` env, then Mongo is the source of truth (`qbo_tokens` collection). Concurrent refreshes are coalesced via an in-flight promise.
+- **Webhook handler returns 200 immediately.** Downstream work is fire-and-forget. Never block the webhook response on QBO/NMI calls.
+- **`orders/create` is a protected customer data topic.** It requires Partners-dashboard approval. Until then, use synthetic webhook triggers and the programmatic registration path.
+- **Windows + Prisma ARM64 error** — if you hit `query_engine-windows.dll.node is not a valid Win32 application`, set `PRISMA_CLIENT_ENGINE_TYPE=binary`. (Mostly irrelevant since session storage is MongoDB now, but the Prisma client still initializes.)
+- **Polaris `s-button icon="…"` accepts only exact names from `privateIconArray`** — valid examples: `"check"`, `"undo"`, `"delete"`, `"arrow-left"`. `"checkmark"` is not valid and silently shows no icon. Check `node_modules/@shopify/polaris-types/dist/polaris.d.ts` line ~203 for the full list.
+- **React Router 7 auto-revalidates loaders after every fetcher action** — do not call `revalidator.revalidate()` manually inside a `useEffect` that has `revalidator` in its dep array; the reference changes on each state transition and causes an infinite loop. Remove the manual call and rely on auto-revalidation.
+
+## When updating code, update the spec
+
+The maintenance protocol in [wholesale/CLAUDE.md §6](wholesale/CLAUDE.md) requires that meaningful code changes ship with corresponding updates to `wholesale/CLAUDE.md` (status table + changelog) and `wholesale/INTEGRATIONS.md` (affected sections). This is per the project owner's explicit request. Trivial fixes (whitespace, comments) are exempt.
