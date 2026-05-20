@@ -30,7 +30,7 @@ export function shopifyLinesToQboLines(order) {
     const amount = Number((qty * unitPrice).toFixed(2))
     if (!Number.isFinite(amount) || amount <= 0) continue
     lines.push({
-      description: item.title || item.name || `Item ${item.id}`,
+      description: formatLineDescription(item),
       quantity: qty,
       unitPrice,
       amount,
@@ -63,4 +63,24 @@ export function shopifyLinesToQboLines(order) {
     })
   }
   return lines
+}
+
+// Compose the QBO invoice line description from a Shopify line_item.
+// Format: "<product name> by <vendor>, SKU: <sku>" — vendor and SKU are
+// each conditional so missing fields don't leave dangling separators.
+// We use `name` (which Shopify pre-joins as "Title - Variant Title")
+// over `title` so any variant detail survives the trip into QBO.
+//
+// SKU is normalized: some merchants enter the value in Shopify as
+// "SKU: 1234" (with the prefix baked in). Without stripping, the output
+// becomes "SKU: SKU: 1234". Strip any leading "SKU:" (case-insensitive)
+// before re-prefixing so the result is always exactly one "SKU: ".
+export function formatLineDescription(item) {
+  if (!item) return ''
+  const productName = item.name || item.title || `Item ${item.id ?? ''}`.trim()
+  const head = item.vendor ? `${productName} by ${item.vendor}` : productName
+  const parts = [head]
+  const sku = String(item.sku || '').replace(/^\s*sku\s*:\s*/i, '').trim()
+  if (sku) parts.push(`SKU: ${sku}`)
+  return parts.join(', ')
 }

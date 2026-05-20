@@ -249,8 +249,9 @@ export default function OrdersList() {
                 const orderLabel =
                   r.shopifyOrderName ||
                   (r.shopifyOrderNumber ? `#${r.shopifyOrderNumber}` : r.shopifyOrderId);
+                const orderTooltip = `Order ${orderLabel}`;
                 return (
-                  <s-table-row key={r.id} onClick={go}>
+                  <s-table-row key={r.id} onClick={go} title={orderTooltip}>
                     <s-table-cell>
                       <s-text>{orderLabel}</s-text>
                     </s-table-cell>
