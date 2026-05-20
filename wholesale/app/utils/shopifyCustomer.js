@@ -53,7 +53,8 @@ export async function customerCreate(admin, { application, note, tags = ["Pendin
     emailMarketingConsent: {
       marketingState: subscribeNews ? 'SUBSCRIBED' : 'NOT_SUBSCRIBED',
       marketingOptInLevel: subscribeNews ? 'SINGLE_OPT_IN' : null,
-      consentUpdatedAt: new Date().toISOString(),
+      // Back-date 60s so clock skew with Shopify can't trigger "must not be in the future".
+      consentUpdatedAt: new Date(Date.now() - 60_000).toISOString(),
     },
   }
 

@@ -11,6 +11,7 @@ import { createInvoiceForOrder } from '../invoice/invoice.service'
 import { chargeInvoice } from '../payment/payment.service'
 import { validateShopifyOrder } from './order.validator'
 import { paymentConfig } from '../payment/payment.config'
+import { customerHasApprovedTag } from '../shopify/shopify.service'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('order.service')
@@ -86,7 +87,10 @@ export async function processShopifyOrder({ shop, order, webhookId }) {
   //    transitions an existing doc from a reclaimable status into
   //    `processing`. If the update affects 0 docs, another worker has
   //    already claimed this order; we exit.
-  const claimableStatuses = ['received', 'failed', 'customer_ready']
+  //
+  // `pending_approval` is reclaimable so that `replayPendingOrdersForCustomer`
+  // (triggered when an admin approves a customer) can re-enter the pipeline.
+  const claimableStatuses = ['received', 'failed', 'customer_ready', 'pending_approval']
   // Allow stealing stale claims.
   const now = new Date()
   const staleCutoff = new Date(now.getTime() - STALE_CLAIM_MS)
@@ -155,6 +159,44 @@ export async function processShopifyOrder({ shop, order, webhookId }) {
     return local
   }
 
+  // Approval gate — wholesale customers must carry the "Approved" tag
+  // before we touch QBO or NMI. Orders for unapproved customers are held
+  // as `pending_approval` and auto-replayed by `replayPendingOrdersForCustomer`
+  // when the admin approves them (admin/review.js).
+  //
+  // We fetch tags LIVE from Shopify (not the webhook payload) so a customer
+  // approved between order creation and webhook processing is picked up
+  // correctly. A tag-lookup failure throws and lands the order in `failed`,
+  // which is reclaimable on the next attempt.
+  const shopifyCustomerId = order.customer?.id ? String(order.customer.id) : null
+  if (!shopifyCustomerId) {
+    // No customer attached to the order (guest checkout / abandoned cart
+    // recovery / staff-created without a customer). There's no one to
+    // approve — reject definitively rather than holding indefinitely.
+    console.log(`[orders] REJECTED — order has no customer; cannot verify wholesale approval`)
+    log.warn('reject.no_customer', { shopifyOrderId })
+    local.processingStatus = 'rejected'
+    local.rejectionCode = 'NO_CUSTOMER_ID'
+    local.processingError = 'Order has no customer attached; cannot verify wholesale approval'
+    await local.save()
+    return local
+  }
+
+  console.log(`[orders] approval gate — fetching tags for customer ${shopifyCustomerId}`)
+  const approved = await customerHasApprovedTag({ shop, customerId: shopifyCustomerId })
+  if (!approved) {
+    console.log(
+      `[orders] HOLD — customer ${shopifyCustomerId} is not approved; ` +
+        `skipping QBO + NMI. Will auto-replay when "Approved" tag is added.`,
+    )
+    log.info('hold.not_approved', { shopifyOrderId, shopifyCustomerId })
+    local.processingStatus = 'pending_approval'
+    local.processingError = undefined
+    await local.save()
+    return local
+  }
+  console.log(`[orders] approval gate — customer ${shopifyCustomerId} is APPROVED, proceeding`)
+
   console.log(`\n========== Processing order ${order.id} (${order.name || ''}) for ${shop} ==========`)
   try {
     console.log(`[orders] step 1/4 — ensure customer in QBO + NMI`)
@@ -220,4 +262,61 @@ export async function processShopifyOrder({ shop, order, webhookId }) {
     await local.save()
     throw err
   }
+}
+
+// Replay every order held in `pending_approval` for a customer that was
+// just approved. Triggered from admin/review.js after the "Approved" tag
+// is added to the Shopify customer + the wholesale application is marked
+// approved.
+//
+// Sequential — wholesale customers typically have a small backlog (one to
+// a handful) and serial processing keeps NMI vault creation race-free
+// (the first order creates the vault, subsequent orders reuse it).
+//
+// Each invocation goes through processShopifyOrder, so all the existing
+// idempotency layers (atomic claim, claim-first invoice insert) still
+// guard against double-processing if the admin clicks Approve twice.
+//
+// Returns a summary the caller can log; never throws (per-order failures
+// are caught and recorded on the order doc).
+export async function replayPendingOrdersForCustomer({ shop, email }) {
+  if (!shop || !email) {
+    return { total: 0, processed: 0, failed: 0, skipped: 0 }
+  }
+  const normalizedEmail = String(email).toLowerCase()
+  const pending = await ShopifyOrder.find({
+    shop,
+    customerEmail: normalizedEmail,
+    processingStatus: 'pending_approval',
+  })
+    .select('shopifyOrderId rawPayload')
+    .lean()
+
+  console.log(
+    `[orders] replay — found ${pending.length} pending_approval order(s) for ${normalizedEmail}`,
+  )
+  log.info('replay.start', { shop, email: normalizedEmail, count: pending.length })
+
+  let processed = 0
+  let failed = 0
+  let skipped = 0
+  for (const row of pending) {
+    if (!row.rawPayload) {
+      console.warn(`[orders] replay skip — order ${row.shopifyOrderId} has no rawPayload`)
+      skipped += 1
+      continue
+    }
+    try {
+      await processShopifyOrder({ shop, order: row.rawPayload })
+      processed += 1
+    } catch (err) {
+      console.error(`[orders] replay failed for order ${row.shopifyOrderId}: ${err.message}`)
+      log.error('replay.order_failed', { shop, shopifyOrderId: row.shopifyOrderId, err })
+      failed += 1
+    }
+  }
+  const summary = { total: pending.length, processed, failed, skipped }
+  console.log(`[orders] replay done — ${JSON.stringify(summary)}`)
+  log.info('replay.done', { shop, email: normalizedEmail, ...summary })
+  return summary
 }

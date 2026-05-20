@@ -4,6 +4,7 @@ import connectDB from '../../services/APIService/mongo.service'
 import WholesaleApplication from '../../models/wholesaleApplication.server'
 import { sendResponse } from '../../services/APIService/api.service'
 import { updateCustomerTags as customerUpdateTags, sendCustomerInvite as customerSendInvite } from '../../services/shopify/shopify.service'
+import { replayPendingOrdersForCustomer } from '../../services/order/order.service'
 
 // POST /api/admin/customers/:id/review
 // Flips the customer from Pending to Approved: swaps the Shopify tag,
@@ -14,9 +15,11 @@ export async function action({ request, params }) {
   }
 
   let admin
+  let session
   try {
     const auth = await authenticate.admin(request)
     admin = auth.admin
+    session = auth.session
   } catch (e) {
     console.error('[admin/review] auth failed:', e?.message || e)
     return sendResponse(401, 'error', 'Unauthorized', null)
@@ -78,6 +81,29 @@ export async function action({ request, params }) {
     return sendResponse(500, 'error', 'Failed to save review state', {
       detail: e?.message || String(e),
     })
+  }
+
+  // Step 4 — fire-and-forget: replay any orders that were held in
+  // `pending_approval` waiting for this customer's approval. Non-blocking
+  // so the admin sees the success response immediately while N orders
+  // process in the background. Per-order failures are caught inside the
+  // replay helper and surfaced via the order doc's `processingError`.
+  const shop = session?.shop
+  if (shop && doc.email) {
+    Promise.resolve()
+      .then(() => replayPendingOrdersForCustomer({ shop, email: doc.email }))
+      .then((summary) => {
+        console.log(
+          `[admin/review] replay for ${doc.email} → ` +
+            `total=${summary.total} processed=${summary.processed} ` +
+            `failed=${summary.failed} skipped=${summary.skipped}`,
+        )
+      })
+      .catch((err) => {
+        console.error(`[admin/review] replay threw unexpectedly: ${err?.message || err}`)
+      })
+  } else {
+    console.warn('[admin/review] cannot replay pending orders — missing shop or email on application')
   }
 
   return sendResponse(200, 'success', 'Customer approved', { id })

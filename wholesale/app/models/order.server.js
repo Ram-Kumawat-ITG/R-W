@@ -26,6 +26,7 @@ const orderSchema = new mongoose.Schema(
       enum: [
         'received',
         'processing', // claimed atomically by one worker — guards against duplicate QBO invoices
+        'pending_approval', // customer lacks "Approved" tag; held until admin approves, then auto-replayed
         'rejected',
         'customer_ready',
         'invoiced',

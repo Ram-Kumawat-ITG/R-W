@@ -197,7 +197,8 @@ export async function createCustomer(admin, { application, note, tags = ['Pendin
     emailMarketingConsent: {
       marketingState: subscribeNews ? 'SUBSCRIBED' : 'NOT_SUBSCRIBED',
       marketingOptInLevel: subscribeNews ? 'SINGLE_OPT_IN' : null,
-      consentUpdatedAt: new Date().toISOString(),
+      // Back-date 60s so clock skew with Shopify can't trigger "must not be in the future".
+      consentUpdatedAt: new Date(Date.now() - 60_000).toISOString(),
     },
   }
 
@@ -230,6 +231,38 @@ export async function sendCustomerInvite(admin, { customerId, subject, message, 
   )
   if (userErrors.length) throw new Error(userErrors.map((e) => e.message).join('; '))
   return true
+}
+
+// Fetch the current tags for a Shopify customer using an offline session
+// (no request context required — callable from webhook handlers and the
+// scheduler). Returns [] if the customer can't be found.
+//
+// Webhook payloads do include `customer.tags`, but that's a snapshot at
+// order creation. For approval gating we want the LIVE state — so a
+// customer who was tagged "Approved" between order creation and webhook
+// arrival is processed correctly.
+export async function getCustomerTags({ shop, customerId }) {
+  if (!shop || !customerId) {
+    throw new Error('getCustomerTags: shop and customerId are required')
+  }
+  const gid = String(customerId).startsWith('gid://')
+    ? String(customerId)
+    : `gid://shopify/Customer/${customerId}`
+
+  const { admin } = await getUnauthenticatedAdmin(shop)
+  const json = await executeGraphQL(admin, QUERY_CUSTOMER_TAGS, { id: gid })
+  const tags = json?.data?.customer?.tags
+  if (!Array.isArray(tags)) return []
+  return tags
+}
+
+// Convenience predicate used by the order orchestrator's approval gate.
+// Case-insensitive match against the literal "Approved" tag we set when
+// an admin approves a wholesale application (see admin/review.js).
+export async function customerHasApprovedTag({ shop, customerId }) {
+  if (!shop || !customerId) return false
+  const tags = await getCustomerTags({ shop, customerId })
+  return tags.some((t) => String(t).trim().toLowerCase() === 'approved')
 }
 
 // Swap one tag for another on a Shopify customer. Reads current tags,

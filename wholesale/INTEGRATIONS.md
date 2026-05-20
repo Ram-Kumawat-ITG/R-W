@@ -333,11 +333,19 @@ In both modes the webhook returns 200 before downstream calls finish.
 ### 5.1 Lifecycle states (`ShopifyOrder.processingStatus`)
 
 ```
-received  → processing → customer_ready → invoiced → scheduled → completed
-                              │
-                              └── rejected (validation failed)
-                              └── failed   (downstream error)
+received  → processing ──┬─→ pending_approval ──(admin approves)──┐
+                         │                                         │
+                         └─→ customer_ready → invoiced → scheduled → completed
+                                  │
+                                  ├── rejected (validation failed or no customer)
+                                  └── failed   (downstream error)
 ```
+
+`pending_approval` is the hold state for orders from Shopify customers that
+do **not** carry the `Approved` tag. The orchestrator skips QBO and NMI
+work entirely for these orders. They are re-entered into the pipeline by
+`replayPendingOrdersForCustomer` (triggered from `admin/review.js` when an
+admin approves the customer) — see §5.4 below.
 
 ### 5.2 The three idempotency layers (in this function)
 
@@ -352,12 +360,15 @@ The claim filter:
 {
   shop, shopifyOrderId,
   $or: [
-    { processingStatus: { $in: ['received', 'failed', 'customer_ready'] } },
+    { processingStatus: { $in: ['received', 'failed', 'customer_ready', 'pending_approval'] } },
     { processingStatus: 'processing', processingClaimedAt: { $lt: staleCutoff } }, // 5 min stale lock recovery
     { processingStatus: { $exists: false } },
   ]
 }
 ```
+
+`pending_approval` is reclaimable so that the admin-approval replay can
+re-enter the pipeline cleanly through the same orchestrator path.
 
 If `findOneAndUpdate` returns `null`, this worker lost the race and exits.
 The winning worker continues. The `STALE_CLAIM_MS` (5 min) constant
@@ -381,6 +392,60 @@ of thrown:
 | `AMOUNT_INVALID` | total_price not numeric |
 | `ZERO_TOTAL` | total_price ≤ 0 |
 | `NO_LINE_ITEMS` | line_items empty |
+
+The orchestrator also rejects with `NO_CUSTOMER_ID` when an order arrives
+without `order.customer.id`. Guest checkouts and staff-created orders
+that omit the customer are rejected definitively — there is no one to
+approve later. See §5.4 for the approval gate that follows.
+
+### 5.4 Approval gate (Shopify `Approved` tag)
+
+After validation succeeds, the orchestrator checks the Shopify customer's
+tags **live** (not from the webhook payload) before touching QBO or NMI.
+Lookup is `shopify.service.customerHasApprovedTag({ shop, customerId })`,
+which uses an offline session against the Admin GraphQL `customer(id) { tags }`
+query. Live lookup means a customer approved between order creation and
+webhook processing is picked up correctly.
+
+| Order state at gate | Resulting `processingStatus` | Next action |
+|---|---|---|
+| `customer.id` present **and** tags contain `Approved` (case-insensitive) | proceeds to step 1/4 | normal flow: customer_ready → invoiced → scheduled |
+| `customer.id` present, no `Approved` tag | `pending_approval` | held; auto-replayed when admin approves (see §5.5) |
+| no `customer.id` on order | `rejected` with `rejectionCode='NO_CUSTOMER_ID'` | terminal — guest checkouts and staff-created orders without a customer cannot be wholesale-approved |
+| tag lookup throws (Shopify down) | `failed` | reclaimable on next attempt |
+
+The gate sits between validation and `ensureCustomerForOrder`, so unapproved
+orders never write to `customer_maps`, never call QBO `findOrCreateCustomer`,
+and never create an NMI vault — those side effects only happen for
+approved customers.
+
+### 5.5 Pending-order replay (`replayPendingOrdersForCustomer`)
+
+When an admin approves a wholesale application via
+`POST /api/admin/customers/:id/review`, the handler:
+
+1. Swaps the customer's Shopify tag from `Pending` to `Approved`.
+2. Sends the activation/approval email.
+3. Marks the `wholesale_applications` doc as `status='approved'`.
+4. **Fire-and-forget** calls `replayPendingOrdersForCustomer({ shop, email })`.
+
+The admin response returns immediately (step 4 is non-blocking). Replay:
+
+- Finds every `ShopifyOrder` doc with `processingStatus='pending_approval'`
+  and matching `(shop, customerEmail)`.
+- For each, calls `processShopifyOrder({ shop, order: row.rawPayload })`
+  **sequentially**. Serial processing keeps NMI vault creation race-free
+  — the first order creates the vault; subsequent orders reuse it via
+  `customer_maps.nmiCustomerVaultId`.
+- Per-order failures are caught and recorded on the order doc's
+  `processingError`. The replay never throws.
+
+Returns `{ total, processed, failed, skipped }` logged to console + structured logger.
+
+`pending_approval` orders are stored with the full `rawPayload`, so replay
+does not need to re-fetch from Shopify. If an order's `rawPayload` is
+missing (legacy data, schema migration), it's recorded as skipped and the
+admin must re-trigger via another mechanism.
 
 ---
 
