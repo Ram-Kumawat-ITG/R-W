@@ -25,4 +25,6 @@ export default [
   route("/api/admin/customers/:id/decline", "api/admin/decline.js"),
   route("/api/admin/customers/:id/review", "api/admin/review.js"),
   route("/api/admin/customers/:id/unreview", "api/admin/unreview.js"),
+  route("/api/admin/orders/:id/retry-payment", "api/admin/retry-payment.js"),
+  route("/api/admin/orders/:id/qbo-invoice-pdf", "api/admin/qbo-invoice-pdf.js"),
 ];

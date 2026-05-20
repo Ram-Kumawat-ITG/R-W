@@ -212,6 +212,58 @@ export async function qboRequest(opts) {
   })
 }
 
+// Same auth + 401-retry-once dance as rawRequest, but returns the raw
+// bytes for non-JSON endpoints (e.g. /invoice/<id>/pdf which returns a
+// PDF stream). Keeps PDF transport inside services/qbo/ so the
+// "no QBO calls outside services/qbo/" rule is preserved.
+async function rawBinaryRequest({ path, accept, retryOn401 = true }) {
+  const accessToken = await getAccessToken()
+  const url = buildUrl(path)
+
+  console.log(`\n[QBO →] GET ${path}  (binary, accept=${accept})`)
+  const startedAt = Date.now()
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: {
+      Accept: accept,
+      Authorization: `Bearer ${accessToken}`,
+    },
+  })
+  const elapsedMs = Date.now() - startedAt
+  console.log(`[QBO ←] GET ${path}  status=${res.status}  ${elapsedMs}ms`)
+
+  if (res.status === 401 && retryOn401) {
+    console.log('[QBO]   401 received — force-refreshing token and retrying once')
+    log.warn('token.invalid_retry', { path })
+    const doc = await readTokenDoc()
+    if (doc) await refreshAccessToken(doc.refreshToken)
+    return rawBinaryRequest({ path, accept, retryOn401: false })
+  }
+
+  if (!res.ok) {
+    const text = await res.text()
+    const ErrorClass = res.status >= 500 || res.status === 429 ? TransientError : PermanentError
+    throw new ErrorClass(`QBO GET ${path} failed: ${res.status}`, { status: res.status, body: truncate(text, 500) })
+  }
+
+  const arrayBuffer = await res.arrayBuffer()
+  return {
+    buffer: Buffer.from(arrayBuffer),
+    contentType: res.headers.get('content-type') || accept,
+  }
+}
+
+export async function qboGetBinary(path, { accept = 'application/octet-stream' } = {}) {
+  return retry(() => rawBinaryRequest({ path, accept }), {
+    attempts: paymentConfig.httpRetryAttempts,
+    baseMs: paymentConfig.httpRetryBaseMs,
+    maxMs: paymentConfig.httpRetryMaxMs,
+    onAttempt: ({ attempt, err, nextDelayMs }) => {
+      log.warn('binary.retry', { attempt, nextDelayMs, err })
+    },
+  })
+}
+
 // Convenience helpers used by qbo.service.js.
 export const qbo = {
   get: (path, query) => qboRequest({ method: 'GET', path, query }),

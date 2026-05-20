@@ -2,8 +2,9 @@
 // QuickBooks. Combines customer find-or-create, invoice creation, and
 // payment recording. All HTTP plumbing is in qbo.apis.js.
 
-import { qbo } from './qbo.apis'
+import { qbo, qboGetBinary } from './qbo.apis'
 import { qboConfig } from './qbo.config'
+import { QBO_APP_URLS } from './qbo.constants'
 import { escapeQboQuery, toCustomerPayload, toInvoiceLine } from './qbo.utils'
 import { createLogger } from '../../utils/logger.utils'
 
@@ -85,6 +86,25 @@ export async function createInvoice({ qboCustomerId, currency, lines, memo, dueD
 export async function getInvoice(invoiceId) {
   const res = await qbo.get(`/invoice/${encodeURIComponent(invoiceId)}`)
   return res?.Invoice
+}
+
+// Deep link an admin can click to open the QBO invoice in the QuickBooks
+// web app. Routes to sandbox vs prod based on QBO_ENVIRONMENT; Intuit
+// handles realm selection from the operator's login session.
+export function getInvoiceWebUrl(invoiceId) {
+  if (!invoiceId) return null
+  const host = QBO_APP_URLS[qboConfig.environment] || QBO_APP_URLS.production
+  return `${host}/app/invoice?txnId=${encodeURIComponent(invoiceId)}`
+}
+
+// Fetch the rendered invoice PDF straight from QBO. Used by the admin
+// proxy endpoint so operators can view the actual invoice document
+// without leaving the app or logging into QuickBooks.
+export async function getInvoicePdf(invoiceId) {
+  if (!invoiceId) throw new Error('getInvoicePdf: invoiceId is required')
+  return qboGetBinary(`/invoice/${encodeURIComponent(invoiceId)}/pdf`, {
+    accept: 'application/pdf',
+  })
 }
 
 // ── Payment ──────────────────────────────────────────────────────────

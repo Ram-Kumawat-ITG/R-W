@@ -138,6 +138,8 @@ app/
 │   ├── app.jsx, app._index.jsx           #   Embedded admin shell + dashboard
 │   ├── app.customers._index.jsx
 │   ├── app.customers.$id.jsx
+│   ├── app.orders._index.jsx             #   Orders list (filter + paginate)
+│   ├── app.orders.$id.jsx                #   Order detail + "Retry Now" payment action
 │   ├── app.webhooks.jsx                  #   /app/webhooks diagnostic page
 │   ├── webhooks.orders.create.jsx        #   POST /webhooks/orders/create (Shopify orders/create)
 │   ├── webhooks.app.uninstalled.jsx      #   App lifecycle (pre-existing, template)
@@ -822,6 +824,36 @@ For each invoice in the cursor, call `propagateSuccessfulPayment` directly — *
 `PAYMENT_MAX_RETRY_ATTEMPTS` (default `6`). After the 6th failed attempt
 the invoice transitions to `paymentStatus: 'failed'` and the scheduler
 stops trying. Failed invoices need explicit operator action.
+
+### 11.4 Manual retry — admin "Retry Now"
+
+Operators can fire a single charge attempt out-of-band from the order
+detail page (`/app/orders/:id`). The flow:
+
+```
+admin click → POST /api/admin/orders/:id/retry-payment
+            → app/api/admin/retry-payment.js
+                → guards: order in shop, invoice exists,
+                  paymentStatus ∈ {pending, failed},
+                  CustomerMap.nmiCustomerVaultId present
+                → if attemptCount ≥ maxAttempts, bumps maxAttempts++
+                → if paymentStatus === 'failed', flips to 'pending'
+                → calls services/payment/payment.service.chargeInvoice
+            → returns { outcome, transactionId?, responseText? }
+              synchronously so the UI can show the result inline
+```
+
+`attemptCount` is never reset — the `PaymentAttempt` ledger remains
+strictly append-only so the audit trail is intact across manual + auto
+retries. The only state mutation pre-charge is `maxAttempts` (bumped by
+1 when the auto-retry cap has been reached) and a flip of
+`paymentStatus` back to `pending`. After that, the standard
+`chargeInvoice` path runs and all the usual outcome handling applies.
+
+The admin UI hides / disables the button when retry would be unsafe or
+pointless (paid, cancelled, in-progress, or no vault on file); the
+server re-validates those same conditions and returns HTTP 409 so an
+out-of-date page can't bypass them.
 
 ---
 
