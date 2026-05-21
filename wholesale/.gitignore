@@ -16,7 +16,8 @@ database.sqlite
 .env
 .env.*
 
-
+.claude
+.claude/
 
 
 
