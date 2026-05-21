@@ -16,7 +16,12 @@ import PaymentAttempt from '../../models/paymentAttempt.server'
 import { createInvoice as createQboInvoice, recordPayment as recordQboPayment } from '../qbo/qbo.service'
 import { markShopifyOrderPaid } from '../shopify/shopify.service'
 import { paymentConfig } from '../payment/payment.config'
-import { syncWithRetry, shopifyLinesToQboLines } from './invoice.utils'
+import { invoiceConfig } from './invoice.config'
+import {
+  syncWithRetry,
+  shopifyLinesToQboLines,
+  computeInvoiceDueDate,
+} from './invoice.utils'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('invoice.service')
@@ -76,6 +81,17 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
   // Phase 2 — call QBO with the lock held.
   console.log(`[invoice] phase 2 — calling QBO createInvoice (we hold the claim)`)
   const lines = shopifyLinesToQboLines(order)
+  // Due date = order date + termsDays. Sending DueDate explicitly makes
+  // us the source of truth and overrides any QBO customer-level
+  // SalesTerm. Falls back to localOrder.receivedAt if Shopify's
+  // created_at is missing; if both are unparseable, we omit DueDate
+  // and let QBO compute it from its own defaults.
+  const orderDateBasis = order?.created_at || localOrder?.receivedAt
+  const dueDate = computeInvoiceDueDate(orderDateBasis, invoiceConfig.termsDays)
+  console.log(
+    `[invoice] dueDate = ${dueDate || '(QBO default)'} ` +
+      `(order date ${orderDateBasis || '(unknown)'} + ${invoiceConfig.termsDays} days)`,
+  )
   let qboInvoice
   try {
     qboInvoice = await createQboInvoice({
@@ -84,6 +100,7 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
       lines,
       memo: `Shopify order ${order.name || order.id}`,
       docNumber: order.name?.replace(/^#/, '') || shopifyOrderId,
+      dueDate,
     })
   } catch (qboErr) {
     // QBO call failed — mark the claim as failed so a re-run can

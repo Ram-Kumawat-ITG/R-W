@@ -468,15 +468,28 @@ function DueDateCell({ invoice }) {
   const isCancelled = invoice.paymentStatus === "cancelled";
   const today = startOfDay(new Date());
   const overdue = !isPaid && !isCancelled && due < today;
+  const settled = isPaid || isCancelled;
   const label = due.toLocaleDateString(undefined, {
     year: "numeric",
     month: "short",
     day: "numeric",
   });
+  // Strike through the due date once the invoice is settled (or cancelled)
+  // — the date is no longer an active obligation. Uses the semantic
+  // <s> element (rendered with browser-default line-through) so we don't
+  // need inline styles, which are barred in admin routes.
   return (
     <s-stack direction="block" gap="none">
-      <s-text tone={overdue ? "critical" : undefined}>
-        {overdue ? <strong>{label}</strong> : label}
+      <s-text
+        tone={overdue ? "critical" : settled ? "subdued" : undefined}
+      >
+        {settled ? (
+          <s>{label}</s>
+        ) : overdue ? (
+          <strong>{label}</strong>
+        ) : (
+          label
+        )}
       </s-text>
       {overdue && <s-text tone="critical">Overdue</s-text>}
     </s-stack>

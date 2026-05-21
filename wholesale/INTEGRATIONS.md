@@ -580,13 +580,26 @@ POST /v3/company/{realmId}/invoice?minorversion=73
   ],
   "CurrencyRef": { "value": "USD" },
   "CustomerMemo": { "value": "Shopify order #1021" },
-  "DocNumber": "1021"
+  "DocNumber": "1021",
+  "DueDate": "2026-06-05"
 }
 ```
 
 Line items mirror Shopify's: per-product line + Shipping line + Tax
 line. Every line needs an `Item` reference — `QBO_DEFAULT_ITEM_ID`
 (default `"1"`) is used unless `line.qboItemId` is set.
+
+`DueDate` is computed in this app as **order date + `INVOICE_TERMS_DAYS`**
+(default 15) by `invoice.utils.computeInvoiceDueDate`, then sent
+explicitly to QBO. This makes us the source of truth for terms and
+overrides any customer-level `SalesTerm` configured in QBO. The
+returned `DueDate` is captured on the local invoice as `qboDueDate`
+("YYYY-MM-DD" string) for display in the Order List + Order Details.
+
+If both `order.created_at` and `localOrder.receivedAt` are unparseable,
+we omit `DueDate` from the request and QBO falls back to its own
+SalesTerm logic — last-resort safety so a missing date can't break
+invoice creation.
 
 ### 7.4 Payment recording
 
@@ -1276,6 +1289,8 @@ required values throw immediately.
 | `NMI_TEST_CCNUMBER` | (optional) | Dev test card number (sandbox only) |
 | `NMI_TEST_CCEXP` | (optional) | Dev test card expiry MMYY |
 | `NMI_TEST_CVV` | (optional) | Dev test card CVV |
+| **Invoicing** | | |
+| `INVOICE_TERMS_DAYS` | `15` | Days from order date to invoice due date — sent as `DueDate` to QBO (overrides any customer-level SalesTerm) |
 | **Payments** | | |
 | `PAYMENT_CHARGE_IMMEDIATELY` | `false` | `true` = NMI charge in webhook process |
 | `PAYMENT_MAX_RETRY_ATTEMPTS` | `6` | Cap on NMI charge attempts per invoice |

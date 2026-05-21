@@ -11,6 +11,7 @@ import { assertSafeBootConfig } from "./configs";
 import { qboConfig } from "./services/qbo/qbo.config";
 import { nmiConfig } from "./services/nmi/nmi.config";
 import { paymentConfig } from "./services/payment/payment.config";
+import { invoiceConfig } from "./services/invoice/invoice.config";
 import { schedulerConfig } from "./services/scheduler/scheduler.config";
 import { shopifyConfig } from "./services/shopify/shopify.config";
 import { createLogger } from "./utils/logger.utils";
@@ -50,6 +51,8 @@ function printBootBanner() {
     ? `ACTIVE — last4 ${String(tc.ccnumber).slice(-4)} exp ${tc.ccexp}`
     : "(not set)";
   console.log(`  NMI test card (dev only)  : ${tcStatus}`);
+  console.log("  --- Invoicing ---");
+  console.log(`  INVOICE_TERMS_DAYS        : ${invoiceConfig.termsDays} (order date + N → QBO DueDate)`);
   console.log("  --- Payments ---");
   console.log(`  PAYMENT_CHARGE_IMMEDIATELY: ${paymentConfig.chargeImmediately}`);
   console.log(`  PAYMENT_MAX_RETRY_ATTEMPTS: ${paymentConfig.maxRetryAttempts}`);

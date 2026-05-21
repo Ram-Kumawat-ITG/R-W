@@ -3,6 +3,26 @@
 
 import { retry } from '../../utils/retry.utils'
 
+// Compute an invoice due date as "YYYY-MM-DD" — order date + N days.
+// Returns null if `baseDate` is unparseable; callers omit DueDate from
+// the QBO payload in that case so QBO falls back to its own SalesTerm
+// calculation.
+//
+// Uses local-date components (not toISOString()) to avoid the UTC
+// midnight drift that turns a 23:59 timestamp into the next day's date
+// when sliced.
+export function computeInvoiceDueDate(baseDate, termsDays) {
+  if (baseDate == null) return null
+  const d = baseDate instanceof Date ? new Date(baseDate) : new Date(baseDate)
+  if (!Number.isFinite(d.getTime())) return null
+  const n = Number.isFinite(termsDays) ? Math.trunc(termsDays) : 0
+  d.setDate(d.getDate() + n)
+  const yyyy = d.getFullYear()
+  const mm = String(d.getMonth() + 1).padStart(2, '0')
+  const dd = String(d.getDate()).padStart(2, '0')
+  return `${yyyy}-${mm}-${dd}`
+}
+
 // Each downstream sync gets its own retry. Failures are isolated so one
 // dead system doesn't block the others. PermanentError bypasses retry.
 export async function syncWithRetry(label, fn) {

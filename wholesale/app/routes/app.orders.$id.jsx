@@ -1521,9 +1521,10 @@ function OutcomeBadge({ outcome }) {
   return <s-badge tone={m.tone}>{m.label}</s-badge>;
 }
 
-// Format a QBO "YYYY-MM-DD" due date for display. Annotates overdue +
-// unpaid invoices with a trailing "(overdue)" so the value alone is
-// actionable without scanning the rest of the page.
+// Format a QBO "YYYY-MM-DD" due date for display. Returns JSX so we can
+// strike through the date once the invoice is settled (or cancelled) —
+// the date is no longer an active obligation. Annotates overdue +
+// unpaid invoices with a trailing "(overdue)" inline for scanability.
 function formatDueDate(qboDueDate, paymentStatus) {
   if (!qboDueDate || typeof qboDueDate !== "string") return null;
   const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(qboDueDate);
@@ -1538,7 +1539,8 @@ function formatDueDate(qboDueDate, paymentStatus) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const settled = paymentStatus === "paid" || paymentStatus === "cancelled";
-  if (!settled && due < today) return `${label} (overdue)`;
+  if (settled) return <s>{label}</s>;
+  if (due < today) return `${label} (overdue)`;
   return label;
 }
 
