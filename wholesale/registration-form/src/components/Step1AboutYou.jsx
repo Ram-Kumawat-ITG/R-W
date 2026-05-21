@@ -3,18 +3,19 @@ import { Controller, useWatch } from 'react-hook-form'
 import { CREDENTIALS, REFERRALS } from '../constants'
 import CredentialCard from './CredentialCard'
 
-export default function Step1AboutYou({ control, errors, setValue, trigger }) {
+export default function Step1AboutYou({ control, errors, setValue, trigger, clearErrors }) {
   const [showPassword, setShowPassword] = useState(false)
   const credentials = useWatch({ control, name: 'credentials' }) || {}
   const referrals = useWatch({ control, name: 'referrals' }) || {}
   const selectedCreds = CREDENTIALS.filter((c) => credentials[c.id]?.selected)
 
-  const onToggleCredential = (id, checked) => {
+  const onToggleCredential = async (id, checked) => {
     setValue(`credentials.${id}.selected`, checked, { shouldDirty: true })
-    trigger('credentials')
+    await trigger('credentials')
+    if (checked) clearErrors(`credentials.${id}`)
   }
 
-  const onToggleReferral = (id, checked) => {
+  const onToggleReferral = async (id, checked) => {
     if (id === 'none' && checked) {
       REFERRALS.forEach((r) => {
         if (r.id !== 'none') setValue(`referrals.${r.id}.selected`, false)
@@ -23,7 +24,8 @@ export default function Step1AboutYou({ control, errors, setValue, trigger }) {
       setValue('referrals.none.selected', false)
     }
     setValue(`referrals.${id}.selected`, checked, { shouldDirty: true })
-    trigger('referrals')
+    await trigger('referrals')
+    if (checked) clearErrors(`referrals.${id}`)
   }
 
   return (
@@ -91,21 +93,18 @@ export default function Step1AboutYou({ control, errors, setValue, trigger }) {
       <div className="rf-field rf-row rf-row-2">
         <div>
           <label className="rf-label">Phone <span className="rf-req">*</span></label>
-          <div className="rf-prefix">
-            <span className="prefix-text">+1</span>
-            <Controller
-              name="phone"
-              control={control}
-              render={({ field }) => (
-                <input
-                  {...field}
-                  type="tel"
-                  placeholder="(555) 123-4567"
-                  className={`rf-input ${errors.phone ? 'error' : ''}`}
-                />
-              )}
-            />
-          </div>
+          <Controller
+            name="phone"
+            control={control}
+            render={({ field }) => (
+              <input
+                {...field}
+                type="tel"
+                placeholder="+1 (555) 123-4567"
+                className={`rf-input ${errors.phone ? 'error' : ''}`}
+              />
+            )}
+          />
           {errors.phone && <p className="rf-help error">{errors.phone.message}</p>}
         </div>
         <div>

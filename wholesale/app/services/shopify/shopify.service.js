@@ -5,6 +5,15 @@
 // All GraphQL strings are in shopify.queries.js / shopify.mutations.js.
 // All low-level admin-client plumbing is in shopify.apis.js.
 
+// Carries structured Shopify userErrors so callers can map fields back to form inputs.
+export class ShopifyUserError extends Error {
+  constructor(userErrors) {
+    super(userErrors.map((e) => `[${Array.isArray(e.field) ? e.field.join('.') : e.field}] ${e.message}`).join('; '))
+    this.name = 'ShopifyUserError'
+    this.userErrors = userErrors
+  }
+}
+
 import { shopifyConfig } from './shopify.config'
 import { REQUIRED_SUBSCRIPTIONS } from './shopify.constants'
 import { toE164US, mapAddress, toOrderGid } from './shopify.utils'
@@ -190,7 +199,6 @@ export async function createCustomer(admin, { application, note, tags = ['Pendin
     email: application.email,
     firstName: application.firstName,
     lastName: application.lastName,
-    phone: toE164US(application.phone),
     tags,
     note,
     addresses,
@@ -208,7 +216,7 @@ export async function createCustomer(admin, { application, note, tags = ['Pendin
     { input },
     'customerCreate',
   )
-  if (userErrors.length) throw new Error(userErrors.map((e) => e.message).join('; '))
+  if (userErrors.length) throw new ShopifyUserError(userErrors)
   const id = data?.customer?.id
   if (!id) throw new Error('customerCreate returned no customer')
   return id

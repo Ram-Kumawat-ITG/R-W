@@ -6,20 +6,23 @@ export const step3Schema = yup.object({
   payment: yup.object({
     method: yup
       .string()
-      .required('Choose a payment method')
+      .required('Required')
       .oneOf(['check', 'ach', 'card']),
-    cardholderName: yup.string().required('Cardholder name is required'),
-    cardBrand: yup.string().required('Select a card type'),
+    cardholderName: yup.string().required('Required'),
+    cardBrand: yup
+      .string()
+      .required('Card brand could not be detected — enter a Visa, Mastercard, Discover, or AMEX card number')
+      .oneOf(['visa', 'mastercard', 'discover', 'amex'], 'Only Visa, Mastercard, Discover, and AMEX are accepted'),
     cardNumber: yup
       .string()
-      .required('Card number is required')
+      .required('Required')
       .test('digit-count', 'Enter a valid card number', (v) => {
         const digits = (v || '').replace(/\D/g, '')
         return digits.length >= 13 && digits.length <= 19
       }),
     cardExpiry: yup
       .string()
-      .required('Expiry is required')
+      .required('Required')
       .test('valid-expiry', 'Use MM / YY in the future', (v) => {
         const m = (v || '').match(/^(\d{2})\s*\/?\s*(\d{2})$/)
         if (!m) return false
@@ -32,7 +35,7 @@ export const step3Schema = yup.object({
       }),
     cardCvv: yup
       .string()
-      .required('CVV is required')
+      .required('Required')
       .matches(/^\d{3,4}$/, 'CVV must be 3 or 4 digits'),
   }),
   signature: yup
