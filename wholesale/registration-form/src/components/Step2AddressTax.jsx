@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { Controller, useWatch } from "react-hook-form";
 import {
   US_STATES,
@@ -161,19 +161,31 @@ function AddressBlock({ name, control, errors }) {
   );
 }
 
-export default function Step2AddressTax({ control, errors, setValue }) {
+export default function Step2AddressTax({ control, errors, setValue, clearErrors }) {
   const sameAsBilling = useWatch({ control, name: "shippingSameAsBilling" });
   const resells = useWatch({ control, name: "resellsProducts" });
   const taxIdType = useWatch({ control, name: "tax.taxIdType" });
 
-  // Clear shipping when toggle flips back to "same as billing"
+  const isFirstRender = useRef(true);
+
+  // Clear shipping when toggle flips; skip on mount so back-navigation preserves entered address
   useEffect(() => {
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
     if (sameAsBilling) {
       setValue("shippingAddress", null, { shouldValidate: false });
-    } else if (sameAsBilling === false) {
+    } else {
       setValue("shippingAddress", EMPTY_SHIPPING, { shouldValidate: false });
+      clearErrors("shippingAddress");
     }
-  }, [sameAsBilling, setValue]);
+  }, [sameAsBilling, setValue, clearErrors]);
+
+  // Clear tax sub-field errors when the tax section is first revealed
+  useEffect(() => {
+    if (resells) clearErrors("tax");
+  }, [resells, clearErrors]);
 
   return (
     <section className="rf-step">
@@ -240,7 +252,6 @@ export default function Step2AddressTax({ control, errors, setValue }) {
         <Controller
           name="shippingPropertyType"
           control={control}
-          defaultValue="select value"
           render={({ field }) => (
             <select
               {...field}

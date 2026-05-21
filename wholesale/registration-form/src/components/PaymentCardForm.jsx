@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 import { Controller, useWatch } from 'react-hook-form'
-import { CARD_BRANDS, CARD_BRAND_LABELS } from '../constants'
+import { CARD_BRAND_LABELS } from '../constants'
 
 function detectCardBrand(num) {
   const n = (num || '').replace(/\s/g, '')
@@ -47,24 +47,28 @@ export default function PaymentCardForm({ control, setValue, showAllErrors = fal
   return (
     <div>
       <div className="rf-field">
-        <label className="rf-label">Card type <span className="rf-req">*</span></label>
+        <label className="rf-label">Card number <span className="rf-req">*</span></label>
         <Controller
-          name="payment.cardBrand"
+          name="payment.cardNumber"
           control={control}
           render={({ field, fieldState }) => (
             <>
-              <div className="rf-card-type-selector">
-                {CARD_BRANDS.map((brand) => (
-                  <button
-                    type="button"
-                    key={brand}
-                    className={`rf-card-chip ${field.value === brand ? 'active' : ''}`}
-                    onClick={() => field.onChange(brand)}
-                    onBlur={field.onBlur}
-                  >
-                    {CARD_BRAND_LABELS[brand]}
-                  </button>
-                ))}
+              <div className="rf-card-number-wrap">
+                <input
+                  type="text"
+                  placeholder="1234 5678 9012 3456"
+                  inputMode="numeric"
+                  autoComplete="cc-number"
+                  maxLength={23}
+                  value={field.value || ''}
+                  onChange={(e) => field.onChange(formatCardNumber(e.target.value))}
+                  onBlur={field.onBlur}
+                  className={`rf-input ${showError(fieldState) ? 'error' : ''}`}
+                  style={{ fontVariantNumeric: 'tabular-nums', letterSpacing: '0.02em' }}
+                />
+                {detectedBrand && (
+                  <span className="rf-card-brand-badge">{CARD_BRAND_LABELS[detectedBrand]}</span>
+                )}
               </div>
               {showError(fieldState) && (
                 <p className="rf-help error">{fieldState.error.message}</p>
@@ -72,7 +76,15 @@ export default function PaymentCardForm({ control, setValue, showAllErrors = fal
             </>
           )}
         />
-        <p className="rf-help">Auto-selects when you enter your card number — or pick manually.</p>
+        <Controller
+          name="payment.cardBrand"
+          control={control}
+          render={({ fieldState }) =>
+            showError(fieldState) ? (
+              <p className="rf-help error">{fieldState.error.message}</p>
+            ) : null
+          }
+        />
       </div>
 
       <div className="rf-field">
@@ -88,33 +100,6 @@ export default function PaymentCardForm({ control, setValue, showAllErrors = fal
                 placeholder="Name on card"
                 autoComplete="cc-name"
                 className={`rf-input ${showError(fieldState) ? 'error' : ''}`}
-              />
-              {showError(fieldState) && (
-                <p className="rf-help error">{fieldState.error.message}</p>
-              )}
-            </>
-          )}
-        />
-      </div>
-
-      <div className="rf-field">
-        <label className="rf-label">Card number <span className="rf-req">*</span></label>
-        <Controller
-          name="payment.cardNumber"
-          control={control}
-          render={({ field, fieldState }) => (
-            <>
-              <input
-                type="text"
-                placeholder="1234 5678 9012 3456"
-                inputMode="numeric"
-                autoComplete="cc-number"
-                maxLength={23}
-                value={field.value || ''}
-                onChange={(e) => field.onChange(formatCardNumber(e.target.value))}
-                onBlur={field.onBlur}
-                className={`rf-input ${showError(fieldState) ? 'error' : ''}`}
-                style={{ fontVariantNumeric: 'tabular-nums', letterSpacing: '0.02em' }}
               />
               {showError(fieldState) && (
                 <p className="rf-help error">{fieldState.error.message}</p>

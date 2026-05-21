@@ -8,6 +8,7 @@ import {
   createCustomer,
   sendCustomerInvite,
   uploadFileToShopify,
+  ShopifyUserError,
 } from '../services/shopify/shopify.service'
 
 // POST /api/registration-form
@@ -123,6 +124,14 @@ export async function action({ request }) {
 
   payload.shop = shop
 
+  // Reject duplicate submissions before touching Shopify
+  const existing = await WholesaleApplication.findOne({ email: payload.email }).lean()
+  if (existing) {
+    return sendResponse(409, 'error', 'An account with this email already exists.', {
+      fieldErrors: [{ field: 'email', message: 'An account with this email already exists.' }],
+    })
+  }
+
   let app
   try {
     app = await WholesaleApplication.create(payload)
@@ -173,6 +182,19 @@ export async function action({ request }) {
     }
   } catch (e) {
     console.error('[proxy/submit] customerCreate failed:', e?.message || e)
+
+    // Shopify returned structured field errors (e.g., email/phone already taken).
+    // Delete the doc we just created so the user can fix and resubmit cleanly.
+    if (e instanceof ShopifyUserError) {
+      await WholesaleApplication.deleteOne({ _id: app._id })
+      const fieldErrors = e.userErrors.map((ue) => {
+        const rawField = Array.isArray(ue.field) ? ue.field[ue.field.length - 1] : ue.field
+        const field = rawField === 'phone' ? 'phone' : 'email'
+        return { field, message: ue.message }
+      })
+      return sendResponse(409, 'error', e.userErrors[0].message, { fieldErrors })
+    }
+
     await WholesaleApplication.updateOne(
       { _id: app._id },
       {

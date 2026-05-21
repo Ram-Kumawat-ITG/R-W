@@ -23,7 +23,9 @@ export default class ApiService {
     }
 
     if (!response.ok || data.status === 'error') {
-      throw new Error(data.message || `Submit failed (${response.status})`)
+      const err = new Error(data.message || `Submit failed (${response.status})`)
+      err.responseData = data
+      throw err
     }
 
     return data
