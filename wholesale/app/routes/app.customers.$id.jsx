@@ -11,6 +11,7 @@ import connectDB from "../services/APIService/mongo.service";
 import WholesaleApplication from "../models/wholesaleApplication.server";
 import { buildShopifyNote } from "../services/shopify/shopify.utils";
 import { CREDENTIAL_MAP, REFERRAL_MAP } from "../services/shopify/shopify.constants";
+import { KV } from "../components/admin-ui";
 
 export const loader = async ({ request, params }) => {
   await authenticate.admin(request);
@@ -571,14 +572,6 @@ export default function CustomerDetail() {
   );
 }
 
-function KV({ label, value }) {
-  return (
-    <s-stack direction="block" gap="none">
-      <s-text tone="subdued">{label}</s-text>
-      <s-text>{value || "—"}</s-text>
-    </s-stack>
-  );
-}
 
 function AddressBlock({ addr }) {
   if (!addr || (!addr.line1 && !addr.city && !addr.zip)) {

@@ -10,6 +10,13 @@ import { authenticate } from "../shopify.server";
 import connectDB from "../services/APIService/mongo.service";
 import ShopifyOrder from "../models/order.server";
 import Invoice from "../models/invoice.server";
+import { ProcessingBadge, PaymentMethodShortText } from "../components/admin-ui";
+import {
+  formatAmount,
+  parseDateOnly,
+  startOfDay,
+} from "../utils/format.utils";
+import { PAYMENT_METHOD_SHORT } from "../utils/payment.constants";
 
 const PAGE_SIZE = 25;
 
@@ -293,7 +300,7 @@ export default function OrdersList() {
                       />
                     </s-table-cell>
                     <s-table-cell>
-                      <PaymentMethodCell method={r.customerPreference} />
+                      <PaymentMethodShortText method={r.customerPreference} />
                     </s-table-cell>
                     <s-table-cell>
                       <SettledViaCell
@@ -358,22 +365,10 @@ export default function OrdersList() {
   );
 }
 
-function ProcessingBadge({ status }) {
-  const map = {
-    received: { tone: "default", label: "Received" },
-    processing: { tone: "info", label: "Processing" },
-    pending_approval: { tone: "warning", label: "Pending approval" },
-    rejected: { tone: "critical", label: "Rejected" },
-    customer_ready: { tone: "info", label: "Customer ready" },
-    invoiced: { tone: "info", label: "Invoiced" },
-    scheduled: { tone: "info", label: "Scheduled" },
-    completed: { tone: "success", label: "Completed" },
-    failed: { tone: "critical", label: "Failed" },
-  };
-  const m = map[status] || { tone: "default", label: status || "—" };
-  return <s-badge tone={m.tone}>{m.label}</s-badge>;
-}
-
+// Order-list-specific payment badge — multi-line layout (badge above,
+// "attempts" subtitle below). Lives here rather than in admin-ui.jsx
+// because the layout is list-specific; the simple PaymentStatusBadge
+// shared primitive is used on detail pages.
 function PaymentBadge({ paymentStatus, invoice }) {
   if (!invoice) {
     return paymentStatus === "paid" ? (
@@ -401,19 +396,6 @@ function PaymentBadge({ paymentStatus, invoice }) {
       <s-text tone="subdued">{invoice.attemptCount}/{invoice.maxAttempts} attempts</s-text>
     </s-stack>
   );
-}
-
-const PAYMENT_METHOD_SHORT = {
-  card: "Credit card",
-  check: "Cheque",
-  ach: "ACH",
-};
-
-// Immutable order-time preference snapshot (Invoice.customerPaymentPreference).
-// Plain text — no badge — to keep visual weight low in the row.
-function PaymentMethodCell({ method }) {
-  if (!method) return <s-text tone="subdued">—</s-text>;
-  return <s-text>{PAYMENT_METHOD_SHORT[method] || method}</s-text>;
 }
 
 // "Settled via" — the actual method that settled the invoice. Reads
@@ -496,27 +478,3 @@ function DueDateCell({ invoice }) {
   );
 }
 
-function parseDateOnly(s) {
-  if (!s || typeof s !== "string") return null;
-  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
-  if (!m) return null;
-  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
-  return Number.isFinite(d.getTime()) ? d : null;
-}
-
-function startOfDay(d) {
-  const x = new Date(d);
-  x.setHours(0, 0, 0, 0);
-  return x;
-}
-
-function formatAmount(amount, currency) {
-  try {
-    return new Intl.NumberFormat(undefined, {
-      style: "currency",
-      currency: currency || "USD",
-    }).format(amount);
-  } catch {
-    return `${currency || ""} ${Number(amount).toFixed(2)}`;
-  }
-}

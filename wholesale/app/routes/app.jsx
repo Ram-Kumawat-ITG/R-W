@@ -21,8 +21,15 @@ export default function App() {
 
   return (
     <AppProvider embedded apiKey={apiKey}>
+      {/*
+        `rel="home"` marks the root link so Shopify's nav doesn't treat
+        every /app/* route as still being on "Home" (prefix matching
+        otherwise activates the home item on /app/orders/:id, etc.).
+        Recognised by Shopify's app-bridge / nav-menu logic — see
+        node_modules/@shopify/shopify-app-react-router/dist/.../redirect.js.
+      */}
       <s-app-nav>
-        <s-link href="/app">Home</s-link>
+        <s-link href="/app" rel="home">Home</s-link>
         <s-link href="/app/customers">Wholesale applications</s-link>
         <s-link href="/app/orders">Orders</s-link>
         <s-link href="/app/additional">Additional page</s-link>

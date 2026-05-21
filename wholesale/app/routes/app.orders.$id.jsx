@@ -13,18 +13,22 @@ import Invoice from "../models/invoice.server";
 import PaymentAttempt from "../models/paymentAttempt.server";
 import CustomerMap from "../models/customerMap.server";
 import { getInvoice as getQboInvoice, getInvoiceWebUrl } from "../services/qbo/qbo.service";
+import {
+  KV,
+  TotalsRow,
+  ProcessingBadge,
+  PaymentStatusBadge,
+  PaymentMethodBadge,
+  OutcomeBadge,
+} from "../components/admin-ui";
+import { formatAmount, fmtDateTime } from "../utils/format.utils";
+import { PAYMENT_METHOD_LABEL } from "../utils/payment.constants";
 
 // Statuses for which the manual retry / charge / mark-paid buttons can
 // fire. 'paid', 'cancelled', and 'in_progress' must be excluded — see
 // retry-payment.js / charge-card.js / mark-cheque-paid.js for the same
 // guard server-side.
 const RETRYABLE_PAYMENT_STATUSES = new Set(["pending", "failed"]);
-
-const PAYMENT_METHOD_LABEL = {
-  card: "Credit card",
-  check: "Check / Cheque",
-  ach: "ACH / Bank transfer",
-};
 
 // Status → Polaris badge tone for the pipeline strip at the top of the
 // page. "skipped" is rendered same as "pending" tonally; the difference
@@ -36,8 +40,6 @@ const PIPELINE_STEP_TONE = {
   failed: "critical",
   skipped: "default",
 };
-
-const fmtDateTime = (d) => (d ? new Date(d).toLocaleString() : null);
 
 // Derive the six pipeline steps from order + invoice state. Pure — no
 // side effects, safe to recompute on every render.
@@ -1430,58 +1432,9 @@ export default function OrderDetail() {
   );
 }
 
-function KV({ label, value }) {
-  return (
-    <s-stack direction="block" gap="none">
-      <s-text tone="subdued">{label}</s-text>
-      <s-text>{value || value === 0 ? value : "—"}</s-text>
-    </s-stack>
-  );
-}
 
-function TotalsRow({ label, value, strong, tone }) {
-  return (
-    <s-stack
-      direction="inline"
-      gap="base"
-      alignItems="center"
-      justifyContent="space-between"
-    >
-      <s-text tone={strong ? undefined : "subdued"}>
-        {strong ? <strong>{label}</strong> : label}
-      </s-text>
-      <s-text tone={tone}>{strong ? <strong>{value}</strong> : value}</s-text>
-    </s-stack>
-  );
-}
 
-function ProcessingBadge({ status }) {
-  const map = {
-    received: { tone: "default", label: "Received" },
-    processing: { tone: "info", label: "Processing" },
-    pending_approval: { tone: "warning", label: "Pending approval" },
-    rejected: { tone: "critical", label: "Rejected" },
-    customer_ready: { tone: "info", label: "Customer ready" },
-    invoiced: { tone: "info", label: "Invoiced" },
-    scheduled: { tone: "info", label: "Scheduled" },
-    completed: { tone: "success", label: "Completed" },
-    failed: { tone: "critical", label: "Failed" },
-  };
-  const m = map[status] || { tone: "default", label: status || "—" };
-  return <s-badge tone={m.tone}>{m.label}</s-badge>;
-}
 
-function PaymentStatusBadge({ status }) {
-  const map = {
-    pending: { tone: "warning", label: "Pending" },
-    in_progress: { tone: "info", label: "In progress" },
-    paid: { tone: "success", label: "Paid" },
-    failed: { tone: "critical", label: "Failed" },
-    cancelled: { tone: "default", label: "Cancelled" },
-  };
-  const m = map[status] || { tone: "default", label: status || "—" };
-  return <s-badge tone={m.tone}>{m.label}</s-badge>;
-}
 
 function PipelineStepBadge({ step }) {
   return (
@@ -1499,27 +1452,7 @@ function PipelineConnector() {
   return <s-text tone="subdued">→</s-text>;
 }
 
-function PaymentMethodBadge({ method }) {
-  const map = {
-    card: { tone: "info", label: "Credit card" },
-    check: { tone: "default", label: "Check / Cheque" },
-    ach: { tone: "default", label: "ACH" },
-  };
-  const m = map[method] || { tone: "default", label: method || "—" };
-  return <s-badge tone={m.tone}>{m.label}</s-badge>;
-}
 
-function OutcomeBadge({ outcome }) {
-  const map = {
-    approved: { tone: "success", label: "Approved" },
-    declined: { tone: "critical", label: "Declined" },
-    error: { tone: "critical", label: "Error" },
-    skipped: { tone: "default", label: "Skipped" },
-    manual_paid: { tone: "success", label: "Manual paid" },
-  };
-  const m = map[outcome] || { tone: "default", label: outcome || "—" };
-  return <s-badge tone={m.tone}>{m.label}</s-badge>;
-}
 
 // Format a QBO "YYYY-MM-DD" due date for display. Returns JSX so we can
 // strike through the date once the invoice is settled (or cancelled) —
@@ -1544,14 +1477,3 @@ function formatDueDate(qboDueDate, paymentStatus) {
   return label;
 }
 
-function formatAmount(amount, currency) {
-  if (amount == null) return null;
-  try {
-    return new Intl.NumberFormat(undefined, {
-      style: "currency",
-      currency: currency || "USD",
-    }).format(amount);
-  } catch {
-    return `${currency || ""} ${Number(amount).toFixed(2)}`;
-  }
-}
