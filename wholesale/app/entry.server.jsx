@@ -6,6 +6,7 @@ import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
 import connectDB from "./services/APIService/mongo.service";
 import { getAgenda } from "./services/scheduler/scheduler.service";
+import { backfillCustomerPaymentPreferences } from "./services/invoice/invoice.migrations";
 import { assertSafeBootConfig } from "./configs";
 import { qboConfig } from "./services/qbo/qbo.config";
 import { nmiConfig } from "./services/nmi/nmi.config";
@@ -72,6 +73,12 @@ printBootBanner();
     await connectDB();
     console.log("[boot] MongoDB connected");
     await verifyCriticalIndexes();
+    // Idempotent: only writes rows missing the snapshot field. After
+    // the first boot it's a no-op until a new row needs backfill.
+    await backfillCustomerPaymentPreferences().catch((err) => {
+      console.warn("[boot] customerPaymentPreference backfill failed:", err?.message || err);
+      bootLog.warn("backfill.customer_payment_preference.failed", { err });
+    });
     await getAgenda();
     console.log("[boot] Agenda scheduler started");
     bootLog.info("scheduler.ready");

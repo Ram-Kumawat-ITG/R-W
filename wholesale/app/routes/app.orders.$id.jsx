@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import mongoose from "mongoose";
 import {
   useLoaderData,
@@ -25,6 +25,136 @@ const PAYMENT_METHOD_LABEL = {
   check: "Check / Cheque",
   ach: "ACH / Bank transfer",
 };
+
+// Status → Polaris badge tone for the pipeline strip at the top of the
+// page. "skipped" is rendered same as "pending" tonally; the difference
+// is semantic (no longer reachable on this run vs. not reached yet).
+const PIPELINE_STEP_TONE = {
+  done: "success",
+  active: "info",
+  pending: "default",
+  failed: "critical",
+  skipped: "default",
+};
+
+const fmtDateTime = (d) => (d ? new Date(d).toLocaleString() : null);
+
+// Derive the six pipeline steps from order + invoice state. Pure — no
+// side effects, safe to recompute on every render.
+function computePipelineSteps({ order, invoice }) {
+  const paymentStatus = invoice?.paymentStatus;
+  const paid = paymentStatus === "paid";
+  const inProgress = paymentStatus === "in_progress";
+  const failed = paymentStatus === "failed";
+  const cancelled = paymentStatus === "cancelled";
+  const pending = paymentStatus === "pending";
+
+  const invoiceCreated = !!invoice?.qboInvoiceId;
+  const invoiceCreationFailed = invoice?.qboCreationStatus === "failed";
+  const orderRejected = order?.processingStatus === "rejected";
+  const orderFailed = order?.processingStatus === "failed";
+  const completed = order?.processingStatus === "completed";
+  const attempts = invoice?.attemptCount ?? 0;
+  const isManual =
+    invoice?.paymentMethod === "check" || invoice?.paymentMethod === "ach";
+
+  // "Payment processing" subtitle is the most context-loaded — it has
+  // to convey retries, in-flight charges, manual-wait, and failures all
+  // through one line. Order matters: failed wins over retries.
+  let processingSubtitle = null;
+  if (failed) {
+    processingSubtitle = attempts > 0 ? `Failed after ${attempts}` : "Failed";
+  } else if (inProgress) {
+    processingSubtitle = "In progress";
+  } else if (isManual && pending) {
+    processingSubtitle = `Awaiting ${invoice.paymentMethod === "ach" ? "ACH" : "cheque"}`;
+  } else if (attempts > 0 && !paid) {
+    processingSubtitle = `${attempts} attempt${attempts === 1 ? "" : "s"}`;
+  } else if (attempts > 1 && paid) {
+    processingSubtitle = `Cleared after ${attempts}`;
+  }
+
+  const invoiceStatus = invoiceCreated
+    ? "done"
+    : invoiceCreationFailed || orderRejected || orderFailed
+      ? "failed"
+      : invoice
+        ? "active"
+        : "pending";
+
+  const pendingStepStatus = paid || inProgress
+    ? "done"
+    : cancelled
+      ? "skipped"
+      : pending
+        ? "active"
+        : failed
+          ? "failed"
+          : "pending";
+
+  const processingStepStatus = paid
+    ? "done"
+    : inProgress
+      ? "active"
+      : failed
+        ? "failed"
+        : isManual && pending
+          ? "active"
+          : "pending";
+
+  return [
+    {
+      label: "Order placed",
+      status: order ? "done" : "pending",
+      subtitle: fmtDateTime(order?.receivedAt),
+    },
+    {
+      label: "Invoice created",
+      status: invoiceStatus,
+      subtitle: invoice?.qboDocNumber
+        ? `#${invoice.qboDocNumber}`
+        : orderRejected
+          ? order?.rejectionCode || "Rejected"
+          : invoiceCreationFailed
+            ? "QBO error"
+            : null,
+    },
+    {
+      label: "Payment pending",
+      status: pendingStepStatus,
+      subtitle: invoice?.paymentMethod
+        ? PAYMENT_METHOD_LABEL[invoice.paymentMethod] || invoice.paymentMethod
+        : null,
+    },
+    {
+      label: "Payment processing",
+      status: processingStepStatus,
+      subtitle: processingSubtitle,
+    },
+    {
+      label: "Paid",
+      status: paid
+        ? "done"
+        : cancelled
+          ? "skipped"
+          : failed
+            ? "failed"
+            : "pending",
+      // Only surface paidAt once the step is actually done — defensive
+      // against stale fields on partially-migrated rows.
+      subtitle: paid ? fmtDateTime(invoice?.paidAt) : null,
+    },
+    {
+      label: "Completed",
+      status: completed
+        ? "done"
+        : orderRejected || orderFailed
+          ? "failed"
+          : "pending",
+      subtitle: completed ? fmtDateTime(order?.completedAt) : null,
+    },
+  ];
+}
 
 export const loader = async ({ request, params }) => {
   const { session } = await authenticate.admin(request);
@@ -254,6 +384,20 @@ export default function OrderDetail() {
   const paymentMethod = invoice?.paymentMethod || "card";
   const isCardInvoice = paymentMethod === "card";
   const isManualInvoice = paymentMethod === "check" || paymentMethod === "ach";
+  // Immutable preference snapshot taken when this invoice was created.
+  // Reads ONLY from customerPaymentPreference — never falls back to
+  // paymentMethod (which is mutable via cheque → card override). Legacy
+  // invoices missing the snapshot get backfilled at boot from
+  // CustomerMap, so this should be set for every real invoice.
+  const orderTimePreference = invoice?.customerPaymentPreference || null;
+  // Method that actually settled the invoice. For paid invoices, prefer
+  // the explicit paymentSettledVia; legacy paid invoices fall back to
+  // paymentMethod (which is correct since the override hadn't existed).
+  const settledVia =
+    invoice?.paymentStatus === "paid"
+      ? invoice?.paymentSettledVia || invoice?.paymentMethod || null
+      : null;
+  const pipelineSteps = computePipelineSteps({ order, invoice });
   const statusAllowsAction =
     !!invoice && RETRYABLE_PAYMENT_STATUSES.has(invoice.paymentStatus);
 
@@ -544,6 +688,23 @@ export default function OrderDetail() {
         </s-banner>
       )}
 
+      {/* ───── Status pipeline ───── */}
+      <s-section heading="Status pipeline">
+        <s-stack
+          direction="inline"
+          gap="base"
+          alignItems="start"
+          wrap
+        >
+          {pipelineSteps.map((step, i) => (
+            <Fragment key={step.label}>
+              <PipelineStepBadge step={step} />
+              {i < pipelineSteps.length - 1 && <PipelineConnector />}
+            </Fragment>
+          ))}
+        </s-stack>
+      </s-section>
+
       {/* ───── Overview ───── */}
       <s-section heading="Overview">
         <s-stack direction="block" gap="base">
@@ -557,7 +718,7 @@ export default function OrderDetail() {
                 Received {new Date(order.receivedAt).toLocaleString()}
               </s-text>
             )}
-            {order.completedAt && (
+            {order.processingStatus === "completed" && order.completedAt && (
               <s-text tone="subdued">
                 · Completed {new Date(order.completedAt).toLocaleString()}
               </s-text>
@@ -757,8 +918,29 @@ export default function OrderDetail() {
             <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
               <s-grid-item>
                 <KV
-                  label="Payment method"
+                  label="Customer preference (at order)"
+                  value={
+                    PAYMENT_METHOD_LABEL[orderTimePreference] ||
+                    orderTimePreference
+                  }
+                />
+              </s-grid-item>
+              <s-grid-item>
+                <KV
+                  label="Active method"
                   value={PAYMENT_METHOD_LABEL[paymentMethod] || paymentMethod}
+                />
+              </s-grid-item>
+              <s-grid-item>
+                <KV
+                  label="Settled via"
+                  value={
+                    settledVia
+                      ? PAYMENT_METHOD_LABEL[settledVia] || settledVia
+                      : invoice.paymentStatus === "cancelled"
+                        ? "—"
+                        : "(not yet settled)"
+                  }
                 />
               </s-grid-item>
               <s-grid-item>
@@ -769,6 +951,16 @@ export default function OrderDetail() {
               </s-grid-item>
               <s-grid-item>
                 <KV label="QBO creation status" value={invoice.qboCreationStatus} />
+              </s-grid-item>
+              <s-grid-item>
+                <KV
+                  label="Payment due"
+                  value={
+                    invoice.qboDueDate
+                      ? formatDueDate(invoice.qboDueDate, invoice.paymentStatus)
+                      : null
+                  }
+                />
               </s-grid-item>
               <s-grid-item>
                 <KV
@@ -1291,6 +1483,22 @@ function PaymentStatusBadge({ status }) {
   return <s-badge tone={m.tone}>{m.label}</s-badge>;
 }
 
+function PipelineStepBadge({ step }) {
+  return (
+    <s-stack direction="block" gap="none" alignItems="center">
+      <s-badge tone={PIPELINE_STEP_TONE[step.status] || "default"}>
+        {step.label}
+      </s-badge>
+      {/* nbsp keeps row heights aligned when a step has no subtitle */}
+      <s-text tone="subdued">{step.subtitle || " "}</s-text>
+    </s-stack>
+  );
+}
+
+function PipelineConnector() {
+  return <s-text tone="subdued">→</s-text>;
+}
+
 function PaymentMethodBadge({ method }) {
   const map = {
     card: { tone: "info", label: "Credit card" },
@@ -1311,6 +1519,27 @@ function OutcomeBadge({ outcome }) {
   };
   const m = map[outcome] || { tone: "default", label: outcome || "—" };
   return <s-badge tone={m.tone}>{m.label}</s-badge>;
+}
+
+// Format a QBO "YYYY-MM-DD" due date for display. Annotates overdue +
+// unpaid invoices with a trailing "(overdue)" so the value alone is
+// actionable without scanning the rest of the page.
+function formatDueDate(qboDueDate, paymentStatus) {
+  if (!qboDueDate || typeof qboDueDate !== "string") return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(qboDueDate);
+  if (!m) return qboDueDate;
+  const due = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  if (!Number.isFinite(due.getTime())) return qboDueDate;
+  const label = due.toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const settled = paymentStatus === "paid" || paymentStatus === "cancelled";
+  if (!settled && due < today) return `${label} (overdue)`;
+  return label;
 }
 
 function formatAmount(amount, currency) {

@@ -112,6 +112,14 @@ export async function chargeInvoice({ invoice, customerMap }) {
     invoice.amountPaid = Number((invoice.amountPaid + amount).toFixed(2))
     invoice.paidAt = new Date()
     invoice.paymentStatus = invoice.amountPaid >= invoice.amountDue ? 'paid' : 'pending'
+    // Record what actually settled this charge. Reflects the active
+    // `paymentMethod` at the moment of approval, which is 'card' or
+    // 'ach' for NMI-driven settlements. The cheque → card override
+    // flips paymentMethod BEFORE chargeInvoice runs, so a cheque
+    // invoice that fell back to card lands here with paymentMethod
+    // already set to 'card'.
+    invoice.paymentSettledVia = invoice.paymentMethod === 'ach' ? 'ach' : 'card'
+    invoice.paymentSettledAt = invoice.paidAt
 
     await propagateSuccessfulPayment({
       invoice,

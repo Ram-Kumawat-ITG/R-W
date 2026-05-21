@@ -19,6 +19,12 @@ const invoiceSchema = new mongoose.Schema(
     qboInvoiceId: { type: String, index: true },
     qboDocNumber: String,
     qboSyncToken: String,
+    // Payment due date as returned by QBO at invoice creation. Stored as
+    // an ISO date string ("YYYY-MM-DD") to match QBO's date-only format
+    // — Mongoose Date would coerce to UTC midnight and risk timezone
+    // off-by-ones when rendered locally.
+    qboDueDate: String,
+    qboTxnDate: String,
 
     // Tracks the creation handshake so a crash mid-flight is recoverable:
     //   claimed  — Invoice row inserted, QBO call not yet attempted
@@ -42,12 +48,44 @@ const invoiceSchema = new mongoose.Schema(
     //   card  — eligible for CRON auto-charge against the NMI vault
     //   check — held until an admin records a manual cheque, or falls back to card
     //   ach   — same manual treatment as check (per project decision)
+    //
+    // CAN be mutated post-creation by the cheque → card admin fallback
+    // (api/admin/charge-card.js). For the immutable order-time
+    // preference, see `customerPaymentPreference`. For what actually
+    // settled the invoice, see `paymentSettledVia`.
     paymentMethod: {
       type: String,
       enum: ['card', 'check', 'ach'],
       default: 'card',
       index: true,
     },
+
+    // Immutable snapshot of the customer's payment-method preference at
+    // the moment this invoice was created. Even if the customer updates
+    // their preference later (via /api/update-profile), this never
+    // changes — historical orders display the preference they were
+    // placed with. Display fallback for legacy invoices missing this
+    // field: use `paymentMethod` (they were equal before the
+    // cheque → card override existed).
+    customerPaymentPreference: {
+      type: String,
+      enum: ['card', 'check', 'ach'],
+    },
+
+    // Method that actually settled (or last contributed to settling)
+    // the invoice. Written on every successful payment event — an
+    // approved NMI charge sets it to the active `paymentMethod`
+    // ('card' or 'ach'), a manual cheque receipt sets it to 'check'
+    // or 'ach'. Stays null while the invoice is unpaid; the display
+    // layer falls back to "Active method" (`paymentMethod`) in that
+    // case. Distinct from `paymentMethod` (current operational
+    // method, mutable) and `customerPaymentPreference` (order-time
+    // snapshot, immutable).
+    paymentSettledVia: {
+      type: String,
+      enum: ['card', 'check', 'ach'],
+    },
+    paymentSettledAt: Date,
 
     // Lifecycle of the invoice's payment, independent of QBO's own status.
     paymentStatus: {

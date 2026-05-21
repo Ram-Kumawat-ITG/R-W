@@ -58,13 +58,18 @@ export const loader = async ({ request }) => {
     )
     .lean();
 
-  // Pull the linked invoices in one query so we can show attemptCount /
-  // lastAttemptError inline without N+1 lookups.
+  // Pull the linked invoices in one query — every payment-related field
+  // we render lives on Invoice now, so a single fetch covers attemptCount,
+  // QBO due date, the order-time preference snapshot, and the settled-via
+  // record. No N+1 and no separate CustomerMap fetch (which would have
+  // returned the *current* preference, not the order-time one).
   const invoiceIds = rows.map((r) => r.invoiceRef).filter(Boolean);
   const invoiceById = new Map();
   if (invoiceIds.length) {
     const invoices = await Invoice.find({ _id: { $in: invoiceIds } })
-      .select("paymentStatus attemptCount maxAttempts lastAttemptError amountDue amountPaid")
+      .select(
+        "paymentStatus paymentMethod customerPaymentPreference paymentSettledVia paymentSettledAt attemptCount maxAttempts lastAttemptError amountDue amountPaid qboDueDate qboTxnDate",
+      )
       .lean();
     for (const inv of invoices) invoiceById.set(inv._id.toString(), inv);
   }
@@ -106,13 +111,26 @@ export const loader = async ({ request }) => {
         invoice: inv
           ? {
               paymentStatus: inv.paymentStatus,
+              paymentMethod: inv.paymentMethod || null,
+              paymentSettledVia: inv.paymentSettledVia || null,
+              paymentSettledAt: inv.paymentSettledAt || null,
               attemptCount: inv.attemptCount,
               maxAttempts: inv.maxAttempts,
               lastAttemptError: inv.lastAttemptError || null,
               amountDue: inv.amountDue,
               amountPaid: inv.amountPaid,
+              qboDueDate: inv.qboDueDate || null,
+              qboTxnDate: inv.qboTxnDate || null,
             }
           : null,
+        // Immutable preference snapshot from the time this order was
+        // placed. Reads ONLY from Invoice.customerPaymentPreference —
+        // never `paymentMethod` (which is mutable via cheque → card
+        // override) and never CustomerMap (which is the *current*
+        // preference, not the historical one). Legacy invoices missing
+        // the snapshot are backfilled at boot via
+        // backfillCustomerPaymentPreferences in invoice.migrations.js.
+        customerPreference: inv?.customerPaymentPreference || null,
       };
     }),
     total,
@@ -241,7 +259,11 @@ export default function OrdersList() {
               <s-table-header>Amount</s-table-header>
               <s-table-header>Processing</s-table-header>
               <s-table-header>Payment</s-table-header>
-              <s-table-header>Received</s-table-header>
+              <s-table-header>Preferred method</s-table-header>
+              <s-table-header>Settled via</s-table-header>
+              <s-table-header>Settled at</s-table-header>
+              <s-table-header>Due</s-table-header>
+              <s-table-header>Order date</s-table-header>
             </s-table-header-row>
             <s-table-body>
               {rows.map((r) => {
@@ -269,6 +291,21 @@ export default function OrdersList() {
                         paymentStatus={r.paymentStatus}
                         invoice={r.invoice}
                       />
+                    </s-table-cell>
+                    <s-table-cell>
+                      <PaymentMethodCell method={r.customerPreference} />
+                    </s-table-cell>
+                    <s-table-cell>
+                      <SettledViaCell
+                        invoice={r.invoice}
+                        preference={r.customerPreference}
+                      />
+                    </s-table-cell>
+                    <s-table-cell>
+                      <SettledAtCell invoice={r.invoice} />
+                    </s-table-cell>
+                    <s-table-cell>
+                      <DueDateCell invoice={r.invoice} />
                     </s-table-cell>
                     <s-table-cell>
                       {r.receivedAt
@@ -364,6 +401,100 @@ function PaymentBadge({ paymentStatus, invoice }) {
       <s-text tone="subdued">{invoice.attemptCount}/{invoice.maxAttempts} attempts</s-text>
     </s-stack>
   );
+}
+
+const PAYMENT_METHOD_SHORT = {
+  card: "Credit card",
+  check: "Cheque",
+  ach: "ACH",
+};
+
+// Immutable order-time preference snapshot (Invoice.customerPaymentPreference).
+// Plain text — no badge — to keep visual weight low in the row.
+function PaymentMethodCell({ method }) {
+  if (!method) return <s-text tone="subdued">—</s-text>;
+  return <s-text>{PAYMENT_METHOD_SHORT[method] || method}</s-text>;
+}
+
+// "Settled via" — the actual method that settled the invoice. Reads
+// Invoice.paymentSettledVia (set explicitly on each successful payment
+// event — NMI approval OR manual cheque). Blank when the invoice
+// hasn't been settled yet; "Settled" only means something once payment
+// has actually landed. Legacy paid invoices without paymentSettledVia
+// fall back to paymentMethod (no override existed before this field,
+// so they're equivalent).
+function SettledViaCell({ invoice, preference }) {
+  if (!invoice || invoice.paymentStatus !== "paid") {
+    return <s-text tone="subdued">—</s-text>;
+  }
+  const method = invoice.paymentSettledVia || invoice.paymentMethod;
+  if (!method) return <s-text tone="subdued">—</s-text>;
+  const label = PAYMENT_METHOD_SHORT[method] || method;
+  const overridden = preference && preference !== method;
+  if (overridden) {
+    return (
+      <s-stack direction="block" gap="none">
+        <s-text>{label}</s-text>
+        <s-text tone="subdued">override</s-text>
+      </s-stack>
+    );
+  }
+  return <s-text>{label}</s-text>;
+}
+
+// Timestamp the invoice was settled (paymentSettledAt). Only renders
+// for paid invoices — pending/failed/cancelled show "—" to match the
+// Settled-via column.
+function SettledAtCell({ invoice }) {
+  if (
+    !invoice ||
+    invoice.paymentStatus !== "paid" ||
+    !invoice.paymentSettledAt
+  ) {
+    return <s-text tone="subdued">—</s-text>;
+  }
+  return <s-text>{new Date(invoice.paymentSettledAt).toLocaleString()}</s-text>;
+}
+
+// Render the QBO due date for an invoice. Highlights overdue + unpaid in
+// critical tone so admins can scan the list and spot collections work.
+// `qboDueDate` is a "YYYY-MM-DD" string (QBO's date-only format) — see
+// the qboDueDate field on the Invoice model.
+function DueDateCell({ invoice }) {
+  if (!invoice?.qboDueDate) return <s-text tone="subdued">—</s-text>;
+  const due = parseDateOnly(invoice.qboDueDate);
+  if (!due) return <s-text tone="subdued">{invoice.qboDueDate}</s-text>;
+  const isPaid = invoice.paymentStatus === "paid";
+  const isCancelled = invoice.paymentStatus === "cancelled";
+  const today = startOfDay(new Date());
+  const overdue = !isPaid && !isCancelled && due < today;
+  const label = due.toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+  return (
+    <s-stack direction="block" gap="none">
+      <s-text tone={overdue ? "critical" : undefined}>
+        {overdue ? <strong>{label}</strong> : label}
+      </s-text>
+      {overdue && <s-text tone="critical">Overdue</s-text>}
+    </s-stack>
+  );
+}
+
+function parseDateOnly(s) {
+  if (!s || typeof s !== "string") return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+  if (!m) return null;
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  return Number.isFinite(d.getTime()) ? d : null;
+}
+
+function startOfDay(d) {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  return x;
 }
 
 function formatAmount(amount, currency) {

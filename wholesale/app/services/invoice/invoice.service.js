@@ -51,7 +51,12 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
       amountDue: Number(order.total_price ?? 0), // placeholder, refined after QBO POST returns
       // Lock the payment method at invoice creation. Cheque/ACH invoices
       // are skipped by the CRON scheduler; only 'card' is auto-charged.
+      // `paymentMethod` is the active/operational method — the cheque →
+      // card admin fallback flips it. `customerPaymentPreference` is
+      // the immutable order-time snapshot; even if the customer changes
+      // their preference later, this stays. Both start equal.
       paymentMethod: customerMap.paymentMethod || 'card',
+      customerPaymentPreference: customerMap.paymentMethod || 'card',
       paymentStatus: 'pending',
       maxAttempts: paymentConfig.maxRetryAttempts,
       qboCreationStatus: 'claimed',
@@ -96,6 +101,8 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
   invoice.qboInvoiceId = qboInvoice.Id
   invoice.qboDocNumber = qboInvoice.DocNumber
   invoice.qboSyncToken = qboInvoice.SyncToken
+  invoice.qboDueDate = qboInvoice.DueDate || undefined
+  invoice.qboTxnDate = qboInvoice.TxnDate || undefined
   invoice.amountDue = Number(qboInvoice.TotalAmt ?? invoice.amountDue)
   invoice.currency = qboInvoice.CurrencyRef?.value || invoice.currency
   invoice.qboCreationStatus = 'created'
@@ -343,6 +350,12 @@ export async function recordManualPayment({
   invoice.amountPaid = Number((invoice.amountPaid + amt).toFixed(2))
   invoice.paidAt = invoice.paidAt || new Date()
   invoice.paymentStatus = invoice.amountPaid >= invoice.amountDue ? 'paid' : 'pending'
+  // Record what settled this — `cheque` kind maps to the canonical
+  // 'check' enum value on the Invoice; 'ach' stays 'ach'. Latest write
+  // wins for partial-payment sequences (Invoice.manualPayments[] has
+  // the full ledger if more detail is needed).
+  invoice.paymentSettledVia = kind === 'ach' ? 'ach' : 'check'
+  invoice.paymentSettledAt = new Date()
   await invoice.save()
 
   // Propagate to QBO + Shopify + local order doc. Uses paymentRef so the

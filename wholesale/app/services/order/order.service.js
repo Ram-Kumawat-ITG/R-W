@@ -247,7 +247,6 @@ export async function processShopifyOrder({ shop, order, webhookId }) {
     console.log(`[orders] step 4/4 — order marked as scheduled (scheduler owns payment retries)`)
     local.processingStatus = 'scheduled'
     local.processingError = undefined
-    local.completedAt = new Date()
     await local.save()
 
     console.log(

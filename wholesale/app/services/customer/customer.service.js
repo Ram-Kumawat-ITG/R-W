@@ -106,26 +106,38 @@ export async function ensureCustomerForOrder({ shop, order, paymentDetails }) {
     console.log(`[customers] QBO link already set on customer_maps: Id=${mapping.qboCustomerId}`)
   }
 
-  // Payment-method preference — sourced once from the customer's
-  // wholesale application. Persisted on the mapping so future invoices
-  // can pick it up without re-querying. We only populate if currently
-  // unset; the manual cheque→card fallback (per-invoice override) does
-  // NOT alter this preference.
-  if (!mapping.paymentMethod) {
+  // Payment-method preference — refreshed from the customer's wholesale
+  // application on every order intake so customer-side changes (via
+  // /api/update-profile) flow into NEW orders. Historical invoices
+  // preserve their original preference via the immutable
+  // `Invoice.customerPaymentPreference` snapshot written at invoice
+  // creation, so flipping this here does NOT rewrite history.
+  //
+  // The cheque → card admin fallback (per-invoice override) still
+  // mutates `Invoice.paymentMethod`, never this customer-level value.
+  {
     const app = await WholesaleApplication.findOne({ shop, email: profile.email })
       .select('payment.method')
       .lean()
     const resolved = normalizePaymentMethod(app?.payment?.method)
-    mapping.paymentMethod = resolved
-    console.log(
-      `[customers] payment-method preference resolved → "${resolved}"` +
-        (app?.payment?.method ? ` (from wholesale_applications.payment.method="${app.payment.method}")` : ` (default; no application on file)`),
-    )
-    log.info('payment_method.resolved', {
-      email: profile.email,
-      paymentMethod: resolved,
-      sourcedFromApp: Boolean(app?.payment?.method),
-    })
+    const previous = mapping.paymentMethod
+    if (previous !== resolved) {
+      console.log(
+        `[customers] payment-method preference ${previous ? `${previous} → ${resolved}` : `→ "${resolved}"`}` +
+          (app?.payment?.method
+            ? ` (from wholesale_applications.payment.method="${app.payment.method}")`
+            : ` (default; no application on file)`),
+      )
+      log.info('payment_method.resolved', {
+        email: profile.email,
+        previous: previous || null,
+        paymentMethod: resolved,
+        sourcedFromApp: Boolean(app?.payment?.method),
+      })
+      mapping.paymentMethod = resolved
+    } else {
+      console.log(`[customers] payment-method preference unchanged ("${resolved}")`)
+    }
   }
 
   // NMI side

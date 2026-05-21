@@ -700,20 +700,44 @@ are held for manual admin action from the Order Details page.
 
 ### 9.1 Method propagation
 
+Three distinct payment-method fields live on the Invoice doc, each
+covering a different question:
+
+| Field | Set when | Mutable? | Answers |
+|---|---|---|---|
+| `Invoice.customerPaymentPreference` | invoice creation | Never | "What did the customer prefer when they placed *this* order?" |
+| `Invoice.paymentMethod` | invoice creation; flipped by cheque → card admin override | Yes, by `api/admin/charge-card.js` | "What method is currently *active* for this invoice?" (drives CRON eligibility) |
+| `Invoice.paymentSettledVia` | each successful payment event | Latest write wins | "What actually *settled* this invoice?" |
+
+Propagation:
+
 ```
-WholesaleApplication.payment.method
-  ↓ first time we sync this customer
+WholesaleApplication.payment.method                ← end user can edit
+  │                                                  via /api/update-profile
+  ↓ refreshed on every order intake
 services/customer/customer.service.js → ensureCustomerForOrder
-  ↓ writes CustomerMap.paymentMethod (sticky, per-customer)
+  ↓ writes CustomerMap.paymentMethod                 (kept fresh per order)
 services/invoice/invoice.service.js → createInvoiceForOrder
-  ↓ writes Invoice.paymentMethod   (locked, per-invoice)
+  ↓ on Invoice.create:
+    • paymentMethod                = customerMap.paymentMethod  (active)
+    • customerPaymentPreference    = customerMap.paymentMethod  (immutable snapshot)
+
+services/payment/payment.service.js → chargeInvoice (NMI approval)
+  ↓ paymentSettledVia = invoice.paymentMethod === 'ach' ? 'ach' : 'card'
+
+services/invoice/invoice.service.js → recordManualPayment (cheque receipt)
+  ↓ paymentSettledVia = kind === 'ach' ? 'ach' : 'check'
 ```
 
-`CustomerMap.paymentMethod` is set only when currently unset, so a
-customer's preference change in `wholesale_applications` does NOT
-silently flip future orders without an explicit re-sync. The per-order
-cheque→card fallback (see §9.4) only mutates `Invoice.paymentMethod`,
-never `CustomerMap.paymentMethod`.
+The snapshot field gives historical stability: when a customer updates
+their preferred method, only *new* invoices pick up the new value via
+the `customer.service.js` refresh. Existing invoices continue to show
+the original preference forever, because `customerPaymentPreference`
+is never mutated after invoice creation.
+
+Legacy invoices that pre-date `customerPaymentPreference` /
+`paymentSettledVia` use `paymentMethod` as a display fallback — the
+values were equivalent before the cheque → card override existed.
 
 Unknown / missing values default to `card`. This preserves the legacy
 auto-charge behavior for customers that pre-date this feature.
@@ -723,7 +747,7 @@ auto-charge behavior for customers that pre-date this feature.
 insensitive, trimmed) and folds both to canonical `check`. The
 mark-cheque-paid endpoint applies the same tolerance to the inbound
 `kind` field. Canonical values are: `card`, `check`, `ach` on the
-Invoice/CustomerMap; `cheque`, `ach` on the manualPayments ledger.
+Invoice fields; `cheque`, `ach` on the manualPayments ledger.
 
 ### 9.2 Scheduler gating
 
@@ -1283,7 +1307,7 @@ All in MongoDB, single database from `MONGODB_URI`.
 | `qbo_tokens` | `models/qboToken.server.js` | One row per realm — current access + refresh token |
 | `customer_maps` | `models/customerMap.server.js` | Shopify email ↔ QBO customer ↔ NMI vault; carries `paymentMethod` preference |
 | `shopify_orders` | `models/order.server.js` | Local mirror of every received Shopify order |
-| `invoices` | `models/invoice.server.js` | Local invoice mirror + sync state; carries `paymentMethod` (locked at creation) and `manualPayments[]` ledger |
+| `invoices` | `models/invoice.server.js` | Local invoice mirror + sync state; carries `paymentMethod` (active, mutable), `customerPaymentPreference` (immutable order-time snapshot), `paymentSettledVia` + `paymentSettledAt` (recorded on each successful payment), `qboDueDate`, and `manualPayments[]` ledger |
 | `payment_attempts` | `models/paymentAttempt.server.js` | Append-only charge ledger (NMI + manual cheque receipts as `outcome: 'manual_paid'`) |
 | `wholesale_applications` | `models/wholesaleApplication.server.js` | Wholesale signups (pre-existing) |
 
@@ -1587,14 +1611,26 @@ for a given customer.
 
 ### 22.12 Customer changes payment-method preference after orders exist
 
-`CustomerMap.paymentMethod` is sticky once set — re-running
-`ensureCustomerForOrder` does NOT re-query `wholesale_applications` for
-the method. To pick up a new preference, unset
-`customer_maps.paymentMethod` for that row and trigger any subsequent
-order for that customer (it'll re-resolve from the application). Open
-invoices keep the method they were created with — that's deliberate;
-flipping invoice method mid-flight is the explicit "Charge card on
-file" admin action.
+End users can update their preferred payment method via
+`/api/update-profile`, which writes `wholesale_applications.payment.method`.
+On the next order for that customer, `ensureCustomerForOrder` re-reads
+the application and refreshes `CustomerMap.paymentMethod`, so new
+invoices automatically pick up the change.
+
+Existing invoices retain their original preference forever — the
+immutable `Invoice.customerPaymentPreference` snapshot is the source
+of truth for the "Preferred method" column in the Order List and the
+"Customer preference (at order)" KV on Order Details. Display layers
+must NEVER read `CustomerMap.paymentMethod` to render historical
+preference — that would drift.
+
+Open invoices likewise keep their active `paymentMethod` until an
+admin explicitly flips it via the cheque → card admin action. That
+override mutates only `Invoice.paymentMethod`; the preference snapshot
+is never touched. Once the invoice settles, `Invoice.paymentSettledVia`
+records what actually settled it — so a cheque order overridden to
+card shows `preference=Cheque, settledVia=Credit card` (and the
+Settled-via cell renders an "override" hint).
 
 ---
 
