@@ -198,3 +198,25 @@ These are pulled from [wholesale/README.md](wholesale/README.md) and the integra
 ## When updating code, update the spec
 
 The maintenance protocol in [wholesale/CLAUDE.md §6](wholesale/CLAUDE.md) requires that meaningful code changes ship with corresponding updates to `wholesale/CLAUDE.md` (status table + changelog) and `wholesale/INTEGRATIONS.md` (affected sections). This is per the project owner's explicit request. Trivial fixes (whitespace, comments) are exempt.
+
+## Implementation status (snapshot)
+
+This list focuses on the order-to-payment pipeline. Detailed flow lives in [wholesale/INTEGRATIONS.md](wholesale/INTEGRATIONS.md).
+
+| Module | Status | Notes |
+|---|---|---|
+| Shopify orders/create webhook ingest | ✅ | `app/routes/webhooks.orders.create.jsx` → `processShopifyOrder` |
+| QBO customer + invoice creation | ✅ | claim-first invoice insert (§13.4) |
+| NMI vault add + sale | ✅ | card path; ACH transport supported but not used in CRON |
+| Scheduler PASS 1 (auto-charge) | ✅ | card-only via `paymentMethod: 'card'` filter (§9.2) |
+| Scheduler PASS 2 (sync retry) | ✅ | method-agnostic |
+| Admin Retry payment (card) | ✅ | `/api/admin/orders/:id/retry-payment` |
+| Admin Mark cheque paid | ✅ | `/api/admin/orders/:id/mark-cheque-paid` — records `manualPayments[]`, propagates to QBO + Shopify |
+| Admin Charge card fallback (cheque → card) | ✅ | `/api/admin/orders/:id/charge-card` — flips invoice method only |
+| Pending-approval replay | ✅ | `replayPendingOrdersForCustomer` on customer approve |
+
+## Changelog
+
+- **2026-05-21** — Cheque/ACH workflow: invoices carry `paymentMethod` (locked at creation from `CustomerMap.paymentMethod`, which is sourced from `wholesale_applications.payment.method`). CRON scheduler now skips non-card invoices. Order Details page exposes "Mark cheque paid" (records cheque ref + propagates to QBO + Shopify) and "Charge card on file" (per-invoice override) for cheque/ACH invoices. New audit outcome `manual_paid`. Spec details in [INTEGRATIONS.md §9](wholesale/INTEGRATIONS.md), gating in §11.1, admin endpoints in §11.4, edge cases §22.11–22.12.
+
+> **Heads up:** this file contains unresolved git merge conflict markers (lines around 96/104/151 and 192/193/196). They predate the changes in this entry — flagging so they can be resolved separately. The §4 Implementation Status / §6 Maintenance protocol / §8 Changelog headings referenced elsewhere were lost in the conflict; the snapshot + changelog above are a temporary stand-in until the conflict is cleaned up.

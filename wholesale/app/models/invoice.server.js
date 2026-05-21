@@ -37,6 +37,18 @@ const invoiceSchema = new mongoose.Schema(
     amountDue: { type: Number, required: true },
     amountPaid: { type: Number, default: 0 },
 
+    // Payment method locked at invoice creation, sourced from the
+    // customer's wholesale-application preference (mirrored on CustomerMap).
+    //   card  — eligible for CRON auto-charge against the NMI vault
+    //   check — held until an admin records a manual cheque, or falls back to card
+    //   ach   — same manual treatment as check (per project decision)
+    paymentMethod: {
+      type: String,
+      enum: ['card', 'check', 'ach'],
+      default: 'card',
+      index: true,
+    },
+
     // Lifecycle of the invoice's payment, independent of QBO's own status.
     paymentStatus: {
       type: String,
@@ -49,6 +61,28 @@ const invoiceSchema = new mongoose.Schema(
     maxAttempts: { type: Number, default: 6 },
     lastAttemptAt: Date,
     lastAttemptError: String,
+
+    // Ledger of manual (non-NMI) payments recorded against this invoice —
+    // currently just cheque receipts. Append-only; one entry per admin
+    // action on the Order Details page.
+    manualPayments: {
+      type: [
+        new mongoose.Schema(
+          {
+            kind: { type: String, enum: ['cheque', 'ach'], required: true },
+            reference: { type: String, required: true },
+            amount: { type: Number, required: true },
+            currency: String,
+            receivedAt: { type: Date, default: Date.now },
+            recordedBy: String,
+            recordedAt: { type: Date, default: Date.now },
+            note: String,
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
 
     paidAt: Date,
 

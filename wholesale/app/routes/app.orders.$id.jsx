@@ -14,10 +14,17 @@ import PaymentAttempt from "../models/paymentAttempt.server";
 import CustomerMap from "../models/customerMap.server";
 import { getInvoice as getQboInvoice, getInvoiceWebUrl } from "../services/qbo/qbo.service";
 
-// Statuses for which the manual retry button can fire. 'paid', 'cancelled',
-// and 'in_progress' must be excluded — see retry-payment.js for the same
+// Statuses for which the manual retry / charge / mark-paid buttons can
+// fire. 'paid', 'cancelled', and 'in_progress' must be excluded — see
+// retry-payment.js / charge-card.js / mark-cheque-paid.js for the same
 // guard server-side.
 const RETRYABLE_PAYMENT_STATUSES = new Set(["pending", "failed"]);
+
+const PAYMENT_METHOD_LABEL = {
+  card: "Credit card",
+  check: "Check / Cheque",
+  ach: "ACH / Bank transfer",
+};
 
 export const loader = async ({ request, params }) => {
   const { session } = await authenticate.admin(request);
@@ -212,11 +219,20 @@ export default function OrderDetail() {
   const navigate = useNavigate();
   const shopify = useAppBridge();
   const retryFetcher = useFetcher();
+  const chequeFetcher = useFetcher();
+  const chargeCardFetcher = useFetcher();
   const pdfFetcher = useFetcher();
   const modalRef = useRef(null);
+  const chequeModalRef = useRef(null);
+  const chargeCardModalRef = useRef(null);
   const [bannerError, setBannerError] = useState(null);
   const [bannerSuccess, setBannerSuccess] = useState(null);
+  const [chequeReference, setChequeReference] = useState("");
+  const [chequeAmount, setChequeAmount] = useState("");
+  const [chequeReceivedAt, setChequeReceivedAt] = useState("");
   const handledRetryRef = useRef(null);
+  const handledChequeRef = useRef(null);
+  const handledChargeCardRef = useRef(null);
   const handledPdfRef = useRef(null);
   // Holds the window opened synchronously on PDF click; we redirect it
   // to a blob URL once the fetcher returns. Opening *after* the async
@@ -229,10 +245,26 @@ export default function OrderDetail() {
 
   const retrying =
     retryFetcher.state === "submitting" || retryFetcher.state === "loading";
+  const chequeSubmitting =
+    chequeFetcher.state === "submitting" || chequeFetcher.state === "loading";
+  const chargeCardSubmitting =
+    chargeCardFetcher.state === "submitting" ||
+    chargeCardFetcher.state === "loading";
+
+  const paymentMethod = invoice?.paymentMethod || "card";
+  const isCardInvoice = paymentMethod === "card";
+  const isManualInvoice = paymentMethod === "check" || paymentMethod === "ach";
+  const statusAllowsAction =
+    !!invoice && RETRYABLE_PAYMENT_STATUSES.has(invoice.paymentStatus);
 
   const canRetry =
-    !!invoice &&
-    RETRYABLE_PAYMENT_STATUSES.has(invoice.paymentStatus) &&
+    isCardInvoice &&
+    statusAllowsAction &&
+    !!customerMap?.nmiCustomerVaultId;
+  const canMarkChequePaid = isManualInvoice && statusAllowsAction;
+  const canChargeCard =
+    isManualInvoice &&
+    statusAllowsAction &&
     !!customerMap?.nmiCustomerVaultId;
 
   // Surface retry result via banner + toast. Don't auto-revalidate manually —
@@ -279,6 +311,102 @@ export default function OrderDetail() {
       action: `/api/admin/orders/${order._id}/retry-payment`,
     });
   };
+
+  const onConfirmCheque = () => {
+    setBannerError(null);
+    setBannerSuccess(null);
+    const ref = chequeReference.trim();
+    if (!ref) {
+      setBannerError("Cheque reference is required");
+      return;
+    }
+    const body = { reference: ref, kind: paymentMethod === "ach" ? "ach" : "cheque" };
+    if (chequeAmount && Number(chequeAmount) > 0) body.amount = Number(chequeAmount);
+    if (chequeReceivedAt) body.receivedAt = new Date(chequeReceivedAt).toISOString();
+    chequeModalRef.current?.hideOverlay?.();
+    chequeFetcher.submit(body, {
+      method: "POST",
+      action: `/api/admin/orders/${order._id}/mark-cheque-paid`,
+      encType: "application/json",
+    });
+  };
+
+  const onConfirmChargeCard = () => {
+    setBannerError(null);
+    setBannerSuccess(null);
+    chargeCardModalRef.current?.hideOverlay?.();
+    chargeCardFetcher.submit(null, {
+      method: "POST",
+      action: `/api/admin/orders/${order._id}/charge-card`,
+    });
+  };
+
+  useEffect(() => {
+    if (!chequeFetcher.data) return;
+    if (chequeFetcher.state !== "idle") return;
+    if (handledChequeRef.current === chequeFetcher.data) return;
+    handledChequeRef.current = chequeFetcher.data;
+
+    const data = chequeFetcher.data;
+    if (data.status === "success") {
+      const r = data.result || {};
+      const partial = r.paymentStatus !== "paid";
+      const syncIssues = Array.isArray(r.syncErrors) && r.syncErrors.length > 0;
+      let msg = partial
+        ? `Cheque recorded — partial payment, $${r.amountPaid?.toFixed?.(2) ?? r.amountPaid} of $${r.amountDue?.toFixed?.(2) ?? r.amountDue}`
+        : `Cheque recorded — invoice marked paid`;
+      if (syncIssues) {
+        msg += ` (sync warnings: ${r.syncErrors.join("; ")})`;
+      }
+      setBannerSuccess(msg);
+      setChequeReference("");
+      setChequeAmount("");
+      setChequeReceivedAt("");
+      shopify?.toast?.show("Cheque recorded");
+    } else {
+      setBannerError(data.message || "Could not record cheque");
+      shopify?.toast?.show(data.message || "Cheque record failed", { isError: true });
+    }
+  }, [chequeFetcher.data, chequeFetcher.state, shopify]);
+
+  useEffect(() => {
+    if (!chargeCardFetcher.data) return;
+    if (chargeCardFetcher.state !== "idle") return;
+    if (handledChargeCardRef.current === chargeCardFetcher.data) return;
+    handledChargeCardRef.current = chargeCardFetcher.data;
+
+    const data = chargeCardFetcher.data;
+    if (data.status === "success") {
+      const outcome = data.result?.outcome;
+      const note =
+        data.result?.originalMethod && data.result.originalMethod !== "card"
+          ? ` (method flipped ${data.result.originalMethod} → card)`
+          : "";
+      if (outcome === "approved") {
+        setBannerSuccess(
+          `Card charge approved — transaction ${data.result?.transactionId || "(no id)"}${note}`,
+        );
+        shopify?.toast?.show("Card charged — approved");
+      } else if (outcome === "declined") {
+        setBannerError(
+          `Declined: ${data.result?.responseText || "(no detail)"}${note}`,
+        );
+        shopify?.toast?.show("Card declined", { isError: true });
+      } else if (outcome === "error") {
+        setBannerError(
+          `NMI error: ${data.result?.responseText || data.message}${note}`,
+        );
+        shopify?.toast?.show("Card charge errored", { isError: true });
+      } else if (data.result?.skipped) {
+        setBannerError(`Skipped: ${data.result.reason}${note}`);
+      } else {
+        setBannerSuccess(data.message || "Charge submitted");
+      }
+    } else {
+      setBannerError(data.message || "Could not charge card");
+      shopify?.toast?.show(data.message || "Charge failed", { isError: true });
+    }
+  }, [chargeCardFetcher.data, chargeCardFetcher.state, shopify]);
 
   // Click handler must open the new window *synchronously* — that's the
   // only way it counts as a user-gesture and survives popup blockers.
@@ -363,7 +491,7 @@ export default function OrderDetail() {
       >
         Back
       </s-button>
-      {invoice && (
+      {invoice && isCardInvoice && (
         <s-button
           slot="primary-action"
           variant="primary"
@@ -372,6 +500,34 @@ export default function OrderDetail() {
           {...(retrying ? { loading: true } : {})}
         >
           Retry payment
+        </s-button>
+      )}
+      {invoice && isManualInvoice && (
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          disabled={!canMarkChequePaid}
+          onClick={() => {
+            const outstandingForForm =
+              invoice != null
+                ? Number((invoice.amountDue - invoice.amountPaid).toFixed(2))
+                : 0;
+            setChequeAmount(String(outstandingForForm));
+            chequeModalRef.current?.showOverlay?.();
+          }}
+          {...(chequeSubmitting ? { loading: true } : {})}
+        >
+          Mark cheque paid
+        </s-button>
+      )}
+      {invoice && isManualInvoice && (
+        <s-button
+          slot="secondary-actions"
+          disabled={!canChargeCard}
+          onClick={() => chargeCardModalRef.current?.showOverlay?.()}
+          {...(chargeCardSubmitting ? { loading: true } : {})}
+        >
+          Charge card on file
         </s-button>
       )}
 
@@ -592,12 +748,19 @@ export default function OrderDetail() {
           <s-stack direction="block" gap="base">
             <s-stack direction="inline" gap="base" alignItems="center">
               <PaymentStatusBadge status={invoice.paymentStatus} />
+              <PaymentMethodBadge method={paymentMethod} />
               <s-text tone="subdued">
                 {invoice.attemptCount}/{invoice.maxAttempts} attempts
               </s-text>
             </s-stack>
 
             <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
+              <s-grid-item>
+                <KV
+                  label="Payment method"
+                  value={PAYMENT_METHOD_LABEL[paymentMethod] || paymentMethod}
+                />
+              </s-grid-item>
               <s-grid-item>
                 <KV label="QBO invoice ID" value={invoice.qboInvoiceId} />
               </s-grid-item>
@@ -675,7 +838,7 @@ export default function OrderDetail() {
               </s-banner>
             )}
 
-            {!canRetry && invoice && (
+            {invoice && isCardInvoice && !canRetry && (
               <s-paragraph tone="subdued">
                 {invoice.paymentStatus === "paid"
                   ? "This invoice is already paid."
@@ -687,6 +850,45 @@ export default function OrderDetail() {
                         ? "No NMI vault on file for this customer — collect a payment method before retrying."
                         : null}
               </s-paragraph>
+            )}
+            {invoice && isManualInvoice && (
+              <s-paragraph tone="subdued">
+                {invoice.paymentStatus === "paid"
+                  ? "This invoice is already paid."
+                  : invoice.paymentStatus === "cancelled"
+                    ? "This invoice has been cancelled."
+                    : invoice.paymentStatus === "in_progress"
+                      ? "A charge is currently in progress — wait for it to finish."
+                      : `Customer chose ${PAYMENT_METHOD_LABEL[paymentMethod] || paymentMethod}. The scheduler will not auto-charge — record the cheque manually once received, or fall back to charging the card on file.${
+                          !customerMap?.nmiCustomerVaultId
+                            ? " (Card fallback unavailable — no NMI vault on file.)"
+                            : ""
+                        }`}
+              </s-paragraph>
+            )}
+
+            {invoice.manualPayments?.length > 0 && (
+              <s-box
+                padding="base"
+                border="base"
+                borderRadius="base"
+                background="subdued"
+              >
+                <s-stack direction="block" gap="tight">
+                  <s-text>
+                    <strong>Manual payments recorded</strong>
+                  </s-text>
+                  {invoice.manualPayments.map((mp, i) => (
+                    <s-text key={`${mp.reference}-${i}`} tone="subdued">
+                      {`${(mp.kind || "cheque").toUpperCase()} ref ${mp.reference} — ${formatAmount(mp.amount, mp.currency || invoice.currency)}${
+                        mp.receivedAt
+                          ? ` · received ${new Date(mp.receivedAt).toLocaleDateString()}`
+                          : ""
+                      }${mp.note ? ` · ${mp.note}` : ""}`}
+                    </s-text>
+                  ))}
+                </s-stack>
+              </s-box>
             )}
           </s-stack>
         )}
@@ -943,6 +1145,95 @@ export default function OrderDetail() {
           Cancel
         </s-button>
       </s-modal>
+
+      <s-modal
+        ref={chequeModalRef}
+        id="mark-cheque-paid-modal"
+        heading="Record cheque payment"
+        accessibilityLabel="Record cheque payment"
+      >
+        <s-stack direction="block" gap="base">
+          <s-paragraph>
+            Record a manual cheque receipt against this invoice. The QBO invoice
+            will be marked paid (with the cheque reference) and the Shopify
+            order will be flagged paid.
+          </s-paragraph>
+          <s-text tone="subdued">
+            Outstanding balance:{" "}
+            <strong>{formatAmount(outstanding ?? 0, invoice?.currency)}</strong>
+          </s-text>
+          <s-text-field
+            label="Cheque reference"
+            placeholder="e.g. 1042"
+            value={chequeReference}
+            required
+            onChange={(e) => setChequeReference(e.currentTarget.value)}
+          />
+          <s-text-field
+            label="Amount"
+            type="number"
+            min="0.01"
+            step="0.01"
+            value={chequeAmount}
+            onChange={(e) => setChequeAmount(e.currentTarget.value)}
+            details="Defaults to the full outstanding balance"
+          />
+          <s-date-field
+            label="Received on"
+            value={chequeReceivedAt}
+            onChange={(e) => setChequeReceivedAt(e.currentTarget.value)}
+            details="Defaults to today"
+          />
+        </s-stack>
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          onClick={onConfirmCheque}
+          {...(chequeSubmitting ? { loading: true } : {})}
+        >
+          Mark cheque paid
+        </s-button>
+        <s-button
+          slot="secondary-actions"
+          onClick={() => chequeModalRef.current?.hideOverlay?.()}
+        >
+          Cancel
+        </s-button>
+      </s-modal>
+
+      <s-modal
+        ref={chargeCardModalRef}
+        id="charge-card-modal"
+        heading="Charge the card on file?"
+        accessibilityLabel="Charge card fallback confirmation"
+      >
+        <s-paragraph>
+          Customer chose{" "}
+          <strong>
+            {PAYMENT_METHOD_LABEL[paymentMethod] || paymentMethod}
+          </strong>{" "}
+          for this invoice, but no cheque was received. Charging the card on
+          file now will switch this invoice&apos;s payment method to credit
+          card and attempt an NMI sale for{" "}
+          <strong>{formatAmount(outstanding ?? 0, invoice?.currency)}</strong>.
+          The customer&apos;s default preference will not change for future
+          orders.
+        </s-paragraph>
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          onClick={onConfirmChargeCard}
+          {...(chargeCardSubmitting ? { loading: true } : {})}
+        >
+          Charge card now
+        </s-button>
+        <s-button
+          slot="secondary-actions"
+          onClick={() => chargeCardModalRef.current?.hideOverlay?.()}
+        >
+          Cancel
+        </s-button>
+      </s-modal>
     </s-page>
   );
 }
@@ -1000,12 +1291,23 @@ function PaymentStatusBadge({ status }) {
   return <s-badge tone={m.tone}>{m.label}</s-badge>;
 }
 
+function PaymentMethodBadge({ method }) {
+  const map = {
+    card: { tone: "info", label: "Credit card" },
+    check: { tone: "default", label: "Check / Cheque" },
+    ach: { tone: "default", label: "ACH" },
+  };
+  const m = map[method] || { tone: "default", label: method || "—" };
+  return <s-badge tone={m.tone}>{m.label}</s-badge>;
+}
+
 function OutcomeBadge({ outcome }) {
   const map = {
     approved: { tone: "success", label: "Approved" },
     declined: { tone: "critical", label: "Declined" },
     error: { tone: "critical", label: "Error" },
     skipped: { tone: "default", label: "Skipped" },
+    manual_paid: { tone: "success", label: "Manual paid" },
   };
   const m = map[outcome] || { tone: "default", label: outcome || "—" };
   return <s-badge tone={m.tone}>{m.label}</s-badge>;

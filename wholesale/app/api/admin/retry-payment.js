@@ -70,6 +70,17 @@ export async function action({ request, params }) {
   if (invoice.paymentStatus === 'in_progress') {
     return sendResponse(409, 'error', 'A charge is already in progress for this invoice', null)
   }
+  // Cheque / ACH invoices use the dedicated mark-cheque-paid + charge-card
+  // endpoints. Retrying card-charge logic against a cheque invoice would
+  // bypass the per-method workflow on the Order Details page.
+  if (invoice.paymentMethod && invoice.paymentMethod !== 'card') {
+    return sendResponse(
+      409,
+      'error',
+      `Invoice payment method is "${invoice.paymentMethod}" — use the cheque or charge-card actions instead`,
+      null,
+    )
+  }
 
   const customerMap = order.customerEmail
     ? await CustomerMap.findOne({ shop: session.shop, email: order.customerEmail })

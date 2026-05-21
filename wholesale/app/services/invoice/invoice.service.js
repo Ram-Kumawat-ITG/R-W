@@ -12,6 +12,7 @@
 
 import Invoice from '../../models/invoice.server'
 import ShopifyOrder from '../../models/order.server'
+import PaymentAttempt from '../../models/paymentAttempt.server'
 import { createInvoice as createQboInvoice, recordPayment as recordQboPayment } from '../qbo/qbo.service'
 import { markShopifyOrderPaid } from '../shopify/shopify.service'
 import { paymentConfig } from '../payment/payment.config'
@@ -48,6 +49,9 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
       customerEmail: customerMap.email,
       currency: order.currency || 'USD',
       amountDue: Number(order.total_price ?? 0), // placeholder, refined after QBO POST returns
+      // Lock the payment method at invoice creation. Cheque/ACH invoices
+      // are skipped by the CRON scheduler; only 'card' is auto-charged.
+      paymentMethod: customerMap.paymentMethod || 'card',
       paymentStatus: 'pending',
       maxAttempts: paymentConfig.maxRetryAttempts,
       qboCreationStatus: 'claimed',
@@ -256,4 +260,99 @@ export async function propagateSuccessfulPayment({ invoice, customerMap, amount,
   }
   await invoice.save()
   return { syncErrors }
+}
+
+// Record a manual (non-NMI) payment against an invoice — admin clicks
+// "Mark cheque paid" on the Order Details page. Appends a manualPayments
+// ledger entry + an audit PaymentAttempt row, mutates the invoice's
+// amountPaid / paymentStatus, then runs the same propagateSuccessfulPayment
+// path that an approved NMI charge would (so QBO records the payment and
+// Shopify marks the order paid). The cheque reference is forwarded to
+// QBO as the paymentRef so it shows up on the QBO payment record.
+//
+// Returns { invoice, attempt, syncErrors }. Throws PermanentError-style
+// Errors on validation problems (caller maps to HTTP 4xx).
+export async function recordManualPayment({
+  invoice,
+  customerMap,
+  kind = 'cheque',
+  reference,
+  amount,
+  receivedAt,
+  recordedBy,
+  note,
+}) {
+  if (invoice.paymentStatus === 'paid' || invoice.paymentStatus === 'cancelled') {
+    throw new Error(`Invoice is already ${invoice.paymentStatus}`)
+  }
+  if (invoice.paymentStatus === 'in_progress') {
+    throw new Error('A charge is currently in progress for this invoice')
+  }
+  if (!reference || !String(reference).trim()) {
+    throw new Error('Cheque reference is required')
+  }
+  const outstanding = Number((invoice.amountDue - invoice.amountPaid).toFixed(2))
+  const amt = amount != null ? Number(amount) : outstanding
+  if (!Number.isFinite(amt) || amt <= 0) {
+    throw new Error('Amount must be a positive number')
+  }
+  if (amt > outstanding + 0.001) {
+    throw new Error(`Amount $${amt.toFixed(2)} exceeds outstanding balance $${outstanding.toFixed(2)}`)
+  }
+
+  const attemptNumber = invoice.attemptCount + 1
+  const ref = String(reference).trim()
+  const paymentRef = `${kind}:${ref}`
+
+  console.log(
+    `[invoice] recordManualPayment kind=${kind} ref="${ref}" amount=$${amt.toFixed(2)} ` +
+      `invoice=${invoice._id} outstanding=$${outstanding.toFixed(2)}`,
+  )
+  log.info('manual_payment.recording', {
+    invoiceId: invoice._id.toString(),
+    kind,
+    reference: ref,
+    amount: amt,
+    recordedBy,
+  })
+
+  invoice.manualPayments.push({
+    kind,
+    reference: ref,
+    amount: amt,
+    currency: invoice.currency,
+    receivedAt: receivedAt || new Date(),
+    recordedBy,
+    recordedAt: new Date(),
+    note: note || undefined,
+  })
+
+  const attempt = await PaymentAttempt.create({
+    invoiceRef: invoice._id,
+    qboInvoiceId: invoice.qboInvoiceId,
+    attemptNumber,
+    amount: amt,
+    currency: invoice.currency,
+    outcome: 'manual_paid',
+    nmiResponseText: `Manual ${kind} payment — ref ${ref}`,
+  })
+
+  invoice.attemptCount = attemptNumber
+  invoice.lastAttemptAt = new Date()
+  invoice.lastAttemptError = null
+  invoice.amountPaid = Number((invoice.amountPaid + amt).toFixed(2))
+  invoice.paidAt = invoice.paidAt || new Date()
+  invoice.paymentStatus = invoice.amountPaid >= invoice.amountDue ? 'paid' : 'pending'
+  await invoice.save()
+
+  // Propagate to QBO + Shopify + local order doc. Uses paymentRef so the
+  // QBO RecordPayment carries the cheque/ACH reference (not a NMI txn id).
+  const { syncErrors } = await propagateSuccessfulPayment({
+    invoice,
+    customerMap,
+    amount: amt,
+    transactionId: paymentRef,
+  })
+
+  return { invoice, attempt, syncErrors }
 }

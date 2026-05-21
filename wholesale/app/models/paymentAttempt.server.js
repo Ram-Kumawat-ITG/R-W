@@ -12,10 +12,12 @@ const paymentAttemptSchema = new mongoose.Schema(
     amount: { type: Number, required: true },
     currency: { type: String, default: 'USD' },
 
-    // Result of the NMI call.
+    // Result of the NMI call, or 'manual_paid' for a cheque/ACH receipt
+    // recorded by an admin from the Order Details page (no NMI fields set
+    // on those rows — only attemptNumber, amount, and outcome).
     outcome: {
       type: String,
-      enum: ['approved', 'declined', 'error', 'skipped'],
+      enum: ['approved', 'declined', 'error', 'skipped', 'manual_paid'],
       required: true,
       index: true,
     },

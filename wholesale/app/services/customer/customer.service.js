@@ -3,6 +3,7 @@
 // customer_maps (one row per (shop, email)).
 
 import CustomerMap from '../../models/customerMap.server'
+import WholesaleApplication from '../../models/wholesaleApplication.server'
 import { findOrCreateCustomer as findOrCreateQboCustomer } from '../qbo/qbo.service'
 import { findOrCreateCustomerVault } from '../nmi/nmi.service'
 import { resolvePaymentDetails } from './paymentDetails.service'
@@ -12,6 +13,23 @@ import {
   formatAddress,
 } from './customer.utils'
 import { createLogger } from '../../utils/logger.utils'
+
+// Map a wholesale-application payment.method to the invoice/customerMap
+// enum. Tolerates either spelling of the cheque option ('check' or
+// 'cheque'), case insensitive, since both surface in real data — the
+// registration form uses id 'check' but some application records carry
+// 'cheque'. Canonical storage value is 'check'.
+//
+// Unknown / missing values default to 'card' so existing customers
+// without a captured preference keep the legacy CRON-auto-charge
+// behavior.
+function normalizePaymentMethod(raw) {
+  const v = String(raw || '').trim().toLowerCase()
+  if (v === 'check' || v === 'cheque') return 'check'
+  if (v === 'ach' || v === 'bank' || v === 'bank-transfer') return 'ach'
+  if (v === 'card' || v === 'credit-card' || v === 'creditcard' || v === 'cc') return 'card'
+  return 'card'
+}
 
 const log = createLogger('customer.service')
 
@@ -86,6 +104,28 @@ export async function ensureCustomerForOrder({ shop, order, paymentDetails }) {
     log.info('qbo.linked', { email: profile.email, qboCustomerId: customer.Id })
   } else {
     console.log(`[customers] QBO link already set on customer_maps: Id=${mapping.qboCustomerId}`)
+  }
+
+  // Payment-method preference — sourced once from the customer's
+  // wholesale application. Persisted on the mapping so future invoices
+  // can pick it up without re-querying. We only populate if currently
+  // unset; the manual cheque→card fallback (per-invoice override) does
+  // NOT alter this preference.
+  if (!mapping.paymentMethod) {
+    const app = await WholesaleApplication.findOne({ shop, email: profile.email })
+      .select('payment.method')
+      .lean()
+    const resolved = normalizePaymentMethod(app?.payment?.method)
+    mapping.paymentMethod = resolved
+    console.log(
+      `[customers] payment-method preference resolved → "${resolved}"` +
+        (app?.payment?.method ? ` (from wholesale_applications.payment.method="${app.payment.method}")` : ` (default; no application on file)`),
+    )
+    log.info('payment_method.resolved', {
+      email: profile.email,
+      paymentMethod: resolved,
+      sourcedFromApp: Boolean(app?.payment?.method),
+    })
   }
 
   // NMI side

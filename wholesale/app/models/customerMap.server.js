@@ -13,6 +13,16 @@ const customerMapSchema = new mongoose.Schema(
     qboCustomerId: { type: String, index: true },
     nmiCustomerVaultId: { type: String, index: true },
 
+    // Customer's preferred payment method, sourced from the wholesale
+    // registration application at customer-sync time. Drives the default
+    // for newly-created invoices; per-invoice overrides (cheque → card
+    // fallback) live on the Invoice doc, not here.
+    paymentMethod: {
+      type: String,
+      enum: ['card', 'check', 'ach'],
+      index: true,
+    },
+
     // Snapshot used for matching/recreating in either system. Kept here
     // (not just referenced from Shopify) so jobs running async don't
     // need a fresh admin API call.

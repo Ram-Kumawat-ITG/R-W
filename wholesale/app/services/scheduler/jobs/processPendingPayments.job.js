@@ -25,8 +25,14 @@ export function registerProcessPendingPaymentsJob(agenda) {
       await connectDB()
 
       // PASS 1 — pending invoices that still need to be charged.
+      //
+      // Card-only: cheque and ACH invoices are skipped by the CRON. Those
+      // sit on `paymentStatus: 'pending'` until an admin records a
+      // manual cheque receipt or falls back to charging the card from
+      // the Order Details page.
       const pendingCursor = Invoice.find({
         paymentStatus: 'pending',
+        paymentMethod: 'card',
         $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
       }).cursor()
 

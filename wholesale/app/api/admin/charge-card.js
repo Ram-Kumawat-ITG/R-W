@@ -1,0 +1,106 @@
+import mongoose from 'mongoose'
+import { authenticate } from '../../shopify.server'
+import connectDB from '../../services/APIService/mongo.service'
+import ShopifyOrder from '../../models/order.server'
+import Invoice from '../../models/invoice.server'
+import CustomerMap from '../../models/customerMap.server'
+import { chargeInvoice } from '../../services/payment/payment.service'
+import { sendResponse } from '../../services/APIService/api.service'
+
+// POST /api/admin/orders/:id/charge-card
+//
+// Cheque → card fallback. Used when a customer's preferred payment method
+// is cheque/ACH but the admin needs to actually collect by charging the
+// card on file (e.g. cheque never arrived). The action:
+//   1. Flips invoice.paymentMethod from 'check'|'ach' → 'card'
+//      (per-invoice override; CustomerMap preference stays untouched)
+//   2. Runs the same chargeInvoice() flow as Retry payment
+//
+// Guards mirror retry-payment.js. The endpoint stays separate so the
+// per-invoice override is explicit and auditable in logs.
+export async function action({ request, params }) {
+  if (request.method !== 'POST') {
+    return sendResponse(405, 'error', 'Method not allowed', null)
+  }
+
+  let session
+  try {
+    const auth = await authenticate.admin(request)
+    session = auth.session
+  } catch (e) {
+    console.error('[admin/charge-card] auth failed:', e?.message || e)
+    return sendResponse(401, 'error', 'Unauthorized', null)
+  }
+
+  const { id } = params
+  if (!id || !mongoose.isValidObjectId(id)) {
+    return sendResponse(400, 'error', 'Invalid order id', null)
+  }
+
+  await connectDB()
+
+  const order = await ShopifyOrder.findOne({ _id: id, shop: session.shop })
+  if (!order) return sendResponse(404, 'error', 'Order not found in this shop', null)
+  if (!order.invoiceRef) {
+    return sendResponse(409, 'error', 'No invoice exists for this order yet', null)
+  }
+
+  const invoice = await Invoice.findById(order.invoiceRef)
+  if (!invoice) return sendResponse(409, 'error', 'Linked invoice record is missing', null)
+
+  if (invoice.paymentStatus === 'paid' || invoice.paymentStatus === 'cancelled') {
+    return sendResponse(409, 'error', `Invoice is already ${invoice.paymentStatus}`, null)
+  }
+  if (invoice.paymentStatus === 'in_progress') {
+    return sendResponse(409, 'error', 'A charge is already in progress for this invoice', null)
+  }
+
+  const customerMap = order.customerEmail
+    ? await CustomerMap.findOne({ shop: session.shop, email: order.customerEmail })
+    : null
+  if (!customerMap?.nmiCustomerVaultId) {
+    return sendResponse(
+      409,
+      'error',
+      'No NMI vault on file for this customer — collect a payment method before charging',
+      null,
+    )
+  }
+
+  // Per-order override: flip method to card so the scheduler will also
+  // pick this invoice up on subsequent ticks if this attempt declines.
+  const originalMethod = invoice.paymentMethod
+  if (invoice.paymentMethod !== 'card') {
+    console.log(
+      `[admin/charge-card] flipping invoice ${invoice._id} paymentMethod ${originalMethod} → card (per-order override)`,
+    )
+    invoice.paymentMethod = 'card'
+  }
+  // Same maxAttempts / failed→pending unblocking as retry-payment.js.
+  if (invoice.attemptCount >= invoice.maxAttempts) {
+    invoice.maxAttempts = invoice.attemptCount + 1
+  }
+  if (invoice.paymentStatus === 'failed') {
+    invoice.paymentStatus = 'pending'
+  }
+  await invoice.save()
+
+  console.log(
+    `[admin/charge-card] shop=${session.shop} order=${order.shopifyOrderId} ` +
+      `invoice=${invoice._id} originalMethod=${originalMethod} → charging card`,
+  )
+
+  let result
+  try {
+    result = await chargeInvoice({ invoice, customerMap })
+  } catch (e) {
+    console.error('[admin/charge-card] chargeInvoice threw:', e?.message || e)
+    return sendResponse(500, 'error', e?.message || 'Charge failed', null)
+  }
+
+  return sendResponse(200, 'success', 'Charge attempted', {
+    ...result,
+    originalMethod,
+    newMethod: invoice.paymentMethod,
+  })
+}

@@ -220,14 +220,21 @@ export async function processShopifyOrder({ shop, order, webhookId }) {
     local.processingStatus = 'invoiced'
     await local.save()
 
-    // Step 3 — optional immediate NMI charge.
-    if (paymentConfig.chargeImmediately) {
-      console.log(`[orders] step 3/4 — immediate NMI charge (PAYMENT_CHARGE_IMMEDIATELY=true)`)
+    // Step 3 — optional immediate NMI charge. Only cards are charged
+    // automatically. Cheque / ACH invoices are held until an admin acts
+    // from the Order Details page (mark received or fall back to card).
+    if (paymentConfig.chargeImmediately && invoice.paymentMethod === 'card') {
+      console.log(`[orders] step 3/4 — immediate NMI charge (PAYMENT_CHARGE_IMMEDIATELY=true, method=card)`)
       const chargeResult = await chargeInvoice({ invoice, customerMap })
       console.log(
         `[orders] immediate charge → outcome=${chargeResult.outcome || 'skipped'}` +
           (chargeResult.reason ? ` reason="${chargeResult.reason}"` : '') +
           (chargeResult.responseText ? ` text="${chargeResult.responseText}"` : ''),
+      )
+    } else if (invoice.paymentMethod !== 'card') {
+      console.log(
+        `[orders] step 3/4 — auto-charge skipped (paymentMethod=${invoice.paymentMethod}); ` +
+          `awaiting admin action on Order Details page`,
       )
     } else {
       console.log(`[orders] step 3/4 — immediate charge disabled (scheduler-driven flow)`)

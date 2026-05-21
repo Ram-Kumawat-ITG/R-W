@@ -693,19 +693,109 @@ The parsed result includes `transactionId`, `responseCode`, `responseText`,
 
 ## 9. Cheque / ACH payment handling
 
-NMI supports ACH/echeck via the same vault add_customer / sale API.
-The current implementation surfaces it through `paymentDetails`:
+Each customer carries a preferred payment method on their wholesale
+application (`wholesale_applications.payment.method` — one of `check`,
+`ach`, `card`). The CRON only auto-charges `card`; `check` and `ach`
+are held for manual admin action from the Order Details page.
 
-```js
-{
-  achRouting,
-  achAccount,
-  achAccountType: 'checking' | 'savings',
-  checkName,          // optional, falls back to firstName + lastName
-}
+### 9.1 Method propagation
+
+```
+WholesaleApplication.payment.method
+  ↓ first time we sync this customer
+services/customer/customer.service.js → ensureCustomerForOrder
+  ↓ writes CustomerMap.paymentMethod (sticky, per-customer)
+services/invoice/invoice.service.js → createInvoiceForOrder
+  ↓ writes Invoice.paymentMethod   (locked, per-invoice)
 ```
 
-When `paymentDetails.achAccount` is set, `createCustomerVault` sends:
+`CustomerMap.paymentMethod` is set only when currently unset, so a
+customer's preference change in `wholesale_applications` does NOT
+silently flip future orders without an explicit re-sync. The per-order
+cheque→card fallback (see §9.4) only mutates `Invoice.paymentMethod`,
+never `CustomerMap.paymentMethod`.
+
+Unknown / missing values default to `card`. This preserves the legacy
+auto-charge behavior for customers that pre-date this feature.
+
+**Spelling tolerance** — `normalizePaymentMethod` in
+`customer.service.js` accepts either `check` or `cheque` (case
+insensitive, trimmed) and folds both to canonical `check`. The
+mark-cheque-paid endpoint applies the same tolerance to the inbound
+`kind` field. Canonical values are: `card`, `check`, `ach` on the
+Invoice/CustomerMap; `cheque`, `ach` on the manualPayments ledger.
+
+### 9.2 Scheduler gating
+
+PASS 1 of `process-pending-payments` filters by `paymentMethod: 'card'`:
+
+```js
+Invoice.find({
+  paymentStatus: 'pending',
+  paymentMethod: 'card',
+  $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
+})
+```
+
+Cheque / ACH invoices sit on `pending` indefinitely until an admin acts.
+PASS 2 (downstream sync retry) is NOT gated by method — once an invoice
+is `paid`, any failed QBO/Shopify sync is replayed regardless of how
+the invoice was paid.
+
+The same gate applies to the immediate-charge path in
+`order.service.processShopifyOrder`: even with
+`PAYMENT_CHARGE_IMMEDIATELY=true`, only `card` invoices fire the inline
+NMI sale.
+
+### 9.3 Manual cheque receipt — admin "Mark cheque paid"
+
+```
+POST /api/admin/orders/:id/mark-cheque-paid
+  body: { reference, amount?, receivedAt?, kind?='cheque'|'ach', note? }
+  → app/api/admin/mark-cheque-paid.js
+    → services/invoice/invoice.service.recordManualPayment
+        - validates: paymentStatus ∈ {pending, failed},
+          paymentMethod ≠ 'card', reference present, amount > 0,
+          amount ≤ outstanding
+        - appends Invoice.manualPayments[] entry
+        - creates PaymentAttempt { outcome: 'manual_paid' }
+        - bumps amountPaid, sets paidAt, transitions paymentStatus
+          to 'paid' (or stays 'pending' on partial)
+        - propagateSuccessfulPayment with paymentRef=`cheque:<ref>`
+          (records QBO payment, marks Shopify order paid, updates
+          shopify_orders mirror)
+  → returns { paymentStatus, amountPaid, amountDue, paidAt,
+              reference, kind, syncErrors }
+```
+
+The cheque reference is stored on the manualPayments entry AND forwarded
+to QBO as the `paymentRef`. On the Shopify side, `markShopifyOrderPaid`
+is idempotent so retries are safe.
+
+### 9.4 Cheque → card fallback — admin "Charge card on file"
+
+```
+POST /api/admin/orders/:id/charge-card
+  → app/api/admin/charge-card.js
+    - guards: order in shop, invoice exists,
+      paymentStatus ∈ {pending, failed}, vault id present
+    - flips Invoice.paymentMethod → 'card' (per-invoice override only,
+      CustomerMap.paymentMethod stays 'check'/'ach')
+    - same maxAttempts++ / failed→pending unblock as retry-payment
+    - calls chargeInvoice() against the NMI vault
+  → returns { ...chargeResult, originalMethod, newMethod: 'card' }
+```
+
+After this flip, the scheduler will also pick this invoice up on
+subsequent ticks if the admin attempt declines (because PASS 1 now
+matches). The next order for the same customer still defaults to the
+original cheque/ACH preference.
+
+### 9.5 ACH transport (existing)
+
+NMI supports ACH/echeck through the same vault add_customer / sale API.
+When the vault was created with `paymentDetails.achAccount`,
+`createCustomerVault` sends:
 
 ```
 payment=check
@@ -715,14 +805,9 @@ checkaccount=<account number>
 account_type=checking
 ```
 
-Sale transactions then use the same `type=sale` against the vault id;
-NMI uses the stored ACH details automatically.
-
-**Current status**:
-
-- Vault add supports ACH via `paymentDetails.achAccount` (`services/nmi/nmi.service.js:71-77`).
-- The orchestrator does **not** currently differentiate ACH from card for charge attempts — both go through `chargeCustomerVault` with `type=sale`.
-- No paper-cheque (manual deposit / non-electronic) flow exists. If that's needed, the right shape is a new `paymentDetailsResolver` strategy that returns `{ method: 'manual-check' }` and a dedicated path in `chargeInvoice` that skips the NMI sale call and waits for a manual-mark-paid signal instead.
+This transport is unchanged. The workflow change in this section gates
+*when* we run the sale, not how. Per project decision, ACH invoices are
+treated as manual (same as cheque) and skipped by the CRON.
 
 ---
 
@@ -789,9 +874,14 @@ or in prod:
 ```js
 Invoice.find({
   paymentStatus: 'pending',
+  paymentMethod: 'card',
   $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
 })
 ```
+
+`paymentMethod: 'card'` is the cheque/ACH gate (see §9). Only card
+invoices are eligible for CRON auto-charge; cheque/ACH invoices sit on
+`pending` until an admin acts.
 
 For each invoice in the cursor:
 
@@ -825,35 +915,57 @@ For each invoice in the cursor, call `propagateSuccessfulPayment` directly — *
 the invoice transitions to `paymentStatus: 'failed'` and the scheduler
 stops trying. Failed invoices need explicit operator action.
 
-### 11.4 Manual retry — admin "Retry Now"
+### 11.4 Manual retry — admin actions on Order Details
 
-Operators can fire a single charge attempt out-of-band from the order
-detail page (`/app/orders/:id`). The flow:
+The Order Details page surfaces a different primary action depending on
+`Invoice.paymentMethod`. All three endpoints share the same eligibility
+guards (`paymentStatus ∈ {pending, failed}`, order in shop, etc.) and
+re-validate server-side, so an out-of-date UI cannot bypass them.
+
+#### "Retry payment" — card invoices only
 
 ```
 admin click → POST /api/admin/orders/:id/retry-payment
             → app/api/admin/retry-payment.js
-                → guards: order in shop, invoice exists,
-                  paymentStatus ∈ {pending, failed},
+                → guards: invoice.paymentMethod === 'card',
                   CustomerMap.nmiCustomerVaultId present
                 → if attemptCount ≥ maxAttempts, bumps maxAttempts++
                 → if paymentStatus === 'failed', flips to 'pending'
                 → calls services/payment/payment.service.chargeInvoice
             → returns { outcome, transactionId?, responseText? }
-              synchronously so the UI can show the result inline
 ```
 
-`attemptCount` is never reset — the `PaymentAttempt` ledger remains
-strictly append-only so the audit trail is intact across manual + auto
-retries. The only state mutation pre-charge is `maxAttempts` (bumped by
-1 when the auto-retry cap has been reached) and a flip of
-`paymentStatus` back to `pending`. After that, the standard
-`chargeInvoice` path runs and all the usual outcome handling applies.
+Refuses non-card invoices with HTTP 409 — those have their own actions
+below.
 
-The admin UI hides / disables the button when retry would be unsafe or
-pointless (paid, cancelled, in-progress, or no vault on file); the
-server re-validates those same conditions and returns HTTP 409 so an
-out-of-date page can't bypass them.
+#### "Mark cheque paid" — cheque / ACH invoices
+
+```
+admin click → modal collects reference (+ amount + receivedAt)
+            → POST /api/admin/orders/:id/mark-cheque-paid (JSON body)
+            → app/api/admin/mark-cheque-paid.js
+                → guards: invoice.paymentMethod !== 'card'
+                → services/invoice/invoice.service.recordManualPayment
+                  (see §9.3 for details)
+            → returns { paymentStatus, amountPaid, amountDue, paidAt,
+                        reference, kind, syncErrors }
+```
+
+Partial payments are supported — the invoice stays `pending` until
+cumulative `amountPaid ≥ amountDue`.
+
+#### "Charge card on file" — cheque / ACH invoices (fallback)
+
+```
+admin click → POST /api/admin/orders/:id/charge-card
+            → app/api/admin/charge-card.js (see §9.4 for details)
+            → returns { ...chargeResult, originalMethod, newMethod }
+```
+
+`attemptCount` is never reset across any of these paths — the
+`PaymentAttempt` ledger is strictly append-only. The `manual_paid`
+outcome distinguishes cheque receipts from NMI-driven attempts in the
+audit history.
 
 ---
 
@@ -1169,10 +1281,10 @@ All in MongoDB, single database from `MONGODB_URI`.
 | `sessions` | (Shopify session storage) | OAuth offline sessions per shop |
 | `agenda_jobs` | (Agenda's own) | Scheduler job state |
 | `qbo_tokens` | `models/qboToken.server.js` | One row per realm — current access + refresh token |
-| `customer_maps` | `models/customerMap.server.js` | Shopify email ↔ QBO customer ↔ NMI vault |
+| `customer_maps` | `models/customerMap.server.js` | Shopify email ↔ QBO customer ↔ NMI vault; carries `paymentMethod` preference |
 | `shopify_orders` | `models/order.server.js` | Local mirror of every received Shopify order |
-| `invoices` | `models/invoice.server.js` | Local invoice mirror + sync state |
-| `payment_attempts` | `models/paymentAttempt.server.js` | Append-only NMI charge ledger |
+| `invoices` | `models/invoice.server.js` | Local invoice mirror + sync state; carries `paymentMethod` (locked at creation) and `manualPayments[]` ledger |
+| `payment_attempts` | `models/paymentAttempt.server.js` | Append-only charge ledger (NMI + manual cheque receipts as `outcome: 'manual_paid'`) |
 | `wholesale_applications` | `models/wholesaleApplication.server.js` | Wholesale signups (pre-existing) |
 
 ### 17.1 Critical indexes
@@ -1184,6 +1296,7 @@ customer_maps     unique on (shop, email)
 shopify_orders    unique on (shop, shopifyOrderId)
 invoices          unique on (shop, shopifyOrderId)
                   + (paymentStatus, attemptCount)  for scheduler cursor
+                  + (paymentMethod)                for cheque/ACH filter
 payment_attempts  (invoiceRef, attemptedAt)
 ```
 
@@ -1461,6 +1574,27 @@ Validation `FINANCIAL_TERMINAL`. Same handling as above.
 ### 22.10 Two simultaneous taps of "Resend webhook" in Shopify admin
 
 Same webhook id, multiple deliveries. Layer 1 (webhook-id dedup) catches it on the second delivery onward.
+
+### 22.11 Customer has no wholesale application on file
+
+`ensureCustomerForOrder` queries `wholesale_applications` by `(shop,
+email)` to resolve `paymentMethod`. If no application exists (or
+`payment.method` is unset), the resolver defaults to `card`. This
+preserves the legacy CRON auto-charge behavior for customers that
+pre-date the cheque/ACH workflow. Operator override path: edit
+`customer_maps.paymentMethod` directly in Mongo if the default is wrong
+for a given customer.
+
+### 22.12 Customer changes payment-method preference after orders exist
+
+`CustomerMap.paymentMethod` is sticky once set — re-running
+`ensureCustomerForOrder` does NOT re-query `wholesale_applications` for
+the method. To pick up a new preference, unset
+`customer_maps.paymentMethod` for that row and trigger any subsequent
+order for that customer (it'll re-resolve from the application). Open
+invoices keep the method they were created with — that's deliberate;
+flipping invoice method mid-flight is the explicit "Charge card on
+file" admin action.
 
 ---
 
