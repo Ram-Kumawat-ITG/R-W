@@ -61,9 +61,9 @@ export default function CustomerDetail() {
         isError: true,
       });
     } else if (isApproved) {
-      shopify?.toast?.show(`${fullName} — Approved`);
+      shopify?.toast?.show(`${fullName} — Reviewed`);
     } else {
-      shopify?.toast?.show(`Loaded ${fullName} — Pending review`);
+      shopify?.toast?.show(`Loaded ${fullName} — Un-reviewed`);
     }
   }, [isApproved, a.shopifyCreateFailed, fullName, shopify]);
 
@@ -125,6 +125,7 @@ export default function CustomerDetail() {
       method: "POST",
       action: `/api/admin/customers/${a._id}/decline`,
     });
+    navigate("/app/customers");
   };
   const openModal = () => modalRef.current?.showOverlay?.();
   const closeModal = () => modalRef.current?.hideOverlay?.();
@@ -213,9 +214,9 @@ export default function CustomerDetail() {
             {a.shopifyCreateFailed ? (
               <s-badge tone="critical">Sync failed</s-badge>
             ) : isApproved ? (
-              <s-badge tone="success">Approved</s-badge>
+              <s-badge tone="success">Reviewed</s-badge>
             ) : (
-              <s-badge>Pending</s-badge>
+              <s-badge>Un-reviewed</s-badge>
             )}
             {submittedLabel && (
               <s-text tone="subdued">Submitted {submittedLabel}</s-text>

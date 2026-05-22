@@ -10,6 +10,7 @@ import {
   uploadFileToShopify,
   ShopifyUserError,
 } from '../services/shopify/shopify.service'
+import { createCustomerVault } from '../services/nmi/nmi.service'
 
 // POST /api/registration-form
 // Storefront-proxied wholesale application submit. Parses the multipart
@@ -87,20 +88,6 @@ export async function action({ request }) {
     const salt = crypto.randomBytes(16).toString('hex')
     const derived = crypto.scryptSync(plain, salt, 64).toString('hex')
     payload.passwordHash = `scrypt:${salt}:${derived}`
-  }
-
-  // Hash card number with HMAC-SHA256 (keyed by Shopify app secret). The raw
-  // PAN is never persisted or logged. CVV is intentionally not collected.
-  if (payload.payment?.cardNumber) {
-    const rawPan = String(payload.payment.cardNumber).replace(/\D/g, '')
-    delete payload.payment.cardNumber
-    if (rawPan) {
-      const key = process.env.SHOPIFY_API_SECRET || 'card-hash-fallback-key'
-      payload.payment.cardNumberHash = crypto
-        .createHmac('sha256', key)
-        .update(`card-pan:${rawPan}`)
-        .digest('hex')
-    }
   }
 
   // Normalise signature: prefer uploaded PNG file URL, fall back to typed text
@@ -206,9 +193,35 @@ export async function action({ request }) {
     )
   }
 
+  // Create NMI Customer Vault using the Collect.js payment token so the card
+  // can be charged later. Non-fatal — application proceeds even if this fails.
+  let nmiCustomerVaultId = null
+  if (payload.payment?.paymentToken) {
+    try {
+      nmiCustomerVaultId = await createCustomerVault({
+        profile: {
+          firstName: payload.firstName,
+          lastName: payload.lastName,
+          email: payload.email,
+          phone: payload.phone,
+          companyName: payload.businessName,
+          billingAddress: payload.billingAddress,
+        },
+        paymentDetails: { paymentToken: payload.payment.paymentToken },
+      })
+      await WholesaleApplication.updateOne(
+        { _id: app._id },
+        { $set: { nmiCustomerVaultId } },
+      )
+    } catch (vaultErr) {
+      console.error('[proxy/submit] NMI vault create failed:', vaultErr?.message || vaultErr)
+    }
+  }
+
   return sendResponse(200, 'success', 'Application submitted', {
     id: app._id.toString(),
     customerId,
+    nmiCustomerVaultId,
   })
 }
 

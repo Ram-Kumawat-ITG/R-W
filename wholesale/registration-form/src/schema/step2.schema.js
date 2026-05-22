@@ -2,10 +2,11 @@ import * as yup from 'yup'
 import { validateZipForState, validateCityForState } from '../utils/zipValidation'
 
 const addressShape = (countryField) => ({
-  line1: yup.string().required('Required'),
-  line2: yup.string().notRequired(),
+  line1: yup.string().trim().required('Required'),
+  line2: yup.string().trim().notRequired(),
   city: yup
     .string()
+    .trim()
     .required('Required')
     .test('city-state-match', 'City not found in the selected state', async function (city) {
       const { state, country } = this.parent
@@ -14,9 +15,10 @@ const addressShape = (countryField) => ({
       if (result.valid) return true
       return this.createError({ message: result.message })
     }),
-  state: yup.string().required('Required'),
+  state: yup.string().trim().required('Required'),
   zip: yup
     .string()
+    .trim()
     .required('Required')
     .when(countryField, {
       is: 'United States',
@@ -31,7 +33,7 @@ const addressShape = (countryField) => ({
             return this.createError({ message: result.message })
           }),
     }),
-  country: yup.string().required('Required'),
+  country: yup.string().trim().required('Required'),
 })
 
 export const step2Schema = yup.object({
@@ -51,19 +53,31 @@ export const step2Schema = yup.object({
     is: true,
     then: () =>
       yup.object({
-        taxIdType: yup.string().required('Required').oneOf(['ein', 'ssn']),
-        taxId: yup.string().required('Required'),
-        salesPermit: yup.string().notRequired(),
-        exemptState: yup.string().required('Required'),
-        itemsToResell: yup.string().required('Required'),
-        businessActivity: yup.string().required('Required'),
+        taxIdType: yup.string().trim().required('Required').oneOf(['ein', 'ssn']),
+        taxId: yup.string().trim().required('Required')
+          .when('taxIdType', {
+            is: 'ein',
+            then: (s) => s.matches(/^\d{2}-?\d{7}$/, 'Enter a valid 9-digit EIN (e.g. 12-3456789)'),
+            otherwise: (s) => s.matches(/^\d{3}-?\d{2}-?\d{4}$/, 'Enter a valid 9-digit SSN (e.g. 123-45-6789)'),
+          }),
+        salesPermit: yup.string().trim().notRequired(),
+        exemptState: yup.string().trim().required('Required'),
+        itemsToResell: yup.string().trim().required('Required'),
+        businessActivity: yup.string().trim().required('Required'),
       }),
     otherwise: (s) => s.notRequired(),
   }),
 })
 
 export const step2Fields = [
-  'billingAddress',
+  // Billing address — always rendered, use nested paths so RHF triggers each registered field
+  'billingAddress.line1',
+  'billingAddress.city',
+  'billingAddress.state',
+  'billingAddress.zip',
+  'billingAddress.country',
+  // Conditional sections — top-level only; sub-fields are registered when visible,
+  // so trigger(parentKey) correctly validates all mounted children
   'shippingSameAsBilling',
   'shippingAddress',
   'shippingPropertyType',

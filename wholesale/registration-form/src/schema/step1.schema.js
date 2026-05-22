@@ -2,7 +2,7 @@ import * as yup from "yup";
 import {
   MAX_FILE_SIZE,
   ACCEPTED_MIME_TYPES,
-  CREDENTIALS,
+  CREDENTIALS,  
   REFERRALS,
 } from "../constants";
 
@@ -28,7 +28,7 @@ const fileWhenSelected = (message = "File is required") =>
 const reqWhenSelected = (message = "Required") =>
   yup.string().when("selected", {
     is: true,
-    then: (s) => s.required(message),
+    then: (s) => s.trim().required(message),
     otherwise: (s) => s.notRequired(),
   });
 
@@ -62,16 +62,19 @@ REFERRALS.forEach((ref) => {
 export const step1Schema = yup.object({
   firstName: yup
     .string()
+    .trim()
     .required("Required")
     .min(2, "Too short")
     .matches(/^[A-Za-z\s'-]+$/, "Letters only"),
-  lastName: yup.string().required("Required").min(2, "Too short"),
+  lastName: yup.string().trim().required("Required").min(2, "Too short"),
   email: yup
     .string()
+    .trim()
     .required("Required")
     .email("Enter a valid email"),
   phone: yup
     .string()
+    .trim()
     .required("Required")
     .matches(
       /^\(?([0-9]{3})\)?[-. ]?([0-9]{3})[-. ]?([0-9]{4})$/,
@@ -79,11 +82,12 @@ export const step1Schema = yup.object({
     ),
   password: yup
     .string()
+    .trim()
     .required("Required")
     .min(8, "At least 8 characters")
     .matches(/[A-Za-z]/, "Must include a letter")
     .matches(/\d/, "Must include a number"),
-  businessName: yup.string().notRequired(),
+  businessName: yup.string().trim().notRequired(),
   credentials: yup
     .object(credentialShape)
     .test("one-selected", "Select at least one credential", (c) =>
@@ -94,7 +98,7 @@ export const step1Schema = yup.object({
     .test("one-selected", "Select at least one referral source", (r) =>
       r ? Object.values(r).some((x) => x && x.selected === true) : false,
     ),
-});3
+});
 
 export const step1Fields = [
   "firstName",

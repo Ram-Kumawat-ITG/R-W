@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(npm run *)",
-      "Bash(Get-ChildItem -Path \"c:\\\\Apps\\\\Natural-solutions\\\\wholesale\\\\registration-form\\\\src\\\\services\\\\\" -Filter \"*.js*\")"
-    ]
-  }
-}

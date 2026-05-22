@@ -24,7 +24,7 @@ function mapAddress(a) {
   }
 }
 
-export async function customerCreate(admin, { application, note, tags = ["Pending"], subscribeNews = false }) {
+export async function customerCreate(admin, { application, note, tags = ["Un-reviewed"], subscribeNews = false }) {
   const addresses = []
   if (application.billingAddress) {
     addresses.push({
@@ -163,6 +163,49 @@ export async function customerUpdateNote(admin, { customerId, note }) {
   )
   const json = await res.json()
   const errs = json?.data?.customerUpdate?.userErrors
+  if (errs?.length) throw new Error(errs.map((e) => e.message).join('; '))
+  return true
+}
+
+export async function customerUpdateDefaultAddress(admin, { customerId, address }) {
+  const fetchRes = await admin.graphql(
+    `#graphql
+    query GetDefaultAddress($id: ID!) {
+      customer(id: $id) {
+        defaultAddress { id }
+      }
+    }`,
+    { variables: { id: customerId } }
+  )
+  const fetchJson = await fetchRes.json()
+  const addressId = fetchJson?.data?.customer?.defaultAddress?.id
+  if (!addressId) throw new Error('Customer has no default address to update')
+
+  const res = await admin.graphql(
+    `#graphql
+    mutation UpdateAddress($customerId: ID!, $addressId: ID!, $address: CustomerAddressInput!) {
+      customerAddressUpdate(customerId: $customerId, id: $addressId, address: $address) {
+        customerAddress { id }
+        userErrors { field message }
+      }
+    }`,
+    {
+      variables: {
+        customerId,
+        addressId,
+        address: {
+          address1: address.line1 || '',
+          address2: address.line2 || '',
+          city: address.city || '',
+          province: address.state || '',
+          zip: address.zip || '',
+          country: address.country || '',
+        },
+      },
+    }
+  )
+  const json = await res.json()
+  const errs = json?.data?.customerAddressUpdate?.userErrors
   if (errs?.length) throw new Error(errs.map((e) => e.message).join('; '))
   return true
 }

@@ -49,7 +49,6 @@ export async function createCustomerVault({ profile, paymentDetails }) {
     first_name: profile.firstName,
     last_name: profile.lastName,
     company: profile.companyName,
-    email: profile.email,
     phone: profile.phone,
   }
   if (profile.billingAddress) {

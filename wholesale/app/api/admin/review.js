@@ -40,8 +40,8 @@ export async function action({ request, params }) {
     try {
       await customerUpdateTags(admin, {
         customerId: doc.customerId,
-        addTag: 'Approved',
-        removeTag: 'Pending',
+        addTag: 'Reviewed',
+        removeTag: 'Un-reviewed',
       })
     } catch (e) {
       console.error('[admin/review] customerUpdateTags failed:', e?.message || e)

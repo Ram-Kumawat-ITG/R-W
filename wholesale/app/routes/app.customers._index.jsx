@@ -39,11 +39,10 @@ export const loader = async ({ request }) => {
   };
 };
 
-
 const STATUS_FILTERS = [
   { id: "all", label: "All" },
-  { id: "pending", label: "Pending" },
-  { id: "approved", label: "Approved" },
+  { id: "pending", label: "Un-reviewed" },
+  { id: "approved", label: "Reviewed" },
   { id: "sync-failed", label: "Sync failed" },
 ];
 
@@ -52,22 +51,24 @@ export default function CustomersList() {
   const navigate = useNavigate();
   const navigation = useNavigation();
   const shopify = useAppBridge();
-  const fetcher = useFetcher();
   const reviewFetcher = useFetcher();
   const revalidator = useRevalidator();
 
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
-  const [declineTarget, setDeclineTarget] = useState(null);
+  const [sortOrder, setSortOrder] = useState("desc");
   const [filterPending, setFilterPending] = useState(false);
   const [reviewingId, setReviewingId] = useState(null);
-  const modalRef = useRef(null);
+  const [decliningId, setDecliningId] = useState(null);
+  const [pendingDeclineRow, setPendingDeclineRow] = useState(null);
+  const declineFetcher = useFetcher();
+  const declineModalRef = useRef(null);
   const loadedToastShown = useRef(false);
   // Track which response payload we've already handled so React-Router's
   // automatic post-action revalidation doesn't re-fire toast / state resets
   // on every subsequent render.
-  const handledDeclineRef = useRef(null);
   const handledReviewRef = useRef(null);
+  const handledDeclineRef = useRef(null);
 
   // One-time toast on initial mount confirming data was fetched.
   useEffect(() => {
@@ -90,12 +91,12 @@ export default function CustomersList() {
     filterPending ||
     navigation.state === "loading" ||
     revalidator.state === "loading" ||
-    fetcher.state !== "idle" ||
-    reviewFetcher.state !== "idle";
+    reviewFetcher.state !== "idle" ||
+    declineFetcher.state !== "idle";
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return rows.filter((r) => {
+    const result = rows.filter((r) => {
       if (statusFilter === "approved") {
         if (!(r.status === "approved" && !r.shopifyCreateFailed)) return false;
       } else if (statusFilter === "pending") {
@@ -117,32 +118,18 @@ export default function CustomersList() {
         .toLowerCase();
       return haystack.includes(q);
     });
-  }, [rows, search, statusFilter]);
 
-  const declining = fetcher.state === "submitting" || fetcher.state === "loading";
+    result.sort((a, b) => {
+      const tA = a.submittedAt ? new Date(a.submittedAt).getTime() : 0;
+      const tB = b.submittedAt ? new Date(b.submittedAt).getTime() : 0;
+      const cmp = tA - tB;
+      return sortOrder === "asc" ? cmp : -cmp;
+    });
 
-  // Handle decline result. React-Router auto-revalidates the loader after a
-  // fetcher action, so we don't call revalidator.revalidate() manually — that
-  // would race with the auto-revalidation and (because revalidator's reference
-  // changes on each state transition) put this effect into an infinite loop.
-  useEffect(() => {
-    if (!fetcher.data) return;
-    if (fetcher.state !== "idle") return;
-    if (handledDeclineRef.current === fetcher.data) return;
-    handledDeclineRef.current = fetcher.data;
+    return result;
+  }, [rows, search, statusFilter, sortOrder]);
 
-    if (fetcher.data.status === "success") {
-      shopify?.toast?.show("Customer declined and removed.");
-      setDeclineTarget(null);
-    } else if (fetcher.data.status === "error") {
-      shopify?.toast?.show(
-        fetcher.data.result?.detail || fetcher.data.message || "Decline failed.",
-        { isError: true },
-      );
-    }
-  }, [fetcher.data, fetcher.state, shopify]);
-
-  // Handle review / un-review result (same pattern as decline above).
+  // Handle review / un-review result.
   useEffect(() => {
     if (!reviewFetcher.data) return;
     if (reviewFetcher.state !== "idle") return;
@@ -173,21 +160,43 @@ export default function CustomersList() {
     });
   };
 
-  const openDeclineFor = (row) => {
-    setDeclineTarget(row);
-    requestAnimationFrame(() => modalRef.current?.showOverlay?.());
+  // Handle decline result.
+  useEffect(() => {
+    if (!declineFetcher.data) return;
+    if (declineFetcher.state !== "idle") return;
+    if (handledDeclineRef.current === declineFetcher.data) return;
+    handledDeclineRef.current = declineFetcher.data;
+
+    if (declineFetcher.data.status === "success") {
+      shopify?.toast?.show("Customer declined and removed.");
+      setDecliningId(null);
+    } else if (declineFetcher.data.status === "error") {
+      shopify?.toast?.show(
+        declineFetcher.data.result?.detail ||
+          declineFetcher.data.message ||
+          "Decline failed.",
+        { isError: true },
+      );
+      setDecliningId(null);
+    }
+  }, [declineFetcher.data, declineFetcher.state, shopify]);
+
+  const openDeclineModal = (row) => {
+    if (!row?.id) return;
+    setPendingDeclineRow(row);
+    declineModalRef.current?.showOverlay?.();
   };
-  const closeModal = () => {
-    modalRef.current?.hideOverlay?.();
-    setDeclineTarget(null);
-  };
-  const confirmDecline = () => {
-    if (!declineTarget) return;
-    fetcher.submit(null, {
+  const closeDeclineModal = () => declineModalRef.current?.hideOverlay?.();
+  const onConfirmDecline = () => {
+    if (!pendingDeclineRow?.id) return;
+    const id = pendingDeclineRow.id;
+    closeDeclineModal();
+    setDecliningId(id);
+    declineFetcher.submit(null, {
       method: "POST",
-      action: `/api/admin/customers/${declineTarget.id}/decline`,
+      action: `/api/admin/customers/${id}/decline`,
     });
-    modalRef.current?.hideOverlay?.();
+    setPendingDeclineRow(null);
   };
 
   return (
@@ -195,16 +204,57 @@ export default function CustomersList() {
       <s-section padding="none">
         <s-box padding="base">
           <s-stack direction="block" gap="base">
-            <s-search-field
-              label="Search"
-              labelAccessibilityVisibility="exclusive"
-              placeholder="Search by name, email, phone, or business"
-              value={search}
-              onInput={(e) => {
-                setSearch(e?.currentTarget?.value ?? "");
-                flashFilterLoading();
-              }}
-            />
+            <s-grid gap="small-200" gridTemplateColumns="1fr auto">
+              <s-search-field
+                label="Search"
+                labelAccessibilityVisibility="exclusive"
+                placeholder="Search by name, email, phone, or business"
+                value={search}
+                onInput={(e) => {
+                  setSearch(e?.currentTarget?.value ?? "");
+                  flashFilterLoading();
+                }}
+              />
+              <s-button
+                icon="sort"
+                variant="secondary"
+                accessibilityLabel="Sort"
+                interestFor="sort-tooltip"
+                commandFor="sort-actions"
+              />
+              <s-tooltip id="sort-tooltip">
+                <s-text>Sort</s-text>
+              </s-tooltip>
+              <s-popover id="sort-actions">
+                <s-stack gap="none">
+                  <s-box padding="small">
+                    <s-stack direction="block" gap="small-200">
+                      <s-text variant="headingSm">Order</s-text>
+                      <s-stack direction="inline" gap="small-200">
+                        <s-clickable-chip
+                          color={sortOrder === "asc" ? "strong" : "base"}
+                          onClick={() => {
+                            setSortOrder("asc");
+                            flashFilterLoading();
+                          }}
+                        >
+                          Oldest first
+                        </s-clickable-chip>
+                        <s-clickable-chip
+                          color={sortOrder === "desc" ? "strong" : "base"}
+                          onClick={() => {
+                            setSortOrder("desc");
+                            flashFilterLoading();
+                          }}
+                        >
+                          Newest first
+                        </s-clickable-chip>
+                      </s-stack>
+                    </s-stack>
+                  </s-box>
+                </s-stack>
+              </s-popover>
+            </s-grid>
             <s-stack direction="inline" gap="small-200">
               {STATUS_FILTERS.map((f) => {
                 const active = statusFilter === f.id;
@@ -213,11 +263,13 @@ export default function CustomersList() {
                     ? rows.length
                     : f.id === "approved"
                       ? rows.filter(
-                          (r) => r.status === "approved" && !r.shopifyCreateFailed,
+                          (r) =>
+                            r.status === "approved" && !r.shopifyCreateFailed,
                         ).length
                       : f.id === "pending"
                         ? rows.filter(
-                            (r) => r.status !== "approved" && !r.shopifyCreateFailed,
+                            (r) =>
+                              r.status !== "approved" && !r.shopifyCreateFailed,
                           ).length
                         : rows.filter((r) => r.shopifyCreateFailed).length;
                 return (
@@ -260,7 +312,9 @@ export default function CustomersList() {
               <s-table-header>Phone</s-table-header>
               <s-table-header>Submitted</s-table-header>
               <s-table-header>Status</s-table-header>
-              <s-table-header><s-stack alignItems="center">Actions</s-stack></s-table-header>
+              <s-table-header>
+                <s-stack alignItems="center">Actions</s-stack>
+              </s-table-header>
             </s-table-header-row>
             <s-table-body>
               {filtered.map((r) => {
@@ -276,22 +330,31 @@ export default function CustomersList() {
                       <s-text>{fullName}</s-text>
                     </s-table-cell>
                     <s-table-cell>{r.email}</s-table-cell>
-                    <s-table-cell>{r.phone || "—"}</s-table-cell>
+                    <s-table-cell>{r.phone || "-"}</s-table-cell>
                     <s-table-cell>{submitted}</s-table-cell>
                     <s-table-cell>
                       {r.shopifyCreateFailed ? (
                         <s-badge tone="critical">Sync failed</s-badge>
                       ) : r.status === "approved" ? (
-                        <s-badge tone="success">Approved</s-badge>
+                        <s-badge tone="success">Reviewed</s-badge>
                       ) : (
-                        <s-badge>Pending</s-badge>
+                        <s-badge>Un-reviewed</s-badge>
                       )}
                     </s-table-cell>
                     <s-table-cell>
-                      <s-stack direction="inline" gap="tight" justifyContent="center" alignItems="center">
+                      <s-stack
+                        direction="inline"
+                        gap="small"
+                        justifyContent="center"
+                        alignItems="center"
+                      >
                         <s-button
-                          variant={r.status === "approved" ? "secondary" : "primary"}
-                          tone={r.status === "approved" ? "critical" : undefined}
+                          variant={
+                            r.status === "approved" ? "secondary" : "primary"
+                          }
+                          tone={
+                            r.status === "approved" ? "critical" : undefined
+                          }
                           icon={r.status === "approved" ? "undo" : "check"}
                           accessibilityLabel={
                             r.status === "approved"
@@ -308,15 +371,16 @@ export default function CustomersList() {
                           {r.status === "approved" ? "Revoke" : "Review"}
                         </s-button>
                         <s-button
-                          variant="tertiary"
+                          variant="secondary"
                           tone="critical"
                           icon="delete"
                           accessibilityLabel={`Decline ${fullName}`}
                           onClick={(e) => {
                             e.stopPropagation();
-                            openDeclineFor(r);
+                            openDeclineModal(r);
                           }}
-                        />
+                          {...(decliningId === r.id ? { loading: true } : {})}
+                        ></s-button>
                       </s-stack>
                     </s-table-cell>
                   </s-table-row>
@@ -328,29 +392,25 @@ export default function CustomersList() {
       </s-section>
 
       <s-modal
-        ref={modalRef}
+        ref={declineModalRef}
         id="decline-customer-modal"
-        heading={
-          declineTarget
-            ? `Decline ${declineTarget.firstName} ${declineTarget.lastName}?`
-            : "Decline customer?"
-        }
+        heading="Decline and delete this customer?"
         accessibilityLabel="Decline customer confirmation"
       >
         <s-paragraph>
-          This will remove the customer from Shopify, delete their record from the
-          database, and send them a rejection email. This cannot be undone.
+          This will remove the customer from Shopify, delete their record from
+          the database, and send them a rejection email. This cannot be undone.
         </s-paragraph>
         <s-button
           slot="primary-action"
           variant="primary"
           tone="critical"
-          onClick={confirmDecline}
-          {...(declining ? { loading: true } : {})}
+          onClick={onConfirmDecline}
+          {...(declineFetcher.state !== "idle" ? { loading: true } : {})}
         >
           Decline &amp; delete
         </s-button>
-        <s-button slot="secondary-actions" onClick={closeModal}>
+        <s-button slot="secondary-actions" onClick={closeDeclineModal}>
           Cancel
         </s-button>
       </s-modal>
@@ -358,60 +418,60 @@ export default function CustomersList() {
   );
 }
 
-function EmptyState({ rowsTotal, statusFilter, search, onClearSearch, onShowAll }) {
-  // Pick the right copy + action based on context.
-  let icon = "📭";
+function EmptyState({
+  rowsTotal,
+  statusFilter,
+  search,
+  onClearSearch,
+  onShowAll,
+}) {
   let heading = "No applications yet";
-  let body = "Once customers submit the wholesale form, their applications will show up here.";
+  let body =
+    "Once customers submit the wholesale form, their applications will show up here.";
   let actionLabel = null;
   let actionHandler = null;
 
   const hasSearch = (search || "").trim().length > 0;
 
   if (rowsTotal === 0) {
-    // Truly empty database.
-    icon = "📭";
     heading = "No applications yet";
     body =
       "Share the wholesale registration form with your customers. Their applications will appear here as they come in.";
   } else if (hasSearch) {
-    icon = "🔍";
     heading = "No matches";
     body = `No applications match "${search}". Try a different keyword or clear the search.`;
     actionLabel = "Clear search";
     actionHandler = onClearSearch;
   } else if (statusFilter === "approved") {
-    icon = "✅";
-    heading = "No approved applications";
+    heading = "No reviewed applications";
     body =
-      "Approved customers will appear here once you review and approve them.";
+      "Reviewed customers will appear here once you mark them as reviewed.";
     actionLabel = "Show all";
     actionHandler = onShowAll;
   } else if (statusFilter === "pending") {
-    icon = "📨";
-    heading = "No pending applications";
-    body =
-      "Pending applications waiting on your review will appear here.";
+    heading = "No un-reviewed applications";
+    body = "Un-reviewed applications waiting on your review will appear here.";
     actionLabel = "Show all";
     actionHandler = onShowAll;
   } else if (statusFilter === "sync-failed") {
-    icon = "🎉";
     heading = "No failed syncs";
     body =
       "Every application has successfully synced to Shopify. If any fail in the future, they'll show up here so you can retry them.";
     actionLabel = "Show all";
     actionHandler = onShowAll;
   } else {
-    // Fallback — shouldn't normally hit this branch.
-    icon = "📭";
     heading = "No applications match the current filters";
     body = "Try changing the filters or clearing the search.";
   }
 
   return (
     <s-box padding="large-500">
-      <s-stack direction="block" gap="base" alignItems="center" justifyContent="center">
-        <s-text>{icon}</s-text>
+      <s-stack
+        direction="block"
+        gap="base"
+        alignItems="center"
+        justifyContent="center"
+      >
         <s-heading>{heading}</s-heading>
         <s-paragraph tone="subdued">{body}</s-paragraph>
         {actionLabel && actionHandler && (

@@ -30,6 +30,7 @@ import {
   MUTATION_CUSTOMER_SEND_INVITE,
   MUTATION_CUSTOMER_UPDATE,
   MUTATION_CUSTOMER_DELETE,
+  MUTATION_ORDER_DELETE,
   MUTATION_STAGED_UPLOADS_CREATE,
   MUTATION_FILE_CREATE,
 } from './shopify.mutations'
@@ -298,6 +299,18 @@ export async function deleteCustomer(admin, customerId) {
     MUTATION_CUSTOMER_DELETE,
     { id: customerId },
     'customerDelete',
+  )
+  if (userErrors.length) throw new Error(userErrors.map((e) => e.message).join('; '))
+  return true
+}
+
+export async function deleteOrder(admin, shopifyOrderId) {
+  const orderGid = toOrderGid(shopifyOrderId)
+  const { userErrors } = await executeMutation(
+    admin,
+    MUTATION_ORDER_DELETE,
+    { orderId: orderGid },
+    'orderDelete',
   )
   if (userErrors.length) throw new Error(userErrors.map((e) => e.message).join('; '))
   return true
