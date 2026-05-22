@@ -8,6 +8,10 @@
 //   3. waitForClaimToComplete — internal helper for losing concurrent
 //      workers to wait for the winner's QBO call
 //
+// Plus a small helper:
+//   appendInvoiceRemark — atomic $push into Invoice.remarks[] for the
+//   Order List "Remarks" column.
+//
 // The actual NMI charge attempt lives in services/payment/payment.service.js.
 
 import Invoice from '../../models/invoice.server'
@@ -26,6 +30,7 @@ import {
   syncWithRetry,
   shopifyLinesToQboLines,
   computeInvoiceDueDate,
+  computeInvoiceDueAt,
   toYmd,
   computeProcessingFee,
   buildProcessingFeeLine,
@@ -104,9 +109,16 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
   // and let QBO compute it from its own defaults.
   const orderDateBasis = order?.created_at || localOrder?.receivedAt
   const dueDate = computeInvoiceDueDate(orderDateBasis, invoiceConfig.termsDays)
+  const dueAt = computeInvoiceDueAt(
+    orderDateBasis,
+    invoiceConfig.termsDays,
+    invoiceConfig.termsMinutes,
+  )
   console.log(
     `[invoice] dueDate = ${dueDate || '(QBO default)'} ` +
-      `(order date ${orderDateBasis || '(unknown)'} + ${invoiceConfig.termsDays} days)`,
+      `(order date ${orderDateBasis || '(unknown)'} + ${invoiceConfig.termsDays} days` +
+      (invoiceConfig.termsMinutes ? ` + ${invoiceConfig.termsMinutes} min` : '') +
+      `) dueAt = ${dueAt ? dueAt.toISOString() : '(none)'}`,
   )
   // Ship-to fields. Address uses the same shipping → billing → customer
   // default fallback as the customer sync (buildProfileFromShopifyOrder) so
@@ -148,6 +160,7 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
   invoice.qboSyncToken = qboInvoice.SyncToken
   invoice.qboDueDate = qboInvoice.DueDate || undefined
   invoice.qboTxnDate = qboInvoice.TxnDate || undefined
+  invoice.dueAt = dueAt || undefined
   invoice.amountDue = Number(qboInvoice.TotalAmt ?? invoice.amountDue)
   invoice.currency = qboInvoice.CurrencyRef?.value || invoice.currency
   invoice.qboCreationStatus = 'created'
@@ -392,6 +405,37 @@ export async function propagateSuccessfulPayment({ invoice, customerMap, amount,
   return { syncErrors }
 }
 
+// Atomic $push into Invoice.remarks[]. The remarks ledger powers the
+// Order List "Remarks" column — every CRON tick and admin settlement
+// action appends one entry so operators can see the follow-up trail
+// without opening the Order Details page. Distinct from PaymentAttempt
+// (strict charge audit) and manualPayments[] (cheque/ACH receipts);
+// this one is the operator-facing "what happened next" feed.
+//
+// `invoiceId` accepts either a Mongoose ObjectId or its string form.
+// `entry.kind` must match the Invoice schema's remarks enum.
+export async function appendInvoiceRemark(invoiceId, entry) {
+  if (!invoiceId) throw new Error('appendInvoiceRemark: invoiceId is required')
+  if (!entry?.kind || !entry?.message) {
+    throw new Error('appendInvoiceRemark: entry.kind and entry.message are required')
+  }
+  await Invoice.updateOne(
+    { _id: invoiceId },
+    {
+      $push: {
+        remarks: {
+          kind: entry.kind,
+          message: entry.message,
+          amount: entry.amount,
+          currency: entry.currency,
+          source: entry.source || 'system',
+          createdAt: entry.createdAt || new Date(),
+        },
+      },
+    },
+  )
+}
+
 // Record a manual (non-NMI) payment against an invoice — admin clicks
 // "Mark cheque paid" on the Order Details page. Appends a manualPayments
 // ledger entry + an audit PaymentAttempt row, mutates the invoice's
@@ -519,6 +563,19 @@ export async function recordManualPayment({
     customerMap,
     amount: amt,
     transactionId: paymentRef,
+  })
+
+  // Surface the receipt on the Order List "Remarks" column. Includes the
+  // admin email + reference so the audit trail is operator-readable
+  // without clicking into the Order Details page.
+  await appendInvoiceRemark(invoice._id, {
+    kind: 'admin_action',
+    message:
+      `Admin marked ${kind} payment received — ref ${ref} ($${amt.toFixed(2)})` +
+      (recordedBy ? ` by ${recordedBy}` : ''),
+    amount: amt,
+    currency: invoice.currency,
+    source: 'admin',
   })
 
   return { invoice, attempt, syncErrors }

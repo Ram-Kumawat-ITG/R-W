@@ -25,6 +25,13 @@ const invoiceSchema = new mongoose.Schema(
     // off-by-ones when rendered locally.
     qboDueDate: String,
     qboTxnDate: String,
+    // Full-datetime due timestamp — order date + termsDays + termsMinutes
+    // (see invoice.config.js). The local Order List "Overdue" indicator
+    // and cheque-reminder UI compare against this rather than qboDueDate
+    // so the INVOICE_TERMS_MINUTES testing knob can drive sub-day
+    // granularity. qboDueDate remains the canonical value sent to QBO
+    // (date-only, per QBO's DueDate field).
+    dueAt: Date,
 
     // Tracks the creation handshake so a crash mid-flight is recoverable:
     //   claimed  — Invoice row inserted, QBO call not yet attempted
@@ -115,6 +122,53 @@ const invoiceSchema = new mongoose.Schema(
             recordedBy: String,
             recordedAt: { type: Date, default: Date.now },
             note: String,
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+
+    // Append-only follow-up / remarks ledger surfaced on the Order List
+    // page's Remarks column. Each entry is a single CRON-tick or admin
+    // action's worth of activity. Distinct from PaymentAttempt (which
+    // is the strict charge-attempt audit log) — remarks include
+    // non-charge events too (cheque reminders, manual receipts,
+    // failed-payment follow-ups). PaymentAttempt is the source of
+    // truth for accounting; remarks[] is the source of truth for the
+    // operator-facing "what has the system been doing for this
+    // order" timeline.
+    //
+    // kinds:
+    //   cron_card_attempt    — PASS 1 CRON tried to charge a card
+    //   cron_cheque_reminder — PASS 1.5 CRON logged a reminder for a
+    //                          pending cheque / ACH invoice (no charge
+    //                          attempted — admins still need to act)
+    //   cron_failed_followup — PASS 1.5 CRON noted a failed card
+    //                          invoice that exhausted retries
+    //   admin_action         — admin-driven settlement event (retry,
+    //                          charge-card fallback, mark cheque paid)
+    //   system_note          — any other system-generated note
+    remarks: {
+      type: [
+        new mongoose.Schema(
+          {
+            kind: {
+              type: String,
+              enum: [
+                'cron_card_attempt',
+                'cron_cheque_reminder',
+                'cron_failed_followup',
+                'admin_action',
+                'system_note',
+              ],
+              required: true,
+            },
+            message: { type: String, required: true },
+            amount: Number,
+            currency: String,
+            source: { type: String, enum: ['cron', 'admin', 'system'], default: 'system' },
+            createdAt: { type: Date, default: Date.now },
           },
           { _id: false },
         ),

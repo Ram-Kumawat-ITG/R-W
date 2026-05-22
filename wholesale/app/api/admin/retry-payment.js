@@ -5,6 +5,7 @@ import ShopifyOrder from '../../models/order.server'
 import Invoice from '../../models/invoice.server'
 import CustomerMap from '../../models/customerMap.server'
 import { chargeInvoice } from '../../services/payment/payment.service'
+import { appendInvoiceRemark } from '../../services/invoice/invoice.service'
 import { sendResponse } from '../../services/APIService/api.service'
 
 // POST /api/admin/orders/:id/retry-payment
@@ -113,6 +114,9 @@ export async function action({ request, params }) {
     `[admin/retry-payment] manual retry by shop=${session.shop} order=${order.shopifyOrderId} invoice=${invoice._id}`,
   )
 
+  const initiatedBy =
+    session.onlineAccessInfo?.associated_user?.email || session.shop
+
   let result
   try {
     result = await chargeInvoice({ invoice, customerMap })
@@ -120,6 +124,28 @@ export async function action({ request, params }) {
     console.error('[admin/retry-payment] chargeInvoice threw:', e?.message || e)
     return sendResponse(500, 'error', e?.message || 'Charge failed', null)
   }
+
+  // Surface the retry outcome on the Order List "Remarks" column so
+  // admins see follow-up activity without opening the Order Details
+  // page. Failure-mode messages mirror what the CRON's PASS 1 writes
+  // so the same column reads consistently across origins.
+  let remarkMsg
+  if (result.skipped) {
+    remarkMsg = `Admin retry skipped: ${result.reason}`
+  } else if (result.outcome === 'approved') {
+    remarkMsg = `Admin retry approved (NMI txn ${result.transactionId || '?'})`
+  } else if (result.outcome === 'declined') {
+    remarkMsg = `Admin retry declined: ${result.responseText || 'no reason given'}`
+  } else {
+    remarkMsg = `Admin retry errored: ${result.error || result.responseText || 'unknown'}`
+  }
+  await appendInvoiceRemark(invoice._id, {
+    kind: 'admin_action',
+    message: `${remarkMsg} by ${initiatedBy}`,
+    amount: result.amount,
+    currency: invoice.currency,
+    source: 'admin',
+  })
 
   return sendResponse(200, 'success', 'Retry processed', result)
 }

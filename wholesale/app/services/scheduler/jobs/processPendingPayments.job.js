@@ -57,6 +57,36 @@ export function registerProcessPendingPaymentsJob(agenda) {
             : null
 
           const result = await chargeInvoice({ invoice, customerMap })
+          // Mirror the outcome into the remarks[] ledger — surfaces in
+          // the Order List "Remarks" column. We re-read the invoice
+          // because chargeInvoice mutates amountDue / fee state.
+          const after = await Invoice.findById(invoice._id).select('amountDue amountPaid currency')
+          const outstanding = after ? Number((after.amountDue - after.amountPaid).toFixed(2)) : null
+          let remarkMsg
+          if (result.skipped) {
+            remarkMsg = `CRON skipped: ${result.reason}`
+          } else if (result.outcome === 'approved') {
+            remarkMsg = `CRON charged successfully (NMI txn ${result.transactionId || '?'})`
+          } else if (result.outcome === 'declined') {
+            remarkMsg = `CRON charge declined: ${result.responseText || 'no reason given'}`
+          } else {
+            remarkMsg = `CRON charge errored: ${result.error || result.responseText || 'unknown'}`
+          }
+          await Invoice.updateOne(
+            { _id: invoice._id },
+            {
+              $push: {
+                remarks: {
+                  kind: 'cron_card_attempt',
+                  message: remarkMsg,
+                  amount: outstanding,
+                  currency: after?.currency || invoice.currency,
+                  source: 'cron',
+                  createdAt: new Date(),
+                },
+              },
+            },
+          )
           if (result.skipped) {
             skipped += 1
             console.log(`│     → SKIPPED reason="${result.reason}"`)
@@ -76,6 +106,46 @@ export function registerProcessPendingPaymentsJob(agenda) {
           console.error(err.stack || err)
           log.error('charge.unexpected', { invoiceId: invId, err })
         }
+      }
+
+      // PASS 1.5 — non-card pending invoices (cheque + ACH) and failed
+      // card invoices. CRON cannot auto-charge these, so we log a
+      // "reminder" remark each tick. Admins see the follow-up trail on
+      // the Order List "Remarks" column and can act manually (mark
+      // cheque paid / charge card on file). No customer-facing
+      // notifications are sent here — operator-visible log only.
+      const reminderCursor = Invoice.find({
+        $or: [
+          { paymentStatus: 'pending', paymentMethod: { $in: ['check', 'ach'] } },
+          { paymentStatus: 'failed' },
+        ],
+      }).cursor()
+      let remindersLogged = 0
+      for await (const invoice of reminderCursor) {
+        const outstanding = Number((invoice.amountDue - invoice.amountPaid).toFixed(2))
+        const isFailed = invoice.paymentStatus === 'failed'
+        const kind = isFailed ? 'cron_failed_followup' : 'cron_cheque_reminder'
+        const methodLabel = invoice.paymentMethod === 'ach' ? 'ACH' : 'Cheque'
+        const message = isFailed
+          ? `Failed payment follow-up — $${outstanding.toFixed(2)} outstanding after ${invoice.attemptCount} attempt(s)`
+          : `${methodLabel} payment reminder — $${outstanding.toFixed(2)} still outstanding`
+        await Invoice.updateOne(
+          { _id: invoice._id },
+          {
+            $push: {
+              remarks: {
+                kind,
+                message,
+                amount: outstanding,
+                currency: invoice.currency,
+                source: 'cron',
+                createdAt: new Date(),
+              },
+            },
+          },
+        )
+        remindersLogged += 1
+        console.log(`│ ⓘ reminder logged invoice=${invoice._id} "${message}"`)
       }
 
       // PASS 2 — invoices already paid in NMI but whose downstream sync
@@ -126,11 +196,13 @@ export function registerProcessPendingPaymentsJob(agenda) {
       console.log(
         `└─── tick ${tick} done in ${elapsedMs}ms — ` +
           `charges: processed=${processed} approved=${approved} declined=${declined} errored=${errored} skipped=${skipped}` +
+          ` | reminders: ${remindersLogged}` +
           ` | sync-retries: processed=${sweepProcessed} ok=${sweepOk} failed=${sweepFailed}\n`,
       )
       log.info('tick.complete', {
         tick, tickId, elapsedMs,
         processed, approved, declined, errored, skipped,
+        remindersLogged,
         sweepProcessed, sweepOk, sweepFailed,
       })
     },

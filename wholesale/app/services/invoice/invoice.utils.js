@@ -29,6 +29,23 @@ export function computeInvoiceDueDate(baseDate, termsDays) {
   return toYmd(d)
 }
 
+// Compute the full-datetime `dueAt` — order date + termsDays + termsMinutes.
+// Distinct from computeInvoiceDueDate which returns a date-only string for
+// QBO. Returns null on unparseable input. Used for the local Overdue
+// indicator + cheque-reminder gating; the testing knob
+// `INVOICE_TERMS_MINUTES` makes invoices flag as overdue within minutes
+// of creation without needing whole-day granularity.
+export function computeInvoiceDueAt(baseDate, termsDays, termsMinutes) {
+  if (baseDate == null) return null
+  const d = baseDate instanceof Date ? new Date(baseDate) : new Date(baseDate)
+  if (!Number.isFinite(d.getTime())) return null
+  const days = Number.isFinite(termsDays) ? Math.trunc(termsDays) : 0
+  const mins = Number.isFinite(termsMinutes) ? Math.trunc(termsMinutes) : 0
+  d.setDate(d.getDate() + days)
+  d.setMinutes(d.getMinutes() + mins)
+  return d
+}
+
 // Each downstream sync gets its own retry. Failures are isolated so one
 // dead system doesn't block the others. PermanentError bypasses retry.
 export async function syncWithRetry(label, fn) {

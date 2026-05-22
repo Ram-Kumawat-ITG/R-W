@@ -5,6 +5,7 @@ import ShopifyOrder from '../../models/order.server'
 import Invoice from '../../models/invoice.server'
 import CustomerMap from '../../models/customerMap.server'
 import { chargeInvoice } from '../../services/payment/payment.service'
+import { appendInvoiceRemark } from '../../services/invoice/invoice.service'
 import { sendResponse } from '../../services/APIService/api.service'
 
 // POST /api/admin/orders/:id/charge-card
@@ -90,6 +91,9 @@ export async function action({ request, params }) {
       `invoice=${invoice._id} originalMethod=${originalMethod} → charging card`,
   )
 
+  const initiatedBy =
+    session.onlineAccessInfo?.associated_user?.email || session.shop
+
   let result
   try {
     result = await chargeInvoice({ invoice, customerMap })
@@ -97,6 +101,27 @@ export async function action({ request, params }) {
     console.error('[admin/charge-card] chargeInvoice threw:', e?.message || e)
     return sendResponse(500, 'error', e?.message || 'Charge failed', null)
   }
+
+  // Log the cheque → card fallback attempt for the Order List "Remarks"
+  // column. Distinct from a normal retry — the originalMethod field
+  // makes the override traceable.
+  let remarkMsg
+  if (result.skipped) {
+    remarkMsg = `Charge card on file skipped: ${result.reason}`
+  } else if (result.outcome === 'approved') {
+    remarkMsg = `Charge card on file approved (NMI txn ${result.transactionId || '?'})`
+  } else if (result.outcome === 'declined') {
+    remarkMsg = `Charge card on file declined: ${result.responseText || 'no reason given'}`
+  } else {
+    remarkMsg = `Charge card on file errored: ${result.error || result.responseText || 'unknown'}`
+  }
+  await appendInvoiceRemark(invoice._id, {
+    kind: 'admin_action',
+    message: `${remarkMsg} (was ${originalMethod} → card) by ${initiatedBy}`,
+    amount: result.amount,
+    currency: invoice.currency,
+    source: 'admin',
+  })
 
   return sendResponse(200, 'success', 'Charge attempted', {
     ...result,

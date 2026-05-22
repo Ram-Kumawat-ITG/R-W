@@ -47,6 +47,12 @@ const STATUS_FILTERS = [
   { id: "sync-failed", label: "Sync failed" },
 ];
 
+// Records per page. Filtering and pagination both happen client-side
+// (the loader returns the full list), so we just slice the filtered
+// array. Matches the project's existing list-page pattern (Orders list
+// uses 25).
+const PAGE_SIZE = 15;
+
 export default function CustomersList() {
   const { rows } = useLoaderData();
   const navigate = useNavigate();
@@ -61,6 +67,7 @@ export default function CustomersList() {
   const [declineTarget, setDeclineTarget] = useState(null);
   const [filterPending, setFilterPending] = useState(false);
   const [reviewingId, setReviewingId] = useState(null);
+  const [page, setPage] = useState(1);
   const modalRef = useRef(null);
   const loadedToastShown = useRef(false);
   // Track which response payload we've already handled so React-Router's
@@ -93,6 +100,12 @@ export default function CustomersList() {
     fetcher.state !== "idle" ||
     reviewFetcher.state !== "idle";
 
+  // Whenever the filter inputs change, snap back to page 1 so the user
+  // isn't stranded on (e.g.) page 4 of an empty result set.
+  useEffect(() => {
+    setPage(1);
+  }, [search, statusFilter]);
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     return rows.filter((r) => {
@@ -118,6 +131,16 @@ export default function CustomersList() {
       return haystack.includes(q);
     });
   }, [rows, search, statusFilter]);
+
+  // Clamp page to the new max whenever filtered shrinks (e.g. after a
+  // decline that removed the last row on this page). useMemo + effect
+  // keeps the slice stable across renders.
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const currentPage = Math.min(page, totalPages);
+  const pageStart = (currentPage - 1) * PAGE_SIZE;
+  const visibleRows = filtered.slice(pageStart, pageStart + PAGE_SIZE);
+  const firstShown = filtered.length === 0 ? 0 : pageStart + 1;
+  const lastShown = pageStart + visibleRows.length;
 
   const declining = fetcher.state === "submitting" || fetcher.state === "loading";
 
@@ -263,7 +286,7 @@ export default function CustomersList() {
               <s-table-header><s-stack alignItems="center">Actions</s-stack></s-table-header>
             </s-table-header-row>
             <s-table-body>
-              {filtered.map((r) => {
+              {visibleRows.map((r) => {
                 const fullName =
                   `${r.firstName} ${r.lastName}`.trim() || "(no name)";
                 const submitted = r.submittedAt
@@ -324,6 +347,41 @@ export default function CustomersList() {
               })}
             </s-table-body>
           </s-table>
+        )}
+
+        {filtered.length > 0 && (
+          <s-box padding="base">
+            <s-stack
+              direction="inline"
+              gap="base"
+              alignItems="center"
+              justifyContent="space-between"
+            >
+              <s-text tone="subdued">
+                Showing {firstShown}–{lastShown} of {filtered.length}
+              </s-text>
+              <s-stack direction="inline" gap="small-200" alignItems="center">
+                <s-button
+                  variant="tertiary"
+                  disabled={currentPage <= 1}
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  icon="arrow-left"
+                >
+                  Previous
+                </s-button>
+                <s-text tone="subdued">
+                  Page {currentPage} of {totalPages}
+                </s-text>
+                <s-button
+                  variant="tertiary"
+                  disabled={currentPage >= totalPages}
+                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                >
+                  Next
+                </s-button>
+              </s-stack>
+            </s-stack>
+          </s-box>
         )}
       </s-section>
 

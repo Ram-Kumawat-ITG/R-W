@@ -32,6 +32,17 @@ import { PAYMENT_METHOD_LABEL } from "../utils/payment.constants";
 // guard server-side.
 const RETRYABLE_PAYMENT_STATUSES = new Set(["pending", "failed"]);
 
+// Human-readable label + Polaris badge tone for each Invoice.remarks[]
+// kind. Keep in lockstep with the enum in models/invoice.server.js so
+// the Remarks section never renders an unknown badge.
+const REMARK_KIND_META = {
+  cron_card_attempt: { label: "CRON charge", tone: "info" },
+  cron_cheque_reminder: { label: "Cheque reminder", tone: "warning" },
+  cron_failed_followup: { label: "Failed follow-up", tone: "critical" },
+  admin_action: { label: "Admin action", tone: "default" },
+  system_note: { label: "Note", tone: "default" },
+};
+
 // Status → Polaris badge tone for the pipeline strip at the top of the
 // page. "skipped" is rendered same as "pending" tonally; the difference
 // is semantic (no longer reachable on this run vs. not reached yet).
@@ -1340,6 +1351,69 @@ export default function OrderDetail() {
                     </s-table-cell>
                   </s-table-row>
                 ))}
+              </s-table-body>
+            </s-table>
+          )}
+        </s-section>
+      )}
+
+      {/* ───── Remarks (CRON + admin follow-up timeline) ───── */}
+      {invoice && (
+        <s-section heading={`Remarks (${invoice.remarks?.length || 0})`}>
+          {!invoice.remarks?.length ? (
+            <s-paragraph tone="subdued">
+              No remarks yet. CRON ticks and admin settlement actions
+              (retry, charge card, mark cheque/ACH paid) append entries
+              here automatically.
+            </s-paragraph>
+          ) : (
+            <s-table>
+              <s-table-header-row>
+                <s-table-header>When</s-table-header>
+                <s-table-header>Kind</s-table-header>
+                <s-table-header>Source</s-table-header>
+                <s-table-header>Message</s-table-header>
+                <s-table-header>Amount</s-table-header>
+              </s-table-header-row>
+              <s-table-body>
+                {/* Newest-first — remarks[] is append-only so the
+                    server-side order is chronological ascending. */}
+                {[...invoice.remarks].reverse().map((r, i) => {
+                  const meta = REMARK_KIND_META[r.kind] || {
+                    label: r.kind || "—",
+                    tone: "default",
+                  };
+                  return (
+                    <s-table-row key={`${r.createdAt || i}-${i}`}>
+                      <s-table-cell>
+                        {r.createdAt
+                          ? new Date(r.createdAt).toLocaleString()
+                          : "—"}
+                      </s-table-cell>
+                      <s-table-cell>
+                        <s-badge tone={meta.tone}>{meta.label}</s-badge>
+                      </s-table-cell>
+                      <s-table-cell>
+                        <s-text tone="subdued">
+                          {r.source === "admin"
+                            ? "Admin"
+                            : r.source === "cron"
+                              ? "CRON"
+                              : "System"}
+                        </s-text>
+                      </s-table-cell>
+                      <s-table-cell>{r.message || "—"}</s-table-cell>
+                      <s-table-cell>
+                        {r.amount != null
+                          ? formatAmount(
+                              r.amount,
+                              r.currency || invoice.currency,
+                            )
+                          : "—"}
+                      </s-table-cell>
+                    </s-table-row>
+                  );
+                })}
               </s-table-body>
             </s-table>
           )}

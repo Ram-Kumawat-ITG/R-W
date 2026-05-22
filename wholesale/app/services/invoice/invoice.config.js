@@ -13,6 +13,15 @@ export const invoiceConfig = {
   // INVOICE_TERMS_DAYS env var.
   termsDays: readInt('INVOICE_TERMS_DAYS', 15),
 
+  // Additional minutes added to the due date — primarily a TESTING aid
+  // so admins can watch the Overdue indicator + cheque reminders fire
+  // without waiting whole days. Drives the full-datetime `dueAt` field
+  // on the Invoice doc; QBO's `DueDate` (date-only) still uses
+  // `termsDays` rounded to the nearest day. Default 0 (no offset).
+  // Set INVOICE_TERMS_MINUTES=1 to make every new invoice flag as
+  // overdue ~1 minute after order creation.
+  termsMinutes: readInt('INVOICE_TERMS_MINUTES', 0),
+
   // Processing-fee rates by settlement method. Decimal (0.03 = 3%).
   // The fee is decided per-settlement, not per-preference: an invoice
   // settled via card carries the card rate even if the customer's

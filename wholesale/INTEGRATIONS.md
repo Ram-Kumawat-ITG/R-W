@@ -235,6 +235,14 @@ Design rules:
 │                          attemptCount < maxAttempts:                  │
 │     chargeInvoice → chargeCustomerVault                        │
 │     on approved: propagateSuccessfulPayment                           │
+│     always: push Invoice.remarks[] entry (cron_card_attempt)          │
+│                                                                       │
+│ PASS 1.5 — reminders for invoices CRON can't auto-charge              │
+│   for each Invoice where (pending && paymentMethod ∈ {check,ach})     │
+│                       OR paymentStatus='failed':                      │
+│     push Invoice.remarks[] entry (cron_cheque_reminder /              │
+│                                   cron_failed_followup)               │
+│     no charge / no customer notification                              │
 │                                                                       │
 │ PASS 2 — paid invoices with broken downstream sync                    │
 │   for each Invoice where paymentStatus='paid' and                     │
@@ -1375,6 +1383,7 @@ required values throw immediately.
 | `NMI_TEST_CVV` | (optional) | Dev test card CVV |
 | **Invoicing** | | |
 | `INVOICE_TERMS_DAYS` | `15` | Days from order date to invoice due date — sent as `DueDate` to QBO (overrides any customer-level SalesTerm) |
+| `INVOICE_TERMS_MINUTES` | `0` | Extra minutes added on top of `INVOICE_TERMS_DAYS` for the local full-datetime `Invoice.dueAt` field. **Testing knob** — set to `1` to flag invoices Overdue ~1 minute after creation without waiting whole days. The QBO date-only `DueDate` ignores this offset (it still rounds to `termsDays`); only the local Order List "Overdue" indicator + cheque-reminder UI uses `dueAt`. |
 | `INVOICE_FEE_RATE_CARD` | `0.03` | Per-method processing fee (decimal): card. Appended as a line at settlement when an NMI card charge approves or the cheque → card admin fallback runs. `0` disables. |
 | `INVOICE_FEE_RATE_ACH` | `0.01` | Per-method processing fee (decimal): ACH. Appended on `kind='ach'` manual receipts. `0` disables. |
 | `INVOICE_FEE_RATE_CHECK` | `0` | Per-method processing fee (decimal): cheque. Defaults to no fee. |
@@ -1409,7 +1418,7 @@ All in MongoDB, single database from `MONGODB_URI`.
 | `qbo_tokens` | `models/qboToken.server.js` | One row per realm — current access + refresh token |
 | `customer_maps` | `models/customerMap.server.js` | Shopify email ↔ QBO customer ↔ NMI vault; carries `paymentMethod` preference |
 | `shopify_orders` | `models/order.server.js` | Local mirror of every received Shopify order |
-| `invoices` | `models/invoice.server.js` | Local invoice mirror + sync state; carries `paymentMethod` (active, mutable), `customerPaymentPreference` (immutable order-time snapshot), `paymentSettledVia` + `paymentSettledAt` (recorded on each successful payment), `qboDueDate`, and `manualPayments[]` ledger |
+| `invoices` | `models/invoice.server.js` | Local invoice mirror + sync state; carries `paymentMethod` (active, mutable), `customerPaymentPreference` (immutable order-time snapshot), `paymentSettledVia` + `paymentSettledAt` (recorded on each successful payment), `qboDueDate`, `manualPayments[]` ledger, and `remarks[]` ledger (append-only CRON + admin follow-up entries — `kind` ∈ `cron_card_attempt` / `cron_cheque_reminder` / `cron_failed_followup` / `admin_action` / `system_note`; powers the Order List **Remarks** column) |
 | `payment_attempts` | `models/paymentAttempt.server.js` | Append-only charge ledger (NMI + manual cheque receipts as `outcome: 'manual_paid'`) |
 | `wholesale_applications` | `models/wholesaleApplication.server.js` | Wholesale signups (pre-existing) |
 
