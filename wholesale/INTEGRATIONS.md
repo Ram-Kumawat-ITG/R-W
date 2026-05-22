@@ -99,7 +99,7 @@ app/
 │   │   ├── qbo.service.js                #   Domain: findOrCreateCustomer, createInvoice, recordPayment
 │   │   ├── qbo.apis.js                   #   OAuth2 + retry + 401-refresh + Fault classification
 │   │   ├── qbo.config.js                 #   QBO_* env (clientId/secret/realmId/refreshToken/etc.)
-│   │   ├── qbo.utils.js                  #   escapeQboQuery, truncate, toCustomerPayload, toInvoiceLine
+│   │   ├── qbo.utils.js                  #   escapeQboQuery, truncate, toCustomerPayload, toInvoiceLine, toQboAddress
 │   │   └── qbo.constants.js              #   QBO_BASE_URLS, OAUTH_TOKEN_URL, ACCESS_TOKEN_SAFETY_MS
 │   │
 │   ├── nmi/                              # NMI gateway
@@ -581,7 +581,15 @@ POST /v3/company/{realmId}/invoice?minorversion=73
   "CurrencyRef": { "value": "USD" },
   "CustomerMemo": { "value": "Shopify order #1021" },
   "DocNumber": "1021",
-  "DueDate": "2026-06-05"
+  "DueDate": "2026-06-05",
+  "ShipDate": "2026-05-21",
+  "ShipAddr": {
+    "Line1": "123 Main St",
+    "City": "Austin",
+    "CountrySubDivisionCode": "TX",
+    "PostalCode": "78701",
+    "Country": "US"
+  }
 }
 ```
 
@@ -600,6 +608,82 @@ If both `order.created_at` and `localOrder.receivedAt` are unparseable,
 we omit `DueDate` from the request and QBO falls back to its own
 SalesTerm logic — last-resort safety so a missing date can't break
 invoice creation.
+
+`ShipAddr` is derived from the Shopify order using the same
+shipping → billing → customer-default fallback chain that the
+customer sync uses (`customer.utils.buildProfileFromShopifyOrder`),
+so the invoice still ships somewhere on pickup / digital orders that
+arrive without a `shipping_address`. The normalized address is
+projected to QBO's `PhysicalAddress` shape by `qbo.utils.toQboAddress`,
+which `BillAddr` on the customer payload also uses. If no address is
+on file at all, `ShipAddr` is omitted from the payload (QBO rejects
+empty address objects).
+
+`ShipDate` uses `order.created_at` (falling back to
+`localOrder.receivedAt`) formatted to `YYYY-MM-DD` via
+`invoice.utils.toYmd`. Shopify's `orders/create` webhook fires before
+fulfillment, so there's no real ship timestamp on the order yet — the
+order date is the closest meaningful "ship on or after" marker.
+Unparseable → omitted (QBO leaves the field blank on the rendered
+invoice).
+
+**Processing-fee line — applied at settlement, per actual method.**
+A `<Method> Processing Fee – <X>%` line is appended to the QBO invoice
+the moment a payment is processed. The fee is decided by the **actual
+settlement method**, not the customer's preference, and per-method
+rates are configurable:
+
+| Method  | Default rate | Env var |
+|---|---|---|
+| Credit card | `3%` | `INVOICE_FEE_RATE_CARD` |
+| ACH | `1%` | `INVOICE_FEE_RATE_ACH` |
+| Cheque | `0%` | `INVOICE_FEE_RATE_CHECK` |
+
+| Settlement path | Fee applied? |
+|---|---|
+| CRON auto-charge (card-preferred customer) | ✓ card rate |
+| Admin **Retry payment** (card-preferred) | ✓ card rate |
+| Admin **Charge card on file** (cheque → card fallback) | ✓ card rate |
+| Admin **Mark ACH paid** (`kind='ach'`) | ✓ ACH rate |
+| Admin **Mark cheque paid** (`kind='cheque'`) | ✗ (0% by default) |
+| Declined / errored card attempt | ✗ (only successful payments write the line) |
+
+**Mechanics.** Both `payment.service.chargeInvoice` (NMI) and
+`invoice.service.recordManualPayment` (admin receipts) follow the same
+pattern: compute `baseAmount = amountDue - amountPaid`, compute the fee
+via `invoice.utils.computeProcessingFee` against the active method, and
+stage the result locally (`invoice.processingFeeAmount`,
+`processingFeeRate`, `processingFeeMethod`). On approval / receipt the
+local `amountDue` is bumped to match `(base + fee)`.
+`propagateSuccessfulPayment` then runs **step 0** before
+`recordPayment`: GET the current QBO invoice, append the fee line via
+`qbo.service.appendInvoiceLines` (sparse update with the fresh
+SyncToken), and set `processingFeeAppliedAt`. Only after the line is
+on QBO does `recordPayment` fire — otherwise the recorded payment
+would exceed the invoice's `TotalAmt` and QBO would carry a customer
+credit. If the append fails, scheduler PASS 2 retries both steps
+(sweeps `paymentStatus: 'paid'` with `qboPaymentRecorded: false`).
+
+**ACH receipts.** Manual `kind='ach'` receipts inflate the expected
+amount by 1%. The admin is responsible for collecting the inflated
+total from the customer (they're charged a 1% ACH processing fee on
+the invoice, the same as the customer would see for a card payment).
+`recordManualPayment` validates the entered amount against the
+fee-inflated outstanding balance, then propagation appends the ACH
+fee line to QBO before recording the payment.
+
+**Preview / confirmation.** Before settling, admins can call
+`POST /api/admin/orders/:id/preview-payment` with `{ method }` to get
+the new total breakdown (`{ baseAmount, feeAmount, newTotal, ... }`)
+without modifying QBO or the local DB. The admin UI uses this to
+show "Original: $100. Card fee: $3. New total: $103." in the
+confirmation modal before the actual settle endpoint fires.
+
+**Idempotency.** Repeat runs are safe: a defensive
+`findExistingProcessingFeeLine` check on the QBO `Line` array detects
+when a prior run already wrote the line (matches any method's
+"Processing Fee" description), adopts the SyncToken, and proceeds to
+`recordPayment` without double-adding.
 
 ### 7.4 Payment recording
 
@@ -1291,6 +1375,9 @@ required values throw immediately.
 | `NMI_TEST_CVV` | (optional) | Dev test card CVV |
 | **Invoicing** | | |
 | `INVOICE_TERMS_DAYS` | `15` | Days from order date to invoice due date — sent as `DueDate` to QBO (overrides any customer-level SalesTerm) |
+| `INVOICE_FEE_RATE_CARD` | `0.03` | Per-method processing fee (decimal): card. Appended as a line at settlement when an NMI card charge approves or the cheque → card admin fallback runs. `0` disables. |
+| `INVOICE_FEE_RATE_ACH` | `0.01` | Per-method processing fee (decimal): ACH. Appended on `kind='ach'` manual receipts. `0` disables. |
+| `INVOICE_FEE_RATE_CHECK` | `0` | Per-method processing fee (decimal): cheque. Defaults to no fee. |
 | **Payments** | | |
 | `PAYMENT_CHARGE_IMMEDIATELY` | `false` | `true` = NMI charge in webhook process |
 | `PAYMENT_MAX_RETRY_ATTEMPTS` | `6` | Cap on NMI charge attempts per invoice |
@@ -1386,7 +1473,11 @@ POST /v3/company/{realmId}/invoice?minorversion=73
   "Line": [ { "DetailType": "SalesItemLineDetail", "Amount": 23.16,
               "SalesItemLineDetail": { "ItemRef": { "value": "1" },
                                        "Qty": 4, "UnitPrice": 5.79 } } ],
-  "DocNumber": "1021", "CustomerMemo": { "value": "Shopify order #1021" } }
+  "DocNumber": "1021", "CustomerMemo": { "value": "Shopify order #1021" },
+  "DueDate": "2026-06-05", "ShipDate": "2026-05-21",
+  "ShipAddr": { "Line1": "123 Main St", "City": "Austin",
+                "CountrySubDivisionCode": "TX", "PostalCode": "78701",
+                "Country": "US" } }
 
 → { "Invoice": { "Id": "175", "DocNumber": "1021", "TotalAmt": 23.16,
                  "SyncToken": "0", "CurrencyRef": { "value": "USD" } } }

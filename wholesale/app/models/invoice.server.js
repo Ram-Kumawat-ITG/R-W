@@ -133,6 +133,20 @@ const invoiceSchema = new mongoose.Schema(
     shopifyMarkedPaid: { type: Boolean, default: false },
     shopifyMarkedPaidAt: Date,
     lastSyncError: String,
+
+    // Processing-fee state — captures the per-method surcharge added to
+    // the invoice at settlement time (card=3%, ach=1%, check=0% by
+    // default). The fee is decided by the **actual settlement method**
+    // (paymentMethod at the moment of payment), not the customer's
+    // preference: a cheque-preferred customer who gets charged via the
+    // admin charge-card fallback lands here with method='card', so the
+    // 3% fee applies. processingFeeAmount > 0 with processingFeeAppliedAt
+    // == null means "fee owed but not yet on QBO" — propagateSuccessful-
+    // Payment retries the append on every run until it lands.
+    processingFeeAmount: Number,
+    processingFeeRate: Number,
+    processingFeeMethod: { type: String, enum: ['card', 'ach', 'check'] },
+    processingFeeAppliedAt: Date,
   },
   { collection: 'invoices', timestamps: true, strict: true },
 )

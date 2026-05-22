@@ -13,7 +13,12 @@
 import Invoice from '../../models/invoice.server'
 import ShopifyOrder from '../../models/order.server'
 import PaymentAttempt from '../../models/paymentAttempt.server'
-import { createInvoice as createQboInvoice, recordPayment as recordQboPayment } from '../qbo/qbo.service'
+import {
+  createInvoice as createQboInvoice,
+  recordPayment as recordQboPayment,
+  appendInvoiceLines as appendQboInvoiceLines,
+  getInvoice as getQboInvoice,
+} from '../qbo/qbo.service'
 import { markShopifyOrderPaid } from '../shopify/shopify.service'
 import { paymentConfig } from '../payment/payment.config'
 import { invoiceConfig } from './invoice.config'
@@ -21,7 +26,12 @@ import {
   syncWithRetry,
   shopifyLinesToQboLines,
   computeInvoiceDueDate,
+  toYmd,
+  computeProcessingFee,
+  buildProcessingFeeLine,
+  findExistingProcessingFeeLine,
 } from './invoice.utils'
+import { buildProfileFromShopifyOrder } from '../customer/customer.utils'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('invoice.service')
@@ -80,6 +90,12 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
 
   // Phase 2 — call QBO with the lock held.
   console.log(`[invoice] phase 2 — calling QBO createInvoice (we hold the claim)`)
+  // No processing-fee line at creation — the fee is appended at
+  // settlement time, with the rate selected by the actual settlement
+  // method (card / ach / check). This keeps the fee tied to the real
+  // method used to settle, including the cheque → card admin fallback
+  // and ACH receipts. See propagateSuccessfulPayment + recordManual-
+  // Payment for the append flow.
   const lines = shopifyLinesToQboLines(order)
   // Due date = order date + termsDays. Sending DueDate explicitly makes
   // us the source of truth and overrides any QBO customer-level
@@ -92,6 +108,16 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
     `[invoice] dueDate = ${dueDate || '(QBO default)'} ` +
       `(order date ${orderDateBasis || '(unknown)'} + ${invoiceConfig.termsDays} days)`,
   )
+  // Ship-to fields. Address uses the same shipping → billing → customer
+  // default fallback as the customer sync (buildProfileFromShopifyOrder) so
+  // the invoice still ships somewhere on pickup/digital orders with no
+  // shipping_address. ShipDate is the order date — Shopify's orders/create
+  // fires pre-fulfillment so we use created_at as the invoice's ship-on date.
+  const shipAddr = buildProfileFromShopifyOrder(order).shippingAddress
+  const shipDate = toYmd(orderDateBasis)
+  console.log(
+    `[invoice] shipDate = ${shipDate || '(none)'} shipAddr = ${shipAddr ? 'present' : '(none)'}`,
+  )
   let qboInvoice
   try {
     qboInvoice = await createQboInvoice({
@@ -101,6 +127,8 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
       memo: `Shopify order ${order.name || order.id}`,
       docNumber: order.name?.replace(/^#/, '') || shopifyOrderId,
       dueDate,
+      shipAddr,
+      shipDate,
     })
   } catch (qboErr) {
     // QBO call failed — mark the claim as failed so a re-run can
@@ -184,27 +212,105 @@ export async function propagateSuccessfulPayment({ invoice, customerMap, amount,
   )
   const syncErrors = []
 
+  // ── 0) QBO: append processing-fee line (if owed) ──────────────
+  //
+  // Runs BEFORE recordPayment because the recorded payment amount has
+  // to match the invoice's TotalAmt; without the fee line, QBO would
+  // see a $103 payment against a $100 invoice and create a customer
+  // credit. processingFeeAmount > 0 && !processingFeeAppliedAt means
+  // chargeInvoice / recordManualPayment staged the fee but QBO hasn't
+  // been told yet.
+  //
+  // If this step fails, we skip recordPayment too and surface the
+  // error — scheduler PASS 2 retries both on the next tick. Defensive
+  // idempotency via findExistingProcessingFeeLine handles the case
+  // where a prior run wrote the line but crashed before flipping the
+  // local flag.
+  const feePending = invoice.processingFeeAmount > 0 && !invoice.processingFeeAppliedAt
+  let feeReady = !feePending
+  if (feePending) {
+    try {
+      const updated = await syncWithRetry('qbo.append_processing_fee', async () => {
+        const current = await getQboInvoice(invoice.qboInvoiceId)
+        const existing = findExistingProcessingFeeLine(current?.Line)
+        if (existing) {
+          console.log(
+            `[sync] QBO   • fee line already on invoice (LineId=${existing.Id || '?'}) — adopting`,
+          )
+          return current
+        }
+        const line = buildProcessingFeeLine({
+          amount: invoice.processingFeeAmount,
+          rate: invoice.processingFeeRate,
+          method: invoice.processingFeeMethod,
+        })
+        if (!line) {
+          throw new Error('processing-fee line builder returned null — bad rate or amount')
+        }
+        return appendQboInvoiceLines({
+          qboInvoiceId: invoice.qboInvoiceId,
+          newLines: [line],
+        })
+      })
+      invoice.qboSyncToken = updated?.SyncToken || invoice.qboSyncToken
+      invoice.processingFeeAppliedAt = new Date()
+      feeReady = true
+      console.log(
+        `[sync] QBO   ✓ ${invoice.processingFeeMethod} fee $${invoice.processingFeeAmount.toFixed(2)} appended ` +
+          `(SyncToken=${invoice.qboSyncToken})`,
+      )
+      log.info('sync.qbo.fee_appended', {
+        invoiceId: invoice._id.toString(),
+        amount: invoice.processingFeeAmount,
+        rate: invoice.processingFeeRate,
+        method: invoice.processingFeeMethod,
+      })
+    } catch (feeErr) {
+      const msg = `QBO processing-fee append failed: ${feeErr.message}`
+      console.error(`[sync] QBO   ✗ ${msg}`)
+      log.error('sync.qbo.fee_failed', { invoiceId: invoice._id.toString(), err: feeErr })
+      syncErrors.push(msg)
+    }
+  } else if (invoice.processingFeeAppliedAt) {
+    console.log(
+      `[sync] QBO   • ${invoice.processingFeeMethod || 'processing'} fee already applied ` +
+        `at ${invoice.processingFeeAppliedAt.toISOString()}`,
+    )
+  }
+
   // ── 1) QBO: record payment against the invoice ────────────────
   if (!invoice.qboPaymentRecorded) {
-    try {
-      const qboPayment = await syncWithRetry('qbo.record_payment', () =>
-        recordQboPayment({
-          qboCustomerId: customerMap.qboCustomerId,
-          qboInvoiceId: invoice.qboInvoiceId,
-          amount,
-          currency: invoice.currency,
-          paymentRef: transactionId,
-        }),
-      )
-      invoice.qboPaymentRecorded = true
-      invoice.qboPaymentId = qboPayment?.Id
-      console.log(`[sync] QBO   ✓ payment recorded id=${qboPayment?.Id}`)
-      log.info('sync.qbo.recorded', { invoiceId: invoice._id.toString(), qboPaymentId: qboPayment?.Id })
-    } catch (qboErr) {
-      const msg = `QBO payment record failed after NMI success: ${qboErr.message}`
-      console.error(`[sync] QBO   ✗ ${msg}`)
-      log.error('sync.qbo.failed', { invoiceId: invoice._id.toString(), err: qboErr })
+    if (!feeReady) {
+      const msg =
+        'QBO recordPayment skipped — processing-fee line not yet on invoice; recording ' +
+        'payment now would leave the invoice out of balance'
+      console.warn(`[sync] QBO   ⤳ ${msg}`)
+      log.warn('sync.qbo.record_skipped', {
+        invoiceId: invoice._id.toString(),
+        reason: 'fee_pending',
+      })
       syncErrors.push(msg)
+    } else {
+      try {
+        const qboPayment = await syncWithRetry('qbo.record_payment', () =>
+          recordQboPayment({
+            qboCustomerId: customerMap.qboCustomerId,
+            qboInvoiceId: invoice.qboInvoiceId,
+            amount,
+            currency: invoice.currency,
+            paymentRef: transactionId,
+          }),
+        )
+        invoice.qboPaymentRecorded = true
+        invoice.qboPaymentId = qboPayment?.Id
+        console.log(`[sync] QBO   ✓ payment recorded id=${qboPayment?.Id}`)
+        log.info('sync.qbo.recorded', { invoiceId: invoice._id.toString(), qboPaymentId: qboPayment?.Id })
+      } catch (qboErr) {
+        const msg = `QBO payment record failed after NMI success: ${qboErr.message}`
+        console.error(`[sync] QBO   ✗ ${msg}`)
+        log.error('sync.qbo.failed', { invoiceId: invoice._id.toString(), err: qboErr })
+        syncErrors.push(msg)
+      }
     }
   } else {
     console.log(`[sync] QBO   • already recorded (id=${invoice.qboPaymentId})`)
@@ -315,7 +421,27 @@ export async function recordManualPayment({
   if (!reference || !String(reference).trim()) {
     throw new Error('Cheque reference is required')
   }
-  const outstanding = Number((invoice.amountDue - invoice.amountPaid).toFixed(2))
+
+  // Per-method processing fee. For manual ACH receipts (kind='ach'),
+  // the customer is expected to send (base + 1%) — the admin records
+  // the inflated amount, which equals the new outstanding once the fee
+  // line lands on QBO. For cheque receipts (kind='cheque'), no fee.
+  // The fee is applied at most once per invoice — once
+  // processingFeeAppliedAt is set, this call accepts the existing
+  // amountDue (already inflated) without re-adding.
+  const baseOutstanding = Number((invoice.amountDue - invoice.amountPaid).toFixed(2))
+  // kind='cheque' corresponds to the 'check' method in our config.
+  const feeMethod = kind === 'ach' ? 'ach' : 'check'
+  const feePreview =
+    !invoice.processingFeeAppliedAt &&
+    computeProcessingFee({
+      baseAmount: baseOutstanding,
+      method: feeMethod,
+      rates: invoiceConfig.processingFeeRates,
+    })
+  const feeAmount = feePreview ? feePreview.amount : 0
+  const outstanding = Number((baseOutstanding + feeAmount).toFixed(2))
+
   const amt = amount != null ? Number(amount) : outstanding
   if (!Number.isFinite(amt) || amt <= 0) {
     throw new Error('Amount must be a positive number')
@@ -330,13 +456,15 @@ export async function recordManualPayment({
 
   console.log(
     `[invoice] recordManualPayment kind=${kind} ref="${ref}" amount=$${amt.toFixed(2)} ` +
-      `invoice=${invoice._id} outstanding=$${outstanding.toFixed(2)}`,
+      `invoice=${invoice._id} base=$${baseOutstanding.toFixed(2)} fee=$${feeAmount.toFixed(2)} ` +
+      `outstanding=$${outstanding.toFixed(2)}`,
   )
   log.info('manual_payment.recording', {
     invoiceId: invoice._id.toString(),
     kind,
     reference: ref,
     amount: amt,
+    feeAmount,
     recordedBy,
   })
 
@@ -364,6 +492,15 @@ export async function recordManualPayment({
   invoice.attemptCount = attemptNumber
   invoice.lastAttemptAt = new Date()
   invoice.lastAttemptError = null
+  // Stage processing-fee state so propagateSuccessfulPayment appends
+  // the fee line to QBO before recording the payment. For cheque
+  // (0% fee), feePreview is null and this block is skipped.
+  if (feePreview) {
+    invoice.processingFeeAmount = feePreview.amount
+    invoice.processingFeeRate = feePreview.rate
+    invoice.processingFeeMethod = feePreview.method
+    invoice.amountDue = Number((invoice.amountDue + feeAmount).toFixed(2))
+  }
   invoice.amountPaid = Number((invoice.amountPaid + amt).toFixed(2))
   invoice.paidAt = invoice.paidAt || new Date()
   invoice.paymentStatus = invoice.amountPaid >= invoice.amountDue ? 'paid' : 'pending'

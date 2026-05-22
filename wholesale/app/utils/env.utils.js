@@ -22,6 +22,16 @@ export function readInt(key, fallback) {
   return n
 }
 
+export function readNumber(key, fallback) {
+  const raw = process.env[key]
+  if (raw === undefined || raw === '') return fallback
+  const n = Number(raw)
+  if (!Number.isFinite(n)) {
+    throw new Error(`Environment variable ${key} must be a number, got: ${raw}`)
+  }
+  return n
+}
+
 export function readBool(key, fallback = false) {
   const raw = process.env[key]
   if (raw === undefined || raw === '') return fallback

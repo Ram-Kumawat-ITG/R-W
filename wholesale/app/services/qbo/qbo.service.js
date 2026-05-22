@@ -5,7 +5,7 @@
 import { qbo, qboGetBinary } from './qbo.apis'
 import { qboConfig } from './qbo.config'
 import { QBO_APP_URLS } from './qbo.constants'
-import { escapeQboQuery, toCustomerPayload, toInvoiceLine } from './qbo.utils'
+import { escapeQboQuery, toCustomerPayload, toInvoiceLine, toQboAddress } from './qbo.utils'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('qbo.service')
@@ -48,12 +48,22 @@ export async function findOrCreateCustomer(profile) {
 
 // ── Invoice ──────────────────────────────────────────────────────────
 
-export async function createInvoice({ qboCustomerId, currency, lines, memo, dueDate, docNumber }) {
+export async function createInvoice({
+  qboCustomerId,
+  currency,
+  lines,
+  memo,
+  dueDate,
+  docNumber,
+  shipAddr,
+  shipDate,
+}) {
   if (!qboCustomerId) throw new Error('createInvoice: qboCustomerId is required')
   if (!Array.isArray(lines) || lines.length === 0) {
     throw new Error('createInvoice: at least one line is required')
   }
 
+  const shipAddrPayload = toQboAddress(shipAddr)
   const payload = {
     CustomerRef: { value: String(qboCustomerId) },
     Line: lines.map((l) => toInvoiceLine(l, qboConfig.defaultItemId)),
@@ -61,6 +71,8 @@ export async function createInvoice({ qboCustomerId, currency, lines, memo, dueD
     CustomerMemo: memo ? { value: memo } : undefined,
     DueDate: dueDate || undefined,
     DocNumber: docNumber || undefined,
+    ShipAddr: shipAddrPayload,
+    ShipDate: shipDate || undefined,
   }
 
   console.log(`\n[QBO invoice] creating for customer=${qboCustomerId} lines=${lines.length}`)
@@ -68,7 +80,16 @@ export async function createInvoice({ qboCustomerId, currency, lines, memo, dueD
   for (const line of lines) {
     console.log(`              - ${line.description} qty=${line.quantity} unit=${line.unitPrice} total=${line.amount}`)
   }
-  log.info('invoice.create.request', { qboCustomerId, lineCount: lines.length, docNumber })
+  console.log(
+    `[QBO invoice] shipAddr=${shipAddrPayload ? 'set' : '(none)'} shipDate=${shipDate || '(none)'}`,
+  )
+  log.info('invoice.create.request', {
+    qboCustomerId,
+    lineCount: lines.length,
+    docNumber,
+    hasShipAddr: Boolean(shipAddrPayload),
+    shipDate: shipDate || null,
+  })
 
   const res = await qbo.post('/invoice', payload)
   const created = res?.Invoice
@@ -86,6 +107,53 @@ export async function createInvoice({ qboCustomerId, currency, lines, memo, dueD
 export async function getInvoice(invoiceId) {
   const res = await qbo.get(`/invoice/${encodeURIComponent(invoiceId)}`)
   return res?.Invoice
+}
+
+// Append one or more lines to an existing QBO invoice. QBO replaces the
+// Line array wholesale on sparse updates that include it, so we GET the
+// current invoice, append our new lines to the existing array, and POST
+// the combined set back with the current SyncToken. Returns the updated
+// invoice (new SyncToken + new TotalAmt).
+//
+// Used at settlement time to append the per-method processing-fee line
+// when an NMI charge approves — see invoice.service.propagateSuccessful-
+// Payment. The fee is decided per-settlement so this update path is the
+// source of truth for fee application on the QBO ledger.
+export async function appendInvoiceLines({ qboInvoiceId, newLines }) {
+  if (!qboInvoiceId) throw new Error('appendInvoiceLines: qboInvoiceId is required')
+  if (!Array.isArray(newLines) || newLines.length === 0) {
+    throw new Error('appendInvoiceLines: at least one new line is required')
+  }
+  const current = await getInvoice(qboInvoiceId)
+  if (!current?.Id) {
+    throw new Error(`appendInvoiceLines: QBO invoice ${qboInvoiceId} not found`)
+  }
+  const existingLines = Array.isArray(current.Line) ? current.Line : []
+  const appended = newLines.map((l) => toInvoiceLine(l, qboConfig.defaultItemId))
+  const payload = {
+    Id: String(current.Id),
+    SyncToken: String(current.SyncToken),
+    sparse: true,
+    Line: [...existingLines, ...appended],
+  }
+  console.log(
+    `[QBO invoice] appending ${appended.length} line(s) to Id=${current.Id} ` +
+      `(was ${existingLines.length} lines, SyncToken=${current.SyncToken})`,
+  )
+  log.info('invoice.append_lines.request', {
+    qboInvoiceId,
+    existingCount: existingLines.length,
+    newCount: appended.length,
+    syncToken: current.SyncToken,
+  })
+  const res = await qbo.post('/invoice', payload)
+  const updated = res?.Invoice
+  if (!updated?.Id) throw new Error('QBO invoice update returned no Id')
+  console.log(
+    `[QBO invoice] APPENDED Id=${updated.Id} new TotalAmt=${updated.TotalAmt} ` +
+      `SyncToken=${updated.SyncToken}`,
+  )
+  return updated
 }
 
 // Deep link an admin can click to open the QBO invoice in the QuickBooks

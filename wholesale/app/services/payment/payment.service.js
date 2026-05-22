@@ -16,6 +16,8 @@ import Invoice from '../../models/invoice.server'
 import PaymentAttempt from '../../models/paymentAttempt.server'
 import { chargeCustomerVault } from '../nmi/nmi.service'
 import { propagateSuccessfulPayment } from '../invoice/invoice.service'
+import { invoiceConfig } from '../invoice/invoice.config'
+import { computeProcessingFee } from '../invoice/invoice.utils'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('payment.service')
@@ -58,7 +60,29 @@ export async function chargeInvoice({ invoice, customerMap }) {
   invoice.paymentStatus = 'in_progress'
   await invoice.save()
 
-  const amount = Number((invoice.amountDue - invoice.amountPaid).toFixed(2))
+  // Outstanding (base) — what's left to settle on the invoice before
+  // adding the per-method processing fee. The fee is decided by the
+  // ACTUAL settlement method on the invoice (not the customer's
+  // preference): a cheque-preferred customer who lands here via the
+  // admin charge-card fallback has invoice.paymentMethod === 'card'
+  // already, so the 3% card fee applies. The fee is added at most
+  // once per invoice — once processingFeeAppliedAt is set, retries
+  // use the already-applied amount and don't double-add.
+  const baseAmount = Number((invoice.amountDue - invoice.amountPaid).toFixed(2))
+  const feePreview =
+    !invoice.processingFeeAppliedAt &&
+    computeProcessingFee({
+      baseAmount,
+      method: invoice.paymentMethod,
+      rates: invoiceConfig.processingFeeRates,
+    })
+  const feeAmount = feePreview ? feePreview.amount : 0
+  const amount = Number((baseAmount + feeAmount).toFixed(2))
+  console.log(
+    `[payment] charging invoice=${invoice._id} method=${invoice.paymentMethod} ` +
+      `base=$${baseAmount.toFixed(2)} fee=$${feeAmount.toFixed(2)} total=$${amount.toFixed(2)}`,
+  )
+
   const attemptNumber = invoice.attemptCount + 1
   let result
   try {
@@ -109,6 +133,16 @@ export async function chargeInvoice({ invoice, customerMap }) {
   invoice.lastAttemptError = result.outcome === 'approved' ? null : result.responseText
 
   if (result.outcome === 'approved') {
+    // Stage processing-fee state locally — propagateSuccessfulPayment
+    // appends the fee line to QBO and sets processingFeeAppliedAt once
+    // QBO confirms. We bump amountDue here so the invoice math
+    // reconciles after the inflated NMI charge.
+    if (feePreview) {
+      invoice.processingFeeAmount = feePreview.amount
+      invoice.processingFeeRate = feePreview.rate
+      invoice.processingFeeMethod = feePreview.method
+      invoice.amountDue = Number((invoice.amountDue + feeAmount).toFixed(2))
+    }
     invoice.amountPaid = Number((invoice.amountPaid + amount).toFixed(2))
     invoice.paidAt = new Date()
     invoice.paymentStatus = invoice.amountPaid >= invoice.amountDue ? 'paid' : 'pending'
@@ -137,6 +171,9 @@ export async function chargeInvoice({ invoice, customerMap }) {
     outcome: result.outcome,
     transactionId: result.transactionId,
     responseText: result.responseText,
+    baseAmount,
+    feeAmount,
+    amount,
   }
 }
 

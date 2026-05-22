@@ -28,5 +28,6 @@ export default [
   route("/api/admin/orders/:id/retry-payment", "api/admin/retry-payment.js"),
   route("/api/admin/orders/:id/mark-cheque-paid", "api/admin/mark-cheque-paid.js"),
   route("/api/admin/orders/:id/charge-card", "api/admin/charge-card.js"),
+  route("/api/admin/orders/:id/preview-payment", "api/admin/preview-payment.js"),
   route("/api/admin/orders/:id/qbo-invoice-pdf", "api/admin/qbo-invoice-pdf.js"),
 ];

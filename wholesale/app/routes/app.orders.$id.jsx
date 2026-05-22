@@ -13,6 +13,8 @@ import Invoice from "../models/invoice.server";
 import PaymentAttempt from "../models/paymentAttempt.server";
 import CustomerMap from "../models/customerMap.server";
 import { getInvoice as getQboInvoice, getInvoiceWebUrl } from "../services/qbo/qbo.service";
+import { invoiceConfig } from "../services/invoice/invoice.config";
+import { computeProcessingFee, processingFeeLabel } from "../services/invoice/invoice.utils";
 import {
   KV,
   TotalsRow,
@@ -218,6 +220,11 @@ export const loader = async ({ request, params }) => {
     attempts: attempts.map(serialize),
     customerMap: customerMap ? serialize(customerMap) : null,
     breakdown,
+    // Processing-fee rates by settlement method. Surfaced to the client
+    // so confirmation modals (charge-card, mark-cheque-paid) can show the
+    // fee breakdown + new total before the admin commits. Matches the
+    // values that propagateSuccessfulPayment will append to QBO.
+    processingFeeRates: { ...invoiceConfig.processingFeeRates },
     qbo: {
       invoice: qboInvoice,
       error: qboInvoiceError,
@@ -346,7 +353,7 @@ function serialize(doc) {
 }
 
 export default function OrderDetail() {
-  const { order, invoice, attempts, customerMap, breakdown, qbo } =
+  const { order, invoice, attempts, customerMap, breakdown, qbo, processingFeeRates } =
     useLoaderData();
   const navigate = useNavigate();
   const shopify = useAppBridge();
@@ -386,6 +393,11 @@ export default function OrderDetail() {
   const paymentMethod = invoice?.paymentMethod || "card";
   const isCardInvoice = paymentMethod === "card";
   const isManualInvoice = paymentMethod === "check" || paymentMethod === "ach";
+  // "Mark cheque paid" is cheque-specific — ACH-preferred invoices have
+  // their own settlement path (record-ach-paid endpoint when needed) and
+  // shouldn't surface the cheque-receipt action. The cheque → card
+  // fallback ("Charge card on file") remains visible for both.
+  const isChequeInvoice = paymentMethod === "check";
   // Immutable preference snapshot taken when this invoice was created.
   // Reads ONLY from customerPaymentPreference — never falls back to
   // paymentMethod (which is mutable via cheque → card override). Legacy
@@ -407,7 +419,7 @@ export default function OrderDetail() {
     isCardInvoice &&
     statusAllowsAction &&
     !!customerMap?.nmiCustomerVaultId;
-  const canMarkChequePaid = isManualInvoice && statusAllowsAction;
+  const canMarkChequePaid = isChequeInvoice && statusAllowsAction;
   const canChargeCard =
     isManualInvoice &&
     statusAllowsAction &&
@@ -627,6 +639,25 @@ export default function OrderDetail() {
       ? Number((invoice.amountDue - invoice.amountPaid).toFixed(2))
       : null;
 
+  // Per-method fee preview for the confirmation modals. Mirrors the
+  // server's computeProcessingFee so the breakdown shown in-modal
+  // exactly matches what propagateSuccessfulPayment will append to QBO.
+  // Returns null when no fee applies (rate=0 or already-applied invoice).
+  const previewFee = (method) => {
+    if (outstanding == null || outstanding <= 0) return null;
+    if (invoice?.processingFeeAppliedAt) return null; // already on invoice
+    return computeProcessingFee({
+      baseAmount: outstanding,
+      method,
+      rates: processingFeeRates,
+    });
+  };
+  const cardFeePreview = previewFee("card");
+  const cardFeeTotal =
+    outstanding != null
+      ? Number(((outstanding ?? 0) + (cardFeePreview?.amount ?? 0)).toFixed(2))
+      : null;
+
   return (
     <s-page inlineSize="large" heading={`Order ${orderLabel}`}>
       <s-button
@@ -637,18 +668,21 @@ export default function OrderDetail() {
       >
         Back
       </s-button>
-      {invoice && isCardInvoice && (
-        <s-button
-          slot="primary-action"
-          variant="primary"
-          disabled={!canRetry}
-          onClick={() => modalRef.current?.showOverlay?.()}
-          {...(retrying ? { loading: true } : {})}
-        >
-          Retry payment
-        </s-button>
-      )}
-      {invoice && isManualInvoice && (
+      {invoice &&
+        isCardInvoice &&
+        invoice.paymentStatus !== "paid" &&
+        invoice.paymentStatus !== "cancelled" && (
+          <s-button
+            slot="primary-action"
+            variant="primary"
+            disabled={!canRetry}
+            onClick={() => modalRef.current?.showOverlay?.()}
+            {...(retrying ? { loading: true } : {})}
+          >
+            Retry payment
+          </s-button>
+        )}
+      {invoice && isChequeInvoice && (
         <s-button
           slot="primary-action"
           variant="primary"
@@ -1319,10 +1353,42 @@ export default function OrderDetail() {
         accessibilityLabel="Retry payment confirmation"
       >
         <s-paragraph>
-          This will charge the customer&apos;s NMI vault for the outstanding balance
-          of <strong>{formatAmount(outstanding ?? 0, invoice?.currency)}</strong>{" "}
-          right now. If the charge succeeds, the QBO invoice will be marked paid
-          and the Shopify order will be flagged paid as well.
+          This will charge the customer&apos;s NMI vault right now. If the
+          charge succeeds, the QBO invoice will be marked paid and the
+          Shopify order will be flagged paid as well.
+        </s-paragraph>
+        <s-paragraph>
+          <strong>Payment breakdown</strong>
+        </s-paragraph>
+        <s-paragraph>
+          Invoice balance:{" "}
+          <strong>{formatAmount(outstanding ?? 0, invoice?.currency)}</strong>
+          <br />
+          {cardFeePreview ? (
+            <>
+              {processingFeeLabel("card")} (
+              {+(cardFeePreview.rate * 100).toFixed(4)}
+              %):{" "}
+              <strong>
+                {formatAmount(cardFeePreview.amount, invoice?.currency)}
+              </strong>
+              <br />
+              <strong>
+                Total to charge:{" "}
+                {formatAmount(cardFeeTotal ?? 0, invoice?.currency)}
+              </strong>
+              <br />
+              <s-text tone="subdued" size="small">
+                The processing fee will be added as a separate line on the QBO
+                invoice once the charge is approved.
+              </s-text>
+            </>
+          ) : (
+            <strong>
+              Total to charge:{" "}
+              {formatAmount(outstanding ?? 0, invoice?.currency)}
+            </strong>
+          )}
         </s-paragraph>
         <s-button
           slot="primary-action"
@@ -1408,10 +1474,57 @@ export default function OrderDetail() {
           </strong>{" "}
           for this invoice, but no cheque was received. Charging the card on
           file now will switch this invoice&apos;s payment method to credit
-          card and attempt an NMI sale for{" "}
-          <strong>{formatAmount(outstanding ?? 0, invoice?.currency)}</strong>.
-          The customer&apos;s default preference will not change for future
-          orders.
+          card and attempt an NMI sale. The customer&apos;s default preference
+          will not change for future orders.
+        </s-paragraph>
+        <s-paragraph>
+          <strong>Payment breakdown</strong>
+        </s-paragraph>
+        <s-paragraph>
+          Invoice balance:{" "}
+          <strong>{formatAmount(outstanding ?? 0, invoice?.currency)}</strong>
+          <br />
+          {cardFeePreview ? (
+            <>
+              {processingFeeLabel("card")} (
+              {+(cardFeePreview.rate * 100).toFixed(4)}
+              %):{" "}
+              <strong>
+                {formatAmount(cardFeePreview.amount, invoice?.currency)}
+              </strong>
+              <br />
+              <strong>
+                Total to charge:{" "}
+                {formatAmount(cardFeeTotal ?? 0, invoice?.currency)}
+              </strong>
+              <br />
+              <s-text tone="subdued" size="small">
+                The processing fee will be added as a separate line on the QBO
+                invoice once the charge is approved.
+              </s-text>
+            </>
+          ) : (
+            <>
+              <strong>
+                Total to charge:{" "}
+                {formatAmount(outstanding ?? 0, invoice?.currency)}
+              </strong>
+              {invoice?.processingFeeAppliedAt ? (
+                <>
+                  <br />
+                  <s-text tone="subdued" size="small">
+                    A {invoice.processingFeeMethod || "processing"} fee of{" "}
+                    {formatAmount(
+                      invoice.processingFeeAmount || 0,
+                      invoice?.currency,
+                    )}{" "}
+                    is already on this invoice from a prior settlement
+                    attempt; no additional fee will be added.
+                  </s-text>
+                </>
+              ) : null}
+            </>
+          )}
         </s-paragraph>
         <s-button
           slot="primary-action"
