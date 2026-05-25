@@ -401,7 +401,10 @@ export default function OrdersList() {
                         : "—"}
                     </s-table-cell>
                     <s-table-cell>
-                      <ProcessingBadge status={r.processingStatus} />
+                      <ProcessingBadge
+                        status={r.processingStatus}
+                        paymentMethod={r.invoice?.paymentMethod}
+                      />
                     </s-table-cell>
                     <s-table-cell>
                       <PaymentBadge

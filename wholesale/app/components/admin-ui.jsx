@@ -60,9 +60,25 @@ const PROCESSING_TONE_MAP = {
   failed: { tone: "critical", label: "Failed" },
 };
 
+// "Scheduled" implies the CRON will auto-charge the card — true for
+// card invoices, misleading for cheque / ACH which are intentionally
+// skipped by the scheduler and held for an admin action on the Order
+// Details page. Swap the label so the Processing column reads
+// truthfully for non-card invoices.
+const MANUAL_SCHEDULED_LABEL = {
+  check: { tone: "warning", label: "Awaiting cheque" },
+  ach: { tone: "warning", label: "Awaiting ACH" },
+};
+
 // Renders a Shopify order's `processingStatus` — see `models/order.server.js`
-// for the canonical enum.
-export function ProcessingBadge({ status }) {
+// for the canonical enum. Pass `paymentMethod` (the linked invoice's
+// active method) so the `scheduled` state can swap its label for
+// cheque / ACH invoices, which are NOT actually scheduled for CRON.
+export function ProcessingBadge({ status, paymentMethod }) {
+  if (status === "scheduled" && MANUAL_SCHEDULED_LABEL[paymentMethod]) {
+    const m = MANUAL_SCHEDULED_LABEL[paymentMethod];
+    return <s-badge tone={m.tone}>{m.label}</s-badge>;
+  }
   const m =
     PROCESSING_TONE_MAP[status] || { tone: "default", label: status || "—" };
   return <s-badge tone={m.tone}>{m.label}</s-badge>;

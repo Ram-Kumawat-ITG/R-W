@@ -756,7 +756,10 @@ export default function OrderDetail() {
       <s-section heading="Overview">
         <s-stack direction="block" gap="base">
           <s-stack direction="inline" gap="base" alignItems="center">
-            <ProcessingBadge status={order.processingStatus} />
+            <ProcessingBadge
+              status={order.processingStatus}
+              paymentMethod={invoice?.paymentMethod}
+            />
             {order.rejectionCode && (
               <s-badge tone="critical">{order.rejectionCode}</s-badge>
             )}
