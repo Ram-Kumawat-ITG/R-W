@@ -182,20 +182,33 @@ export function findExistingProcessingFeeLine(qboLines) {
 // ad-hoc. Keeps the partial → paid transitions consistent.
 //
 // Priority (highest wins):
-//   1. failed / in_progress  — sticky operator-set / in-flight states
+//   1. `cancelled` — sticky. Only the orders/cancelled webhook (or a
+//       future admin cancel action) writes this; we never want a stray
+//       payment landing to undo a cancellation.
 //   2. payment-based:
 //        amountPaid == 0           → 'pending'
 //        amountPaid >= amountDue   → 'paid'
 //        otherwise                 → 'partially_paid'
 //
+// `in_progress` is NOT sticky. It is a transient lock written by
+// chargeInvoice ONLY for the duration of the NMI sale, and the very
+// next thing chargeInvoice does after the call returns is invoke this
+// derive — at which point the lock is being released, so we want the
+// amount-based status, not the lock state, to win.
+//
+// `failed` is NOT sticky either. If an invoice has exhausted retries
+// (failed) and then a manual payment arrives, the money is real and
+// the status should reflect that (partially_paid / paid). The CRON
+// PASS 1 cursor filters on `paymentStatus: 'pending'` and does NOT
+// pick up partially_paid invoices, so flipping out of `failed` won't
+// cause double-charges. The `Invoice.attemptCount >= maxAttempts`
+// guard still blocks any further auto-retry on the card side.
+//
 // Use 0.005 tolerance so 2-dp rounded floats (e.g. 100.00 vs 100.01)
 // don't accidentally flip "paid" to "partially_paid".
 export function deriveInvoicePaymentStatus(invoice) {
   if (!invoice) return 'pending'
-  const sticky = invoice.paymentStatus
-  if (sticky === 'failed' || sticky === 'in_progress') {
-    return sticky
-  }
+  if (invoice.paymentStatus === 'cancelled') return 'cancelled'
   const due = Number(invoice.amountDue || 0)
   const paid = Number(invoice.amountPaid || 0)
   const EPS = 0.005

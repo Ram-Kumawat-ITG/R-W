@@ -443,9 +443,94 @@ export default function OrderDetail() {
   // invoices missing the snapshot get backfilled at boot from
   // CustomerMap, so this should be set for every real invoice.
   const orderTimePreference = invoice?.customerPaymentPreference || null;
+
+  // Unified payment-history rows for the Invoice & payment section.
+  // Merges PaymentAttempt rows where the money actually landed (outcome
+  // ∈ {approved, manual_paid}) into a single chronological timeline so
+  // the admin sees the full picture in one place — partial cheque +
+  // partial card + NMI ACH all together, not split across two boxes.
+  //
+  // Row shape per entry:
+  //   method      — 'check' | 'ach' | 'card' (best-effort; card is the
+  //                 default for approved NMI attempts since 99% of NMI
+  //                 charges in this app are card)
+  //   source      — 'nmi' | 'manual' (drives the reference label)
+  //   amount, currency, when (Date), reference, response, by
+  const paymentHistoryRows = (() => {
+    if (!Array.isArray(attempts) || attempts.length === 0) return [];
+    const rows = [];
+    for (const a of attempts) {
+      if (a.outcome !== "approved" && a.outcome !== "manual_paid") continue;
+      const when = a.attemptedAt ? new Date(a.attemptedAt) : null;
+      if (a.outcome === "approved") {
+        rows.push({
+          key: `nmi-${a._id}`,
+          source: "nmi",
+          method: invoice?.paymentMethod === "ach" ? "ach" : "card",
+          amount: a.amount,
+          currency: a.currency || invoice?.currency,
+          when,
+          reference: a.nmiTransactionId || null,
+          response: a.nmiResponseText || null,
+          authCode: a.nmiAuthCode || null,
+          attemptNumber: a.attemptNumber ?? null,
+        });
+      } else {
+        // manual_paid — find the matching manualPayments[] entry by
+        // amount + timestamp (within 60s) to recover the cheque/ACH
+        // reference and kind. Falls back to parsing the response text
+        // ("Manual cheque payment — ref 65") when no match.
+        const mp = (invoice?.manualPayments || []).find((m) => {
+          if (Number(m.amount).toFixed(2) !== Number(a.amount).toFixed(2)) {
+            return false;
+          }
+          if (!m.recordedAt || !when) return true;
+          return Math.abs(new Date(m.recordedAt) - when) < 60_000;
+        });
+        const textKindMatch = /Manual\s+(cheque|ach)\s+payment/i.exec(
+          a.nmiResponseText || "",
+        );
+        const textRefMatch = /ref\s+([^\s—)]+)/i.exec(a.nmiResponseText || "");
+        const rawKind = (mp?.kind || textKindMatch?.[1] || "cheque").toLowerCase();
+        rows.push({
+          key: `manual-${a._id}`,
+          source: "manual",
+          // canonical Invoice enum value is 'check'; 'cheque' is the
+          // manualPayments display label
+          method: rawKind === "ach" ? "ach" : "check",
+          amount: a.amount,
+          currency: a.currency || mp?.currency || invoice?.currency,
+          when: when || (mp?.recordedAt ? new Date(mp.recordedAt) : null),
+          reference: mp?.reference || textRefMatch?.[1] || null,
+          response: mp?.note || a.nmiResponseText || null,
+          authCode: null,
+          attemptNumber: a.attemptNumber ?? null,
+        });
+      }
+    }
+    rows.sort((x, y) => {
+      const tx = x.when ? x.when.getTime() : 0;
+      const ty = y.when ? y.when.getTime() : 0;
+      return tx - ty;
+    });
+    return rows;
+  })();
+  const totalReceived = paymentHistoryRows.reduce(
+    (sum, r) => sum + Number(r.amount || 0),
+    0,
+  );
+  // Distinct settlement methods used across the invoice's payment
+  // history. Drives the "Settled via" KV when multiple methods
+  // contributed (e.g. partial cheque + final card).
+  const settledMethods = Array.from(
+    new Set(paymentHistoryRows.map((r) => r.method).filter(Boolean)),
+  );
   // Method that actually settled the invoice. For paid invoices, prefer
   // the explicit paymentSettledVia; legacy paid invoices fall back to
   // paymentMethod (which is correct since the override hadn't existed).
+  // When multiple methods contributed, settledMethods carries the
+  // full list — the KV renders all of them so the admin sees the
+  // breakdown at a glance.
   const settledVia =
     invoice?.paymentStatus === "paid"
       ? invoice?.paymentSettledVia || invoice?.paymentMethod || null
@@ -1013,11 +1098,18 @@ export default function OrderDetail() {
                 <KV
                   label="Settled via"
                   value={
-                    settledVia
-                      ? PAYMENT_METHOD_LABEL[settledVia] || settledVia
-                      : invoice.paymentStatus === "cancelled"
-                        ? "—"
-                        : "(not yet settled)"
+                    settledMethods.length > 1
+                      ? settledMethods
+                          .map((m) => PAYMENT_METHOD_LABEL[m] || m)
+                          .join(" + ")
+                      : settledVia
+                        ? PAYMENT_METHOD_LABEL[settledVia] || settledVia
+                        : settledMethods.length === 1
+                          ? PAYMENT_METHOD_LABEL[settledMethods[0]] ||
+                            settledMethods[0]
+                          : invoice.paymentStatus === "cancelled"
+                            ? "—"
+                            : "(not yet settled)"
                   }
                 />
               </s-grid-item>
@@ -1147,7 +1239,7 @@ export default function OrderDetail() {
                 </s-banner>
               )}
 
-            {invoice.manualPayments?.length > 0 && (
+            {paymentHistoryRows.length > 0 && (
               <s-box
                 padding="base"
                 border="base"
@@ -1155,18 +1247,88 @@ export default function OrderDetail() {
                 background="subdued"
               >
                 <s-stack direction="block" gap="tight">
-                  <s-text>
-                    <strong>Manual payments recorded</strong>
-                  </s-text>
-                  {invoice.manualPayments.map((mp, i) => (
-                    <s-text key={`${mp.reference}-${i}`} tone="subdued">
-                      {`${(mp.kind || "cheque").toUpperCase()} ref ${mp.reference} — ${formatAmount(mp.amount, mp.currency || invoice.currency)}${
-                        mp.receivedAt
-                          ? ` · received ${new Date(mp.receivedAt).toLocaleDateString()}`
-                          : ""
-                      }${mp.note ? ` · ${mp.note}` : ""}`}
+                  <s-stack
+                    direction="inline"
+                    gap="base"
+                    alignItems="center"
+                    justifyContent="space-between"
+                  >
+                    <s-text>
+                      <strong>
+                        Payment history ({paymentHistoryRows.length})
+                      </strong>
                     </s-text>
-                  ))}
+                    <s-text tone="subdued">
+                      Total received:{" "}
+                      <strong>
+                        {formatAmount(totalReceived, invoice.currency)}
+                      </strong>
+                      {" "}of{" "}
+                      {formatAmount(invoice.amountDue, invoice.currency)}
+                    </s-text>
+                  </s-stack>
+                  <s-table>
+                    <s-table-header-row>
+                      <s-table-header>#</s-table-header>
+                      <s-table-header>Method</s-table-header>
+                      <s-table-header>Amount</s-table-header>
+                      <s-table-header>Reference</s-table-header>
+                      <s-table-header>When</s-table-header>
+                      <s-table-header>Notes</s-table-header>
+                    </s-table-header-row>
+                    <s-table-body>
+                      {paymentHistoryRows.map((row, idx) => (
+                        <s-table-row key={row.key}>
+                          <s-table-cell>{idx + 1}</s-table-cell>
+                          <s-table-cell>
+                            <s-stack direction="block" gap="none">
+                              <PaymentMethodBadge method={row.method} />
+                              <s-text tone="subdued">
+                                {row.source === "nmi"
+                                  ? "NMI charge"
+                                  : row.method === "ach"
+                                    ? "Manual ACH"
+                                    : "Manual cheque"}
+                              </s-text>
+                            </s-stack>
+                          </s-table-cell>
+                          <s-table-cell>
+                            {formatAmount(row.amount, row.currency)}
+                          </s-table-cell>
+                          <s-table-cell>
+                            {row.reference ? (
+                              <s-stack direction="block" gap="none">
+                                <s-text>
+                                  {row.source === "nmi"
+                                    ? `NMI txn ${row.reference}`
+                                    : `Ref ${row.reference}`}
+                                </s-text>
+                                {row.authCode && (
+                                  <s-text tone="subdued">
+                                    Auth {row.authCode}
+                                  </s-text>
+                                )}
+                              </s-stack>
+                            ) : (
+                              <s-text tone="subdued">—</s-text>
+                            )}
+                          </s-table-cell>
+                          <s-table-cell>
+                            {row.when
+                              ? new Date(row.when).toLocaleString()
+                              : "—"}
+                          </s-table-cell>
+                          <s-table-cell>
+                            {row.response ? (
+                              <s-text>{row.response}</s-text>
+                            ) : (
+                              <s-text tone="subdued">—</s-text>
+                            )}
+                          </s-table-cell>
+                        </s-table-row>
+                      ))}
+                    </s-table-body>
+                  </s-table>
                 </s-stack>
               </s-box>
             )}

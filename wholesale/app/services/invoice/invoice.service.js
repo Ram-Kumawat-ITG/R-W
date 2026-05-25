@@ -229,6 +229,30 @@ export async function propagateSuccessfulPayment({ invoice, customerMap, transac
   )
   const syncErrors = []
 
+  // Self-heal stale paymentStatus before doing any downstream work.
+  // `chargeInvoice` writes `paymentStatus='in_progress'` as a transient
+  // lock and relies on the post-charge derive to release it; if a
+  // previous run ever left an invoice stuck at `in_progress` (e.g. a
+  // crash mid-charge before the final save, or a now-fixed sticky-
+  // derive bug), this re-derivation reconciles the status with the
+  // actual money fields so the rest of this function (and the local
+  // mirror update at the bottom) see the correct state.
+  const priorStatus = invoice.paymentStatus
+  const derivedStatus = applyDerivedPaymentStatus(invoice)
+  if (priorStatus !== derivedStatus) {
+    console.log(
+      `[sync]   status self-heal: ${priorStatus} → ${derivedStatus} ` +
+        `(amountPaid=$${(invoice.amountPaid || 0).toFixed(2)} of $${(invoice.amountDue || 0).toFixed(2)})`,
+    )
+    log.info('status.self_heal', {
+      invoiceId: invoice._id.toString(),
+      from: priorStatus,
+      to: derivedStatus,
+      amountPaid: invoice.amountPaid,
+      amountDue: invoice.amountDue,
+    })
+  }
+
   // ── 0) QBO: append processing-fee line (if owed) ──────────────
   //
   // Runs BEFORE recordPayment because the recorded payment amount has

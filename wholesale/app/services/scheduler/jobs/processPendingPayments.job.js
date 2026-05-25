@@ -158,11 +158,24 @@ export function registerProcessPendingPaymentsJob(agenda) {
       // also belongs here. We use $expr to compare numeric fields, then
       // OR with the legacy boolean flags (covers pre-cumulative invoices
       // that don't have qboRecordedTotal/shopifyRecordedTotal populated).
+      //
+      // We also sweep `in_progress` rows. That status is the transient
+      // lock chargeInvoice writes around its NMI call — if anything
+      // ever leaves an invoice stuck there (a crash between the
+      // approval and the final save, or a now-fixed sticky-derive
+      // bug that prevented release of the lock), propagate's
+      // self-heal at the top will re-derive the status from the
+      // money fields and fix it. The benign concurrent-charge race
+      // (CRON sweep firing while a real chargeInvoice is mid-NMI)
+      // doesn't post duplicates: propagate's diff-against-cumulative
+      // sync skips work that's already done, and chargeInvoice's
+      // own save() runs after this loop completes.
       const sweepFilter = {
-        paymentStatus: { $in: ['paid', 'partially_paid', 'partially_refunded'] },
+        paymentStatus: { $in: ['paid', 'partially_paid', 'partially_refunded', 'in_progress'] },
         $or: [
           { qboPaymentRecorded: false },
           { shopifyMarkedPaid: false, paymentStatus: 'paid' },
+          { paymentStatus: 'in_progress' },
           {
             $expr: {
               $gt: [
