@@ -176,6 +176,45 @@ export function findExistingProcessingFeeLine(qboLines) {
   )
 }
 
+// Derive the canonical paymentStatus from the invoice's money fields.
+// Single source of truth — every service that mutates `amountPaid` MUST
+// run the result through this rather than setting `paymentStatus`
+// ad-hoc. Keeps the partial → paid transitions consistent.
+//
+// Priority (highest wins):
+//   1. failed / in_progress  — sticky operator-set / in-flight states
+//   2. payment-based:
+//        amountPaid == 0           → 'pending'
+//        amountPaid >= amountDue   → 'paid'
+//        otherwise                 → 'partially_paid'
+//
+// Use 0.005 tolerance so 2-dp rounded floats (e.g. 100.00 vs 100.01)
+// don't accidentally flip "paid" to "partially_paid".
+export function deriveInvoicePaymentStatus(invoice) {
+  if (!invoice) return 'pending'
+  const sticky = invoice.paymentStatus
+  if (sticky === 'failed' || sticky === 'in_progress') {
+    return sticky
+  }
+  const due = Number(invoice.amountDue || 0)
+  const paid = Number(invoice.amountPaid || 0)
+  const EPS = 0.005
+
+  if (paid <= EPS) return 'pending'
+  if (paid + EPS >= due) return 'paid'
+  return 'partially_paid'
+}
+
+// Apply the derived status to an Invoice document IN-PLACE. Returns the
+// status that was set so callers can log it cleanly. Does NOT save —
+// callers run save() at the end of their transaction.
+export function applyDerivedPaymentStatus(invoice) {
+  if (!invoice) return null
+  const next = deriveInvoicePaymentStatus(invoice)
+  invoice.paymentStatus = next
+  return next
+}
+
 // Compose the QBO invoice line description from a Shopify line_item.
 // Format: "<product name> by <vendor>, SKU: <sku>" — vendor and SKU are
 // each conditional so missing fields don't leave dangling separators.

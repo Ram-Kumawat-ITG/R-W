@@ -175,6 +175,60 @@ export async function getInvoicePdf(invoiceId) {
   })
 }
 
+// Void a QBO invoice. Void (vs delete) keeps the document on QBO's
+// ledger for audit but zeros out the amount and removes the line items'
+// effect on inventory / income. Used by the orders/cancelled webhook
+// when the cancelled Shopify order has a corresponding QBO invoice
+// that has not yet received any payments.
+//
+// QBO endpoint: POST /v3/company/{realmId}/invoice?operation=void
+// Body must include Id + current SyncToken. We GET the latest invoice
+// first to grab the SyncToken so concurrent updates don't trip a
+// stale-write error.
+//
+// Returns the updated QBO invoice. Throws if the invoice has linked
+// payments (callers should check `LinkedTxn` first; the orders/cancelled
+// flow gates on local `amountPaid === 0` before calling).
+export async function voidInvoice(qboInvoiceId) {
+  if (!qboInvoiceId) throw new Error('voidInvoice: qboInvoiceId is required')
+
+  const current = await getInvoice(qboInvoiceId)
+  if (!current?.Id) {
+    throw new Error(`voidInvoice: QBO invoice ${qboInvoiceId} not found`)
+  }
+
+  const payload = {
+    Id: String(current.Id),
+    SyncToken: String(current.SyncToken),
+  }
+
+  console.log(
+    `\n[QBO void] voiding invoice Id=${current.Id} DocNumber=${current.DocNumber} ` +
+      `currentBalance=${current.Balance} SyncToken=${current.SyncToken}`,
+  )
+  log.info('invoice.void.request', {
+    qboInvoiceId,
+    docNumber: current.DocNumber,
+    syncToken: current.SyncToken,
+  })
+
+  const res = await qbo.post('/invoice?operation=void', payload)
+  const voided = res?.Invoice
+  if (!voided?.Id) {
+    throw new Error('QBO invoice void returned no Id')
+  }
+  console.log(
+    `[QBO void] VOIDED Id=${voided.Id} new SyncToken=${voided.SyncToken} ` +
+      `TotalAmt=${voided.TotalAmt} Balance=${voided.Balance}`,
+  )
+  log.info('invoice.void.success', {
+    qboInvoiceId: voided.Id,
+    docNumber: voided.DocNumber,
+    syncToken: voided.SyncToken,
+  })
+  return voided
+}
+
 // ── Payment ──────────────────────────────────────────────────────────
 
 // Record a payment against a QBO invoice. Called after a successful NMI

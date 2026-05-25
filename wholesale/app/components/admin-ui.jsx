@@ -58,6 +58,7 @@ const PROCESSING_TONE_MAP = {
   scheduled: { tone: "info", label: "Scheduled" },
   completed: { tone: "success", label: "Completed" },
   failed: { tone: "critical", label: "Failed" },
+  cancelled: { tone: "default", label: "Cancelled" },
 };
 
 // "Scheduled" implies the CRON will auto-charge the card — true for
@@ -87,6 +88,7 @@ export function ProcessingBadge({ status, paymentMethod }) {
 const PAYMENT_STATUS_TONE_MAP = {
   pending: { tone: "warning", label: "Pending" },
   in_progress: { tone: "info", label: "In progress" },
+  partially_paid: { tone: "info", label: "Partially paid" },
   paid: { tone: "success", label: "Paid" },
   failed: { tone: "critical", label: "Failed" },
   cancelled: { tone: "default", label: "Cancelled" },

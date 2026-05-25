@@ -148,12 +148,43 @@ export function registerProcessPendingPaymentsJob(agenda) {
         console.log(`│ ⓘ reminder logged invoice=${invoice._id} "${message}"`)
       }
 
-      // PASS 2 — invoices already paid in NMI but whose downstream sync
-      // (QBO recordPayment or Shopify orderMarkAsPaid) failed previously.
-      // Replays just the sync side; never re-charges NMI.
+      // PASS 2 — invoices that have money paid but downstream sync
+      // (QBO recordPayment, Shopify SALE transaction, or Shopify
+      // orderMarkAsPaid) is behind. Replays just the sync side; never
+      // re-charges NMI.
+      //
+      // The filter covers partial-payment cases too: a partially_paid
+      // invoice whose Shopify SALE transactions don't sum to amountPaid
+      // also belongs here. We use $expr to compare numeric fields, then
+      // OR with the legacy boolean flags (covers pre-cumulative invoices
+      // that don't have qboRecordedTotal/shopifyRecordedTotal populated).
       const sweepFilter = {
-        paymentStatus: 'paid',
-        $or: [{ qboPaymentRecorded: false }, { shopifyMarkedPaid: false }],
+        paymentStatus: { $in: ['paid', 'partially_paid', 'partially_refunded'] },
+        $or: [
+          { qboPaymentRecorded: false },
+          { shopifyMarkedPaid: false, paymentStatus: 'paid' },
+          {
+            $expr: {
+              $gt: [
+                { $subtract: ['$amountPaid', { $ifNull: ['$qboRecordedTotal', 0] }] },
+                0.005,
+              ],
+            },
+          },
+          {
+            $expr: {
+              $gt: [
+                {
+                  $subtract: [
+                    '$amountPaid',
+                    { $ifNull: ['$shopifyRecordedTotal', 0] },
+                  ],
+                },
+                0.005,
+              ],
+            },
+          },
+        ],
       }
       const sweepCursor = Invoice.find(sweepFilter).cursor()
       let sweepProcessed = 0
@@ -174,7 +205,6 @@ export function registerProcessPendingPaymentsJob(agenda) {
           const { syncErrors } = await propagateSuccessfulPayment({
             invoice,
             customerMap,
-            amount: invoice.amountDue,
             transactionId: undefined,
           })
           if (syncErrors.length === 0) {

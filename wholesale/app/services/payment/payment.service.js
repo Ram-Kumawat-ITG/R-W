@@ -17,7 +17,7 @@ import PaymentAttempt from '../../models/paymentAttempt.server'
 import { chargeCustomerVault, validateCustomerVault } from '../nmi/nmi.service'
 import { propagateSuccessfulPayment } from '../invoice/invoice.service'
 import { invoiceConfig } from '../invoice/invoice.config'
-import { computeProcessingFee } from '../invoice/invoice.utils'
+import { computeProcessingFee, applyDerivedPaymentStatus } from '../invoice/invoice.utils'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('payment.service')
@@ -29,8 +29,13 @@ const log = createLogger('payment.service')
 // Result shape:
 //   { skipped: true, reason }                                              ← no work attempted
 //   { skipped: false, outcome: 'approved'|'declined'|'error', ... }        ← attempted
-export async function chargeInvoice({ invoice, customerMap }) {
-  if (invoice.paymentStatus === 'paid' || invoice.paymentStatus === 'cancelled') {
+export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
+  // Settled / cancelled / fully refunded — nothing to charge.
+  if (
+    invoice.paymentStatus === 'paid' ||
+    invoice.paymentStatus === 'cancelled' ||
+    invoice.paymentStatus === 'refunded'
+  ) {
     return { skipped: true, reason: `invoice already ${invoice.paymentStatus}` }
   }
   if (invoice.attemptCount >= invoice.maxAttempts) {
@@ -51,6 +56,7 @@ export async function chargeInvoice({ invoice, customerMap }) {
     invoice.lastAttemptAt = new Date()
     invoice.lastAttemptError = 'no NMI customer vault on file'
     if (invoice.attemptCount >= invoice.maxAttempts) invoice.paymentStatus = 'failed'
+    else applyDerivedPaymentStatus(invoice)
     await invoice.save()
     return { skipped: true, reason: 'no NMI customer vault on file' }
   }
@@ -79,6 +85,7 @@ export async function chargeInvoice({ invoice, customerMap }) {
     invoice.lastAttemptAt = new Date()
     invoice.lastAttemptError = reason
     if (invoice.attemptCount >= invoice.maxAttempts) invoice.paymentStatus = 'failed'
+    else applyDerivedPaymentStatus(invoice)
     await invoice.save()
     log.warn('charge.skipped.vault_invalid', {
       invoiceId: invoice._id.toString(),
@@ -101,15 +108,41 @@ export async function chargeInvoice({ invoice, customerMap }) {
   // already, so the 3% card fee applies. The fee is added at most
   // once per invoice — once processingFeeAppliedAt is set, retries
   // use the already-applied amount and don't double-add.
-  const baseAmount = Number((invoice.amountDue - invoice.amountPaid).toFixed(2))
+  //
+  // `requestedAmount` is the optional admin-driven partial-charge amount
+  // (entered on the Retry / Charge-card modal). It clips against the
+  // remaining outstanding so an admin can never over-charge. CRON
+  // callers pass it as undefined → full-balance charge as before.
+  const remainingOutstanding = Number((invoice.amountDue - invoice.amountPaid).toFixed(2))
+  let baseAmount = remainingOutstanding
+  if (requestedAmount != null) {
+    const req = Number(requestedAmount)
+    if (!Number.isFinite(req) || req <= 0) {
+      throw new Error(`chargeInvoice: requestedAmount must be > 0, got ${requestedAmount}`)
+    }
+    if (req > remainingOutstanding + 0.005) {
+      throw new Error(
+        `chargeInvoice: requestedAmount $${req.toFixed(2)} exceeds remaining balance $${remainingOutstanding.toFixed(2)}`,
+      )
+    }
+    baseAmount = Number(req.toFixed(2))
+  }
+  // Processing fee is sized off the FULL remaining outstanding (it's a
+  // per-invoice fee, not per-charge). It's only staged the first time —
+  // subsequent partial charges of the same invoice don't re-stage.
   const feePreview =
     !invoice.processingFeeAppliedAt &&
     computeProcessingFee({
-      baseAmount,
+      baseAmount: remainingOutstanding,
       method: invoice.paymentMethod,
       rates: invoiceConfig.processingFeeRates,
     })
-  const feeAmount = feePreview ? feePreview.amount : 0
+  // The fee only rides along on the charge that actually settles the
+  // invoice. Partial charges send just the base portion; the final
+  // charge picks up the fee. This keeps NMI's settled amount in lockstep
+  // with the QBO invoice's TotalAmt.
+  const willSettleNow = baseAmount + 0.005 >= remainingOutstanding
+  const feeAmount = feePreview && willSettleNow ? feePreview.amount : 0
   const amount = Number((baseAmount + feeAmount).toFixed(2))
   console.log(
     `[payment] charging invoice=${invoice._id} method=${invoice.paymentMethod} ` +
@@ -140,7 +173,8 @@ export async function chargeInvoice({ invoice, customerMap }) {
     invoice.attemptCount = attemptNumber
     invoice.lastAttemptAt = new Date()
     invoice.lastAttemptError = err.message
-    invoice.paymentStatus = invoice.attemptCount >= invoice.maxAttempts ? 'failed' : 'pending'
+    if (invoice.attemptCount >= invoice.maxAttempts) invoice.paymentStatus = 'failed'
+    else applyDerivedPaymentStatus(invoice)
     await invoice.save()
     return { skipped: false, outcome: 'error', error: err.message }
   }
@@ -166,11 +200,12 @@ export async function chargeInvoice({ invoice, customerMap }) {
   invoice.lastAttemptError = result.outcome === 'approved' ? null : result.responseText
 
   if (result.outcome === 'approved') {
-    // Stage processing-fee state locally — propagateSuccessfulPayment
-    // appends the fee line to QBO and sets processingFeeAppliedAt once
-    // QBO confirms. We bump amountDue here so the invoice math
-    // reconciles after the inflated NMI charge.
-    if (feePreview) {
+    // Stage processing-fee state locally on the settling charge —
+    // propagateSuccessfulPayment appends the fee line to QBO and sets
+    // processingFeeAppliedAt once QBO confirms. Partial charges
+    // (willSettleNow=false) don't stage the fee; it rides along on the
+    // final charge that closes the invoice.
+    if (feePreview && willSettleNow) {
       invoice.processingFeeAmount = feePreview.amount
       invoice.processingFeeRate = feePreview.rate
       invoice.processingFeeMethod = feePreview.method
@@ -178,7 +213,6 @@ export async function chargeInvoice({ invoice, customerMap }) {
     }
     invoice.amountPaid = Number((invoice.amountPaid + amount).toFixed(2))
     invoice.paidAt = new Date()
-    invoice.paymentStatus = invoice.amountPaid >= invoice.amountDue ? 'paid' : 'pending'
     // Record what actually settled this charge. Reflects the active
     // `paymentMethod` at the moment of approval, which is 'card' or
     // 'ach' for NMI-driven settlements. The cheque → card override
@@ -187,6 +221,10 @@ export async function chargeInvoice({ invoice, customerMap }) {
     // already set to 'card'.
     invoice.paymentSettledVia = invoice.paymentMethod === 'ach' ? 'ach' : 'card'
     invoice.paymentSettledAt = invoice.paidAt
+    // Status flows through the derivation helper: partial_paid when
+    // amountPaid < amountDue, paid when settled, paid-with-refund
+    // states once refunds[] is populated. Single source of truth.
+    applyDerivedPaymentStatus(invoice)
 
     await propagateSuccessfulPayment({
       invoice,
@@ -195,7 +233,8 @@ export async function chargeInvoice({ invoice, customerMap }) {
       transactionId: result.transactionId,
     })
   } else {
-    invoice.paymentStatus = invoice.attemptCount >= invoice.maxAttempts ? 'failed' : 'pending'
+    if (invoice.attemptCount >= invoice.maxAttempts) invoice.paymentStatus = 'failed'
+    else applyDerivedPaymentStatus(invoice)
   }
   await invoice.save()
 

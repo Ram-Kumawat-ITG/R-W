@@ -206,3 +206,60 @@ export async function ensureCustomerForOrder({ shop, order }) {
   console.log(`[customers] customer_maps saved _id=${mapping._id}`)
   return mapping
 }
+
+// Resolve the NMI customer vault id for a customer at a specific shop.
+//
+// `customer_maps.nmiCustomerVaultId` is just a cache that's populated
+// by ensureCustomerForOrder at order intake. The source of truth is
+// `wholesale_applications.nmiCustomerVaultId`. If a customer captured
+// a card AFTER their first order was already processed (or first
+// order pre-dates the cumulative-sync customer.service refactor), the
+// cache shows `null` while the source has the real vault id. The
+// Order Details page and the charge-card / retry-payment endpoints
+// would then disable / reject the action even though the card is on
+// file. This helper closes that gap:
+//
+//   1. Use `customer_maps.nmiCustomerVaultId` if set (fast path)
+//   2. Otherwise read `wholesale_applications.nmiCustomerVaultId`
+//   3. If found there but missing from the cache, lazily sync (and
+//      log) so subsequent reads on either side stay consistent.
+//
+// Returns the resolved vault id, or null if neither source has one.
+// `customerMap` is optional — if not passed, we look it up by email.
+export async function resolveCustomerVaultId({ shop, email, customerMap }) {
+  if (!shop || !email) return null
+  const normalizedEmail = String(email).toLowerCase()
+
+  let cacheVaultId = customerMap?.nmiCustomerVaultId || null
+  if (cacheVaultId) return cacheVaultId
+
+  // Cache miss — consult wholesale_applications (source of truth).
+  const app = await WholesaleApplication.findOne({
+    shop,
+    email: normalizedEmail,
+  })
+    .select('nmiCustomerVaultId')
+    .lean()
+  const sourceVaultId = app?.nmiCustomerVaultId || null
+  if (!sourceVaultId) return null
+
+  // Source has it, cache doesn't — lazily sync so the next reader on
+  // either side gets the same answer. Unconditional upsert keeps this
+  // safe across races (if a parallel ensureCustomerForOrder wrote it
+  // already, this is a no-op).
+  console.log(
+    `[customers] lazy vault sync — copying nmiCustomerVaultId=${sourceVaultId} ` +
+      `from wholesale_applications → customer_maps for ${normalizedEmail}`,
+  )
+  log.info('vault.lazy_sync', { shop, email: normalizedEmail, customerVaultId: sourceVaultId })
+  await CustomerMap.updateOne(
+    { shop, email: normalizedEmail },
+    {
+      $setOnInsert: { shop, email: normalizedEmail },
+      $set: { nmiCustomerVaultId: sourceVaultId, lastSyncedAt: new Date() },
+    },
+    { upsert: true },
+  )
+  return sourceVaultId
+}
+

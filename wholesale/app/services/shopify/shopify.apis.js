@@ -6,7 +6,7 @@
 // This file wraps both with consistent error handling so callers don't
 // have to translate the package-specific exception shapes themselves.
 
-import { unauthenticated } from '../../shopify.server'
+import { unauthenticated, apiVersion } from '../../shopify.server'
 import { createLogger } from '../../utils/logger.utils'
 import { PermanentError, TransientError } from '../../utils/retry.utils'
 
@@ -63,4 +63,71 @@ export async function executeMutation(admin, operation, variables, mutationKey) 
     userErrors: block?.userErrors || [],
     raw: json,
   }
+}
+
+// REST POST helper. The Shopify Admin GraphQL API doesn't expose a clean
+// "record an arbitrary manual payment transaction" mutation — the
+// closest is orderCapture which requires a pre-existing AUTHORIZATION
+// transaction (our wholesale orders never carry one). Falling back to
+// REST is the documented path for partial-payment mirroring on
+// externally-captured orders.
+//
+// Path looks like "/orders/12345/transactions.json". We prepend the
+// versioned admin host so callers stay endpoint-only.
+//
+// Returns the parsed JSON body. 4xx/5xx surface as classified errors
+// (PermanentError vs TransientError) so the retry layer can do the
+// right thing.
+export async function shopifyRestPost({ shop, session, path, body }) {
+  if (!shop) throw new Error('shopifyRestPost: shop is required')
+  if (!path || !path.startsWith('/')) {
+    throw new Error('shopifyRestPost: path must start with "/"')
+  }
+  const accessToken = session?.accessToken
+  if (!accessToken) {
+    throw new PermanentError(
+      `shopifyRestPost: no access token on the session for ${shop}`,
+    )
+  }
+  const url = `https://${shop}/admin/api/${apiVersion}${path}`
+
+  let res
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'X-Shopify-Access-Token': accessToken,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(body),
+    })
+  } catch (err) {
+    log.warn('rest.transient', { url, err })
+    throw new TransientError(`Shopify REST POST threw: ${err.message}`, {
+      cause: err,
+    })
+  }
+  const text = await res.text()
+  let json = null
+  if (text) {
+    try {
+      json = JSON.parse(text)
+    } catch {
+      /* non-JSON error response */
+    }
+  }
+  if (res.status >= 500) {
+    throw new TransientError(`Shopify REST ${url} → ${res.status}`, {
+      status: res.status,
+      body: text,
+    })
+  }
+  if (!res.ok) {
+    throw new PermanentError(`Shopify REST ${url} → ${res.status}: ${text}`, {
+      status: res.status,
+      body: text,
+    })
+  }
+  return json
 }

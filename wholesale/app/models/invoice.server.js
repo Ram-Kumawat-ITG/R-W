@@ -95,9 +95,27 @@ const invoiceSchema = new mongoose.Schema(
     paymentSettledAt: Date,
 
     // Lifecycle of the invoice's payment, independent of QBO's own status.
+    //
+    // Derived state — never set ad-hoc. Use deriveInvoicePaymentStatus
+    // (invoice.utils.js) so payments feed into a consistent transition:
+    //   pending          — no money received yet
+    //   in_progress      — NMI sale call is currently in flight (lock)
+    //   partially_paid   — 0 < amountPaid < amountDue
+    //   paid             — amountPaid >= amountDue
+    //   failed           — exhausted maxAttempts without settling
+    //   cancelled        — kept for backward compatibility with any
+    //                      pre-existing records; no UI path currently
+    //                      writes this state
     paymentStatus: {
       type: String,
-      enum: ['pending', 'in_progress', 'paid', 'failed', 'cancelled'],
+      enum: [
+        'pending',
+        'in_progress',
+        'partially_paid',
+        'paid',
+        'failed',
+        'cancelled',
+      ],
       default: 'pending',
       index: true,
     },
@@ -178,14 +196,33 @@ const invoiceSchema = new mongoose.Schema(
 
     paidAt: Date,
 
-    // Per-side sync state. After a successful NMI charge we need to
-    // mirror "paid" into QBO and Shopify; either can fail independently.
-    // Track them separately so an admin can see precisely what's out of
-    // sync and a follow-up job can retry only the failed side.
+    // Per-side sync state. With partial payments, each payment event
+    // needs its own QBO Payment record and its own Shopify transaction
+    // — a single "did we sync?" boolean would skip the follow-up
+    // payments. We track CUMULATIVE recorded amounts so partial
+    // payments stay in lockstep across all three systems:
+    //
+    //   qboRecordedTotal       — sum of QBO Payment.TotalAmt we've created
+    //   qboPaymentIds[]        — every QBO Payment.Id we've created
+    //   shopifyRecordedTotal   — sum of Shopify transactions.kind=SALE we've created
+    //   shopifyTransactionIds[]— every Shopify transaction.id we've created
+    //
+    // `qboPaymentRecorded` is now derived: true iff
+    // qboRecordedTotal >= amountPaid (within 0.005). Kept as a stored
+    // boolean for backward compat with the CRON PASS 2 cursor and to
+    // avoid breaking pre-partial-payment invoices that have
+    // qboPaymentRecorded=true but no cumulative-total recorded.
+    // `shopifyMarkedPaid` stays as the binary orderMarkAsPaid signal,
+    // fired once on full settlement (transactions handle the partial
+    // mirror).
     qboPaymentRecorded: { type: Boolean, default: false },
-    qboPaymentId: String,
+    qboPaymentId: String, // first recorded QBO Payment.Id (legacy)
+    qboRecordedTotal: { type: Number, default: 0 },
+    qboPaymentIds: { type: [String], default: [] },
     shopifyMarkedPaid: { type: Boolean, default: false },
     shopifyMarkedPaidAt: Date,
+    shopifyRecordedTotal: { type: Number, default: 0 },
+    shopifyTransactionIds: { type: [String], default: [] },
     lastSyncError: String,
 
     // Processing-fee state — captures the per-method surcharge added to

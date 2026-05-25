@@ -32,6 +32,7 @@ const STATUS_FILTERS = [
   { id: "pending_approval", label: "Pending approval", scope: "order" },
   { id: "failed", label: "Failed", scope: "order" },
   { id: "completed", label: "Completed", scope: "order" },
+  { id: "cancelled", label: "Cancelled", scope: "order" },
   { id: "rejected", label: "Rejected", scope: "order" },
   { id: "overdue", label: "Overdue", scope: "invoice" },
   { id: "pending_cheque", label: "Pending cheque", scope: "invoice" },
@@ -498,6 +499,14 @@ function PaymentBadge({ paymentStatus, invoice }) {
   }
   const ps = invoice.paymentStatus;
   if (ps === "paid") return <s-badge tone="success">Paid</s-badge>;
+  if (ps === "partially_paid") {
+    return (
+      <s-stack direction="block" gap="none">
+        <s-badge tone="info">Partially paid</s-badge>
+        <s-text tone="subdued">{invoice.attemptCount}/{invoice.maxAttempts} attempts</s-text>
+      </s-stack>
+    );
+  }
   if (ps === "cancelled") return <s-badge>Cancelled</s-badge>;
   if (ps === "in_progress") return <s-badge tone="info">In progress</s-badge>;
   if (ps === "failed") {

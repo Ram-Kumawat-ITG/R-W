@@ -6,6 +6,7 @@ import Invoice from '../../models/invoice.server'
 import CustomerMap from '../../models/customerMap.server'
 import { chargeInvoice } from '../../services/payment/payment.service'
 import { appendInvoiceRemark } from '../../services/invoice/invoice.service'
+import { resolveCustomerVaultId } from '../../services/customer/customer.service'
 import { sendResponse } from '../../services/APIService/api.service'
 
 // POST /api/admin/orders/:id/retry-payment
@@ -49,6 +50,24 @@ export async function action({ request, params }) {
     return sendResponse(400, 'error', 'Invalid order id', null)
   }
 
+  // Optional partial-charge amount. When omitted, chargeInvoice falls
+  // back to charging the full remaining balance (the legacy behavior
+  // the CRON also uses). When present, it's clipped against the
+  // remaining outstanding by the service layer.
+  let requestedAmount
+  try {
+    const body = await request.clone().json()
+    if (body?.amount !== undefined && body?.amount !== null && body?.amount !== '') {
+      const amt = Number(body.amount)
+      if (!Number.isFinite(amt) || amt <= 0) {
+        return sendResponse(400, 'error', 'amount must be a positive number', null)
+      }
+      requestedAmount = amt
+    }
+  } catch {
+    // No body / non-JSON body = full-balance charge.
+  }
+
   await connectDB()
 
   const order = await ShopifyOrder.findOne({ _id: id, shop: session.shop })
@@ -86,13 +105,26 @@ export async function action({ request, params }) {
   const customerMap = order.customerEmail
     ? await CustomerMap.findOne({ shop: session.shop, email: order.customerEmail })
     : null
-  if (!customerMap?.nmiCustomerVaultId) {
+  // customer_maps is a cache populated at order intake; consult
+  // wholesale_applications (source of truth) as a fallback in case the
+  // customer captured a card after the order ran through customer.service.
+  const resolvedVaultId = order.customerEmail
+    ? await resolveCustomerVaultId({
+        shop: session.shop,
+        email: order.customerEmail,
+        customerMap,
+      })
+    : null
+  if (!resolvedVaultId) {
     return sendResponse(
       409,
       'error',
       'No NMI vault on file for this customer — collect a payment method before retrying',
       null,
     )
+  }
+  if (customerMap && !customerMap.nmiCustomerVaultId) {
+    customerMap.nmiCustomerVaultId = resolvedVaultId
   }
 
   // Bump the ceiling so chargeInvoice's `attemptCount >= maxAttempts` guard
@@ -119,10 +151,16 @@ export async function action({ request, params }) {
 
   let result
   try {
-    result = await chargeInvoice({ invoice, customerMap })
+    result = await chargeInvoice({ invoice, customerMap, requestedAmount })
   } catch (e) {
     console.error('[admin/retry-payment] chargeInvoice threw:', e?.message || e)
-    return sendResponse(500, 'error', e?.message || 'Charge failed', null)
+    const isValidation = /requestedAmount/i.test(e?.message || '')
+    return sendResponse(
+      isValidation ? 400 : 500,
+      'error',
+      e?.message || 'Charge failed',
+      null,
+    )
   }
 
   // Surface the retry outcome on the Order List "Remarks" column so

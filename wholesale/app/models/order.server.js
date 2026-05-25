@@ -21,6 +21,14 @@ const orderSchema = new mongoose.Schema(
 
     // Processing pipeline state for this order. Distinct from invoice
     // payment state — this only tracks the orchestrator's progress.
+    //
+    // `cancelled` is a terminal state set by the orders/cancelled
+    // webhook handler (see services/order/order.service.handleOrder-
+    // Cancelled). Distinct from `rejected` — rejected means "we
+    // never processed this because it was invalid"; cancelled means
+    // "Shopify cancelled it after the fact". TERMINAL_STATUSES
+    // (orchestrator) includes both so late-arriving orders/create
+    // re-deliveries don't re-process either.
     processingStatus: {
       type: String,
       enum: [
@@ -33,12 +41,21 @@ const orderSchema = new mongoose.Schema(
         'scheduled',
         'completed',
         'failed',
+        'cancelled',
       ],
       default: 'received',
       index: true,
     },
     processingError: String,
     rejectionCode: String,
+
+    // Cancellation metadata — set by the orders/cancelled webhook
+    // handler. `cancelReason` carries Shopify's enum value
+    // ('customer', 'fraud', 'inventory', 'declined', 'other').
+    // `cancelledAt` is Shopify's timestamp, not ours, so re-deliveries
+    // don't drift it.
+    cancelledAt: Date,
+    cancelReason: String,
 
     // Latest Shopify webhook-id we've observed for this order. Shopify
     // retries webhooks with the SAME id on at-least-once delivery, so

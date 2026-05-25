@@ -6,6 +6,7 @@ import Invoice from '../../models/invoice.server'
 import CustomerMap from '../../models/customerMap.server'
 import { chargeInvoice } from '../../services/payment/payment.service'
 import { appendInvoiceRemark } from '../../services/invoice/invoice.service'
+import { resolveCustomerVaultId } from '../../services/customer/customer.service'
 import { sendResponse } from '../../services/APIService/api.service'
 
 // POST /api/admin/orders/:id/charge-card
@@ -59,13 +60,28 @@ export async function action({ request, params }) {
   const customerMap = order.customerEmail
     ? await CustomerMap.findOne({ shop: session.shop, email: order.customerEmail })
     : null
-  if (!customerMap?.nmiCustomerVaultId) {
+  // Resolve via the customer_maps cache OR wholesale_applications source
+  // of truth — covers the case where the customer captured a card after
+  // their order was already in flight (cache hasn't been refreshed yet).
+  const resolvedVaultId = order.customerEmail
+    ? await resolveCustomerVaultId({
+        shop: session.shop,
+        email: order.customerEmail,
+        customerMap,
+      })
+    : null
+  if (!resolvedVaultId) {
     return sendResponse(
       409,
       'error',
       'No NMI vault on file for this customer — collect a payment method before charging',
       null,
     )
+  }
+  // Reflect any lazy sync back onto the in-memory map so chargeInvoice's
+  // own `customerMap.nmiCustomerVaultId` read sees the resolved id.
+  if (customerMap && !customerMap.nmiCustomerVaultId) {
+    customerMap.nmiCustomerVaultId = resolvedVaultId
   }
 
   // Per-order override: flip method to card so the scheduler will also

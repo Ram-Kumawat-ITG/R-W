@@ -13,6 +13,7 @@ import Invoice from "../models/invoice.server";
 import PaymentAttempt from "../models/paymentAttempt.server";
 import CustomerMap from "../models/customerMap.server";
 import { getInvoice as getQboInvoice, getInvoiceWebUrl } from "../services/qbo/qbo.service";
+import { resolveCustomerVaultId } from "../services/customer/customer.service";
 import { invoiceConfig } from "../services/invoice/invoice.config";
 import { computeProcessingFee, processingFeeLabel } from "../services/invoice/invoice.utils";
 import {
@@ -27,10 +28,19 @@ import { formatAmount, fmtDateTime } from "../utils/format.utils";
 import { PAYMENT_METHOD_LABEL } from "../utils/payment.constants";
 
 // Statuses for which the manual retry / charge / mark-paid buttons can
-// fire. 'paid', 'cancelled', and 'in_progress' must be excluded — see
-// retry-payment.js / charge-card.js / mark-cheque-paid.js for the same
-// guard server-side.
-const RETRYABLE_PAYMENT_STATUSES = new Set(["pending", "failed"]);
+// fire. 'paid', 'refunded', 'partially_refunded', 'cancelled', and
+// 'in_progress' are excluded — those either have no outstanding balance
+// or another action is already mid-flight. 'partially_paid' IS
+// included so admins can collect the remainder of a half-paid invoice
+// (additional cheque receipt, additional partial card charge, etc).
+// Server-side guards in retry-payment.js / charge-card.js /
+// mark-cheque-paid.js + the recordManualPayment / chargeInvoice
+// service layers all accept partially_paid for the same reason.
+const RETRYABLE_PAYMENT_STATUSES = new Set([
+  "pending",
+  "partially_paid",
+  "failed",
+]);
 
 // Human-readable label + Polaris badge tone for each Invoice.remarks[]
 // kind. Keep in lockstep with the enum in models/invoice.server.js so
@@ -198,6 +208,24 @@ export const loader = async ({ request, params }) => {
         .select("qboCustomerId nmiCustomerVaultId profile")
         .lean()
     : null;
+
+  // Cache-or-source-of-truth vault lookup. customer_maps.nmiCustomerVaultId
+  // is populated at order intake; if the customer captured a card AFTER
+  // that ran, only wholesale_applications has the vault id. The resolver
+  // checks both and lazily syncs the cache when the source has more, so
+  // the page (and the action endpoints below) see a consistent view.
+  const resolvedVaultId = order.customerEmail
+    ? await resolveCustomerVaultId({
+        shop: session.shop,
+        email: order.customerEmail,
+        customerMap,
+      })
+    : null;
+  if (customerMap && resolvedVaultId && !customerMap.nmiCustomerVaultId) {
+    // Lazily-synced — surface the freshly resolved value on the
+    // already-loaded snapshot so the rest of the loader/UI sees it.
+    customerMap.nmiCustomerVaultId = resolvedVaultId;
+  }
 
   // Extract line items + totals from the raw Shopify webhook payload so we
   // don't ship the whole blob (addresses, gateway data, etc.) to the client.
@@ -1101,13 +1129,23 @@ export default function OrderDetail() {
                     ? "This invoice has been cancelled."
                     : invoice.paymentStatus === "in_progress"
                       ? "A charge is currently in progress — wait for it to finish."
-                      : `Customer chose ${PAYMENT_METHOD_LABEL[paymentMethod] || paymentMethod}. The scheduler will not auto-charge — record the cheque manually once received, or fall back to charging the card on file.${
-                          !customerMap?.nmiCustomerVaultId
-                            ? " (Card fallback unavailable — no NMI vault on file.)"
-                            : ""
-                        }`}
+                      : `Customer chose ${PAYMENT_METHOD_LABEL[paymentMethod] || paymentMethod}. The scheduler will not auto-charge — record the cheque manually once received, or fall back to charging the card on file.`}
               </s-paragraph>
             )}
+            {invoice &&
+              isManualInvoice &&
+              statusAllowsAction &&
+              !customerMap?.nmiCustomerVaultId && (
+                <s-banner tone="warning" heading="No card on file">
+                  <s-paragraph>
+                    This customer didn&apos;t save a card at registration, so
+                    the &quot;Charge card on file&quot; fallback is unavailable.
+                    Use &quot;Mark cheque paid&quot; when payment arrives, or
+                    capture a card on file via NMI directly and then refresh
+                    this page.
+                  </s-paragraph>
+                </s-banner>
+              )}
 
             {invoice.manualPayments?.length > 0 && (
               <s-box
@@ -1132,6 +1170,7 @@ export default function OrderDetail() {
                 </s-stack>
               </s-box>
             )}
+
           </s-stack>
         )}
       </s-section>

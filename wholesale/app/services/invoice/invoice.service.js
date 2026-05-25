@@ -23,7 +23,10 @@ import {
   appendInvoiceLines as appendQboInvoiceLines,
   getInvoice as getQboInvoice,
 } from '../qbo/qbo.service'
-import { markShopifyOrderPaid } from '../shopify/shopify.service'
+import {
+  markShopifyOrderPaid,
+  recordOrderTransaction as recordShopifyOrderTransaction,
+} from '../shopify/shopify.service'
 import { paymentConfig } from '../payment/payment.config'
 import { invoiceConfig } from './invoice.config'
 import {
@@ -35,6 +38,7 @@ import {
   computeProcessingFee,
   buildProcessingFeeLine,
   findExistingProcessingFeeLine,
+  applyDerivedPaymentStatus,
 } from './invoice.utils'
 import { buildProfileFromShopifyOrder } from '../customer/customer.utils'
 import { createLogger } from '../../utils/logger.utils'
@@ -218,7 +222,7 @@ async function waitForClaimToComplete(shop, shopifyOrderId) {
 // Called from payment.service.js after an approved NMI charge, and
 // directly from the scheduler's PASS 2 when a previous charge succeeded
 // but a downstream sync failed.
-export async function propagateSuccessfulPayment({ invoice, customerMap, amount, transactionId }) {
+export async function propagateSuccessfulPayment({ invoice, customerMap, transactionId }) {
   console.log(`\n[sync] propagating successful payment for invoice _id=${invoice._id}`)
   console.log(
     `[sync]   state — qboPaymentRecorded=${invoice.qboPaymentRecorded} shopifyMarkedPaid=${invoice.shopifyMarkedPaid}`,
@@ -291,8 +295,30 @@ export async function propagateSuccessfulPayment({ invoice, customerMap, amount,
     )
   }
 
-  // ── 1) QBO: record payment against the invoice ────────────────
-  if (!invoice.qboPaymentRecorded) {
+  // ── 1) QBO: record payment(s) against the invoice ─────────────
+  //
+  // Multi-payment-aware: we record the DIFFERENCE between what the
+  // invoice has been paid and what QBO has already booked, not just
+  // "did we ever record one". Cheque-then-cheque, card-then-card, or
+  // any mix all land their full ledger in QBO across multiple
+  // settlement events.
+  //
+  // Backward-compat: invoices that pre-date `qboRecordedTotal` carry
+  // `qboPaymentRecorded: true` but `qboRecordedTotal: 0`. We can't
+  // tell from the doc alone whether their prior payment was for the
+  // full amount or a partial, so the safe assumption is "the prior
+  // payment covered everything that was paid at that time" — bring
+  // qboRecordedTotal up to amountPaid so we don't double-record.
+  if (invoice.qboPaymentRecorded && !(invoice.qboRecordedTotal > 0)) {
+    invoice.qboRecordedTotal = Number((invoice.amountPaid || 0).toFixed(2))
+    console.log(
+      `[sync] QBO   • backfilling qboRecordedTotal from legacy qboPaymentRecorded flag → $${invoice.qboRecordedTotal.toFixed(2)}`,
+    )
+  }
+  const qboOwed = Number(
+    ((invoice.amountPaid || 0) - (invoice.qboRecordedTotal || 0)).toFixed(2),
+  )
+  if (qboOwed > 0.005) {
     if (!feeReady) {
       const msg =
         'QBO recordPayment skipped — processing-fee line not yet on invoice; recording ' +
@@ -309,15 +335,39 @@ export async function propagateSuccessfulPayment({ invoice, customerMap, amount,
           recordQboPayment({
             qboCustomerId: customerMap.qboCustomerId,
             qboInvoiceId: invoice.qboInvoiceId,
-            amount,
+            amount: qboOwed,
             currency: invoice.currency,
             paymentRef: transactionId,
           }),
         )
-        invoice.qboPaymentRecorded = true
-        invoice.qboPaymentId = qboPayment?.Id
-        console.log(`[sync] QBO   ✓ payment recorded id=${qboPayment?.Id}`)
-        log.info('sync.qbo.recorded', { invoiceId: invoice._id.toString(), qboPaymentId: qboPayment?.Id })
+        invoice.qboPaymentIds = invoice.qboPaymentIds || []
+        if (qboPayment?.Id) invoice.qboPaymentIds.push(String(qboPayment.Id))
+        // Keep the legacy single-id field pointing at the first
+        // recorded payment for backward compat with anything still
+        // reading it.
+        if (!invoice.qboPaymentId && qboPayment?.Id) {
+          invoice.qboPaymentId = String(qboPayment.Id)
+        }
+        invoice.qboRecordedTotal = Number(
+          ((invoice.qboRecordedTotal || 0) + qboOwed).toFixed(2),
+        )
+        // Boolean is now DERIVED: cumulative >= amountPaid (within EPS).
+        // CRON PASS 2 still uses the boolean as a coarse "needs sync"
+        // signal; the cursor query is updated below to use the
+        // cumulative-mismatch shape too.
+        invoice.qboPaymentRecorded =
+          invoice.qboRecordedTotal + 0.005 >= (invoice.amountPaid || 0)
+        console.log(
+          `[sync] QBO   ✓ recorded $${qboOwed.toFixed(2)} (id=${qboPayment?.Id}) — ` +
+            `cumulative $${invoice.qboRecordedTotal.toFixed(2)}/$${(invoice.amountPaid || 0).toFixed(2)}`,
+        )
+        log.info('sync.qbo.recorded', {
+          invoiceId: invoice._id.toString(),
+          qboPaymentId: qboPayment?.Id,
+          amount: qboOwed,
+          cumulativeRecorded: invoice.qboRecordedTotal,
+          amountPaid: invoice.amountPaid,
+        })
       } catch (qboErr) {
         const msg = `QBO payment record failed after NMI success: ${qboErr.message}`
         console.error(`[sync] QBO   ✗ ${msg}`)
@@ -326,45 +376,158 @@ export async function propagateSuccessfulPayment({ invoice, customerMap, amount,
       }
     }
   } else {
-    console.log(`[sync] QBO   • already recorded (id=${invoice.qboPaymentId})`)
+    console.log(
+      `[sync] QBO   • already up to date (recorded $${(invoice.qboRecordedTotal || 0).toFixed(2)} of $${(invoice.amountPaid || 0).toFixed(2)})`,
+    )
   }
 
-  // ── 2) Shopify: mark order as paid ────────────────────────────
-  if (!invoice.shopifyMarkedPaid) {
+  // ── 2) Shopify: per-payment SALE transaction + final mark-as-paid ──
+  //
+  // Two-step Shopify sync so partial payments are visible in Shopify
+  // *before* full settlement:
+  //
+  //   a) Push a manual SALE transaction (REST orders/:id/transactions)
+  //      for the difference between amountPaid and what Shopify has
+  //      already seen. Each partial cheque receipt / partial card
+  //      charge gets its own transaction — Shopify computes
+  //      `displayFinancialStatus` (paid / partially_paid) from the
+  //      sum of transactions.
+  //
+  //   b) On full settlement, also call orderMarkAsPaid. Shopify
+  //      treats it as a no-op when transactions already cover the
+  //      total (markShopifyOrderPaid normalizes "already paid"
+  //      userErrors to success), but the call still triggers the
+  //      "order paid" downstream workflow inside Shopify (notifications,
+  //      fulfillment hooks).
+  //
+  // Backward-compat: same trick as QBO — invoices flagged
+  // `shopifyMarkedPaid: true` from before the cumulative tracker
+  // are assumed to have their `amountPaid` already mirrored.
+  if (invoice.shopifyMarkedPaid && !(invoice.shopifyRecordedTotal > 0)) {
+    invoice.shopifyRecordedTotal = Number((invoice.amountPaid || 0).toFixed(2))
+    console.log(
+      `[sync] SHOP  • backfilling shopifyRecordedTotal from legacy shopifyMarkedPaid flag → $${invoice.shopifyRecordedTotal.toFixed(2)}`,
+    )
+  }
+  const shopOwed = Number(
+    ((invoice.amountPaid || 0) - (invoice.shopifyRecordedTotal || 0)).toFixed(2),
+  )
+  if (shopOwed > 0.005) {
     try {
-      const shopRes = await syncWithRetry('shopify.mark_paid', () =>
-        markShopifyOrderPaid({
+      const shopTxn = await syncWithRetry('shopify.record_transaction', () =>
+        recordShopifyOrderTransaction({
           shop: invoice.shop,
           shopifyOrderId: invoice.shopifyOrderId,
+          amount: shopOwed,
+          currency: invoice.currency,
+          paymentRef: transactionId,
         }),
       )
-      invoice.shopifyMarkedPaid = true
-      invoice.shopifyMarkedPaidAt = new Date()
-      console.log(`[sync] SHOP  ✓ order marked paid (status=${shopRes?.financialStatus})`)
-      log.info('sync.shopify.marked_paid', {
+      invoice.shopifyTransactionIds = invoice.shopifyTransactionIds || []
+      if (shopTxn?.shopifyTransactionId) {
+        invoice.shopifyTransactionIds.push(shopTxn.shopifyTransactionId)
+      }
+      invoice.shopifyRecordedTotal = Number(
+        ((invoice.shopifyRecordedTotal || 0) + shopOwed).toFixed(2),
+      )
+      console.log(
+        `[sync] SHOP  ✓ transaction $${shopOwed.toFixed(2)} (id=${shopTxn?.shopifyTransactionId}) — ` +
+          `cumulative $${invoice.shopifyRecordedTotal.toFixed(2)}/$${(invoice.amountPaid || 0).toFixed(2)}`,
+      )
+      log.info('sync.shopify.transaction', {
         invoiceId: invoice._id.toString(),
-        shopifyOrderId: invoice.shopifyOrderId,
-        alreadyPaid: shopRes?.alreadyPaid,
+        shopifyTransactionId: shopTxn?.shopifyTransactionId,
+        amount: shopOwed,
+        cumulativeRecorded: invoice.shopifyRecordedTotal,
+        amountPaid: invoice.amountPaid,
       })
-    } catch (shopErr) {
-      const msg = `Shopify orderMarkAsPaid failed after NMI success: ${shopErr.message}`
+    } catch (shopTxnErr) {
+      const msg = `Shopify transaction record failed: ${shopTxnErr.message}`
       console.error(`[sync] SHOP  ✗ ${msg}`)
-      log.error('sync.shopify.failed', {
+      log.error('sync.shopify.transaction_failed', {
         invoiceId: invoice._id.toString(),
         shopifyOrderId: invoice.shopifyOrderId,
-        err: shopErr,
+        err: shopTxnErr,
       })
       syncErrors.push(msg)
     }
   } else {
+    console.log(
+      `[sync] SHOP  • transaction ledger up to date ($${(invoice.shopifyRecordedTotal || 0).toFixed(2)} of $${(invoice.amountPaid || 0).toFixed(2)})`,
+    )
+  }
+
+  const fullyPaid = invoice.paymentStatus === 'paid'
+  if (fullyPaid && !invoice.shopifyMarkedPaid) {
+    // If our per-partial SALE transactions already sum to amountPaid,
+    // Shopify's auto-computed displayFinancialStatus is already 'paid'
+    // — orderMarkAsPaid would reject with "Order cannot be marked as
+    // paid" (and even if we catch that via the regex, the round-trip
+    // is wasted work). Just flip the local flag.
+    const salesCoverTotal =
+      (invoice.shopifyRecordedTotal || 0) + 0.005 >= (invoice.amountPaid || 0)
+    if (salesCoverTotal) {
+      invoice.shopifyMarkedPaid = true
+      invoice.shopifyMarkedPaidAt = new Date()
+      console.log(
+        `[sync] SHOP  ✓ order considered paid via SALE transactions ` +
+          `($${(invoice.shopifyRecordedTotal || 0).toFixed(2)} of $${(invoice.amountPaid || 0).toFixed(2)}) — ` +
+          `orderMarkAsPaid skipped (already paid)`,
+      )
+      log.info('sync.shopify.marked_paid_via_transactions', {
+        invoiceId: invoice._id.toString(),
+        shopifyOrderId: invoice.shopifyOrderId,
+        shopifyRecordedTotal: invoice.shopifyRecordedTotal,
+      })
+    } else {
+      try {
+        const shopRes = await syncWithRetry('shopify.mark_paid', () =>
+          markShopifyOrderPaid({
+            shop: invoice.shop,
+            shopifyOrderId: invoice.shopifyOrderId,
+          }),
+        )
+        invoice.shopifyMarkedPaid = true
+        invoice.shopifyMarkedPaidAt = new Date()
+        console.log(`[sync] SHOP  ✓ order marked paid (status=${shopRes?.financialStatus})`)
+        log.info('sync.shopify.marked_paid', {
+          invoiceId: invoice._id.toString(),
+          shopifyOrderId: invoice.shopifyOrderId,
+          alreadyPaid: shopRes?.alreadyPaid,
+        })
+      } catch (shopErr) {
+        const msg = `Shopify orderMarkAsPaid failed after NMI success: ${shopErr.message}`
+        console.error(`[sync] SHOP  ✗ ${msg}`)
+        log.error('sync.shopify.failed', {
+          invoiceId: invoice._id.toString(),
+          shopifyOrderId: invoice.shopifyOrderId,
+          err: shopErr,
+        })
+        syncErrors.push(msg)
+      }
+    }
+  } else if (invoice.shopifyMarkedPaid) {
     console.log(`[sync] SHOP  • already marked paid at ${invoice.shopifyMarkedPaidAt?.toISOString()}`)
   }
 
   // ── 3) ShopifyOrder local doc: mirror final payment state ──────
   try {
+    // Map the Invoice status enum down to the ShopifyOrder.paymentStatus
+    // enum (a narrower {pending, paid, failed} legacy enum). Partial
+    // payments stay 'pending' on the order doc — the precise breakdown
+    // lives on the Invoice — while the financialStatus mirror tracks
+    // the richer Shopify-aligned state.
+    const shopifyOrderPaymentStatus = invoice.paymentStatus === 'paid' ? 'paid' : 'pending'
+    // financialStatus carries the granularity admins see in Shopify
+    // (paid / partially_paid / pending) — the local mirror so the
+    // Order Details page renders without a Shopify Admin round-trip.
+    let financialStatus
+    if (invoice.paymentStatus === 'paid') financialStatus = 'paid'
+    else if (invoice.amountPaid > 0) financialStatus = 'partially_paid'
+    else financialStatus = 'pending'
     const update = {
-      paymentStatus: invoice.paymentStatus, // 'paid' or still 'pending' for partial
-      financialStatus: invoice.paymentStatus === 'paid' ? 'paid' : 'partially_paid',
+      paymentStatus: shopifyOrderPaymentStatus,
+      financialStatus,
     }
     if (transactionId) update.nmiTransactionId = transactionId
     if (invoice.paymentStatus === 'paid') {
@@ -456,7 +619,11 @@ export async function recordManualPayment({
   recordedBy,
   note,
 }) {
-  if (invoice.paymentStatus === 'paid' || invoice.paymentStatus === 'cancelled') {
+  if (
+    invoice.paymentStatus === 'paid' ||
+    invoice.paymentStatus === 'cancelled' ||
+    invoice.paymentStatus === 'refunded'
+  ) {
     throw new Error(`Invoice is already ${invoice.paymentStatus}`)
   }
   if (invoice.paymentStatus === 'in_progress') {
@@ -547,13 +714,16 @@ export async function recordManualPayment({
   }
   invoice.amountPaid = Number((invoice.amountPaid + amt).toFixed(2))
   invoice.paidAt = invoice.paidAt || new Date()
-  invoice.paymentStatus = invoice.amountPaid >= invoice.amountDue ? 'paid' : 'pending'
   // Record what settled this — `cheque` kind maps to the canonical
   // 'check' enum value on the Invoice; 'ach' stays 'ach'. Latest write
   // wins for partial-payment sequences (Invoice.manualPayments[] has
   // the full ledger if more detail is needed).
   invoice.paymentSettledVia = kind === 'ach' ? 'ach' : 'check'
   invoice.paymentSettledAt = new Date()
+  // Single source of truth for the status transition. partially_paid
+  // when amt closes some but not all of the outstanding balance; paid
+  // when fully settled.
+  applyDerivedPaymentStatus(invoice)
   await invoice.save()
 
   // Propagate to QBO + Shopify + local order doc. Uses paymentRef so the

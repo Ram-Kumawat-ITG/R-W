@@ -4,6 +4,7 @@
 // Higher-level domain methods (customer / invoice / payment) live in
 // qbo.service.js. This file is pure transport.
 
+import { randomUUID } from 'node:crypto'
 import { qboConfig, assertQboConfigured } from './qbo.config'
 import { paymentConfig } from '../payment/payment.config'
 import { ACCESS_TOKEN_SAFETY_MS } from './qbo.constants'
@@ -133,7 +134,7 @@ async function getAccessToken() {
   return refreshed.accessToken
 }
 
-function buildUrl(path, query) {
+function buildUrl(path, query, { requestId, method } = {}) {
   const base = `${qboConfig.apiBaseUrl}/v3/company/${qboConfig.realmId}`
   const url = new URL(`${base}${path.startsWith('/') ? path : `/${path}`}`)
   url.searchParams.set('minorversion', qboConfig.minorVersion)
@@ -142,14 +143,25 @@ function buildUrl(path, query) {
       if (v !== undefined && v !== null) url.searchParams.set(k, String(v))
     }
   }
+  // QBO's `requestid` idempotency token. If the same id is sent twice
+  // (e.g. our retry layer re-firing after a transient response error
+  // even though QBO already committed the create), QBO returns the
+  // original response instead of creating a duplicate document. The
+  // id is generated ONCE per logical qboRequest() call (so all
+  // internal retries share it) and only applied to mutating verbs —
+  // GET / query are inherently idempotent and don't need it.
+  // Docs: https://developer.intuit.com/app/developer/qbo/docs/develop/rest-api-features#idempotent-requests
+  if (requestId && method !== 'GET') {
+    url.searchParams.set('requestid', requestId)
+  }
   return url.toString()
 }
 
-async function rawRequest({ method, path, query, body, retryOn401 = true }) {
+async function rawRequest({ method, path, query, body, requestId, retryOn401 = true }) {
   const accessToken = await getAccessToken()
-  const url = buildUrl(path, query)
+  const url = buildUrl(path, query, { requestId, method })
 
-  console.log(`\n[QBO →] ${method} ${path}`)
+  console.log(`\n[QBO →] ${method} ${path}${requestId ? ` (requestid=${requestId})` : ''}`)
   console.log(`        url: ${url}`)
   if (body) console.log(`        body: ${truncate(JSON.stringify(body), 1000)}`)
 
@@ -181,12 +193,15 @@ async function rawRequest({ method, path, query, body, retryOn401 = true }) {
 
   if (res.status === 401 && retryOn401) {
     // Token might have been invalidated mid-flight (e.g. revoked
-    // elsewhere). Force-refresh once and retry.
+    // elsewhere). Force-refresh once and retry. We pass the SAME
+    // requestId through so the post-refresh retry stays idempotent
+    // (a previous attempt with that id, if it actually committed
+    // before the 401, won't be duplicated).
     console.log('[QBO]   401 received — force-refreshing token and retrying once')
     log.warn('token.invalid_retry', { path })
     const doc = await readTokenDoc()
     if (doc) await refreshAccessToken(doc.refreshToken)
-    return rawRequest({ method, path, query, body, retryOn401: false })
+    return rawRequest({ method, path, query, body, requestId, retryOn401: false })
   }
 
   if (!res.ok) {
@@ -202,12 +217,24 @@ async function rawRequest({ method, path, query, body, retryOn401 = true }) {
 }
 
 export async function qboRequest(opts) {
-  return retry(() => rawRequest(opts), {
+  // Generate a single idempotency token for the WHOLE logical operation
+  // before entering the retry loop. Every retry attempt (including the
+  // 401-refresh recursion inside rawRequest) reuses this same id, so
+  // QBO can dedup retries that succeeded server-side but failed to
+  // return a response to us — the classic "QBO created Payment 323
+  // but our retry created Payment 324 because the first 200 never
+  // arrived" duplicate.
+  //
+  // Callers can pin a specific id via opts.requestId if they want
+  // cross-process idempotency (e.g. resuming a crashed job); otherwise
+  // we make one up.
+  const requestId = opts.requestId || randomUUID()
+  return retry(() => rawRequest({ ...opts, requestId }), {
     attempts: paymentConfig.httpRetryAttempts,
     baseMs: paymentConfig.httpRetryBaseMs,
     maxMs: paymentConfig.httpRetryMaxMs,
     onAttempt: ({ attempt, err, nextDelayMs }) => {
-      log.warn('request.retry', { attempt, nextDelayMs, err })
+      log.warn('request.retry', { attempt, nextDelayMs, err, requestId })
     },
   })
 }

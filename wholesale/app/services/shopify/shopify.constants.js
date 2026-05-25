@@ -16,6 +16,10 @@ export const REQUIRED_SUBSCRIPTIONS = [
     topic: 'ORDERS_CREATE',
     callbackPath: '/webhooks/orders/create',
   },
+  {
+    topic: 'ORDERS_CANCELLED',
+    callbackPath: '/webhooks/orders/cancelled',
+  },
 ]
 
 // ── Registration-form note keys ──────────────────────────────────────

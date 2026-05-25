@@ -34,7 +34,12 @@ import {
   MUTATION_STAGED_UPLOADS_CREATE,
   MUTATION_FILE_CREATE,
 } from './shopify.mutations'
-import { getUnauthenticatedAdmin, executeGraphQL, executeMutation } from './shopify.apis'
+import {
+  getUnauthenticatedAdmin,
+  executeGraphQL,
+  executeMutation,
+  shopifyRestPost,
+} from './shopify.apis'
 import { createLogger } from '../../utils/logger.utils'
 import { PermanentError, TransientError } from '../../utils/retry.utils'
 
@@ -64,9 +69,21 @@ export async function markShopifyOrderPaid({ shop, shopifyOrderId }) {
     'orderMarkAsPaid',
   )
 
-  // Idempotency: if Shopify says "already paid", treat as success.
+  // Idempotency: if Shopify says "already paid" — by any phrasing —
+  // treat as success. Shopify has at least three ways to report this:
+  //   - "Order is already paid"     (literal already-paid)
+  //   - "Order already captured"    (auth+capture flow)
+  //   - "fully paid"                (alternative phrasing on some versions)
+  //   - "Order cannot be marked as paid"
+  //       ← surfaces when our SALE transactions on the order already
+  //         sum to the order total (Shopify auto-computes
+  //         displayFinancialStatus=PAID from the txn ledger, so
+  //         orderMarkAsPaid rejects as redundant). Common when
+  //         recordOrderTransaction was called per-partial just before.
   const alreadyPaid = userErrors.some((e) =>
-    /already.*paid|already.*captured|fully paid/i.test(e.message || ''),
+    /already.*paid|already.*captured|fully paid|cannot.*be.*marked.*as.*paid/i.test(
+      e.message || '',
+    ),
   )
   if (alreadyPaid) {
     console.log(`[shopify] order ${shopifyOrderId} was already paid — treating as success`)
@@ -92,6 +109,95 @@ export async function markShopifyOrderPaid({ shop, shopifyOrderId }) {
     financialStatus: order?.displayFinancialStatus,
     updatedAt: order?.updatedAt,
     alreadyPaid: false,
+  }
+}
+
+// Record a manual SALE transaction against a Shopify order. Used for
+// partial-payment mirroring: each cheque receipt / NMI partial charge
+// pushes one SALE transaction so Shopify computes the right
+// `displayFinancialStatus` (paid / partially_paid) from the sum of
+// transactions on the order. Full settlement still calls
+// `markShopifyOrderPaid` separately — Shopify treats that as
+// idempotent ("already paid") when transactions already cover the
+// total.
+//
+// Why REST: the Admin GraphQL API only exposes `orderCapture` for
+// transactions, which requires a pre-existing AUTHORIZATION the
+// wholesale storefront orders never carry. The REST
+// `orders/{id}/transactions.json` endpoint accepts a `kind: 'sale'`
+// with a `gateway: 'manual'` for external-payment recording.
+//
+// Returns { shopifyTransactionId, kind, amount }. Throws
+// PermanentError on userErrors that mean the call can't ever succeed
+// (e.g. order not found); transient network errors propagate through
+// shopifyRestPost's classifier so the retry layer can back off.
+export async function recordOrderTransaction({
+  shop,
+  shopifyOrderId,
+  amount,
+  currency,
+  paymentRef,
+  gateway,
+}) {
+  if (!shop || !shopifyOrderId) {
+    throw new Error('recordOrderTransaction: shop and shopifyOrderId are required')
+  }
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error(
+      `recordOrderTransaction: amount must be > 0, got ${amount}`,
+    )
+  }
+
+  console.log(
+    `[shopify] recordOrderTransaction shop=${shop} order=${shopifyOrderId} amount=$${Number(amount).toFixed(2)}`,
+  )
+  log.info('transaction.request', {
+    shop,
+    shopifyOrderId,
+    amount,
+    paymentRef: paymentRef || null,
+  })
+
+  const { session } = await getUnauthenticatedAdmin(shop)
+  const json = await shopifyRestPost({
+    shop,
+    session,
+    path: `/orders/${encodeURIComponent(shopifyOrderId)}/transactions.json`,
+    body: {
+      transaction: {
+        kind: 'sale',
+        amount: Number(amount).toFixed(2),
+        currency: currency || 'USD',
+        status: 'success',
+        gateway: gateway || 'manual',
+        source: 'external',
+        // 50-char limit on Shopify's side per docs — slice defensively.
+        ...(paymentRef ? { authorization: String(paymentRef).slice(0, 50) } : {}),
+      },
+    },
+  })
+  const txn = json?.transaction
+  if (!txn?.id) {
+    throw new PermanentError(
+      `Shopify orders/${shopifyOrderId}/transactions returned no id`,
+      { body: json },
+    )
+  }
+  console.log(
+    `[shopify] transaction recorded id=${txn.id} kind=${txn.kind} amount=${txn.amount} status=${txn.status}`,
+  )
+  log.info('transaction.success', {
+    shop,
+    shopifyOrderId,
+    shopifyTransactionId: String(txn.id),
+    amount: txn.amount,
+    status: txn.status,
+  })
+  return {
+    shopifyTransactionId: String(txn.id),
+    kind: txn.kind,
+    amount: txn.amount,
+    status: txn.status,
   }
 }
 

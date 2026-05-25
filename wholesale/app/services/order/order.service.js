@@ -6,18 +6,29 @@
 // INTEGRATIONS.md §5 (Order processing orchestrator).
 
 import ShopifyOrder from '../../models/order.server'
+import Invoice from '../../models/invoice.server'
 import { ensureCustomerForOrder } from '../customer/customer.service'
-import { createInvoiceForOrder } from '../invoice/invoice.service'
+import {
+  createInvoiceForOrder,
+  appendInvoiceRemark,
+} from '../invoice/invoice.service'
 import { chargeInvoice } from '../payment/payment.service'
 import { validateShopifyOrder } from './order.validator'
 import { paymentConfig } from '../payment/payment.config'
 import { customerHasApprovedTag } from '../shopify/shopify.service'
+import { voidInvoice as voidQboInvoice } from '../qbo/qbo.service'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('order.service')
 
 // Statuses that mean "no work to redo" — re-deliveries return early.
-const TERMINAL_STATUSES = new Set(['completed', 'invoiced', 'scheduled', 'rejected'])
+const TERMINAL_STATUSES = new Set([
+  'completed',
+  'invoiced',
+  'scheduled',
+  'rejected',
+  'cancelled',
+])
 // Statuses that mean "another worker owns this right now".
 const LOCKED_STATUSES = new Set(['processing'])
 // How long after `processingClaimedAt` we allow a stale claim to be
@@ -220,6 +231,49 @@ export async function processShopifyOrder({ shop, order, webhookId }) {
     local.processingStatus = 'invoiced'
     await local.save()
 
+    // Cancellation race guard — orders/cancelled webhook may have fired
+    // while we were mid-creation. We use `cancelledAt` as the canary
+    // (the create flow never writes it; the cancel webhook always
+    // sets it), so even if our save() above overwrote the cancel
+    // webhook's processingStatus='cancelled' back to 'invoiced',
+    // cancelledAt is the truth. If we see it set, abort the rest of
+    // processing, cancel the invoice we just created, and void it in
+    // QBO (safe because no payments could have landed yet).
+    const cancelCheck = await ShopifyOrder.findById(local._id)
+      .select('cancelledAt cancelReason')
+      .lean()
+    if (cancelCheck?.cancelledAt) {
+      console.log(
+        `[orders] orders/cancelled overtook us mid-creation — invalidating the new invoice (reason="${cancelCheck.cancelReason || 'cancelled'}")`,
+      )
+      log.warn('cancel.during_creation', {
+        shopifyOrderId,
+        invoiceId: invoice._id.toString(),
+        qboInvoiceId: invoice.qboInvoiceId,
+      })
+      invoice.paymentStatus = 'cancelled'
+      await invoice.save()
+      if (invoice.qboInvoiceId) {
+        try {
+          await voidQboInvoice(invoice.qboInvoiceId)
+          console.log(`[orders] race-fix — voided just-created QBO invoice ${invoice.qboInvoiceId}`)
+        } catch (qboErr) {
+          console.error(`[orders] race-fix — QBO void failed: ${qboErr.message}`)
+          log.error('cancel.race_void_failed', {
+            invoiceId: invoice._id.toString(),
+            qboInvoiceId: invoice.qboInvoiceId,
+            err: qboErr,
+          })
+        }
+      }
+      // Restore the cancelled processingStatus our save() just overwrote.
+      await ShopifyOrder.updateOne(
+        { _id: local._id },
+        { $set: { processingStatus: 'cancelled' } },
+      )
+      return await ShopifyOrder.findById(local._id)
+    }
+
     // Step 3 — optional immediate NMI charge. Only cards are charged
     // automatically. Cheque / ACH invoices are held until an admin acts
     // from the Order Details page (mark received or fall back to card).
@@ -326,3 +380,182 @@ export async function replayPendingOrdersForCustomer({ shop, email }) {
   log.info('replay.done', { shop, email: normalizedEmail, ...summary })
   return summary
 }
+
+// Handle an orders/cancelled webhook. Upserts the ShopifyOrder to
+// terminal state `cancelled`, transitions any linked Invoice to
+// `cancelled`, and voids the QBO invoice when it has not yet received
+// any payment.
+//
+// Idempotent + race-safe:
+//   - seenWebhookIds[] dedup catches Shopify's at-least-once retries.
+//   - The upsert means a cancelled webhook arriving BEFORE the
+//     matching orders/create produces a `cancelled` doc immediately;
+//     the create handler's TERMINAL_STATUSES pre-check returns early
+//     when the late create re-delivery shows up.
+//   - We never void a QBO invoice with money against it (amountPaid > 0)
+//     — that would erase a real receipt. The local invoice is still
+//     marked cancelled so the CRON skips it; the admin decides what
+//     to do with the partial payment.
+//
+// `order` is Shopify's orders/cancelled payload — same shape as
+// orders/create plus `cancelled_at` and `cancel_reason`.
+export async function handleOrderCancelled({ shop, order, webhookId }) {
+  if (!order?.id) throw new Error('handleOrderCancelled: order.id is required')
+  const shopifyOrderId = String(order.id)
+
+  console.log(
+    `\n[orders] handleOrderCancelled shop=${shop} order=${shopifyOrderId} webhookId=${webhookId || '(none)'}`,
+  )
+
+  const shopifyCancelledAt = order.cancelled_at ? new Date(order.cancelled_at) : new Date()
+  const cancelReason = order.cancel_reason || 'cancelled in Shopify'
+
+  // ── 1. Dedup against the same webhook delivery ────────────────
+  if (webhookId) {
+    const dup = await ShopifyOrder.findOne({ shop, shopifyOrderId, seenWebhookIds: webhookId })
+      .select('_id processingStatus')
+      .lean()
+    if (dup) {
+      console.log(`[orders] DUPLICATE cancellation webhookId=${webhookId} — already handled`)
+      log.info('cancel.skip.duplicate_webhook', { shopifyOrderId, webhookId })
+      return await ShopifyOrder.findById(dup._id)
+    }
+  }
+
+  // ── 2. Upsert the order doc to `cancelled` ─────────────────────
+  //
+  // Upsert covers the case where the cancellation webhook beats the
+  // create webhook to our endpoint (a rare race when an order is
+  // cancelled within seconds of creation). The $setOnInsert seeds
+  // the minimum required fields; the $set overwrites lifecycle state.
+  const update = {
+    $setOnInsert: {
+      shop,
+      shopifyOrderId,
+      receivedAt: new Date(),
+    },
+    $set: {
+      processingStatus: 'cancelled',
+      cancelledAt: shopifyCancelledAt,
+      cancelReason,
+      shopifyOrderName: order.name,
+      shopifyOrderNumber: order.order_number,
+      customerEmail:
+        (order.email || order.customer?.email || '').toLowerCase() || undefined,
+      shopifyCustomerId: order.customer?.id ? String(order.customer.id) : undefined,
+      currency: order.currency,
+      totalAmount: Number(order.total_price ?? 0),
+      financialStatus: order.financial_status,
+      fulfillmentStatus: 'cancelled',
+      rawPayload: order,
+    },
+  }
+  if (webhookId) {
+    update.$addToSet = { seenWebhookIds: webhookId }
+    update.$set.lastWebhookId = webhookId
+  }
+  const localOrder = await ShopifyOrder.findOneAndUpdate(
+    { shop, shopifyOrderId },
+    update,
+    { upsert: true, new: true },
+  )
+  console.log(
+    `[orders] order doc set processingStatus=cancelled reason="${cancelReason}" cancelledAt=${shopifyCancelledAt.toISOString()}`,
+  )
+
+  // ── 3. Cancel the linked Invoice (if any) + void in QBO ───────
+  if (!localOrder.invoiceRef) {
+    console.log(`[orders] no Invoice linked — nothing to cancel in QBO`)
+    log.info('cancel.done', { shopifyOrderId, hadInvoice: false })
+    return localOrder
+  }
+
+  const invoice = await Invoice.findById(localOrder.invoiceRef)
+  if (!invoice) {
+    console.log(`[orders] WARN — invoiceRef points to missing invoice`)
+    log.warn('cancel.invoice_missing', { shopifyOrderId, invoiceRef: localOrder.invoiceRef })
+    return localOrder
+  }
+
+  if (invoice.paymentStatus === 'cancelled') {
+    console.log(`[orders] invoice already cancelled — nothing to do`)
+    log.info('cancel.invoice_already_cancelled', { invoiceId: invoice._id.toString() })
+    return localOrder
+  }
+
+  const hasPayments = Number(invoice.amountPaid || 0) > 0.005
+  const wasPaid = invoice.paymentStatus === 'paid'
+
+  // Local invoice: always flip to cancelled so the CRON skips it on
+  // every subsequent tick. This is the authoritative "do not charge"
+  // signal — true even for paid invoices, since the cancellation may
+  // need a manual refund decision separately.
+  const priorStatus = invoice.paymentStatus
+  invoice.paymentStatus = 'cancelled'
+  await invoice.save()
+  console.log(`[orders] invoice ${invoice._id} status ${priorStatus} → cancelled`)
+  log.info('cancel.invoice_cancelled', {
+    invoiceId: invoice._id.toString(),
+    priorStatus,
+    amountPaid: invoice.amountPaid,
+  })
+
+  // QBO void: ONLY if no money has been received against the invoice.
+  // Voiding an invoice with linked Payments would orphan / unbalance
+  // the books. For paid or partially-paid invoices, leave the QBO
+  // invoice alone — the admin makes the manual refund decision later.
+  if (!invoice.qboInvoiceId) {
+    console.log(`[orders] invoice has no qboInvoiceId — skipping QBO void`)
+  } else if (hasPayments || wasPaid) {
+    const msg =
+      `QBO void skipped — invoice has $${(invoice.amountPaid || 0).toFixed(2)} in recorded payments. ` +
+      `Refund the payments and void manually in QBO if needed.`
+    console.warn(`[orders] ${msg}`)
+    log.warn('cancel.qbo_void_skipped_has_payments', {
+      invoiceId: invoice._id.toString(),
+      qboInvoiceId: invoice.qboInvoiceId,
+      amountPaid: invoice.amountPaid,
+    })
+    invoice.lastSyncError = msg
+    await invoice.save()
+  } else {
+    try {
+      const voided = await voidQboInvoice(invoice.qboInvoiceId)
+      invoice.qboSyncToken = voided?.SyncToken || invoice.qboSyncToken
+      await invoice.save()
+      console.log(`[orders] QBO invoice ${invoice.qboInvoiceId} voided`)
+      log.info('cancel.qbo_voided', {
+        invoiceId: invoice._id.toString(),
+        qboInvoiceId: invoice.qboInvoiceId,
+      })
+    } catch (qboErr) {
+      const msg = `QBO void failed: ${qboErr.message}`
+      console.error(`[orders] ${msg}`)
+      log.error('cancel.qbo_void_failed', {
+        invoiceId: invoice._id.toString(),
+        qboInvoiceId: invoice.qboInvoiceId,
+        err: qboErr,
+      })
+      invoice.lastSyncError = msg
+      await invoice.save()
+    }
+  }
+
+  // ── 4. Order Details remarks for the audit trail ──────────────
+  await appendInvoiceRemark(invoice._id, {
+    kind: 'system_note',
+    message:
+      `Shopify order cancelled (${cancelReason})` +
+      (hasPayments
+        ? ` — $${(invoice.amountPaid || 0).toFixed(2)} already paid; QBO invoice left intact for refund decision`
+        : invoice.qboInvoiceId
+          ? ' — QBO invoice voided'
+          : ''),
+    source: 'system',
+    currency: invoice.currency,
+  })
+
+  console.log(`[orders] cancellation handling complete for order=${shopifyOrderId}\n`)
+  return localOrder
+}
+

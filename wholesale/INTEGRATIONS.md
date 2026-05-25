@@ -333,6 +333,55 @@ In both modes the webhook returns 200 before downstream calls finish.
   { "route": "/webhooks/orders/create", "status": "alive — POST a Shopify orders/create webhook here", "method_expected": "POST" }
   ```
 
+### 4.5 `orders/cancelled` webhook — `app/routes/webhooks.orders.cancelled.jsx`
+
+Mirror of the create handler: verify HMAC, log, fire-and-forget into
+`services/order/order.service.handleOrderCancelled`, ACK 200 fast.
+Idempotent — uses `seenWebhookIds[]` for dedup just like the create
+path. Subscription registered both ways:
+
+- Declaratively in `shopify.app.dev-rk.toml`.
+- Programmatically via `REQUIRED_SUBSCRIPTIONS` for the default profile
+  (orders/cancelled is a protected customer data topic and needs
+  Partners-dashboard approval before it can be declared).
+
+`handleOrderCancelled({ shop, order, webhookId })` flow:
+
+```
+1. Webhook-id dedup     → ShopifyOrder.seenWebhookIds.includes(webhookId)? exit
+2. Upsert ShopifyOrder  → $set: { processingStatus: 'cancelled',
+                                    cancelledAt: order.cancelled_at,
+                                    cancelReason: order.cancel_reason }
+                          (upsert covers the case where cancelled
+                          arrives BEFORE create — the late create
+                          delivery then early-returns on TERMINAL_STATUSES)
+3. If invoiceRef set:
+    3a. Invoice.paymentStatus → 'cancelled'  (CRON skip is automatic
+                                              via PASS 1's
+                                              paymentStatus: 'pending'
+                                              filter)
+    3b. If invoice.amountPaid === 0 AND qboInvoiceId set:
+          qbo.service.voidInvoice(qboInvoiceId)
+        Else (paid / partially-paid):
+          log warning, leave QBO alone — money is real, admin decides
+          the refund manually
+4. appendInvoiceRemark   { kind: 'system_note',
+                           message: "Shopify order cancelled (<reason>) — ..." }
+```
+
+Race protection — `processShopifyOrder` re-fetches `cancelledAt`
+immediately after invoice creation. If set, it aborts the rest of
+processing, cancels the just-created invoice, and voids it in QBO.
+This closes the narrow window where the cancel webhook flips the
+order to `'cancelled'` while the create handler is mid-flight and a
+subsequent `local.save()` would otherwise overwrite the cancellation
+back to `'invoiced'`.
+
+Refund of already-collected money is **out of scope** of this handler.
+It marks the invoice cancelled and leaves the audit trail; an admin
+who needs to give a partial-paid customer their money back uses the
+gateway's refund tooling directly (NMI portal / cheque void).
+
 ---
 
 ## 5. Order processing orchestrator
@@ -346,8 +395,9 @@ received  → processing ──┬─→ pending_approval ──(admin approves)
                          │                                         │
                          └─→ customer_ready → invoiced → scheduled → completed
                                   │
-                                  ├── rejected (validation failed or no customer)
-                                  └── failed   (downstream error)
+                                  ├── rejected  (validation failed or no customer)
+                                  ├── failed    (downstream error)
+                                  └── cancelled (orders/cancelled webhook — see §4.5)
 ```
 
 `pending_approval` is the hold state for orders from Shopify customers that
@@ -361,7 +411,7 @@ admin approves the customer) — see §5.4 below.
 | Layer | Mechanism | Catches |
 |---|---|---|
 | Webhook-id dedup | `seenWebhookIds[]` on ShopifyOrder | Shopify retries — same `x-shopify-webhook-id` |
-| Terminal-status return | `if status ∈ {completed, invoiced, scheduled, rejected} → return` | Order already processed |
+| Terminal-status return | `if status ∈ {completed, invoiced, scheduled, rejected, cancelled} → return` | Order already processed (or cancelled before / during creation) |
 | Atomic claim | `findOneAndUpdate(filter, $set: { status: 'processing' })` | Two concurrent workers |
 
 The claim filter:
@@ -1156,28 +1206,64 @@ audit history.
 
 ## 12. Status synchronization across QBO, Shopify, and local DB
 
-After NMI returns `response=1` (approved), `propagateSuccessfulPayment`
-(in `services/invoice/invoice.service.js`) mirrors the state into
-three systems. Each side is independent:
+`propagateSuccessfulPayment` (in `services/invoice/invoice.service.js`)
+is the single funnel for mirroring payment activity into QBO + Shopify
++ the local order mirror. It is **cumulative-aware** — partial payments
+each get their own QBO Payment record and their own Shopify SALE
+transaction, instead of being skipped after the first one. Each side
+is independent: a failure on one side does not block the others, and
+re-invocations only do the missing work.
+
+### 12.1 Sync model — diff-against-cumulative
+
+Each downstream system carries its own running total on the Invoice
+doc:
+
+| System | Cumulative field | Per-event id list |
+|---|---|---|
+| QBO `Payment` | `Invoice.qboRecordedTotal` | `Invoice.qboPaymentIds[]` |
+| Shopify SALE transactions | `Invoice.shopifyRecordedTotal` | `Invoice.shopifyTransactionIds[]` |
+
+On every propagate call we record the **diff** between
+`Invoice.amountPaid` and the running total — never the caller-passed
+amount and never the full invoice balance. A cheque receipt of $5 then
+a cheque receipt of $2.72 on a $7.72 invoice produces TWO QBO Payments
+($5 and $2.72) and TWO Shopify SALE transactions, summing to $7.72 on
+each side. The legacy `qboPaymentRecorded` / `shopifyMarkedPaid`
+booleans are derived (true iff cumulative >= amountPaid within 0.005)
+and still drive `CRON PASS 2`'s coarse sweep filter alongside an
+`$expr` cumulative-mismatch check.
 
 ```
-┌──────── 1. QBO ────────────────────────────────────────────────────┐
-│  if !invoice.qboPaymentRecorded:                                   │
-│    syncWithRetry('qbo.record_payment', () =>                       │
-│      recordQboPayment({ customer, invoice, amount, paymentRef }))  │
-│    on success → set qboPaymentRecorded=true, qboPaymentId=<id>     │
-│    on failure → push msg to syncErrors[], keep flag false          │
+┌──────── 1. QBO Payment (per-partial) ──────────────────────────────┐
+│  qboOwed = amountPaid - qboRecordedTotal                           │
+│  if qboOwed > 0.005:                                               │
+│    recordQboPayment({ amount: qboOwed, paymentRef: transactionId })│
+│    qboPaymentIds.push(payment.Id)                                  │
+│    qboRecordedTotal += qboOwed                                     │
+│    qboPaymentRecorded = (qboRecordedTotal >= amountPaid)           │
 └────────────────────────────────────────────────────────────────────┘
 
-┌──────── 2. SHOPIFY ────────────────────────────────────────────────┐
-│  if !invoice.shopifyMarkedPaid:                                    │
-│    syncWithRetry('shopify.mark_paid', () =>                        │
-│      markShopifyOrderPaid({ shop, shopifyOrderId }))               │
-│    on success → set shopifyMarkedPaid=true, shopifyMarkedPaidAt    │
-│    "Already paid" userError is treated as success (idempotent)     │
+┌──────── 2. Shopify SALE transaction (per-partial) ─────────────────┐
+│  shopOwed = amountPaid - shopifyRecordedTotal                      │
+│  if shopOwed > 0.005:                                              │
+│    recordOrderTransaction({ amount: shopOwed, ... })  ← REST       │
+│    shopifyTransactionIds.push(transaction.id)                      │
+│    shopifyRecordedTotal += shopOwed                                │
+│  Shopify's displayFinancialStatus auto-computes from the           │
+│  sum of transactions: paid / partially_paid / refunded.            │
 └────────────────────────────────────────────────────────────────────┘
 
-┌──────── 3. shopify_orders local doc ───────────────────────────────┐
+┌──────── 3. Shopify orderMarkAsPaid (once on full settlement) ──────┐
+│  if invoice.paymentStatus == 'paid' AND !shopifyMarkedPaid:        │
+│    markShopifyOrderPaid({ shop, shopifyOrderId })                  │
+│    shopifyMarkedPaid = true                                        │
+│  Idempotent: Shopify returns "already paid" once the SALE          │
+│  transactions cover the total. Still called for its downstream-    │
+│  workflow side effects (notifications, fulfillment hooks).         │
+└────────────────────────────────────────────────────────────────────┘
+
+┌──────── 4. shopify_orders local mirror ────────────────────────────┐
 │  ShopifyOrder.findOneAndUpdate({ _id: invoice.orderRef }, { $set:  │
 │    paymentStatus:    'paid' | 'pending'  (partial),                │
 │    financialStatus:  'paid' | 'partially_paid',                    │
@@ -1188,8 +1274,109 @@ three systems. Each side is independent:
 ```
 
 `syncWithRetry` = 3 attempts with exponential backoff. `PermanentError`
-(e.g. validation, auth) bypasses retry. Each side's success flag is
-checked before the call so re-invocations only do the missing work.
+(e.g. validation, auth) bypasses retry. The diff guard means re-runs
+naturally skip work that's already done — we never write the same
+payment to QBO twice.
+
+### 12.2 Backward compatibility for pre-cumulative invoices
+
+Invoices created before this change carry `qboPaymentRecorded: true`
+and `shopifyMarkedPaid: true` but no cumulative total. The first call
+into `propagateSuccessfulPayment` after the upgrade backfills:
+
+```
+if (qboPaymentRecorded && !(qboRecordedTotal > 0))
+  qboRecordedTotal = amountPaid           // assume prior sync was full
+if (shopifyMarkedPaid && !(shopifyRecordedTotal > 0))
+  shopifyRecordedTotal = amountPaid
+```
+
+After backfill the diff guard sees nothing owed and skips, so old
+fully-paid invoices don't re-record their old payments. New activity
+on those invoices (e.g. an admin refund or a follow-up cheque on a
+partially-paid pre-upgrade invoice) goes through the normal cumulative
+path.
+
+### 12.3 Shopify Admin call without a request
+
+The scheduler runs autonomously, no logged-in admin session. To call
+the Shopify Admin GraphQL API from the scheduler:
+
+```js
+import { unauthenticated } from '../../shopify.server'
+
+const { admin } = await unauthenticated.admin(shop)
+const response = await admin.graphql(mutation, { variables })
+const json = await response.json()
+```
+
+`unauthenticated.admin(shop)` pulls an **offline session** from the
+same `MongoDBSessionStorage` populated at OAuth install. If the shop
+has uninstalled the app, no offline session exists and the call throws
+`PermanentError("No installed session for shop … — re-install the app")`.
+
+The `orderMarkAsPaid` mutation:
+
+```graphql
+mutation orderMarkAsPaid($input: OrderMarkAsPaidInput!) {
+  orderMarkAsPaid(input: $input) {
+    order { id displayFinancialStatus updatedAt }
+    userErrors { field message }
+  }
+}
+```
+
+Idempotency: a second call to a paid order returns a userError matching
+`/already.*paid/i` which `markShopifyOrderPaid` translates to a success
+with `{ alreadyPaid: true }`.
+
+### 12.4 Per-partial Shopify SALE transactions (REST)
+
+The Admin GraphQL API has no general "record an arbitrary manual
+payment transaction" mutation — `orderCapture` only operates on
+existing AUTHORIZATION transactions, which our wholesale storefront
+orders never carry. Instead we use the documented REST endpoint:
+
+```http
+POST /admin/api/{api_version}/orders/{order_id}/transactions.json
+X-Shopify-Access-Token: <offline-session-token>
+
+{ "transaction": {
+    "kind":     "sale",
+    "amount":   "5.00",
+    "currency": "USD",
+    "status":   "success",
+    "gateway":  "manual",
+    "source":   "external"
+} }
+```
+
+The low-level helper is `shopify.apis.shopifyRestPost({ shop, session,
+path, body })`; the domain wrapper is
+`shopify.service.recordOrderTransaction({ shop, shopifyOrderId,
+amount, currency, paymentRef })`. It reuses the offline session
+loaded by `getUnauthenticatedAdmin(shop)` for the access token, so
+no separate config is needed.
+
+### 12.5 CRON PASS 2 sweep filter
+
+PASS 2 catches invoices where any downstream is behind. Filter:
+
+```js
+{
+  paymentStatus: { $in: ['paid', 'partially_paid', 'partially_refunded'] },
+  $or: [
+    { qboPaymentRecorded: false },
+    { shopifyMarkedPaid: false, paymentStatus: 'paid' },
+    { $expr: { $gt: [{ $subtract: ['$amountPaid', { $ifNull: ['$qboRecordedTotal', 0] }] }, 0.005] } },
+    { $expr: { $gt: [{ $subtract: ['$amountPaid', { $ifNull: ['$shopifyRecordedTotal', 0] }] }, 0.005] } },
+  ],
+}
+```
+
+The two `$expr` clauses catch cumulative-mismatch cases (partial sync
+left QBO or Shopify behind). The first two clauses cover legacy /
+boolean-only invoices.
 
 ### 12.1 Shopify Admin call without a request
 
