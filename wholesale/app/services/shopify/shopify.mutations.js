@@ -68,6 +68,15 @@ export const MUTATION_CUSTOMER_DELETE = `#graphql
   }
 `
 
+export const MUTATION_ORDER_DELETE = `#graphql
+  mutation OrderDelete($orderId: ID!) {
+    orderDelete(orderId: $orderId) {
+      deletedId
+      userErrors { field message }
+    }
+  }
+`
+
 // ── File uploads ─────────────────────────────────────────────────────
 
 export const MUTATION_STAGED_UPLOADS_CREATE = `#graphql

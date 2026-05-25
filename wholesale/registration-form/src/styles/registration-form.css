@@ -14,7 +14,6 @@
   flex-direction: column;
   width: 100%;
 }
-
 /* Topbar */
 .rf-topbar {
   border-bottom: 1px solid var(--color-border);
@@ -35,6 +34,12 @@
   color: var(--color-primary);
   letter-spacing: -0.01em;
 }
+
+#collect-ccnumber #ccnumber{
+  border: none !important;
+  padding-bottom: 8000px;
+}
+
 .rf-brand-sub {
   color: var(--color-text-muted);
   font-size: 12px;
@@ -662,7 +667,7 @@
 .rf-pay-options { display: grid; gap: 10px; margin-bottom: 8px; }
 .rf-pay-card {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 12px;
   padding: 14px 16px;
   border: 1px solid var(--color-border);
@@ -714,14 +719,6 @@
   white-space: nowrap;
 }
 
-/* Stripe element wrap */
-.rf-stripe-element {
-  padding: 11px 14px;
-  border: 1px solid var(--color-border);
-  border-radius: 8px;
-  background: #fff;
-}
-.rf-stripe-element.error { border-color: var(--color-error); }
 
 /* Billing summary */
 .rf-billing-summary {
@@ -1085,4 +1082,18 @@
   color: #b91c1c;
   line-height: 1;
   padding: 0 2px;
+}
+
+/* Collect.js hosted iframe fields */
+.rf-collect-field {
+  overflow: hidden;
+  display: block;
+}
+.rf-collect-field iframe {
+  display: block;
+  width: 100% !important;
+  height: 22px !important;
+  border: none;
+  margin: 0;
+  padding: 0;
 }

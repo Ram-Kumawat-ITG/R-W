@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState , useRef } from "react";
 import { useForm } from "react-hook-form";
 import { yupResolver } from "@hookform/resolvers/yup";
 import { fullSchema } from "./schema/full.schema";
@@ -65,12 +65,11 @@ const defaultValues = {
   payment: {
     method: "check",
     cardholderName: "",
+    paymentToken: "",
     cardBrand: "",
-    cardNumber: "",
-    cardExpiry: "",
-    cardCvv: "",
+    cardLast4: "",
   },
-  signature: { type: "draw", drawn: null, typed: "" },
+  signature: { drawn: null },
   subscribeNews: false,
   termsAccepted: false,
 };
@@ -158,6 +157,9 @@ function FormBody({ onBack }) {
   const [toast, setToast] = useState(null);
   const [successView, setSuccessView] = useState(false);
   const [errorBanner, setErrorBanner] = useState(null);
+  const collectTokenResolverRef = useRef(null);
+  const submitIntentRef = useRef(false);
+  const serverErrorNavRef = useRef(false);
 
   const {
     control,
@@ -176,28 +178,24 @@ function FormBody({ onBack }) {
 
   const validateStep = useStepValidation(trigger);
 
-  // Log validation errors to the browser console any time they change.
-  // Helps debug "why won't this step advance" without sprinkling logs everywhere.
+  // Clear stale errors and banner every time the step changes.
+  // trigger(step2Fields) runs the full yupResolver which evaluates step-3 fields
+  // (signature, cardholderName) even though they aren't triggered — those errors
+  // can leak into RHF state before clearErrors() in next() fires. Clearing again
+  // here (one render later) guarantees the new step always starts clean.
   useEffect(() => {
-    const flat = flattenErrors(errors);
-    if (flat.length === 0) {
-      console.log("[RegistrationForm] no validation errors");
-    } else {
-      console.group(`[RegistrationForm] validation errors (${flat.length})`);
-      flat.forEach(({ path, message, type }) => {
-        console.log(
-          `  • ${path} — ${message}${type ? `  (rule: ${type})` : ""}`,
-        );
-      });
-      console.log("full errors object:", errors);
-      console.groupEnd();
+    if (serverErrorNavRef.current) {
+      serverErrorNavRef.current = false;
+      return;
     }
-  }, [errors]);
+    setErrorBanner(null);
+    clearErrors();
+  }, [currentStep, clearErrors]);
+
 
   const showToast = (severity, message) => {
     setToast({ severity, message });
     setTimeout(() => setToast(null), 4000);
-
   };
 
   const next = async () => {
@@ -229,33 +227,38 @@ function FormBody({ onBack }) {
   };
 
   const onValid = async (values) => {
+    submitIntentRef.current = false;
     setSubmitting(true);
     try {
-      // Send full digits to the backend so it can HMAC-hash them. CVV is
-      // dropped entirely — PCI forbids storing it in any form, including hashed.
-      const digits = (values.payment.cardNumber || "").replace(/\D/g, "");
-      const expMatch = (values.payment.cardExpiry || "").match(
-        /^(\d{2})\s*\/?\s*(\d{2})$/,
-      );
+      // Tokenize card via Collect.js — raw card data never touches our servers.
+      const tokenResult = await new Promise((resolve, reject) => {
+        collectTokenResolverRef.current = { resolve, reject };
+        const tid = setTimeout(() => {
+          if (collectTokenResolverRef.current) {
+            collectTokenResolverRef.current.reject(
+              new Error("Please check your card details and try again."),
+            );
+            collectTokenResolverRef.current = null;
+          }
+        }, 10000);
+        collectTokenResolverRef.current._tid = tid;
+        window.CollectJS.startPaymentRequest();
+      });
+
       const cardPayload = {
         method: values.payment.method,
         cardholderName: values.payment.cardholderName,
-        cardBrand: values.payment.cardBrand,
-        cardNumber: digits, // hashed server-side, never persisted raw
-        cardLast4: digits.slice(-4),
-        cardExpMonth: expMatch ? Number(expMatch[1]) : null,
-        cardExpYear: expMatch ? 2000 + Number(expMatch[2]) : null,
+        paymentToken: tokenResult.token,
+        cardBrand: tokenResult.cardBrand,
+        cardLast4: tokenResult.cardLast4,
       };
 
       const payload = { ...values, payment: cardPayload };
 
       // Signature handled separately so we can attach the PNG as a File
       const fd = buildFormData({ ...payload, signature: undefined });
-      if (values.signature?.type === "draw" && values.signature.drawn) {
+      if (values.signature?.drawn) {
         fd.append("signatureFile", values.signature.drawn, "signature.png");
-      } else if (values.signature?.type === "type" && values.signature.typed) {
-        fd.append("signatureType", "typed");
-        fd.append("signatureValue", values.signature.typed);
       }
 
       const data = await ApiService.submitRegistration(fd);
@@ -263,6 +266,7 @@ function FormBody({ onBack }) {
     } catch (err) {
       const fieldErrors = err?.responseData?.result?.fieldErrors;
       if (fieldErrors?.length) {
+        serverErrorNavRef.current = true;
         setCurrentStep(1);
         setErrorBanner("Oops! A few fields need your attention.");
         window.scrollTo({ top: 0, behavior: "smooth" });
@@ -297,21 +301,28 @@ function FormBody({ onBack }) {
       <main className="rf-main">
         <div className="rf-card">
           <form
-            onSubmit={handleSubmit(onValid, (errs) => {
-              setErrorBanner("Oops! A few fields need your attention.");
-              window.scrollTo({ top: 0, behavior: "smooth" });
-              console.error(
-                "[RegistrationForm] submit blocked by validation:",
-                errs,
-              );
-              console.table(
-                flattenErrors(errs).map(({ path, message, type }) => ({
-                  path,
-                  message,
-                  type,
-                })),
-              );
-            })}
+            onSubmit={(e) => {
+              if (!submitIntentRef.current) {
+                e.preventDefault();
+                return;
+              }
+              handleSubmit(onValid, (errs) => {
+                submitIntentRef.current = false;
+                setErrorBanner("Oops! A few fields need your attention.");
+                window.scrollTo({ top: 0, behavior: "smooth" });
+                console.error(
+                  "[RegistrationForm] submit blocked by validation:",
+                  errs,
+                );
+                console.table(
+                  flattenErrors(errs).map(({ path, message, type }) => ({
+                    path,
+                    message,
+                    type,
+                  })),
+                );
+              })(e);
+            }}
             noValidate
           >
             {errorBanner && (
@@ -355,15 +366,21 @@ function FormBody({ onBack }) {
                 clearErrors={clearErrors}
               />
             )}
-            {currentStep === 3 && (
+            <div style={currentStep !== 3 ? {
+              position: 'absolute',
+              visibility: 'hidden',
+              pointerEvents: 'none',
+              width: '100%',
+            } : undefined}>
               <Step3Payment
                 control={control}
                 errors={errors}
                 setValue={setValue}
                 onEditBilling={prev}
                 isSubmitted={isSubmitted}
+                collectTokenResolverRef={collectTokenResolverRef}
               />
-            )}
+            </div>
 
             <div className="rf-actions">
               {currentStep === 1 ? (
@@ -397,6 +414,7 @@ function FormBody({ onBack }) {
                   type="submit"
                   className="rf-btn rf-btn-primary"
                   disabled={submitting}
+                  onClick={() => { submitIntentRef.current = true }}
                 >
                   {submitting ? "Submitting…" : "Submit application"}
                   {!submitting && (

@@ -51,7 +51,7 @@ function BillingSummary({ control, onEdit }) {
   )
 }
 
-export default function Step3Payment({ control, errors, setValue, onEditBilling, isSubmitted }) {
+export default function Step3Payment({ control, errors, onEditBilling, isSubmitted, collectTokenResolverRef }) {
   return (
     <section className="rf-step">
       <h1 className="rf-step-title">Payment &amp; authorization</h1>
@@ -107,7 +107,7 @@ export default function Step3Payment({ control, errors, setValue, onEditBilling,
         <span>Only the last 4 digits and card brand are stored. We never persist the full card number or CVV.</span>
       </div>
 
-      <PaymentCardForm control={control} setValue={setValue} showAllErrors={isSubmitted} />
+      <PaymentCardForm control={control} tokenResolverRef={collectTokenResolverRef} showAllErrors={isSubmitted} />
 
       <div className="rf-field" style={{ marginTop: 4 }}>
         <label className="rf-label">Card billing address</label>

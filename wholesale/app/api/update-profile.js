@@ -1,20 +1,17 @@
-import crypto from 'node:crypto'
 import { authenticate } from '../shopify.server'
 import connectDB from '../services/APIService/mongo.service'
 import WholesaleApplication from '../models/wholesaleApplication.server'
 import { sendResponse } from '../services/APIService/api.service'
 import { buildShopifyNote } from '../services/shopify/shopify.utils'
-import { customerUpdateNote } from '../utils/shopifyCustomer'
+import { customerUpdateNote, customerUpdateDefaultAddress } from '../utils/shopifyCustomer'
 
-// POST /api/update-profile
+// POST /api/update-profile  (Shopify App Proxy)
 // Content-Type: application/json
 //
-// email      → find customer in MongoDB (required)
-// customer_id → numeric Shopify customer ID, used to update Shopify customer note (optional)
-// payment    → card fields (all optional, send only what changed)
-// tax        → tax fields (all optional, send only what changed)
-//
-// Card security: raw card number is hashed with HMAC-SHA256. The PAN is never stored or logged.
+// Accepts any combination of: profile, address, payment, tax.
+// Send only the fields that changed — everything is optional except email.
+// Address: one address only (mirrors Shopify customer default address).
+// Card: raw cardNumber is HMAC-SHA256 hashed server-side, never stored raw.
 
 export async function action({ request }) {
   if (request.method !== 'POST') {
@@ -45,9 +42,14 @@ export async function action({ request }) {
     return sendResponse(400, 'error', 'Invalid JSON payload', null)
   }
 
-  // email   → identify the customer in MongoDB
-  // customer_id → identify the customer in Shopify (numeric, e.g. 1234567890)
-  const { email, customer_id: rawCustomerId, payment = {}, tax = {} } = body
+  const {
+    email,
+    customer_id: rawCustomerId,
+    profile = {},
+    address,
+    payment = {},
+    tax = {},
+  } = body
 
   if (!email) {
     return sendResponse(400, 'error', 'email is required', null)
@@ -61,38 +63,53 @@ export async function action({ request }) {
   }
 
   const $set = {}
+  let hasProfileUpdate = false
+  let hasAddressUpdate = false
+  let hasPaymentUpdate = false
   let hasTaxUpdate = false
 
-  // ── Card / payment fields ─────────────────────────────────────────────────
-  const { cardNumber: rawCardNumber, ...paymentFields } = payment
-  const paymentKeys = ['method', 'cardholderName', 'cardBrand', 'cardLast4', 'cardExpMonth', 'cardExpYear']
+  // ── Profile fields ────────────────────────────────────────────────────────
+  const profileKeys = ['firstName', 'lastName', 'phone', 'businessName']
+  for (const k of profileKeys) {
+    const v = profile[k]
+    if (v != null && v !== '') {
+      $set[k] = v
+      hasProfileUpdate = true
+    }
+  }
 
-  const hasPaymentUpdate = rawCardNumber || paymentKeys.some((k) => payment[k] != null && payment[k] !== '')
-  if (hasPaymentUpdate) {
-    const numFields = new Set(['cardExpMonth', 'cardExpYear'])
-    for (const k of paymentKeys) {
-      const v = paymentFields[k]
-      if (v != null && v !== '') {
-        $set[`payment.${k}`] = numFields.has(k) ? (parseInt(v, 10) || v) : v
+  // ── Address (single — mirrors Shopify customer default address) ───────────
+  let addressToSync = null
+  if (address && typeof address === 'object') {
+    const addressFields = ['line1', 'line2', 'city', 'state', 'zip', 'country']
+    for (const k of addressFields) {
+      if (address[k] != null) {
+        $set[`billingAddress.${k}`] = address[k]
+        hasAddressUpdate = true
       }
     }
+    if (hasAddressUpdate) {
+      $set['shippingAddress'] = null
+      $set['shippingSameAsBilling'] = true
+      addressToSync = address
+    }
+  }
 
-    // Hash the raw PAN — never store it.
-    if (rawCardNumber) {
-      const pan = String(rawCardNumber).replace(/\D/g, '')
-      if (pan) {
-        const key = process.env.SHOPIFY_API_SECRET || 'card-hash-fallback-key'
-        $set['payment.cardNumberHash'] = crypto
-          .createHmac('sha256', key)
-          .update(`card-pan:${pan}`)
-          .digest('hex')
+  // ── Card / payment fields ─────────────────────────────────────────────────
+  const paymentKeys = ['method', 'cardholderName', 'cardBrand', 'cardLast4', 'paymentToken']
+
+  hasPaymentUpdate = paymentKeys.some((k) => payment[k] != null && payment[k] !== '')
+  if (hasPaymentUpdate) {
+    for (const k of paymentKeys) {
+      const v = payment[k]
+      if (v != null && v !== '') {
+        $set[`payment.${k}`] = v
       }
     }
   }
 
   // ── Tax fields ────────────────────────────────────────────────────────────
   const taxKeys = ['taxIdType', 'taxId', 'salesPermit', 'exemptState', 'itemsToResell', 'businessActivity']
-
   for (const k of taxKeys) {
     const v = tax[k]
     if (v != null && v !== '') {
@@ -101,7 +118,7 @@ export async function action({ request }) {
     }
   }
 
-  if (!hasPaymentUpdate && !hasTaxUpdate) {
+  if (!hasProfileUpdate && !hasAddressUpdate && !hasPaymentUpdate && !hasTaxUpdate) {
     return sendResponse(400, 'error', 'No fields to update', null)
   }
 
@@ -113,46 +130,59 @@ export async function action({ request }) {
     return sendResponse(500, 'error', 'Failed to save update', { detail: e.message })
   }
 
-  // ── Rebuild + push Shopify customer note (tax changes only) ───────────────
-  if (hasTaxUpdate) {
-    try {
-      const merged = {
-        ...doc.toObject(),
-        tax: {
-          ...(doc.tax?.toObject?.() ?? doc.tax ?? {}),
-          ...Object.fromEntries(taxKeys.filter((k) => tax[k] != null && tax[k] !== '').map((k) => [k, tax[k]])),
-        },
+  // ── Sync to Shopify (address + note) ─────────────────────────────────────
+  if (hasTaxUpdate || hasAddressUpdate || hasProfileUpdate) {
+    const customerId = shopifyGid || doc.customerId
+    if (customerId) {
+      // Push updated default address to Shopify
+      if (addressToSync) {
+        try {
+          await customerUpdateDefaultAddress(admin, { customerId, address: addressToSync })
+        } catch (e) {
+          console.error('[proxy/update-profile] shopify address update failed:', e?.message || e)
+        }
       }
-      const note = buildShopifyNote(merged)
-      const customerId = shopifyGid || doc.customerId
-      if (customerId) {
+
+      // Rebuild and push customer note
+      try {
+        const merged = {
+          ...doc.toObject(),
+          tax: {
+            ...(doc.tax?.toObject?.() ?? doc.tax ?? {}),
+            ...Object.fromEntries(taxKeys.filter((k) => tax[k] != null && tax[k] !== '').map((k) => [k, tax[k]])),
+          },
+        }
+        const note = buildShopifyNote(merged)
         await customerUpdateNote(admin, { customerId, note })
+      } catch (e) {
+        console.error('[proxy/update-profile] shopify note sync failed:', e?.message || e)
       }
-    } catch (e) {
-      console.error('[proxy/update-profile] shopify note sync failed:', e?.message || e)
     }
   }
 
-  const existingPayment = doc.payment?.toObject?.() ?? doc.payment ?? {}
-  const existingTax = doc.tax?.toObject?.() ?? doc.tax ?? {}
-
-  const updatedPayment = { ...existingPayment, ...Object.fromEntries(
-    Object.entries($set)
-      .filter(([k]) => k.startsWith('payment.'))
-      .map(([k, v]) => [k.replace('payment.', ''), v])
-  )}
-  const updatedTax = { ...existingTax, ...Object.fromEntries(
-    Object.entries($set)
-      .filter(([k]) => k.startsWith('tax.'))
-      .map(([k, v]) => [k.replace('tax.', ''), v])
-  )}
-
-  // Never expose the card hash
-  delete updatedPayment.cardNumberHash
+  // ── Build response ────────────────────────────────────────────────────────
+  const updatedDoc = doc.toObject()
+  for (const [key, val] of Object.entries($set)) {
+    const parts = key.split('.')
+    if (parts.length === 1) {
+      updatedDoc[key] = val
+    } else {
+      updatedDoc[parts[0]] = { ...(updatedDoc[parts[0]] ?? {}), [parts[1]]: val }
+    }
+  }
+  delete updatedDoc.passwordHash
+  if (updatedDoc.payment) delete updatedDoc.payment.cardNumber
 
   return sendResponse(200, 'success', 'Profile updated', {
-    payment: updatedPayment,
-    tax: updatedTax,
+    profile: {
+      firstName: updatedDoc.firstName,
+      lastName: updatedDoc.lastName,
+      phone: updatedDoc.phone,
+      businessName: updatedDoc.businessName,
+    },
+    address: updatedDoc.billingAddress ?? null,
+    payment: updatedDoc.payment ?? null,
+    tax: updatedDoc.tax ?? null,
   })
 }
 

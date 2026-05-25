@@ -31,9 +31,7 @@ const paymentSchema = new mongoose.Schema(
     cardholderName: String,
     cardBrand: String,
     cardLast4: String,
-    cardNumberHash: String,
-    cardExpMonth: Number,
-    cardExpYear: Number,
+    paymentToken: String,
   },
   { _id: false },
 );
@@ -86,6 +84,7 @@ const wholesaleApplicationSchema = new mongoose.Schema(
     reviewedAt: { type: Date, default: null },
 
     customerId: { type: String, index: true },
+    nmiCustomerVaultId: { type: String, default: null },
     customerInviteSentAt: { type: Date, default: null },
     shopifyCreateFailed: { type: Boolean, default: false, index: true },
     shopifyCreateError: { type: String, default: null },

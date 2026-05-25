@@ -18,10 +18,18 @@ const EMPTY_SHIPPING = {
   country: "United States",
 };
 
-function AddressBlock({ name, control, errors }) {
+function AddressBlock({ name, control, errors, setValue }) {
   const country = useWatch({ control, name: `${name}.country` });
+  const prevCountryRef = useRef(country);
   const states = getStatesForCountry(country);
   const e = errors?.[name] || {};
+
+  useEffect(() => {
+    if (prevCountryRef.current === country) return;
+    prevCountryRef.current = country;
+    setValue(`${name}.state`, '', { shouldValidate: false });
+    setValue(`${name}.zip`, '', { shouldValidate: false });
+  }, [country, name, setValue]);
   return (
     <>
       <div className="rf-field">
@@ -202,7 +210,7 @@ export default function Step2AddressTax({ control, errors, setValue, clearErrors
       <h3 className="rf-section-label" style={{ marginBottom: 14 }}>
         Billing address
       </h3>
-      <AddressBlock name="billingAddress" control={control} errors={errors} />
+      <AddressBlock name="billingAddress" control={control} errors={errors} setValue={setValue} />
 
       <div className="rf-toggle-row">
         <div>
@@ -237,6 +245,7 @@ export default function Step2AddressTax({ control, errors, setValue, clearErrors
               name="shippingAddress"
               control={control}
               errors={errors}
+              setValue={setValue}
             />
           )}
         </div>

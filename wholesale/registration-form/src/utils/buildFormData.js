@@ -29,7 +29,6 @@ function walk(value, prefix, fd) {
 
   if (typeof value === 'object') {
     Object.entries(value).forEach(([k, v]) => {
-      // Skip internal hooks like payment._stripe (live Stripe instance handles)
       if (k.startsWith('_')) return
       const next = prefix ? `${prefix}[${k}]` : k
       walk(v, next, fd)

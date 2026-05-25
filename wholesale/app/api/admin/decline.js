@@ -2,8 +2,13 @@ import mongoose from 'mongoose'
 import { authenticate } from '../../shopify.server'
 import connectDB from '../../services/APIService/mongo.service'
 import WholesaleApplication from '../../models/wholesaleApplication.server'
+import ShopifyOrder from '../../models/order.server'
 import { sendResponse } from '../../services/APIService/api.service'
-import { sendCustomerInvite as customerSendInvite, deleteCustomer as customerDelete } from '../../services/shopify/shopify.service'
+import {
+  sendCustomerInvite as customerSendInvite,
+  deleteCustomer as customerDelete,
+  deleteOrder as shopifyOrderDelete,
+} from '../../services/shopify/shopify.service'
 
 // POST /api/admin/customers/:id/decline
 // Cascading decline: send a final email, delete in Shopify, delete from Mongo.
@@ -58,6 +63,30 @@ export async function action({ request, params }) {
       return sendResponse(502, 'error', 'Failed to delete Shopify customer', {
         detail: e?.message || String(e),
       })
+    }
+  }
+
+  // Step 2b — delete all orders of this customer from Shopify + Mongo.
+  if (doc.customerId) {
+    const orders = await ShopifyOrder.find({ shopifyCustomerId: doc.customerId })
+      .select('_id shopifyOrderId')
+      .lean()
+    for (const o of orders) {
+      if (o.shopifyOrderId) {
+        try {
+          await shopifyOrderDelete(admin, o.shopifyOrderId)
+        } catch (e) {
+          console.error(
+            `[admin/decline] shopifyOrderDelete failed for ${o.shopifyOrderId}:`,
+            e?.message || e,
+          )
+        }
+      }
+    }
+    try {
+      await ShopifyOrder.deleteMany({ shopifyCustomerId: doc.customerId })
+    } catch (e) {
+      console.error('[admin/decline] mongo order deleteMany failed:', e?.message || e)
     }
   }
 

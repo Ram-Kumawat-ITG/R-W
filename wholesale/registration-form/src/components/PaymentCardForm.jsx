@@ -1,165 +1,277 @@
-import { useEffect } from 'react'
-import { Controller, useWatch } from 'react-hook-form'
-import { CARD_BRAND_LABELS } from '../constants'
+import { useEffect, useRef, useState } from "react";
+import { Controller } from "react-hook-form";
 
-function detectCardBrand(num) {
-  const n = (num || '').replace(/\s/g, '')
-  if (!n) return null
-  if (/^4/.test(n)) return 'visa'
-  if (/^(?:5[1-5]|2[2-7])/.test(n)) return 'mastercard'
-  if (/^3[47]/.test(n)) return 'amex'
-  if (/^6(?:011|5)/.test(n)) return 'discover'
-  return null
+const COLLECT_JS_URL = "https://sandbox.nmi.com/token/Collect.js";
+
+function loadCollectJs(tokenizationKey) {
+  return new Promise((resolve, reject) => {
+    if (window.CollectJS) {
+      resolve();
+      return;
+    }
+    if (!tokenizationKey) {
+      reject(
+        new Error("VITE_NMI_TOKENIZATION_KEY is not set. Add it to .env.local"),
+      );
+      return;
+    }
+
+    // Script already in DOM (component remounted) but CollectJS not ready yet — poll for it
+    const existing = document.querySelector("script[data-tokenization-key]");
+    if (existing) {
+      const start = Date.now();
+      const poll = () => {
+        if (window.CollectJS) {
+          resolve();
+          return;
+        }
+        if (Date.now() - start > 5000) {
+          reject(
+            new Error(
+              "CollectJS timed out — check that your tokenization key is valid",
+            ),
+          );
+          return;
+        }
+        setTimeout(poll, 100);
+      };
+      poll();
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.src = COLLECT_JS_URL;
+    script.setAttribute("data-tokenization-key", tokenizationKey);
+    script.setAttribute("data-variant", "inline");
+    script.onload = () => {
+      if (window.CollectJS) {
+        resolve();
+      } else {
+        reject(
+          new Error(                                            
+            "CollectJS did not initialize — check that your tokenization key is valid",
+          ),
+        );
+      }
+    };
+    script.onerror = () => reject(new Error("Failed to load Collect.js"));
+    document.head.appendChild(script);
+  });
 }
 
-function formatCardNumber(num) {
-  const raw = (num || '').replace(/\D/g, '')
-  if (/^3[47]/.test(raw)) {
-    const a = raw.slice(0, 4)
-    const b = raw.slice(4, 10)
-    const c = raw.slice(10, 15)
-    return [a, b, c].filter(Boolean).join(' ')
-  }
-  const clipped = raw.slice(0, 19)
-  return clipped.replace(/(\d{4})(?=\d)/g, '$1 ')
-}
+const fieldMessages = {
+  ccnumber: "Enter a valid card number",
+  ccexp: "Enter a valid expiry date",
+  cvv: "Enter a valid CVV",
+};
 
-function formatExpiry(value) {
-  const raw = (value || '').replace(/\D/g, '').slice(0, 4)
-  if (raw.length >= 3) return raw.slice(0, 2) + ' / ' + raw.slice(2)
-  return raw
-}
-
-export default function PaymentCardForm({ control, setValue, showAllErrors = false }) {
-  const cardNumber = useWatch({ control, name: 'payment.cardNumber' })
-  const selectedBrand = useWatch({ control, name: 'payment.cardBrand' })
-  const detectedBrand = detectCardBrand(cardNumber)
+export default function PaymentCardForm({
+  control,
+  tokenResolverRef,
+  showAllErrors = false,
+}) {
+  const [fieldsReady, setFieldsReady] = useState(false);
+  const [loadError, setLoadError] = useState(null);
+  const [fieldErrors, setFieldErrors] = useState({
+    ccnumber: null,
+    ccexp: null,
+    cvv: null,
+  });
+  const [fieldTouched, setFieldTouched] = useState({
+    ccnumber: false,
+    ccexp: false,
+    cvv: false,
+  });
+  const [cardholderTouched, setCardholderTouched] = useState(false);
+  const initialized = useRef(false);
+  const tokenKey = import.meta.env.VITE_NMI_TOKENIZATION_KEY;
 
   useEffect(() => {
-    if (detectedBrand && detectedBrand !== selectedBrand) {
-      setValue('payment.cardBrand', detectedBrand, { shouldDirty: false, shouldValidate: false })
-    }
-  }, [detectedBrand, selectedBrand, setValue])
+    if (initialized.current) return;
+    initialized.current = true;
 
-  const showError = (fieldState) =>
-    (fieldState.isTouched || showAllErrors) && fieldState.error?.message
+    loadCollectJs(tokenKey)
+      .then(() => {
+        window.CollectJS.configure({
+          variant: "inline",
+          styleSniffer: false,
+          fields: {
+            ccnumber: {
+              selector: "#collect-ccnumber",
+              placeholder: "1234 5678 9012 3456",
+            },
+            ccexp: { selector: "#collect-ccexp", placeholder: "MM / YY" },
+            cvv: { selector: "#collect-cvv", placeholder: "CVV" },
+          },
+          customCss: {
+            "font-size": "17px",
+            color: "#1a1a1a",
+            background: "transparent",
+            border: "none",
+            "border-radius": "0",
+            outline: "none",
+            "box-shadow": "none",
+            "-webkit-appearance": "none",
+            "-moz-appearance": "none",
+            appearance: "none",
+            width: "100%",
+            height: "100%",
+            padding: "0",
+            margin: "0",
+          },
+          focusCss: {
+            border: "none",
+            outline: "0px",
+            "outline-width": "0",
+            "outline-style": "none",
+            "box-shadow": "none",
+          },
+          invalidCss: {
+            color: "#e74c3c",
+            border: "none",
+            "box-shadow": "none",
+          },
+          validCss: {
+            color: "#1a1a1a",
+            border: "none",
+          },
+          placeholderCss: {
+            color: "#999",
+          },
+          fieldsAvailableCallback: () => setFieldsReady(true),
+          validationCallback: (field, status, _message) => {
+            setFieldErrors((prev) => ({
+              ...prev,
+              [field]: status ? null : (fieldMessages[field] ?? "Invalid"),
+            }));
+            setFieldTouched((prev) => ({ ...prev, [field]: true }));
+
+            if (!status && tokenResolverRef.current) {
+              const tid = tokenResolverRef.current._tid;
+              if (tid) clearTimeout(tid);
+              tokenResolverRef.current.reject(
+                new Error("Please check your card details and try again."),
+              );
+              tokenResolverRef.current = null;
+            }
+          },
+          callback: (response) => {
+            if (!tokenResolverRef.current) return;
+            const tid = tokenResolverRef.current._tid;
+            if (tid) clearTimeout(tid);
+            if (response.token) {
+              tokenResolverRef.current.resolve({
+                token: response.token,
+                cardBrand: response.card?.type || null,
+                cardLast4:
+                  (response.card?.number || "").replace(/\D/g, "").slice(-4) ||
+                  null,
+              });
+            } else {
+              tokenResolverRef.current.reject(
+                new Error(
+                  "Card tokenization failed. Check your card details and try again.",
+                ),
+              );
+            }
+            tokenResolverRef.current = null;
+          },
+        });
+      })
+      .catch((err) => setLoadError(err.message));
+  }, [tokenKey, tokenResolverRef]);
 
   return (
     <div>
-      <div className="rf-field">
-        <label className="rf-label">Card number <span className="rf-req">*</span></label>
-        <Controller
-          name="payment.cardNumber"
-          control={control}
-          render={({ field, fieldState }) => (
-            <>
-              <div className="rf-card-number-wrap">
-                <input
-                  type="text"
-                  placeholder="1234 5678 9012 3456"
-                  inputMode="numeric"
-                  autoComplete="cc-number"
-                  maxLength={23}
-                  value={field.value || ''}
-                  onChange={(e) => field.onChange(formatCardNumber(e.target.value))}
-                  onBlur={field.onBlur}
-                  className={`rf-input ${showError(fieldState) ? 'error' : ''}`}
-                  style={{ fontVariantNumeric: 'tabular-nums', letterSpacing: '0.02em' }}
-                />
-                {detectedBrand && (
-                  <span className="rf-card-brand-badge">{CARD_BRAND_LABELS[detectedBrand]}</span>
-                )}
-              </div>
-              {showError(fieldState) && (
-                <p className="rf-help error">{fieldState.error.message}</p>
-              )}
-            </>
-          )}
+      {loadError && (
+        <p className="rf-help error">
+          Payment fields failed to load: {loadError}
+        </p>
+      )}
+
+      <div
+        className="rf-field"
+        style={!fieldsReady ? { opacity: 0.4, pointerEvents: "none" } : {}}
+      >
+        <label className="rf-label">
+          Card number <span className="rf-req">*</span>
+        </label>
+        <div
+          id="collect-ccnumber"
+          className={`rf-input rf-collect-field ${fieldTouched.ccnumber && fieldErrors.ccnumber ? "error" : ""}`}
         />
-        <Controller
-          name="payment.cardBrand"
-          control={control}
-          render={({ fieldState }) =>
-            showError(fieldState) ? (
-              <p className="rf-help error">{fieldState.error.message}</p>
-            ) : null
-          }
-        />
+        {fieldTouched.ccnumber && fieldErrors.ccnumber && (
+          <p className="rf-help error">{fieldErrors.ccnumber}</p>
+        )}
       </div>
 
       <div className="rf-field">
-        <label className="rf-label">Cardholder name <span className="rf-req">*</span></label>
+        <label className="rf-label">
+          Cardholder name <span className="rf-req">*</span>
+        </label>
         <Controller
           name="payment.cardholderName"
           control={control}
-          render={({ field, fieldState }) => (
-            <>
-              <input
-                {...field}
-                type="text"
-                placeholder="Name on card"
-                autoComplete="cc-name"
-                className={`rf-input ${showError(fieldState) ? 'error' : ''}`}
-              />
-              {showError(fieldState) && (
-                <p className="rf-help error">{fieldState.error.message}</p>
-              )}
-            </>
-          )}
-        />
-      </div>
-
-      <div className="rf-field rf-row rf-row-2">
-        <div>
-          <label className="rf-label">Expiry <span className="rf-req">*</span></label>
-          <Controller
-            name="payment.cardExpiry"
-            control={control}
-            render={({ field, fieldState }) => (
-              <>
-                <input
-                  type="text"
-                  placeholder="MM / YY"
-                  inputMode="numeric"
-                  autoComplete="cc-exp"
-                  maxLength={7}
-                  value={field.value || ''}
-                  onChange={(e) => field.onChange(formatExpiry(e.target.value))}
-                  onBlur={field.onBlur}
-                  className={`rf-input ${showError(fieldState) ? 'error' : ''}`}
-                />
-                {showError(fieldState) && (
-                  <p className="rf-help error">{fieldState.error.message}</p>
-                )}
-              </>
-            )}
-          />
-        </div>
-        <div>
-          <label className="rf-label">CVV <span className="rf-req">*</span></label>
-          <Controller
-            name="payment.cardCvv"
-            control={control}
-            render={({ field, fieldState }) => (
+          render={({ field, fieldState }) => {
+            const showErr =
+              (cardholderTouched || showAllErrors) && fieldState.error?.message;
+            return (
               <>
                 <input
                   {...field}
+                  onBlur={(e) => {
+                    field.onBlur(e);
+                    setCardholderTouched(true);
+                  }}
                   type="text"
-                  placeholder="123"
-                  inputMode="numeric"
-                  autoComplete="cc-csc"
-                  maxLength={4}
-                  onChange={(e) => field.onChange((e.target.value || '').replace(/\D/g, '').slice(0, 4))}
-                  className={`rf-input ${showError(fieldState) ? 'error' : ''}`}
+                  placeholder="Name on card"
+                  autoComplete="cc-name"
+                  className={`rf-input ${showErr ? "error" : ""}`}
                 />
-                {showError(fieldState) && (
+                {showErr && (
                   <p className="rf-help error">{fieldState.error.message}</p>
                 )}
               </>
-            )}
+            );
+          }}
+        />
+      </div>
+
+      <div
+        className="rf-field rf-row rf-row-2"
+        style={!fieldsReady ? { opacity: 0.4, pointerEvents: "none" } : {}}
+      >
+        <div>
+          <label className="rf-label">
+            Expiry <span className="rf-req">*</span>
+          </label>
+          <div
+            id="collect-ccexp"
+            className={`rf-input rf-collect-field ${fieldTouched.ccexp && fieldErrors.ccexp ? "error" : ""}`}
           />
+          {fieldTouched.ccexp && fieldErrors.ccexp && (
+            <p className="rf-help error">{fieldErrors.ccexp}</p>
+          )}
+        </div>
+        <div>
+          <label className="rf-label">
+            CVV <span className="rf-req">*</span>
+          </label>
+          <div
+            id="collect-cvv"
+            className={`rf-input rf-collect-field ${fieldTouched.cvv && fieldErrors.cvv ? "error" : ""}`}
+          />
+          {fieldTouched.cvv && fieldErrors.cvv && (
+            <p className="rf-help error">{fieldErrors.cvv}</p>
+          )}
         </div>
       </div>
+
+      {!fieldsReady && !loadError && (
+        <p className="rf-help" style={{ marginTop: 8 }}>
+          Loading secure card fields…
+        </p>
+      )}
     </div>
-  )
+  );
 }
