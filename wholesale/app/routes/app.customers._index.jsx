@@ -10,18 +10,18 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import connectDB from "../services/APIService/mongo.service";
 import WholesaleApplication from "../models/wholesaleApplication.server";
-
+ 
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
   await connectDB();
-
+ 
   const rows = await WholesaleApplication.find({})
     .sort({ submittedAt: -1 })
     .select(
       "firstName lastName email phone submittedAt customerId shopifyCreateFailed businessName status reviewedAt",
     )
     .lean();
-
+ 
   return {
     rows: rows.map((r) => ({
       id: r._id.toString(),
@@ -38,33 +38,23 @@ export const loader = async ({ request }) => {
     })),
   };
 };
-
+ 
 const STATUS_FILTERS = [
   { id: "all", label: "All" },
-  { id: "pending", label: "Un-reviewed" },
-  { id: "approved", label: "Reviewed" },
   { id: "sync-failed", label: "Sync failed" },
 ];
-
-// Records per page. Filtering and pagination both happen client-side
-// (the loader returns the full list), so we just slice the filtered
-// array. Matches the project's existing list-page pattern (Orders list
-// uses 25).
-const PAGE_SIZE = 15;
-
+ 
 export default function CustomersList() {
   const { rows } = useLoaderData();
   const navigate = useNavigate();
   const navigation = useNavigation();
   const shopify = useAppBridge();
-  const reviewFetcher = useFetcher();
   const revalidator = useRevalidator();
-
+ 
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [sortOrder, setSortOrder] = useState("desc");
   const [filterPending, setFilterPending] = useState(false);
-  const [reviewingId, setReviewingId] = useState(null);
   const [decliningId, setDecliningId] = useState(null);
   const [pendingDeclineRow, setPendingDeclineRow] = useState(null);
   const declineFetcher = useFetcher();
@@ -73,9 +63,8 @@ export default function CustomersList() {
   // Track which response payload we've already handled so React-Router's
   // automatic post-action revalidation doesn't re-fire toast / state resets
   // on every subsequent render.
-  const handledReviewRef = useRef(null);
   const handledDeclineRef = useRef(null);
-
+ 
   // One-time toast on initial mount confirming data was fetched.
   useEffect(() => {
     if (loadedToastShown.current) return;
@@ -85,35 +74,24 @@ export default function CustomersList() {
       `Loaded ${n} ${n === 1 ? "application" : "applications"}`,
     );
   }, [rows.length, shopify]);
-
+ 
   // Brief artificial loading so search + chip clicks feel responsive even
   // though the actual filter runs client-side in useMemo.
   const flashFilterLoading = () => {
     setFilterPending(true);
     setTimeout(() => setFilterPending(false), 220);
   };
-
+ 
   const tableLoading =
     filterPending ||
     navigation.state === "loading" ||
     revalidator.state === "loading" ||
-    reviewFetcher.state !== "idle" ||
     declineFetcher.state !== "idle";
-
-  // Whenever the filter inputs change, snap back to page 1 so the user
-  // isn't stranded on (e.g.) page 4 of an empty result set.
-  useEffect(() => {
-    setPage(1);
-  }, [search, statusFilter]);
-
+ 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     const result = rows.filter((r) => {
-      if (statusFilter === "approved") {
-        if (!(r.status === "approved" && !r.shopifyCreateFailed)) return false;
-      } else if (statusFilter === "pending") {
-        if (r.status === "approved" || r.shopifyCreateFailed) return false;
-      } else if (statusFilter === "sync-failed") {
+      if (statusFilter === "sync-failed") {
         if (!r.shopifyCreateFailed) return false;
       }
       if (!q) return true;
@@ -130,55 +108,24 @@ export default function CustomersList() {
         .toLowerCase();
       return haystack.includes(q);
     });
-
+ 
     result.sort((a, b) => {
       const tA = a.submittedAt ? new Date(a.submittedAt).getTime() : 0;
       const tB = b.submittedAt ? new Date(b.submittedAt).getTime() : 0;
       const cmp = tA - tB;
       return sortOrder === "asc" ? cmp : -cmp;
     });
-
+ 
     return result;
   }, [rows, search, statusFilter, sortOrder]);
-
-  // Handle review / un-review result.
-  useEffect(() => {
-    if (!reviewFetcher.data) return;
-    if (reviewFetcher.state !== "idle") return;
-    if (handledReviewRef.current === reviewFetcher.data) return;
-    handledReviewRef.current = reviewFetcher.data;
-
-    if (reviewFetcher.data.status === "success") {
-      shopify?.toast?.show(reviewFetcher.data.message || "Updated.");
-      setReviewingId(null);
-    } else if (reviewFetcher.data.status === "error") {
-      shopify?.toast?.show(
-        reviewFetcher.data.result?.detail ||
-          reviewFetcher.data.message ||
-          "Update failed.",
-        { isError: true },
-      );
-      setReviewingId(null);
-    }
-  }, [reviewFetcher.data, reviewFetcher.state, shopify]);
-
-  const toggleReviewForRow = (row) => {
-    if (!row?.id) return;
-    const isApproved = row.status === "approved";
-    setReviewingId(row.id);
-    reviewFetcher.submit(null, {
-      method: "POST",
-      action: `/api/admin/customers/${row.id}/${isApproved ? "unreview" : "review"}`,
-    });
-  };
-
+ 
   // Handle decline result.
   useEffect(() => {
     if (!declineFetcher.data) return;
     if (declineFetcher.state !== "idle") return;
     if (handledDeclineRef.current === declineFetcher.data) return;
     handledDeclineRef.current = declineFetcher.data;
-
+ 
     if (declineFetcher.data.status === "success") {
       shopify?.toast?.show("Customer declined and removed.");
       setDecliningId(null);
@@ -192,7 +139,7 @@ export default function CustomersList() {
       setDecliningId(null);
     }
   }, [declineFetcher.data, declineFetcher.state, shopify]);
-
+ 
   const openDeclineModal = (row) => {
     if (!row?.id) return;
     setPendingDeclineRow(row);
@@ -210,7 +157,7 @@ export default function CustomersList() {
     });
     setPendingDeclineRow(null);
   };
-
+ 
   return (
     <s-page inlineSize="large" heading="Wholesale applications">
       <s-section padding="none">
@@ -273,17 +220,7 @@ export default function CustomersList() {
                 const count =
                   f.id === "all"
                     ? rows.length
-                    : f.id === "approved"
-                      ? rows.filter(
-                          (r) =>
-                            r.status === "approved" && !r.shopifyCreateFailed,
-                        ).length
-                      : f.id === "pending"
-                        ? rows.filter(
-                            (r) =>
-                              r.status !== "approved" && !r.shopifyCreateFailed,
-                          ).length
-                        : rows.filter((r) => r.shopifyCreateFailed).length;
+                    : rows.filter((r) => r.shopifyCreateFailed).length;
                 return (
                   <s-clickable-chip
                     key={f.id}
@@ -301,7 +238,7 @@ export default function CustomersList() {
             </s-stack>
           </s-stack>
         </s-box>
-
+ 
         {filtered.length === 0 ? (
           <EmptyState
             rowsTotal={rows.length}
@@ -329,7 +266,7 @@ export default function CustomersList() {
               </s-table-header>
             </s-table-header-row>
             <s-table-body>
-              {visibleRows.map((r) => {
+              {filtered.map((r) => {
                 const fullName =
                   `${r.firstName} ${r.lastName}`.trim() || "(no name)";
                 const submitted = r.submittedAt
@@ -347,10 +284,8 @@ export default function CustomersList() {
                     <s-table-cell>
                       {r.shopifyCreateFailed ? (
                         <s-badge tone="critical">Sync failed</s-badge>
-                      ) : r.status === "approved" ? (
-                        <s-badge tone="success">Reviewed</s-badge>
                       ) : (
-                        <s-badge>Un-reviewed</s-badge>
+                        <s-badge tone="success">Approved</s-badge>
                       )}
                     </s-table-cell>
                     <s-table-cell>
@@ -360,28 +295,6 @@ export default function CustomersList() {
                         justifyContent="center"
                         alignItems="center"
                       >
-                        <s-button
-                          variant={
-                            r.status === "approved" ? "secondary" : "primary"
-                          }
-                          tone={
-                            r.status === "approved" ? "critical" : undefined
-                          }
-                          icon={r.status === "approved" ? "undo" : "check"}
-                          accessibilityLabel={
-                            r.status === "approved"
-                              ? `Revoke ${fullName}`
-                              : `Review ${fullName}`
-                          }
-                          disabled={!r.customerId || r.shopifyCreateFailed}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            toggleReviewForRow(r);
-                          }}
-                          {...(reviewingId === r.id ? { loading: true } : {})}
-                        >
-                          {r.status === "approved" ? "Revoke" : "Review"}
-                        </s-button>
                         <s-button
                           variant="secondary"
                           tone="critical"
@@ -401,43 +314,8 @@ export default function CustomersList() {
             </s-table-body>
           </s-table>
         )}
-
-        {filtered.length > 0 && (
-          <s-box padding="base">
-            <s-stack
-              direction="inline"
-              gap="base"
-              alignItems="center"
-              justifyContent="space-between"
-            >
-              <s-text tone="subdued">
-                Showing {firstShown}–{lastShown} of {filtered.length}
-              </s-text>
-              <s-stack direction="inline" gap="small-200" alignItems="center">
-                <s-button
-                  variant="tertiary"
-                  disabled={currentPage <= 1}
-                  onClick={() => setPage((p) => Math.max(1, p - 1))}
-                  icon="arrow-left"
-                >
-                  Previous
-                </s-button>
-                <s-text tone="subdued">
-                  Page {currentPage} of {totalPages}
-                </s-text>
-                <s-button
-                  variant="tertiary"
-                  disabled={currentPage >= totalPages}
-                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                >
-                  Next
-                </s-button>
-              </s-stack>
-            </s-stack>
-          </s-box>
-        )}
       </s-section>
-
+ 
       <s-modal
         ref={declineModalRef}
         id="decline-customer-modal"
@@ -464,7 +342,7 @@ export default function CustomersList() {
     </s-page>
   );
 }
-
+ 
 function EmptyState({
   rowsTotal,
   statusFilter,
@@ -477,9 +355,9 @@ function EmptyState({
     "Once customers submit the wholesale form, their applications will show up here.";
   let actionLabel = null;
   let actionHandler = null;
-
+ 
   const hasSearch = (search || "").trim().length > 0;
-
+ 
   if (rowsTotal === 0) {
     heading = "No applications yet";
     body =
@@ -489,17 +367,6 @@ function EmptyState({
     body = `No applications match "${search}". Try a different keyword or clear the search.`;
     actionLabel = "Clear search";
     actionHandler = onClearSearch;
-  } else if (statusFilter === "approved") {
-    heading = "No reviewed applications";
-    body =
-      "Reviewed customers will appear here once you mark them as reviewed.";
-    actionLabel = "Show all";
-    actionHandler = onShowAll;
-  } else if (statusFilter === "pending") {
-    heading = "No un-reviewed applications";
-    body = "Un-reviewed applications waiting on your review will appear here.";
-    actionLabel = "Show all";
-    actionHandler = onShowAll;
   } else if (statusFilter === "sync-failed") {
     heading = "No failed syncs";
     body =
@@ -510,7 +377,7 @@ function EmptyState({
     heading = "No applications match the current filters";
     body = "Try changing the filters or clearing the search.";
   }
-
+ 
   return (
     <s-box padding="large-500">
       <s-stack
@@ -528,3 +395,5 @@ function EmptyState({
     </s-box>
   );
 }
+ 
+ 
