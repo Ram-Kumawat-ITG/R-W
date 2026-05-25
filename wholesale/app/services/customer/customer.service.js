@@ -5,8 +5,7 @@
 import CustomerMap from '../../models/customerMap.server'
 import WholesaleApplication from '../../models/wholesaleApplication.server'
 import { findOrCreateCustomer as findOrCreateQboCustomer } from '../qbo/qbo.service'
-import { findOrCreateCustomerVault } from '../nmi/nmi.service'
-import { resolvePaymentDetails } from './paymentDetails.service'
+import { validateCustomerVault } from '../nmi/nmi.service'
 import {
   buildProfileFromShopifyOrder,
   missingBillingFields,
@@ -33,10 +32,16 @@ function normalizePaymentMethod(raw) {
 
 const log = createLogger('customer.service')
 
-// Ensure the customer exists in QBO + NMI and persist the mapping.
-// `paymentDetails` is forwarded to NMI only when a new vault entry has
-// to be created (e.g. first-time customer with a captured token).
-export async function ensureCustomerForOrder({ shop, order, paymentDetails }) {
+// Ensure the customer exists in QBO and that the NMI customer vault
+// captured at registration time is mirrored onto the local mapping.
+//
+// Vault sourcing: the NMI Customer Vault is created exactly once, at
+// registration submit (see app/api/registration-form.js). The vault id
+// is persisted on `wholesale_applications.nmiCustomerVaultId`. This
+// service no longer creates vaults — it copies the id forward and runs
+// a `validateCustomerVault` pre-flight against NMI so downstream charge
+// paths can trust whatever lands on `CustomerMap.nmiCustomerVaultId`.
+export async function ensureCustomerForOrder({ shop, order }) {
   const profile = buildProfileFromShopifyOrder(order)
   console.log(`[customers] ensureCustomerForOrder(shop=${shop}, email=${profile.email})`)
   console.log(`[customers] resolved profile:`)
@@ -106,19 +111,24 @@ export async function ensureCustomerForOrder({ shop, order, paymentDetails }) {
     console.log(`[customers] QBO link already set on customer_maps: Id=${mapping.qboCustomerId}`)
   }
 
-  // Payment-method preference — refreshed from the customer's wholesale
-  // application on every order intake so customer-side changes (via
-  // /api/update-profile) flow into NEW orders. Historical invoices
-  // preserve their original preference via the immutable
-  // `Invoice.customerPaymentPreference` snapshot written at invoice
-  // creation, so flipping this here does NOT rewrite history.
+  // Payment-method preference + NMI vault link — both sourced from the
+  // customer's wholesale_application doc on every order intake. The
+  // vault id is captured ONCE at registration submit (see
+  // app/api/registration-form.js) and is the single source of truth;
+  // this service mirrors it onto CustomerMap as a runtime cache so the
+  // payment service can read the vault id without a second collection
+  // hit per charge.
   //
-  // The cheque → card admin fallback (per-invoice override) still
-  // mutates `Invoice.paymentMethod`, never this customer-level value.
+  // Historical invoices preserve their original preference via the
+  // immutable `Invoice.customerPaymentPreference` snapshot written at
+  // invoice creation, so flipping `paymentMethod` here does NOT rewrite
+  // history. The cheque → card admin fallback mutates
+  // `Invoice.paymentMethod`, never this customer-level value.
+  const app = await WholesaleApplication.findOne({ shop, email: profile.email })
+    .select('payment.method nmiCustomerVaultId')
+    .lean()
+
   {
-    const app = await WholesaleApplication.findOne({ shop, email: profile.email })
-      .select('payment.method')
-      .lean()
     const resolved = normalizePaymentMethod(app?.payment?.method)
     const previous = mapping.paymentMethod
     if (previous !== resolved) {
@@ -140,31 +150,55 @@ export async function ensureCustomerForOrder({ shop, order, paymentDetails }) {
     }
   }
 
-  // NMI side
-  if (!mapping.nmiCustomerVaultId) {
-    // Resolver picks payment details — currently the static dev test card
-    // when in sandbox, future: wholesale_applications lookup. An explicit
-    // paymentDetails arg from the caller still wins.
-    const effectivePaymentDetails =
-      paymentDetails ||
-      (await resolvePaymentDetails({
-        shop,
-        email: profile.email,
-        shopifyCustomerId: profile.shopifyCustomerId,
-      }))
-    if (effectivePaymentDetails) {
+  // NMI side — read-through from wholesale_applications. We do NOT
+  // create vaults here. If the application has no vault on file (the
+  // customer registered without payment, or vault creation failed
+  // during registration), `mapping.nmiCustomerVaultId` is left empty
+  // and any downstream charge will be skipped with a clear "no vault
+  // on file" reason by payment.service.chargeInvoice.
+  const sourceVaultId = app?.nmiCustomerVaultId || null
+  if (!sourceVaultId) {
+    if (mapping.nmiCustomerVaultId) {
       console.log(
-        `[customers] using payment details from "${effectivePaymentDetails._source || 'caller'}" for NMI vault create`,
+        `[customers] WARN — customer_maps.nmiCustomerVaultId=${mapping.nmiCustomerVaultId} but ` +
+          `wholesale_applications has no vault id; clearing cache so the source of truth wins`,
       )
+      log.warn('nmi.vault.cleared_stale_cache', { email: profile.email })
+      mapping.nmiCustomerVaultId = undefined
+    } else {
+      console.log(
+        `[customers] no NMI vault on wholesale_applications for ${profile.email} — ` +
+          `card charges will be skipped until one is captured at registration`,
+      )
+      log.info('nmi.vault.missing_on_application', { email: profile.email })
     }
-    const { customerVaultId } = await findOrCreateCustomerVault({
-      profile,
-      paymentDetails: effectivePaymentDetails,
-    })
-    mapping.nmiCustomerVaultId = customerVaultId
-    log.info('nmi.linked', { email: profile.email, customerVaultId })
   } else {
-    console.log(`[customers] NMI vault link already set on customer_maps: ${mapping.nmiCustomerVaultId}`)
+    // Validate the vault id is still resolvable in NMI before we
+    // promote it onto CustomerMap. This is the pre-flight required by
+    // every payment-related operation — failures here mean the
+    // downstream charge code never has to second-guess the vault id.
+    console.log(`[customers] NMI vault from wholesale_applications: ${sourceVaultId} — validating`)
+    const { valid, reason } = await validateCustomerVault(sourceVaultId)
+    if (!valid) {
+      console.log(
+        `[customers] WARN — NMI vault ${sourceVaultId} did not validate: ${reason}. ` +
+          `Charges for ${profile.email} will be skipped until the vault is re-captured.`,
+      )
+      log.warn('nmi.vault.invalid', { email: profile.email, customerVaultId: sourceVaultId, reason })
+      // Drop the stale id from the runtime cache so the payment
+      // service's "no vault on file" guard fires correctly.
+      mapping.nmiCustomerVaultId = undefined
+    } else {
+      if (mapping.nmiCustomerVaultId !== sourceVaultId) {
+        console.log(
+          `[customers] NMI vault link updated on customer_maps: ${mapping.nmiCustomerVaultId || '(none)'} → ${sourceVaultId}`,
+        )
+        log.info('nmi.linked', { email: profile.email, customerVaultId: sourceVaultId })
+        mapping.nmiCustomerVaultId = sourceVaultId
+      } else {
+        console.log(`[customers] NMI vault link unchanged on customer_maps: ${sourceVaultId}`)
+      }
+    }
   }
 
   mapping.lastSyncedAt = new Date()

@@ -207,7 +207,7 @@ This list focuses on the order-to-payment pipeline. Detailed flow lives in [whol
 |---|---|---|
 | Shopify orders/create webhook ingest | ✅ | `app/routes/webhooks.orders.create.jsx` → `processShopifyOrder` |
 | QBO customer + invoice creation | ✅ | claim-first invoice insert (§13.4) |
-| NMI vault add + sale | ✅ | card path; ACH transport supported but not used in CRON |
+| NMI vault add + sale | ✅ | vault `add_customer` happens ONCE at registration (`api/registration-form.js`); order/payment flows only read + validate the stored id (`customer.service` mirror + `validateCustomerVault` pre-flight in `chargeInvoice`). Card path; ACH transport supported but not used in CRON |
 | Scheduler PASS 1 (auto-charge) | ✅ | card-only via `paymentMethod: 'card'` filter (§9.2) |
 | Scheduler PASS 2 (sync retry) | ✅ | method-agnostic |
 | Admin Retry payment (card) | ✅ | `/api/admin/orders/:id/retry-payment` |
@@ -216,6 +216,8 @@ This list focuses on the order-to-payment pipeline. Detailed flow lives in [whol
 | Pending-approval replay | ✅ | `replayPendingOrdersForCustomer` on customer approve |
 
 ## Changelog
+
+- **2026-05-25** — NMI Customer Vault is now created **exactly once per customer**, at wholesale-registration submit (`app/api/registration-form.js`). Every downstream flow reads through `wholesale_applications.nmiCustomerVaultId` rather than re-creating: `customer.service.ensureCustomerForOrder` mirrors the id onto `CustomerMap.nmiCustomerVaultId` and validates it via the new `validateCustomerVault(vaultId)` helper (`query.php?report_type=customer_vault&customer_vault_id=…`); `payment.service.chargeInvoice` re-runs the same pre-flight before every NMI sale and writes a `skipped` PaymentAttempt with `"NMI vault X invalid: …"` if the id no longer resolves (vault deleted out-of-band, env swap, etc.). Removed: `nmi.service.findOrCreateCustomerVault` call from `customer.service` (still exported for legacy/diagnostic use); the `paymentDetails.service.js` strategy registry + its dev-only static-test-card strategy (it only fed the now-dead vault-create path on the order side). `customer.service.ensureCustomerForOrder` no longer accepts a `paymentDetails` argument. Spec: INTEGRATIONS.md §6.3 (rewritten), §6.4 (new — vault sourcing), §8.3 (rewritten — three vault-facing helpers).
 
 - **2026-05-22** — QBO invoice payload now includes `ShipAddr` and `ShipDate`. Address derived via `customer.utils.buildProfileFromShopifyOrder` (shipping → billing → customer default fallback) and projected through new `qbo.utils.toQboAddress`, which `BillAddr` on the customer payload now also uses. Ship date is `order.created_at` formatted to `YYYY-MM-DD` via new `invoice.utils.toYmd` (Shopify's `orders/create` fires pre-fulfillment, so the order date is the best ship-on marker). Both fields are omitted when no source data is available. Spec: INTEGRATIONS.md §7.3 + §18.3.
 - **2026-05-22** — Card invoices now carry a "Credit Card Processing Fee – 3%" line, appended by `shopifyLinesToQboLines` on top of the products + shipping + tax subtotal. Rate is `INVOICE_CREDIT_CARD_FEE_RATE` (default `0.03`); set to `0` to disable. Cheque/ACH invoices never carry the fee, and the surcharge is locked at invoice creation — the cheque → card admin fallback does NOT retroactively add a fee line (existing QBO line items are immutable). New helper `readNumber` in `utils/env.utils.js`. Spec: INTEGRATIONS.md §7.3 + env table.

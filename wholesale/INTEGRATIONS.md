@@ -114,9 +114,8 @@ app/
 │   │   └── payment.config.js             #   maxRetryAttempts, chargeImmediately, httpRetry*
 │   │
 │   ├── customer/                         # Cross-system customer mapping
-│   │   ├── customer.service.js           #   ensureCustomerForOrder
-│   │   ├── customer.utils.js             #   normalizeAddress, buildProfileFromShopifyOrder
-│   │   └── paymentDetails.service.js     #   Strategy registry for NMI payment details
+│   │   ├── customer.service.js           #   ensureCustomerForOrder (sources NMI vault from wholesale_applications)
+│   │   └── customer.utils.js             #   normalizeAddress, buildProfileFromShopifyOrder
 │   │
 │   ├── invoice/                          # Local invoice lifecycle
 │   │   ├── invoice.service.js            #   createInvoiceForOrder, propagateSuccessfulPayment
@@ -508,30 +507,59 @@ ensureCustomerForOrder({ shop, order })
   │     findOrCreateQboCustomer(profile)    ← query QBO by email, then create
   │     mapping.qboCustomerId = result.Id
   │
-  ├── if !mapping.nmiCustomerVaultId:
-  │     paymentDetails ← resolvePaymentDetails({ shop, email })
-  │     findOrCreateCustomerVault({ profile, paymentDetails })
-  │                                          ← query.php by email, then add_customer
-  │     mapping.nmiCustomerVaultId = result.customer_vault_id
+  ├── WholesaleApplication.findOne({ shop, email }).select('payment.method nmiCustomerVaultId')
+  │     mapping.paymentMethod   = normalize(app.payment.method)
+  │     // NMI vault — read-through, no creation. Source of truth is the
+  │     // wholesale_applications doc, which captured the vault id at
+  │     // registration submit (see §6.4).
+  │     if app.nmiCustomerVaultId:
+  │       validateCustomerVault(app.nmiCustomerVaultId)   ← query.php by id
+  │       mapping.nmiCustomerVaultId = app.nmiCustomerVaultId (if valid)
+  │     else:
+  │       mapping.nmiCustomerVaultId = undefined          (no vault on file)
   │
   └── mapping.save()
 ```
 
-QBO and NMI customer creation are **skipped** if the mapping already has
-the corresponding ID. Re-running the orchestrator for a known customer
-makes zero external calls.
+QBO customer creation is **skipped** if the mapping already has
+`qboCustomerId`. The NMI side has no "create" branch at all — vaults
+are captured exactly once during registration (§6.4) and the customer
+service only mirrors + validates the id. Re-running the orchestrator
+for a known customer still hits QBO zero times and NMI once (the
+`validateCustomerVault` pre-flight via `query.php`).
 
-### 6.4 Payment details resolver
+### 6.4 NMI Customer Vault sourcing (registration-time only)
 
-`services/customer/paymentDetails.service.js` implements a
-strategy registry so the source of customer payment data is pluggable.
+The NMI Customer Vault is created **exactly once per customer**, at
+wholesale-registration submit:
 
-Currently registered strategies (tried in order, first non-null wins):
+```
+POST /api/registration-form      (app/api/registration-form.js)
+  │
+  ├── WholesaleApplication.create(payload)
+  ├── customerCreate() in Shopify (+ Pending tag)
+  └── if payload.payment.paymentToken:        ← Collect.js token from form
+        createCustomerVault({ profile, paymentDetails: { paymentToken } })
+        WholesaleApplication.updateOne({ _id }, { $set: { nmiCustomerVaultId } })
+```
 
-1. **`static-test-card`** — returns `NMI_TEST_CCNUMBER` / `NMI_TEST_CCEXP` from env, **sandbox only**. Production env throws these out at boot via `assertSafeTestCardConfig()`.
-2. **`wholesale-application`** — stub in place, not yet implemented. Future code path that pulls a Collect.js token stored at registration time in the `wholesale_applications` collection.
+`wholesale_applications.nmiCustomerVaultId` is then the **single source
+of truth** for the customer's stored payment method. Every downstream
+flow reads through it:
 
-Adding a new source = one `registerPaymentDetailsStrategy(name, fn)` call. No other code changes.
+| Caller | Behavior |
+|---|---|
+| `customer.service.ensureCustomerForOrder` | Reads `wholesale_applications.nmiCustomerVaultId`, validates via `validateCustomerVault`, mirrors onto `CustomerMap.nmiCustomerVaultId` for fast access during charges. |
+| `payment.service.chargeInvoice` | Reads from `customerMap.nmiCustomerVaultId` (the mirror); re-validates with `validateCustomerVault` before every NMI sale to catch stale ids (vault deleted from NMI dashboard, env swap, etc.). |
+| `api/admin/retry-payment.js` / `charge-card.js` | Same path — read vault from customerMap, charge funnels through `chargeInvoice`'s vault validation. |
+
+The order pipeline no longer creates vaults. Customers who registered
+without a payment method (or whose vault create failed in
+[registration-form.js](app/api/registration-form.js)) land in the
+order flow with `nmiCustomerVaultId = null`; their card charges are
+skipped with `"no NMI customer vault on file"` until a vault is
+captured at registration. Cheque / ACH workflows are unaffected since
+they don't need a vault.
 
 ---
 
@@ -752,24 +780,52 @@ Explicit `NMI_API_URL` / `NMI_QUERY_URL` overrides win if set.
 
 ### 8.3 Customer Vault — `services/nmi/nmi.service.js`
 
-`findOrCreateCustomerVault({ profile, paymentDetails })`:
+Three vault-facing helpers, each owned by a different lifecycle stage:
 
-1. **Lookup** via `query.php?report_type=customer_vault&email=…`. NMI doesn't expose a structured search; we substring-match the email in the returned XML.
-2. **Create** via `transact.php`:
-   ```
-   customer_vault=add_customer
-   first_name, last_name, company, email, phone
-   address1, city, state, zip, country
-   shipping_address1, shipping_city, ...
-   (one of:)
-     ccnumber, ccexp[, cvv]
-     payment_token              ← Collect.js / hosted tokenizer
-     payment=check, checkaba, checkaccount, account_type
-   ```
+| Function | Caller | When it runs |
+|---|---|---|
+| `createCustomerVault({ profile, paymentDetails })` | `app/api/registration-form.js` ONLY | Once per customer, at registration submit, against the Collect.js paymentToken captured by the form. |
+| `findCustomerVaultByEmail(email)` | Recovery / diagnostics only — not on the hot path | Substring email match via `query.php?report_type=customer_vault&email=…`. Legacy reconciliation helper. |
+| `validateCustomerVault(customerVaultId)` | `customer.service.ensureCustomerForOrder` (on every order intake) and `payment.service.chargeInvoice` (before every NMI sale) | Confirms a stored vault id still resolves in NMI — protects against "vault deleted out-of-band". Returns `{ valid, reason? }`. |
 
-NMI rejects `add_customer` without a billing address. The orchestrator
-pre-validates the five required fields (see §6.2) so a missing field
-produces a clear local error instead of a generic NMI rejection.
+The order-processing pipeline **does not** call `createCustomerVault`.
+Vaults are captured exactly once during registration (§6.4) and the
+order flow only reads + validates the stored id. This eliminates the
+duplicate-vault risk the legacy `findOrCreateCustomerVault` path could
+hit when two near-simultaneous orders both saw a missing
+`CustomerMap.nmiCustomerVaultId`.
+
+`createCustomerVault` payload (registration only):
+
+```
+customer_vault=add_customer
+first_name, last_name, company, email, phone
+address1, city, state, zip, country
+shipping_address1, shipping_city, ...
+(one of:)
+  ccnumber, ccexp[, cvv]
+  payment_token              ← Collect.js / hosted tokenizer (preferred)
+  payment=check, checkaba, checkaccount, account_type
+```
+
+NMI rejects `add_customer` without a billing address. The
+registration form pre-validates the required billing fields client-side
+before submit; the order orchestrator additionally pre-validates the
+five NMI-required fields (see §6.2) so a missing field produces a
+clear local error rather than a generic NMI rejection.
+
+`validateCustomerVault` payload:
+
+```
+query.php?report_type=customer_vault&customer_vault_id=<vaultId>
+```
+
+A `200` containing `<customer_vault_id>` confirms the vault exists; an
+`<error_response>` block, an HTTP error, or a mismatched id resolves to
+`{ valid: false, reason }`. Callers MUST NOT proceed to charge on
+`valid: false` — `payment.service.chargeInvoice` writes a `skipped`
+PaymentAttempt row and bumps `attemptCount` so the operator sees the
+follow-up in the Order List remarks.
 
 ### 8.4 Sale transaction — `services/nmi/nmi.service.js`
 

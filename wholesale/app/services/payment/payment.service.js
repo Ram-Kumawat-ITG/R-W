@@ -14,7 +14,7 @@
 
 import Invoice from '../../models/invoice.server'
 import PaymentAttempt from '../../models/paymentAttempt.server'
-import { chargeCustomerVault } from '../nmi/nmi.service'
+import { chargeCustomerVault, validateCustomerVault } from '../nmi/nmi.service'
 import { propagateSuccessfulPayment } from '../invoice/invoice.service'
 import { invoiceConfig } from '../invoice/invoice.config'
 import { computeProcessingFee } from '../invoice/invoice.utils'
@@ -53,6 +53,39 @@ export async function chargeInvoice({ invoice, customerMap }) {
     if (invoice.attemptCount >= invoice.maxAttempts) invoice.paymentStatus = 'failed'
     await invoice.save()
     return { skipped: true, reason: 'no NMI customer vault on file' }
+  }
+
+  // Vault-existence pre-flight against NMI. Vaults are captured once
+  // at registration submit (wholesale_applications.nmiCustomerVaultId)
+  // and mirrored onto CustomerMap. Anything could happen between then
+  // and a charge weeks later — vault deleted from the NMI dashboard,
+  // sandbox→prod environment swap, data import that lost the id — so
+  // we ALWAYS confirm the vault exists before attempting a sale rather
+  // than letting NMI's transact.php reject with a generic decline.
+  const vaultCheck = await validateCustomerVault(customerMap.nmiCustomerVaultId)
+  if (!vaultCheck.valid) {
+    const attemptNumber = invoice.attemptCount + 1
+    const reason = `NMI vault ${customerMap.nmiCustomerVaultId} invalid: ${vaultCheck.reason}`
+    await PaymentAttempt.create({
+      invoiceRef: invoice._id,
+      qboInvoiceId: invoice.qboInvoiceId,
+      attemptNumber,
+      amount: invoice.amountDue - invoice.amountPaid,
+      currency: invoice.currency,
+      outcome: 'skipped',
+      errorMessage: reason,
+    })
+    invoice.attemptCount = attemptNumber
+    invoice.lastAttemptAt = new Date()
+    invoice.lastAttemptError = reason
+    if (invoice.attemptCount >= invoice.maxAttempts) invoice.paymentStatus = 'failed'
+    await invoice.save()
+    log.warn('charge.skipped.vault_invalid', {
+      invoiceId: invoice._id.toString(),
+      customerVaultId: customerMap.nmiCustomerVaultId,
+      reason: vaultCheck.reason,
+    })
+    return { skipped: true, reason }
   }
 
   // Mark in-flight so two concurrent jobs don't both charge the same card.

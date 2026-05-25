@@ -31,6 +31,41 @@ export async function findCustomerVaultByEmail(email) {
   }
 }
 
+// Confirm a stored vault id still resolves to a real Customer Vault entry
+// in NMI. Used as a pre-flight before any sale/charge against a vault id
+// that was captured at registration time — protects against the case
+// where a vault was deleted out-of-band or the id was corrupted.
+//
+// Returns `{ valid: boolean, reason?: string }`. Network / transport
+// failures resolve to `{ valid: false, reason }` so callers can decide
+// whether to retry or skip — they MUST NOT silently proceed to charge.
+export async function validateCustomerVault(customerVaultId) {
+  if (!customerVaultId) return { valid: false, reason: 'no vault id provided' }
+  try {
+    const xml = await nmiQuery({
+      report_type: 'customer_vault',
+      customer_vault_id: customerVaultId,
+    })
+    // query.php returns a <customer_vault><customer> block on success,
+    // or an <error_response>…</error_response> when the id is unknown.
+    if (/<error_response>/i.test(xml)) {
+      const reason = (xml.match(/<error_response>([^<]+)<\/error_response>/i) || [])[1] || 'vault not found'
+      log.warn('vault.validate.not_found', { customerVaultId, reason })
+      return { valid: false, reason: reason.trim() }
+    }
+    const idMatch = xml.match(/<customer_vault_id>([^<]+)<\/customer_vault_id>/)
+    if (!idMatch || idMatch[1].trim() !== String(customerVaultId).trim()) {
+      log.warn('vault.validate.mismatch', { customerVaultId, returned: idMatch?.[1] })
+      return { valid: false, reason: 'vault id not present in NMI response' }
+    }
+    log.info('vault.validate.ok', { customerVaultId })
+    return { valid: true }
+  } catch (err) {
+    log.warn('vault.validate.failed', { customerVaultId, err })
+    return { valid: false, reason: err?.message || 'vault lookup failed' }
+  }
+}
+
 // Create a Customer Vault profile. Payment details are OPTIONAL — if
 // none are supplied we create an empty profile (you'll need to attach a
 // payment method via NMI's hosted tokenizer before any charge succeeds).
