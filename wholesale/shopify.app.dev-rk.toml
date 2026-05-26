@@ -1,18 +1,24 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "e4de0235635b192d07f7b96bc1a5e0df"
+name = "dev-rk"
 application_url = "https://unconsoled-internationally-stephani.ngrok-free.dev"
 embedded = true
-name = "dev-rk"
 handle = "dev-rk-2"
 
-[app_proxy]
-url = "https://unconsoled-internationally-stephani.ngrok-free.dev"
-subpath = "wholesale-application"
-prefix = "apps"
+[build]
+automatically_update_urls_on_dev = false
 
 [webhooks]
 api_version = "2025-07"
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/orders/cancelled"
+  topics = [ "orders/cancelled" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/orders/create"
+  topics = [ "orders/create" ]
 
   [[webhooks.subscriptions]]
   uri = "/webhooks/app/uninstalled"
@@ -21,17 +27,6 @@ api_version = "2025-07"
   [[webhooks.subscriptions]]
   uri = "/webhooks/app/scopes_update"
   topics = [ "app/scopes_update" ]
-
-  [[webhooks.subscriptions]]
-  uri = "/webhooks/orders/create"
-  topics = [ "orders/create" ]
-
-  [[webhooks.subscriptions]]
-  uri = "/webhooks/orders/cancelled"
-  topics = [ "orders/cancelled" ]
-
-[pos]
-embedded = false
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
@@ -44,5 +39,10 @@ redirect_urls = [
   "https://unconsoled-internationally-stephani.ngrok-free.dev/api/auth/callback"
 ]
 
-[build]
-automatically_update_urls_on_dev = false
+[app_proxy]
+url = "https://unconsoled-internationally-stephani.ngrok-free.dev"
+subpath = "wholesale-application"
+prefix = "apps"
+
+[pos]
+embedded = false
