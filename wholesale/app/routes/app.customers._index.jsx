@@ -60,10 +60,13 @@ export default function CustomersList() {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [sortOrder, setSortOrder] = useState("desc");
+  const [page, setPage] = useState(1);
   const [filterPending, setFilterPending] = useState(false);
   const [decliningId, setDecliningId] = useState(null);
   const [pendingDeclineRow, setPendingDeclineRow] = useState(null);
   const declineFetcher = useFetcher();
+  const syncFetcher = useFetcher();
+  const handledSyncRef = useRef(null);
   const declineModalRef = useRef(null);
   const loadedToastShown = useRef(false);
   // Track which response payload we've already handled so React-Router's
@@ -131,6 +134,12 @@ export default function CustomersList() {
     return result;
   }, [rows, search, statusFilter, sortOrder]);
 
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const currentPage = Math.min(page, totalPages);
+  const firstShown = filtered.length === 0 ? 0 : (currentPage - 1) * PAGE_SIZE + 1;
+  const lastShown = Math.min(currentPage * PAGE_SIZE, filtered.length);
+  const visibleRows = filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+
   // Handle decline result.
   useEffect(() => {
     if (!declineFetcher.data) return;
@@ -152,6 +161,28 @@ export default function CustomersList() {
     }
   }, [declineFetcher.data, declineFetcher.state, shopify]);
 
+  useEffect(() => {
+    if (!syncFetcher.data) return;
+    if (syncFetcher.state !== "idle") return;
+    if (handledSyncRef.current === syncFetcher.data) return;
+    handledSyncRef.current = syncFetcher.data;
+
+    if (syncFetcher.data.status === "success") {
+      const r = syncFetcher.data.result || {};
+      shopify?.toast?.show(
+        `Sync done: ${r.synced ?? 0} synced, ${r.failed ?? 0} failed`,
+      );
+    } else {
+      shopify?.toast?.show(
+        syncFetcher.data.message || "Sync failed.",
+        { isError: true },
+      );
+    }
+  }, [syncFetcher.data, syncFetcher.state, shopify]);
+
+  const runSyncBackfill = () =>
+    syncFetcher.submit(null, { method: "POST", action: "/api/admin/sync/backfill" });
+
   const openDeclineModal = (row) => {
     if (!row?.id) return;
     setPendingDeclineRow(row);
@@ -170,8 +201,19 @@ export default function CustomersList() {
     setPendingDeclineRow(null);
   };
 
+  const syncBusy =
+    syncFetcher.state === "submitting" || syncFetcher.state === "loading";
+
   return (
     <s-page inlineSize="large" heading="Wholesale applications">
+      <s-button
+        slot="primary-action"
+        variant="secondary"
+        onClick={runSyncBackfill}
+        {...(syncBusy ? { loading: true } : {})}
+      >
+        {syncBusy ? "Syncing…" : "Sync products to retail"}
+      </s-button>
       <s-section padding="none">
         <s-box padding="base">
           <s-stack direction="block" gap="base">

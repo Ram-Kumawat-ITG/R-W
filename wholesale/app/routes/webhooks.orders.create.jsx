@@ -15,6 +15,7 @@ import { authenticate } from '../shopify.server'
 import connectDB from '../services/APIService/mongo.service'
 import { scheduleNow, JOB_NAMES } from '../services/scheduler/scheduler.service'
 import { processShopifyOrder } from '../services/order/order.service'
+import { isSyncEnabled, deductRetailInventoryForOrder } from '../services/sync/index'
 import { createLogger } from '../utils/logger.utils'
 
 const log = createLogger('webhook.orders_create')
@@ -120,6 +121,13 @@ export const action = async ({ request }) => {
     console.error(`[webhook] enqueue/connect failed:`, err?.stack || err)
     log.error('enqueue.failed', { shop, orderId: payload.id, err })
     return new Response('Enqueue failed', { status: 500 })
+  }
+
+  // Cross-store sync: deduct retail inventory for the same quantities.
+  // Fire-and-forget — sync failure must never affect the 200 response.
+  if (isSyncEnabled()) {
+    deductRetailInventoryForOrder(payload)
+      .catch((err) => log.error('retail_inventory_deduct.failed', { shop, orderId: payload.id, err }))
   }
 
   return new Response(null, { status: 200 })

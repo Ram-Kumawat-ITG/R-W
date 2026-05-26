@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { Controller } from "react-hook-form";
 
-const COLLECT_JS_URL = "https://sandbox.nmi.com/token/Collect.js";
+// const COLLECT_JS_URL = "https://sandbox.nmi.com/token/Collect.js";
+const COLLECT_JS_URL =
+  import.meta.env.VITE_NMI_COLLECT_JS_URL ||
+  "https://sandbox.nmi.com/token/Collect.js";
 
 function loadCollectJs(tokenizationKey) {
   return new Promise((resolve, reject) => {
@@ -48,7 +51,7 @@ function loadCollectJs(tokenizationKey) {
         resolve();
       } else {
         reject(
-          new Error(                                            
+          new Error(
             "CollectJS did not initialize — check that your tokenization key is valid",
           ),
         );

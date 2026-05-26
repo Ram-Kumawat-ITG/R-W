@@ -77,8 +77,8 @@ export const step1Schema = yup.object({
     .trim()
     .required("Required")
     .matches(
-      /^\(?([0-9]{3})\)?[-. ]?([0-9]{3})[-. ]?([0-9]{4})$/,
-      "Enter a valid phone number (e.g. (555) 123-4567)",
+      /^\+?1?[-.\s]?\(?([2-9][0-9]{2})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})$/,
+      "Enter a valid US phone number (e.g. (555) 123-4567 or +1 555 123-4567)",
     ),
   password: yup
     .string()
