@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { Controller } from "react-hook-form";
 
-const COLLECT_JS_URL = "https://sandbox.nmi.com/token/Collect.js";
+// const COLLECT_JS_URL = "https://sandbox.nmi.com/token/Collect.js";
+const COLLECT_JS_URL = "https://secure.nmi.com/token/Collect.js";
+
+
 
 function loadCollectJs(tokenizationKey) {
   return new Promise((resolve, reject) => {
