@@ -283,6 +283,75 @@ const invoiceSchema = new mongoose.Schema(
     },
     invoiceEmailedAmountPaid: Number,
     lastEmailError: String,
+
+    // Append-only history of every QBO `/invoice/<id>/send` attempt.
+    // Powers the "Email history" panel on the Order Details page and
+    // gives ops a full audit trail of who sent what, when, and whether
+    // QBO accepted it.
+    //
+    // One entry per attempt — both successes and failures are recorded
+    // so a failed delivery is visible to admins even after a later
+    // attempt succeeds. The aggregate baseline fields above
+    // (invoiceEmailSentAt / invoiceEmailLastSentAt / etc.) are the
+    // dedup-driver for the lifecycle dispatcher; this ledger is the
+    // audit-trail counterpart and exists alongside, not instead.
+    //
+    // Fields:
+    //   triggerType   — 'auto' (lifecycle dispatcher fired from create /
+    //                    payment events / CRON sweep) or 'manual'
+    //                    (admin clicked "Send invoice")
+    //   triggeredBy   — 'system' for auto sends, the admin's session
+    //                    email for manual sends (falls back to shop
+    //                    domain when no associated user email).
+    //   source        — what kind of trigger fired the send:
+    //                     invoice_created  — initial email at creation
+    //                     payment_recorded — re-send because amountPaid grew
+    //                     status_changed   — re-send because paymentStatus moved
+    //                                        but amountPaid did not
+    //                     manual_resend    — admin used the "Send invoice" button
+    //   recipient     — `sendTo` we passed to QBO
+    //   status        — 'sent' (QBO accepted the call) or 'failed' (any
+    //                    error from sendInvoiceEmail)
+    //   errorMessage  — failure detail (undefined on success)
+    //   paymentStatusSnapshot / amountPaidSnapshot — invoice state at
+    //                    send time, so the history reads sensibly even
+    //                    after later payments change the current state.
+    emailEvents: {
+      type: [
+        new mongoose.Schema(
+          {
+            createdAt: { type: Date, default: Date.now },
+            triggerType: {
+              type: String,
+              enum: ['auto', 'manual'],
+              required: true,
+            },
+            triggeredBy: { type: String, required: true },
+            source: {
+              type: String,
+              enum: [
+                'invoice_created',
+                'payment_recorded',
+                'status_changed',
+                'manual_resend',
+              ],
+              required: true,
+            },
+            recipient: { type: String, required: true },
+            status: {
+              type: String,
+              enum: ['sent', 'failed'],
+              required: true,
+            },
+            errorMessage: String,
+            paymentStatusSnapshot: String,
+            amountPaidSnapshot: Number,
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
   },
   { collection: 'invoices', timestamps: true, strict: true },
 )

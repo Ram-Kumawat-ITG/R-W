@@ -5,7 +5,7 @@ import ShopifyOrder from '../../models/order.server'
 import Invoice from '../../models/invoice.server'
 import CustomerMap from '../../models/customerMap.server'
 import { sendInvoiceEmail } from '../../services/qbo/qbo.service'
-import { appendInvoiceRemark } from '../../services/invoice/invoice.service'
+import { appendInvoiceRemark, recordEmailEvent } from '../../services/invoice/invoice.service'
 import { sendResponse } from '../../services/APIService/api.service'
 
 // POST /api/admin/orders/:id/send-invoice
@@ -94,8 +94,19 @@ export async function action({ request, params }) {
   } catch (err) {
     const msg = `QBO invoice send failed: ${err?.message || 'unknown error'}`
     console.error(`[admin/send-invoice] ${msg}`)
-    // Persist the failure so it surfaces on the Order Details page.
+    // Persist the failure so it surfaces on the Order Details page —
+    // both as the headline lastEmailError and as a row in the
+    // emailEvents[] audit ledger so admins can see exactly when /
+    // who attempted it.
     invoice.lastEmailError = msg
+    recordEmailEvent(invoice, {
+      triggerType: 'manual',
+      triggeredBy: initiatedBy,
+      source: 'manual_resend',
+      recipient: sendTo,
+      status: 'failed',
+      errorMessage: err?.message || 'unknown error',
+    })
     await invoice.save()
     return sendResponse(502, 'error', msg, null)
   }
@@ -109,6 +120,13 @@ export async function action({ request, params }) {
   invoice.invoiceEmailedStatus = invoice.paymentStatus
   invoice.invoiceEmailedAmountPaid = Number((invoice.amountPaid || 0).toFixed(2))
   invoice.lastEmailError = undefined
+  recordEmailEvent(invoice, {
+    triggerType: 'manual',
+    triggeredBy: initiatedBy,
+    source: 'manual_resend',
+    recipient: sendTo,
+    status: 'sent',
+  })
   await invoice.save()
 
   await appendInvoiceRemark(invoice._id, {

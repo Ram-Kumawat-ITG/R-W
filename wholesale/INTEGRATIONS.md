@@ -844,6 +844,31 @@ emails. Local guards above are the only protection against double-
 sends, which is why every email path lives inside this single
 dispatcher.
 
+**Audit ledger — `Invoice.emailEvents[]`:**
+
+Distinct from the dedup guards above, `emailEvents[]` is the append-only
+history of every `/invoice/<id>/send` attempt — successes AND failures.
+One row per attempt. Powers the "Email history" section on the Order
+Details page and is the operator-facing audit trail for "did the
+customer get the latest invoice?"
+
+| Field | Notes |
+|---|---|
+| `createdAt` | When the attempt fired. |
+| `triggerType` | `'auto'` — fired from the lifecycle dispatcher (create / payment / status / CRON sweep paths). `'manual'` — fired from the admin "Send invoice" button (`api/admin/send-invoice.js`). |
+| `triggeredBy` | `'system'` for auto sends; the admin's session email (or shop domain fallback) for manual sends. |
+| `source` | `invoice_created` / `payment_recorded` / `status_changed` / `manual_resend` — derived from the same conditions as the human-readable `reasonLabel` in the dispatcher. |
+| `recipient` | The `sendTo` we passed to QBO. |
+| `status` | `'sent'` (QBO accepted the call) or `'failed'` (any error from `sendInvoiceEmail`). |
+| `errorMessage` | Failure detail (undefined on success). |
+| `paymentStatusSnapshot` / `amountPaidSnapshot` | Invoice state at send time — so the history reads sensibly even after later payments change the live values. |
+
+Single shared helper `recordEmailEvent(invoice, eventData)` (exported
+from `invoice.service.js`) is the only writer. Both the dispatcher
+(auto paths) and the admin endpoint (manual path) call it before their
+own `.save()` so the ledger and the dedup baseline always persist
+atomically in the same Mongo write.
+
 **Flow per payment lifecycle:**
 
 ```

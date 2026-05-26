@@ -677,9 +677,17 @@ async function dispatchInvoiceLifecycleEmails({ invoice, customerMap, event }) {
     return
   }
 
+  // Resolve the audit-ledger `source` from the same conditions that
+  // drive the human-readable reason label below. Keep these aligned:
+  // every reasonLabel branch maps to exactly one source enum value.
+  const source = isInitial
+    ? 'invoice_created'
+    : currentPaid > emailedPaid + 0.005
+    ? 'payment_recorded'
+    : 'status_changed'
   const reasonLabel = isInitial
     ? 'initial'
-    : currentPaid > emailedPaid + 0.005
+    : source === 'payment_recorded'
     ? `payment recorded (paid $${emailedPaid.toFixed(2)} → $${currentPaid.toFixed(2)})`
     : `status changed (${invoice.invoiceEmailedStatus || '(none)'} → ${invoice.paymentStatus})`
 
@@ -692,6 +700,13 @@ async function dispatchInvoiceLifecycleEmails({ invoice, customerMap, event }) {
     invoice.invoiceEmailedStatus = invoice.paymentStatus
     invoice.invoiceEmailedAmountPaid = currentPaid
     invoice.lastEmailError = undefined
+    recordEmailEvent(invoice, {
+      triggerType: 'auto',
+      triggeredBy: 'system',
+      source,
+      recipient: sendTo,
+      status: 'sent',
+    })
     log.info('email.invoice_sent', {
       invoiceId: invoice._id.toString(),
       qboInvoiceId: invoice.qboInvoiceId,
@@ -704,8 +719,48 @@ async function dispatchInvoiceLifecycleEmails({ invoice, customerMap, event }) {
     const msg = `Invoice email failed (${reasonLabel}): ${err.message}`
     console.error(`[email] ${msg}`)
     invoice.lastEmailError = msg
+    recordEmailEvent(invoice, {
+      triggerType: 'auto',
+      triggeredBy: 'system',
+      source,
+      recipient: sendTo,
+      status: 'failed',
+      errorMessage: err.message,
+    })
     log.error('email.invoice_failed', { invoiceId: invoice._id.toString(), reason: reasonLabel, err })
   }
+}
+
+// Push one entry onto invoice.emailEvents[]. Pure in-memory mutation —
+// the caller's existing .save() persists it alongside the baseline
+// fields, so the ledger and the dedup state can never disagree.
+// Exported for the admin "Send invoice" endpoint which manages its own
+// save cycle; the auto path inside dispatchInvoiceLifecycleEmails calls
+// this for both success and failure outcomes.
+//
+// `paymentStatusSnapshot` / `amountPaidSnapshot` come from the invoice's
+// CURRENT state (the state QBO just received via /send), so the history
+// reads sensibly even after later payments change the live values.
+export function recordEmailEvent(invoice, {
+  triggerType,
+  triggeredBy,
+  source,
+  recipient,
+  status,
+  errorMessage,
+}) {
+  if (!Array.isArray(invoice.emailEvents)) invoice.emailEvents = []
+  invoice.emailEvents.push({
+    createdAt: new Date(),
+    triggerType,
+    triggeredBy,
+    source,
+    recipient,
+    status,
+    errorMessage: errorMessage || undefined,
+    paymentStatusSnapshot: invoice.paymentStatus,
+    amountPaidSnapshot: Number((invoice.amountPaid || 0).toFixed(2)),
+  })
 }
 
 // Atomic $push into Invoice.remarks[]. The remarks ledger powers the

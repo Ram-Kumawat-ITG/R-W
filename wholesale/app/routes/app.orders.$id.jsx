@@ -53,6 +53,15 @@ const REMARK_KIND_META = {
   system_note: { label: "Note", tone: "default" },
 };
 
+// emailEvents[].source enum → friendly label for the Email history table.
+// Keep keys aligned with the enum in app/models/invoice.server.js.
+const EMAIL_SOURCE_LABEL = {
+  invoice_created: "Invoice created",
+  payment_recorded: "Payment recorded",
+  status_changed: "Status changed",
+  manual_resend: "Manual resend",
+};
+
 // Status → Polaris badge tone for the pipeline strip at the top of the
 // page. "skipped" is rendered same as "pending" tonally; the difference
 // is semantic (no longer reachable on this run vs. not reached yet).
@@ -1561,6 +1570,77 @@ export default function OrderDetail() {
               </>
             )}
           </s-stack>
+        </s-section>
+      )}
+
+      {/* ───── Email history ───── */}
+      {invoice && (
+        <s-section
+          heading={`Email history (${invoice.emailEvents?.length || 0})`}
+        >
+          {!invoice.emailEvents || invoice.emailEvents.length === 0 ? (
+            <s-paragraph tone="subdued">
+              No invoice emails have been sent yet for this order.
+            </s-paragraph>
+          ) : (
+            <s-table>
+              <s-table-header-row>
+                <s-table-header>When</s-table-header>
+                <s-table-header>Type</s-table-header>
+                <s-table-header>Trigger</s-table-header>
+                <s-table-header>Recipient</s-table-header>
+                <s-table-header>Status</s-table-header>
+                <s-table-header>Triggered by</s-table-header>
+                <s-table-header>Detail</s-table-header>
+              </s-table-header-row>
+              <s-table-body>
+                {[...invoice.emailEvents]
+                  .sort((a, b) =>
+                    String(b.createdAt).localeCompare(String(a.createdAt)),
+                  )
+                  .map((e, i) => (
+                    <s-table-row key={i}>
+                      <s-table-cell>
+                        {e.createdAt
+                          ? new Date(e.createdAt).toLocaleString()
+                          : "—"}
+                      </s-table-cell>
+                      <s-table-cell>
+                        <s-badge
+                          tone={e.triggerType === "manual" ? "info" : "default"}
+                        >
+                          {e.triggerType === "manual" ? "Manual" : "Auto"}
+                        </s-badge>
+                      </s-table-cell>
+                      <s-table-cell>{EMAIL_SOURCE_LABEL[e.source] || e.source}</s-table-cell>
+                      <s-table-cell>{e.recipient || "—"}</s-table-cell>
+                      <s-table-cell>
+                        <s-badge
+                          tone={e.status === "sent" ? "success" : "critical"}
+                        >
+                          {e.status === "sent" ? "Sent" : "Failed"}
+                        </s-badge>
+                      </s-table-cell>
+                      <s-table-cell>{e.triggeredBy || "—"}</s-table-cell>
+                      <s-table-cell>
+                        {e.status === "failed" && e.errorMessage
+                          ? e.errorMessage
+                          : e.paymentStatusSnapshot
+                            ? `${e.paymentStatusSnapshot}${
+                                e.amountPaidSnapshot != null
+                                  ? ` · paid ${formatAmount(
+                                      e.amountPaidSnapshot,
+                                      invoice.currency,
+                                    )}`
+                                  : ""
+                              }`
+                            : "—"}
+                      </s-table-cell>
+                    </s-table-row>
+                  ))}
+              </s-table-body>
+            </s-table>
+          )}
         </s-section>
       )}
 
