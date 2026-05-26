@@ -43,7 +43,7 @@ export const MUTATION_CUSTOMER_CREATE = `#graphql
 `
 
 export const MUTATION_CUSTOMER_SEND_INVITE = `#graphql
-  mutation CustomerSendInvite($customerId: ID!, $email: CustomerEmailInput) {
+  mutation CustomerSendInvite($customerId: ID!, $email: EmailInput) {
     customerSendAccountInviteEmail(customerId: $customerId, email: $email) {
       customer { id }
       userErrors { field message }

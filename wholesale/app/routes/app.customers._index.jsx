@@ -118,7 +118,7 @@ export default function CustomersList() {
  
     return result;
   }, [rows, search, statusFilter, sortOrder]);
- 
+
   // Handle decline result.
   useEffect(() => {
     if (!declineFetcher.data) return;
@@ -370,7 +370,7 @@ function EmptyState({
   } else if (statusFilter === "sync-failed") {
     heading = "No failed syncs";
     body =
-      "Every application has successfully synced to Shopify. If any fail in the future, they'll show up here so you can retry them.";
+      "Every application has successfully synced to Shopify. Any future sync failures will appear here.";
     actionLabel = "Show all";
     actionHandler = onShowAll;
   } else {

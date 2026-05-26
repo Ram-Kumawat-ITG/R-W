@@ -19,12 +19,19 @@ api_version = "2026-07"
   topics = [ "app/scopes_update" ]
   uri = "/webhooks/app/scopes_update"
 
-  # NOTE: `orders/create` and `orders/cancelled` are protected customer
-  # data topics and CANNOT be declared here until the app is approved in
-  # the Partners dashboard (Partners → App → API access → Protected
-  # customer data access). Until then they are registered programmatically
-  # after install — see app/services/shopify/shopify.service.ensure-
-  # ProtectedWebhooks (driven by REQUIRED_SUBSCRIPTIONS in shopify.constants.js).
+  [[webhooks.subscriptions]]
+  topics = ["customers/delete"]
+  uri = "/webhooks/customers/delete"
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/orders/create"
+  topics = [ "orders/create" ]
+
+  # NOTE: `orders/create` is a protected customer data topic and CANNOT
+  # be declared here until the app is approved in the Partners dashboard
+  # (Partners → App → API access → Protected customer data access).
+  # Until then it is registered programmatically after install — see
+  # app/services/shopify/registerWebhooks.server.js.
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
