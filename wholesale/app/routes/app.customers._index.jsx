@@ -41,8 +41,6 @@ export const loader = async ({ request }) => {
 
 const STATUS_FILTERS = [
   { id: "all", label: "All" },
-  { id: "pending", label: "Un-reviewed" },
-  { id: "approved", label: "Reviewed" },
   { id: "sync-failed", label: "Sync failed" },
 ];
 
@@ -57,14 +55,12 @@ export default function CustomersList() {
   const navigate = useNavigate();
   const navigation = useNavigation();
   const shopify = useAppBridge();
-  const reviewFetcher = useFetcher();
   const revalidator = useRevalidator();
 
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [sortOrder, setSortOrder] = useState("desc");
   const [filterPending, setFilterPending] = useState(false);
-  const [reviewingId, setReviewingId] = useState(null);
   const [decliningId, setDecliningId] = useState(null);
   const [pendingDeclineRow, setPendingDeclineRow] = useState(null);
   const declineFetcher = useFetcher();
@@ -73,7 +69,6 @@ export default function CustomersList() {
   // Track which response payload we've already handled so React-Router's
   // automatic post-action revalidation doesn't re-fire toast / state resets
   // on every subsequent render.
-  const handledReviewRef = useRef(null);
   const handledDeclineRef = useRef(null);
 
   // One-time toast on initial mount confirming data was fetched.
@@ -97,7 +92,6 @@ export default function CustomersList() {
     filterPending ||
     navigation.state === "loading" ||
     revalidator.state === "loading" ||
-    reviewFetcher.state !== "idle" ||
     declineFetcher.state !== "idle";
 
   // Whenever the filter inputs change, snap back to page 1 so the user
@@ -109,11 +103,7 @@ export default function CustomersList() {
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     const result = rows.filter((r) => {
-      if (statusFilter === "approved") {
-        if (!(r.status === "approved" && !r.shopifyCreateFailed)) return false;
-      } else if (statusFilter === "pending") {
-        if (r.status === "approved" || r.shopifyCreateFailed) return false;
-      } else if (statusFilter === "sync-failed") {
+      if (statusFilter === "sync-failed") {
         if (!r.shopifyCreateFailed) return false;
       }
       if (!q) return true;
@@ -140,37 +130,6 @@ export default function CustomersList() {
 
     return result;
   }, [rows, search, statusFilter, sortOrder]);
-
-  // Handle review / un-review result.
-  useEffect(() => {
-    if (!reviewFetcher.data) return;
-    if (reviewFetcher.state !== "idle") return;
-    if (handledReviewRef.current === reviewFetcher.data) return;
-    handledReviewRef.current = reviewFetcher.data;
-
-    if (reviewFetcher.data.status === "success") {
-      shopify?.toast?.show(reviewFetcher.data.message || "Updated.");
-      setReviewingId(null);
-    } else if (reviewFetcher.data.status === "error") {
-      shopify?.toast?.show(
-        reviewFetcher.data.result?.detail ||
-          reviewFetcher.data.message ||
-          "Update failed.",
-        { isError: true },
-      );
-      setReviewingId(null);
-    }
-  }, [reviewFetcher.data, reviewFetcher.state, shopify]);
-
-  const toggleReviewForRow = (row) => {
-    if (!row?.id) return;
-    const isApproved = row.status === "approved";
-    setReviewingId(row.id);
-    reviewFetcher.submit(null, {
-      method: "POST",
-      action: `/api/admin/customers/${row.id}/${isApproved ? "unreview" : "review"}`,
-    });
-  };
 
   // Handle decline result.
   useEffect(() => {
@@ -273,17 +232,7 @@ export default function CustomersList() {
                 const count =
                   f.id === "all"
                     ? rows.length
-                    : f.id === "approved"
-                      ? rows.filter(
-                          (r) =>
-                            r.status === "approved" && !r.shopifyCreateFailed,
-                        ).length
-                      : f.id === "pending"
-                        ? rows.filter(
-                            (r) =>
-                              r.status !== "approved" && !r.shopifyCreateFailed,
-                          ).length
-                        : rows.filter((r) => r.shopifyCreateFailed).length;
+                    : rows.filter((r) => r.shopifyCreateFailed).length;
                 return (
                   <s-clickable-chip
                     key={f.id}
@@ -347,10 +296,8 @@ export default function CustomersList() {
                     <s-table-cell>
                       {r.shopifyCreateFailed ? (
                         <s-badge tone="critical">Sync failed</s-badge>
-                      ) : r.status === "approved" ? (
-                        <s-badge tone="success">Reviewed</s-badge>
                       ) : (
-                        <s-badge>Un-reviewed</s-badge>
+                        <s-badge tone="success">Approved</s-badge>
                       )}
                     </s-table-cell>
                     <s-table-cell>
@@ -360,28 +307,6 @@ export default function CustomersList() {
                         justifyContent="center"
                         alignItems="center"
                       >
-                        <s-button
-                          variant={
-                            r.status === "approved" ? "secondary" : "primary"
-                          }
-                          tone={
-                            r.status === "approved" ? "critical" : undefined
-                          }
-                          icon={r.status === "approved" ? "undo" : "check"}
-                          accessibilityLabel={
-                            r.status === "approved"
-                              ? `Revoke ${fullName}`
-                              : `Review ${fullName}`
-                          }
-                          disabled={!r.customerId || r.shopifyCreateFailed}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            toggleReviewForRow(r);
-                          }}
-                          {...(reviewingId === r.id ? { loading: true } : {})}
-                        >
-                          {r.status === "approved" ? "Revoke" : "Review"}
-                        </s-button>
                         <s-button
                           variant="secondary"
                           tone="critical"
@@ -489,21 +414,10 @@ function EmptyState({
     body = `No applications match "${search}". Try a different keyword or clear the search.`;
     actionLabel = "Clear search";
     actionHandler = onClearSearch;
-  } else if (statusFilter === "approved") {
-    heading = "No reviewed applications";
-    body =
-      "Reviewed customers will appear here once you mark them as reviewed.";
-    actionLabel = "Show all";
-    actionHandler = onShowAll;
-  } else if (statusFilter === "pending") {
-    heading = "No un-reviewed applications";
-    body = "Un-reviewed applications waiting on your review will appear here.";
-    actionLabel = "Show all";
-    actionHandler = onShowAll;
   } else if (statusFilter === "sync-failed") {
     heading = "No failed syncs";
     body =
-      "Every application has successfully synced to Shopify. If any fail in the future, they'll show up here so you can retry them.";
+      "Every application has successfully synced to Shopify. Any future sync failures will appear here.";
     actionLabel = "Show all";
     actionHandler = onShowAll;
   } else {

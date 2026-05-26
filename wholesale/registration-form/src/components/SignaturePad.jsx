@@ -12,31 +12,66 @@ export default function SignaturePad({ value, onChange, error }) {
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
-    const rect = canvas.getBoundingClientRect()
-    if (rect.width === 0) return
-    const dpr = window.devicePixelRatio || 1
-    canvas.width = rect.width * dpr
-    canvas.height = rect.height * dpr
-    const ctx = canvas.getContext('2d')
-    ctx.scale(dpr, dpr)
-    ctx.lineWidth = 2.2
-    ctx.lineCap = 'round'
-    ctx.lineJoin = 'round'
-    ctx.strokeStyle = '#1F1B16'
-    ctxRef.current = ctx
 
-    if (savedBlobRef.current) {
-      const blob = savedBlobRef.current
-      savedBlobRef.current = null
-      const url = URL.createObjectURL(blob)
-      const img = new Image()
-      img.onload = () => {
-        ctx.drawImage(img, 0, 0, rect.width, rect.height)
-        URL.revokeObjectURL(url)
-        setHasInk(true)
+    // Re-init the canvas whenever its CSS size changes. Required because
+    // Step 3 mounts inside an absolutely-positioned wrapper (Collect.js iframe
+    // preservation), so the canvas's initial width can differ from its width
+    // once the step becomes visible. Without re-init the drawing buffer and
+    // the cursor coordinates desynchronise, and ink lands offset from the
+    // pointer.
+    const applySize = () => {
+      const rect = canvas.getBoundingClientRect()
+      if (rect.width === 0 || rect.height === 0) return
+      const dpr = window.devicePixelRatio || 1
+      const targetW = Math.round(rect.width * dpr)
+      const targetH = Math.round(rect.height * dpr)
+      if (canvas.width === targetW && canvas.height === targetH && ctxRef.current) {
+        return
       }
-      img.src = url
+
+      // Snapshot existing pixels before the resize wipes them.
+      let snapshot = null
+      if (ctxRef.current && canvas.width > 0 && canvas.height > 0) {
+        try {
+          snapshot = canvas.toDataURL('image/png')
+        } catch {
+          snapshot = null
+        }
+      }
+
+      canvas.width = targetW
+      canvas.height = targetH
+      const ctx = canvas.getContext('2d')
+      ctx.scale(dpr, dpr)
+      ctx.lineWidth = 2.2
+      ctx.lineCap = 'round'
+      ctx.lineJoin = 'round'
+      ctx.strokeStyle = '#1F1B16'
+      ctxRef.current = ctx
+
+      // Prefer restoring the in-progress drawing over the initial saved blob.
+      if (snapshot) {
+        const img = new Image()
+        img.onload = () => ctx.drawImage(img, 0, 0, rect.width, rect.height)
+        img.src = snapshot
+      } else if (savedBlobRef.current) {
+        const blob = savedBlobRef.current
+        savedBlobRef.current = null
+        const url = URL.createObjectURL(blob)
+        const img = new Image()
+        img.onload = () => {
+          ctx.drawImage(img, 0, 0, rect.width, rect.height)
+          URL.revokeObjectURL(url)
+          setHasInk(true)
+        }
+        img.src = url
+      }
     }
+
+    applySize()
+    const ro = new ResizeObserver(applySize)
+    ro.observe(canvas)
+    return () => ro.disconnect()
   }, [])
 
   const getPos = (e) => {

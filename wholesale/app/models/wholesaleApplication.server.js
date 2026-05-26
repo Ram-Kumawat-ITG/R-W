@@ -10,7 +10,7 @@ const addressSchema = new mongoose.Schema(
     country: String,
     type: String,
   },
-  { _id: false },
+  { _id: false }, 
 );
 
 const taxSchema = new mongoose.Schema(
@@ -28,10 +28,8 @@ const taxSchema = new mongoose.Schema(
 const paymentSchema = new mongoose.Schema(
   {
     method: String,
-    cardholderName: String,
-    cardBrand: String,
-    cardLast4: String,
-    paymentToken: String,
+    card: { type: mongoose.Schema.Types.Mixed, default: null },
+    ach: { type: mongoose.Schema.Types.Mixed, default: null },
   },
   { _id: false },
 );

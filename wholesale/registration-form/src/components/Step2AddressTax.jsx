@@ -7,6 +7,7 @@ import {
   TAX_ID_TYPES,
   getStatesForCountry,
 } from "../constants";
+import { lookupPlaceForZip } from "../utils/zipValidation";
 import SegmentedToggle from "./SegmentedToggle";
 
 const EMPTY_SHIPPING = {
@@ -14,22 +15,50 @@ const EMPTY_SHIPPING = {
   line2: "",
   city: "",
   state: "",
-  zip: "",
+  zip: "",  
   country: "United States",
 };
 
 function AddressBlock({ name, control, errors, setValue }) {
   const country = useWatch({ control, name: `${name}.country` });
+  const zip = useWatch({ control, name: `${name}.zip` });
+  const cityValue = useWatch({ control, name: `${name}.city` });
   const prevCountryRef = useRef(country);
   const states = getStatesForCountry(country);
   const e = errors?.[name] || {};
 
+  // Track latest city value via ref so the autofill effect can read it
+  // without re-firing on every keystroke in the city field.
+  const cityRef = useRef(cityValue);
+  useEffect(() => {
+    cityRef.current = cityValue;
+  }, [cityValue]);
+
   useEffect(() => {
     if (prevCountryRef.current === country) return;
     prevCountryRef.current = country;
-    setValue(`${name}.state`, '', { shouldValidate: false });
-    setValue(`${name}.zip`, '', { shouldValidate: false });
+    setValue(`${name}.state`, "", { shouldValidate: false });
+    setValue(`${name}.zip`, "", { shouldValidate: false });
   }, [country, name, setValue]);
+
+  // ZIP → city autofill. When the user pauses typing the ZIP, look up the
+  // place via Zippopotam and fill the city field if it's still empty. We
+  // never overwrite a user-entered city.
+  useEffect(() => {
+    if (!zip || !country) return;
+    let cancelled = false;
+    const tid = setTimeout(async () => {
+      const result = await lookupPlaceForZip(zip, country);
+      if (cancelled || !result?.city) return;
+      if (!cityRef.current?.trim()) {
+        setValue(`${name}.city`, result.city, { shouldValidate: true });
+      }
+    }, 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(tid);
+    };
+  }, [zip, country, name, setValue]);
   return (
     <>
       <div className="rf-field">
@@ -72,21 +101,25 @@ function AddressBlock({ name, control, errors, setValue }) {
       <div className="rf-field rf-row rf-row-2">
         <div>
           <label className="rf-label">
-            City <span className="rf-req">*</span>
+            Country <span className="rf-req">*</span>
           </label>
           <Controller
-            name={`${name}.city`}
+            name={`${name}.country`}
             control={control}
             render={({ field }) => (
-              <input
+              <select
                 {...field}
-                type="text"
-                placeholder="Portland"
-                className={`rf-input ${e.city ? "error" : ""}`}
-              />
+                className={`rf-select ${e.country ? "error" : ""}`}
+              >
+                {COUNTRIES.map((c) => (
+                  <option key={c.code} value={c.name}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
             )}
           />
-          {e.city && <p className="rf-help error">{e.city.message}</p>}
+          {e.country && <p className="rf-help error">{e.country.message}</p>}
         </div>
         <div>
           <label className="rf-label">
@@ -142,34 +175,36 @@ function AddressBlock({ name, control, errors, setValue }) {
           />
           {e.zip && <p className="rf-help error">{e.zip.message}</p>}
         </div>
+
         <div>
           <label className="rf-label">
-            Country <span className="rf-req">*</span>
+            City <span className="rf-req">*</span>
           </label>
           <Controller
-            name={`${name}.country`}
+            name={`${name}.city`}
             control={control}
             render={({ field }) => (
-              <select
+              <input
                 {...field}
-                className={`rf-select ${e.country ? "error" : ""}`}
-              >
-                {COUNTRIES.map((c) => (
-                  <option key={c.code} value={c.name}>
-                    {c.name}
-                  </option>
-                ))}
-              </select>
+                type="text"
+                placeholder="Portland"
+                className={`rf-input ${e.city ? "error" : ""}`}
+              />
             )}
           />
-          {e.country && <p className="rf-help error">{e.country.message}</p>}
+          {e.city && <p className="rf-help error">{e.city.message}</p>}
         </div>
       </div>
     </>
   );
 }
 
-export default function Step2AddressTax({ control, errors, setValue, clearErrors }) {
+export default function Step2AddressTax({
+  control,
+  errors,
+  setValue,
+  clearErrors,
+}) {
   const sameAsBilling = useWatch({ control, name: "shippingSameAsBilling" });
   const resells = useWatch({ control, name: "resellsProducts" });
   const taxIdType = useWatch({ control, name: "tax.taxIdType" });
@@ -210,7 +245,12 @@ export default function Step2AddressTax({ control, errors, setValue, clearErrors
       <h3 className="rf-section-label" style={{ marginBottom: 14 }}>
         Billing address
       </h3>
-      <AddressBlock name="billingAddress" control={control} errors={errors} setValue={setValue} />
+      <AddressBlock
+        name="billingAddress"
+        control={control}
+        errors={errors}
+        setValue={setValue}
+      />
 
       <div className="rf-toggle-row">
         <div>

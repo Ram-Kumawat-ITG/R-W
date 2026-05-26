@@ -1,4 +1,4 @@
-import { useEffect, useState , useRef } from "react";
+import { useEffect, useState, useRef } from "react";
 import { useForm } from "react-hook-form";
 import { yupResolver } from "@hookform/resolvers/yup";
 import { fullSchema } from "./schema/full.schema";
@@ -68,6 +68,10 @@ const defaultValues = {
     paymentToken: "",
     cardBrand: "",
     cardLast4: "",
+    achAccountName: "",
+    achRoutingNumber: "",
+    achAccountNumber: "",
+    achAccountType: "",
   },
   signature: { drawn: null },
   subscribeNews: false,
@@ -131,16 +135,13 @@ function SuccessScreen() {
             <h2>Application received</h2>
             <p>
               Thanks! We've sent a confirmation to your email. Our team will
-              review your application and get back to you within 2 business
-              days.
+              review your application.
             </p>
             <div className="rf-next-steps">
               <h3>What happens next</h3>
               <ol>
                 <li>We verify your credentials and tax information</li>
-                <li>
-                  You'll receive an approval email with your wholesale login
-                </li>
+                <li>We may reach out if we have any questions</li>
                 <li>Start shopping at wholesale pricing</li>
               </ol>
             </div>
@@ -191,7 +192,6 @@ function FormBody({ onBack }) {
     setErrorBanner(null);
     clearErrors();
   }, [currentStep, clearErrors]);
-
 
   const showToast = (severity, message) => {
     setToast({ severity, message });
@@ -252,6 +252,15 @@ function FormBody({ onBack }) {
         cardBrand: tokenResult.cardBrand,
         cardLast4: tokenResult.cardLast4,
       };
+
+      // Include ACH details when ACH is the preferred method.
+      // Full account number is stripped to last 4 — never sent to the server.
+      if (values.payment.method === 'ach') {
+        cardPayload.achAccountName = values.payment.achAccountName;
+        cardPayload.achRoutingNumber = values.payment.achRoutingNumber;
+        cardPayload.achAccountLast4 = (values.payment.achAccountNumber || '').slice(-4);
+        cardPayload.achAccountType = values.payment.achAccountType;
+      }
 
       const payload = { ...values, payment: cardPayload };
 
@@ -366,12 +375,18 @@ function FormBody({ onBack }) {
                 clearErrors={clearErrors}
               />
             )}
-            <div style={currentStep !== 3 ? {
-              position: 'absolute',
-              visibility: 'hidden',
-              pointerEvents: 'none',
-              width: '100%',
-            } : undefined}>
+            <div
+              style={
+                currentStep !== 3
+                  ? {
+                      position: "absolute",
+                      visibility: "hidden",
+                      pointerEvents: "none",
+                      width: "100%",
+                    }
+                  : undefined
+              }
+            >
               <Step3Payment
                 control={control}
                 errors={errors}
@@ -414,7 +429,9 @@ function FormBody({ onBack }) {
                   type="submit"
                   className="rf-btn rf-btn-primary"
                   disabled={submitting}
-                  onClick={() => { submitIntentRef.current = true }}
+                  onClick={() => {
+                    submitIntentRef.current = true;
+                  }}
                 >
                   {submitting ? "Submitting…" : "Submit application"}
                   {!submitting && (

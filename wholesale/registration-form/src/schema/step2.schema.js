@@ -1,5 +1,5 @@
 import * as yup from 'yup'
-import { validateZipForState, validateCityForState } from '../utils/zipValidation'
+import { validateZipForState, validateCityForState, validateZipForCountry } from '../utils/zipValidation'
 
 const addressShape = (countryField) => ({
   line1: yup.string().trim().required('Required'),
@@ -32,6 +32,14 @@ const addressShape = (countryField) => ({
             if (result.valid) return true
             return this.createError({ message: result.message })
           }),
+      otherwise: (s) =>
+        s.test('zip-country-match', 'Postal code not found', async function (zip) {
+          const { country, state } = this.parent
+          if (!zip || !country) return true
+          const result = await validateZipForCountry(zip, country, state || null)
+          if (result.valid) return true
+          return this.createError({ message: result.message })
+        }),
     }),
   country: yup.string().trim().required('Required'),
 })

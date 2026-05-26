@@ -19,6 +19,14 @@ api_version = "2026-07"
   topics = [ "app/scopes_update" ]
   uri = "/webhooks/app/scopes_update"
 
+  [[webhooks.subscriptions]]
+  topics = ["customers/delete"]
+  uri = "/webhooks/customers/delete"
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/orders/create"
+  topics = [ "orders/create" ]
+
   # NOTE: `orders/create` is a protected customer data topic and CANNOT
   # be declared here until the app is approved in the Partners dashboard
   # (Partners → App → API access → Protected customer data access).

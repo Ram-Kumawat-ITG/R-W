@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { Controller, useWatch } from 'react-hook-form'
 import { getStatesForCountry, PAYMENT_METHODS } from '../constants'
 import PaymentCardForm from './PaymentCardForm'
@@ -51,7 +52,111 @@ function BillingSummary({ control, onEdit }) {
   )
 }
 
+const ACH_ACCOUNT_TYPES = ['Checking', 'Savings', 'Business Checking']
+
+function AchForm({ control, errors }) {
+  const [showAccountNumber, setShowAccountNumber] = useState(false)
+  const e = errors?.payment || {}
+  return (
+    <div style={{ marginTop: 16 }}>
+      <div className="rf-field">
+        <label className="rf-label">Account holder name <span className="rf-req">*</span></label>
+        <Controller
+          name="payment.achAccountName"
+          control={control}
+          render={({ field }) => (
+            <input
+              {...field}
+              type="text"
+              placeholder="Name on bank account"
+              className={`rf-input ${e.achAccountName ? 'error' : ''}`}
+            />
+          )}
+        />
+        {e.achAccountName && <p className="rf-help error">{e.achAccountName.message}</p>}
+      </div>
+
+      <div className="rf-field rf-row rf-row-2">
+        <div>
+          <label className="rf-label">Routing number <span className="rf-req">*</span></label>
+          <Controller
+            name="payment.achRoutingNumber"
+            control={control}
+            render={({ field }) => (
+              <input
+                {...field}
+                type="text"
+                placeholder="9-digit ABA routing number"
+                maxLength={9}
+                className={`rf-input ${e.achRoutingNumber ? 'error' : ''}`}
+              />
+            )}
+          />
+          {e.achRoutingNumber && <p className="rf-help error">{e.achRoutingNumber.message}</p>}
+        </div>
+        <div>
+          <label className="rf-label">Account number <span className="rf-req">*</span></label>
+          <div className="rf-password-wrap">
+            <Controller
+              name="payment.achAccountNumber"
+              control={control}
+              render={({ field }) => (
+                <input
+                  {...field}
+                  type={showAccountNumber ? 'text' : 'password'}
+                  placeholder="Bank account number"
+                  maxLength={17}
+                  autoComplete="off"
+                  className={`rf-input ${e.achAccountNumber ? 'error' : ''}`}
+                />
+              )}
+            />
+            <button
+              type="button"
+              className="rf-password-toggle"
+              onClick={() => setShowAccountNumber((s) => !s)}
+              aria-label={showAccountNumber ? 'Hide account number' : 'Show account number'}
+            >
+              {showAccountNumber ? (
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
+                  <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24" />
+                  <line x1="1" y1="1" x2="23" y2="23" />
+                </svg>
+              ) : (
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                  <circle cx="12" cy="12" r="3" />
+                </svg>
+              )}
+            </button>
+          </div>
+          {e.achAccountNumber && <p className="rf-help error">{e.achAccountNumber.message}</p>}
+        </div>
+      </div>
+
+      <div className="rf-field">
+        <label className="rf-label">Account type <span className="rf-req">*</span></label>
+        <Controller
+          name="payment.achAccountType"
+          control={control}
+          render={({ field }) => (
+            <select {...field} className={`rf-select ${e.achAccountType ? 'error' : ''}`}>
+              <option value="">Select account type</option>
+              {ACH_ACCOUNT_TYPES.map((t) => (
+                <option key={t} value={t}>{t}</option>
+              ))}
+            </select>
+          )}
+        />
+        {e.achAccountType && <p className="rf-help error">{e.achAccountType.message}</p>}
+      </div>
+    </div>
+  )
+}
+
 export default function Step3Payment({ control, errors, onEditBilling, isSubmitted, collectTokenResolverRef }) {
+  const paymentMethod = useWatch({ control, name: 'payment.method' })
   return (
     <section className="rf-step">
       <h1 className="rf-step-title">Payment &amp; authorization</h1>
@@ -91,6 +196,16 @@ export default function Step3Payment({ control, errors, onEditBilling, isSubmitt
           )}
         />
       </div>
+
+      {paymentMethod === 'ach' && (
+        <div>
+          <div className="rf-divider">
+            <h2 className="rf-section-label">Bank account details</h2>
+            <p className="rf-section-hint">Your bank account information for ACH transfers.</p>
+          </div>
+          <AchForm control={control} errors={errors} />
+        </div>
+      )}
 
       <div className="rf-divider">
         <h2 className="rf-section-label">Card on file</h2>
@@ -197,6 +312,9 @@ export default function Step3Payment({ control, errors, onEditBilling, isSubmitt
           <a href="#" target="_blank" rel="noreferrer">Privacy Policy</a>, and confirm the information above is accurate.
         </span>
       </label>
+      {errors.termsAccepted && (
+        <p className="rf-help error">{errors.termsAccepted.message}</p>
+      )}
     </section>
   )
 }

@@ -33,7 +33,6 @@ export default function CustomerDetail() {
   const navigate = useNavigate();
   const shopify = useAppBridge();
   const fetcher = useFetcher();
-  const reviewFetcher = useFetcher();
   const [bannerError, setBannerError] = useState(null);
   const [expandedCredId, setExpandedCredId] = useState(null);
   const modalRef = useRef(null);
@@ -42,15 +41,11 @@ export default function CustomerDetail() {
     `${a.firstName || ""} ${a.lastName || ""}`.trim() || "(no name)";
   const declining =
     fetcher.state === "submitting" || fetcher.state === "loading";
-  const reviewing =
-    reviewFetcher.state === "submitting" || reviewFetcher.state === "loading";
-  const isApproved = a.status === "approved";
   const loadedToastShown = useRef(false);
   // Track which response we've handled so React-Router's automatic
   // post-action revalidation doesn't re-trigger toast / navigate / banner
   // on every subsequent render.
   const handledDeclineRef = useRef(null);
-  const handledReviewRef = useRef(null);
 
   // One-time toast confirming data fetched + showing current approval status.
   useEffect(() => {
@@ -60,12 +55,10 @@ export default function CustomerDetail() {
       shopify?.toast?.show(`Loaded ${fullName} — Shopify sync failed`, {
         isError: true,
       });
-    } else if (isApproved) {
-      shopify?.toast?.show(`${fullName} — Reviewed`);
     } else {
-      shopify?.toast?.show(`Loaded ${fullName} — Un-reviewed`);
+      shopify?.toast?.show(`Loaded ${fullName} — Approved`);
     }
-  }, [isApproved, a.shopifyCreateFailed, fullName, shopify]);
+  }, [a.shopifyCreateFailed, fullName, shopify]);
 
   useEffect(() => {
     if (!fetcher.data) return;
@@ -84,39 +77,6 @@ export default function CustomerDetail() {
       );
     }
   }, [fetcher.data, fetcher.state, navigate, shopify]);
-
-  // Review / un-review response → toast on success, banner on error. The
-  // loader is auto-revalidated by React-Router after the fetcher action, so
-  // we do NOT call revalidator.revalidate() manually (doing so would change
-  // revalidator's reference and re-fire this effect in a loop).
-  useEffect(() => {
-    if (!reviewFetcher.data) return;
-    if (reviewFetcher.state !== "idle") return;
-    if (handledReviewRef.current === reviewFetcher.data) return;
-    handledReviewRef.current = reviewFetcher.data;
-
-    if (reviewFetcher.data.status === "success") {
-      shopify?.toast?.show(
-        reviewFetcher.data.message || "Customer updated.",
-      );
-    } else if (reviewFetcher.data.status === "error") {
-      setBannerError(
-        reviewFetcher.data.result?.detail ||
-          reviewFetcher.data.message ||
-          "Action failed. Please retry.",
-      );
-    }
-  }, [reviewFetcher.data, reviewFetcher.state, shopify]);
-
-  const toggleReview = () => {
-    setBannerError(null);
-    reviewFetcher.submit(null, {
-      method: "POST",
-      action: isApproved
-        ? `/api/admin/customers/${a._id}/unreview`
-        : `/api/admin/customers/${a._id}/review`,
-    });
-  };
 
   const onConfirmDecline = () => {
     setBannerError(null);
@@ -169,18 +129,9 @@ export default function CustomerDetail() {
       </s-button>
       <s-button
         slot="primary-action"
-        variant={isApproved ? "secondary" : "primary"}
-        tone={isApproved ? "critical" : undefined}
-        icon={isApproved ? "undo" : "check"}
-        onClick={toggleReview}
-        {...(reviewing ? { loading: true } : {})}
-      >
-        {isApproved ? "Revoke" : "Review"}
-      </s-button>
-      <s-button
-        slot="secondary-actions"
         variant="primary"
         tone="critical"
+        icon="delete"
         onClick={openModal}
         {...(declining ? { loading: true } : {})}
       >
@@ -201,8 +152,17 @@ export default function CustomerDetail() {
           heading="Shopify sync failed for this customer"
         >
           <s-paragraph>
-            {a.shopifyCreateError ||
+            {prettyShopifyError(a.shopifyCreateError) ||
               "Unknown error syncing this customer to Shopify."}
+          </s-paragraph>
+        </s-banner>
+      )}
+
+      {a.phoneDuplicate && (
+        <s-banner tone="info" heading="Duplicate phone number detected">
+          <s-paragraph>
+            Another wholesale application uses the same phone number ({a.phone || "—"}).
+            Review carefully before approving.
           </s-paragraph>
         </s-banner>
       )}
@@ -213,18 +173,11 @@ export default function CustomerDetail() {
           <s-stack direction="inline" gap="base" alignItems="center">
             {a.shopifyCreateFailed ? (
               <s-badge tone="critical">Sync failed</s-badge>
-            ) : isApproved ? (
-              <s-badge tone="success">Reviewed</s-badge>
             ) : (
-              <s-badge>Un-reviewed</s-badge>
+              <s-badge tone="success">Approved</s-badge>
             )}
             {submittedLabel && (
               <s-text tone="subdued">Submitted {submittedLabel}</s-text>
-            )}
-            {a.reviewedAt && isApproved && (
-              <s-text tone="subdued">
-                · Reviewed {new Date(a.reviewedAt).toLocaleString()}
-              </s-text>
             )}
           </s-stack>
 
@@ -636,4 +589,15 @@ function parseNote(note) {
 function truncate(s, n) {
   if (!s) return "";
   return s.length > n ? `${s.slice(0, n)}…` : s;
+}
+
+// Strip the leading "[fieldName] " prefix(es) that ShopifyUserError adds to
+// its Error.message — useful in logs, ugly in the admin UI.
+function prettyShopifyError(text) {
+  if (!text) return "";
+  return text
+    .split(";")
+    .map((part) => part.replace(/^\s*\[[^\]]+\]\s*/, "").trim())
+    .filter(Boolean)
+    .join("; ");
 }
