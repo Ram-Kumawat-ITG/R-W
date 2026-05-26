@@ -22,6 +22,7 @@ import {
   recordPayment as recordQboPayment,
   appendInvoiceLines as appendQboInvoiceLines,
   getInvoice as getQboInvoice,
+  sendInvoiceEmail as sendQboInvoiceEmail,
 } from '../qbo/qbo.service'
 import {
   markShopifyOrderPaid,
@@ -169,16 +170,25 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
   invoice.currency = qboInvoice.CurrencyRef?.value || invoice.currency
   invoice.qboCreationStatus = 'created'
   invoice.qboCreationError = undefined
+
+  // Phase 4 — fire the initial customer-facing invoice email via QBO.
+  // Mutates email-tracking fields on the in-memory doc; never throws.
+  // Runs BEFORE save() so the email-tracking flags persist in the
+  // single .save() below — no second write needed in the happy path.
+  await dispatchInvoiceLifecycleEmails({ invoice, customerMap, event: 'created' })
+
   await invoice.save()
 
   console.log(
     `[invoice] CREATED Invoice _id=${invoice._id} qboInvoiceId=${invoice.qboInvoiceId} ` +
-      `amountDue=${invoice.amountDue} status=pending`,
+      `amountDue=${invoice.amountDue} status=pending ` +
+      `emailedAt=${invoice.invoiceEmailSentAt ? invoice.invoiceEmailSentAt.toISOString() : '(deferred — see lastEmailError)'}`,
   )
   log.info('create.success', {
     invoiceId: invoice._id.toString(),
     qboInvoiceId: invoice.qboInvoiceId,
     amountDue: invoice.amountDue,
+    invoiceEmailSent: Boolean(invoice.invoiceEmailSentAt),
   })
   return invoice
 }
@@ -588,8 +598,114 @@ export async function propagateSuccessfulPayment({ invoice, customerMap, transac
   } else {
     console.log(`[sync] all systems in sync ✓`)
   }
+
+  // Re-send the customer-facing invoice email if this payment grew
+  // amountPaid or transitioned paymentStatus since the last send.
+  // The /send endpoint mails the CURRENT QBO invoice document, so the
+  // customer sees the updated balance + payments list automatically —
+  // no separate payment-receipt channel needed. Idempotent: the in-doc
+  // snapshots (invoiceEmailedAmountPaid + invoiceEmailedStatus) prevent
+  // PASS 2 sync retries and concurrent propagate calls from double-
+  // sending. Best-effort: errors land on invoice.lastEmailError, never
+  // block payment bookkeeping.
+  await dispatchInvoiceLifecycleEmails({ invoice, customerMap, event: 'payment' })
+
   await invoice.save()
   return { syncErrors }
+}
+
+// Dispatch the customer-facing invoice email via QBO's `/invoice/{id}/send`
+// endpoint. Best-effort: a failure never throws upward — payment sync
+// state must not depend on email delivery. Errors are recorded on
+// invoice.lastEmailError so operators can see them.
+//
+// MUTATES the in-memory invoice doc with email-tracking fields but does
+// NOT call .save() — callers persist as part of their own save cycle, so
+// a single Mongo write covers email state + the rest of the propagate-
+// success bookkeeping.
+//
+// Only the INVOICE email is sent — no separate payment-receipt emails.
+// QBO's `/send` mails the CURRENT invoice document, so the customer's
+// re-sent copy already shows every recorded payment + the updated
+// balance + the correct status. One channel covers create, partial-paid,
+// and fully-paid.
+//
+// When it fires:
+//   event='created' — first invoice email, fired once per invoice at
+//                     creation time. Guard: invoiceEmailSentAt.
+//   event='payment' — re-send whenever a successful payment has changed
+//                     either amountPaid (a new payment recorded since
+//                     the last email) or paymentStatus (pending →
+//                     partially_paid, partially_paid → paid). Each
+//                     partial gets its own re-send so the customer sees
+//                     the new balance.
+//
+// QBO does not dedup `/send` calls server-side, so duplicate-send
+// protection lives entirely in the local guards (invoiceEmailSentAt
+// + invoiceEmailedAmountPaid + invoiceEmailedStatus).
+async function dispatchInvoiceLifecycleEmails({ invoice, customerMap, event }) {
+  // Resolve recipient: prefer the live customer record (it can be
+  // updated via /api/update-profile after registration) and fall back
+  // to the invoice's stored email for legacy rows.
+  const sendTo = customerMap?.email || invoice.customerEmail
+  if (!sendTo) {
+    console.warn(`[email] skipped — no recipient on customerMap/invoice ${invoice._id}`)
+    log.warn('email.skip_no_recipient', { invoiceId: invoice._id.toString() })
+    return
+  }
+  // A half-claimed invoice has no QBO id yet — nothing to send.
+  if (!invoice.qboInvoiceId) {
+    console.warn(`[email] skipped — invoice ${invoice._id} has no qboInvoiceId yet`)
+    return
+  }
+
+  // Decide whether to (re)send.
+  //   - 'created' → send once; guard on invoiceEmailSentAt
+  //   - 'payment' → re-send if amountPaid grew OR status moved since
+  //                 the last (re)send (also covers the case where the
+  //                 creation-time email failed and we never stamped a
+  //                 baseline — both fields are falsy then)
+  const currentPaid = Number((invoice.amountPaid || 0).toFixed(2))
+  const emailedPaid = Number((invoice.invoiceEmailedAmountPaid || 0).toFixed(2))
+  const isInitial = event === 'created' && !invoice.invoiceEmailSentAt
+  const isResend =
+    event === 'payment' &&
+    (currentPaid > emailedPaid + 0.005 ||
+      invoice.invoiceEmailedStatus !== invoice.paymentStatus)
+  if (!isInitial && !isResend) {
+    console.log(`[email] no action for invoice ${invoice._id} (event=${event})`)
+    return
+  }
+
+  const reasonLabel = isInitial
+    ? 'initial'
+    : currentPaid > emailedPaid + 0.005
+    ? `payment recorded (paid $${emailedPaid.toFixed(2)} → $${currentPaid.toFixed(2)})`
+    : `status changed (${invoice.invoiceEmailedStatus || '(none)'} → ${invoice.paymentStatus})`
+
+  try {
+    console.log(`[email] sending invoice email — ${reasonLabel} — to ${sendTo} (qboInvoice=${invoice.qboInvoiceId})`)
+    await sendQboInvoiceEmail({ qboInvoiceId: invoice.qboInvoiceId, sendTo })
+    const now = new Date()
+    if (isInitial) invoice.invoiceEmailSentAt = now
+    invoice.invoiceEmailLastSentAt = now
+    invoice.invoiceEmailedStatus = invoice.paymentStatus
+    invoice.invoiceEmailedAmountPaid = currentPaid
+    invoice.lastEmailError = undefined
+    log.info('email.invoice_sent', {
+      invoiceId: invoice._id.toString(),
+      qboInvoiceId: invoice.qboInvoiceId,
+      sendTo,
+      reason: reasonLabel,
+      status: invoice.paymentStatus,
+      amountPaid: currentPaid,
+    })
+  } catch (err) {
+    const msg = `Invoice email failed (${reasonLabel}): ${err.message}`
+    console.error(`[email] ${msg}`)
+    invoice.lastEmailError = msg
+    log.error('email.invoice_failed', { invoiceId: invoice._id.toString(), reason: reasonLabel, err })
+  }
 }
 
 // Atomic $push into Invoice.remarks[]. The remarks ledger powers the

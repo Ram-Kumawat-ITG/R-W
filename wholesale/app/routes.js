@@ -28,4 +28,5 @@ export default [
   route("/api/admin/orders/:id/charge-card", "api/admin/charge-card.js"),
   route("/api/admin/orders/:id/preview-payment", "api/admin/preview-payment.js"),
   route("/api/admin/orders/:id/qbo-invoice-pdf", "api/admin/qbo-invoice-pdf.js"),
+  route("/api/admin/orders/:id/send-invoice", "api/admin/send-invoice.js"),
 ];

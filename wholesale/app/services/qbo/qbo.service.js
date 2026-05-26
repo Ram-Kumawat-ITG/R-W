@@ -229,6 +229,50 @@ export async function voidInvoice(qboInvoiceId) {
   return voided
 }
 
+// ── Email / Send ─────────────────────────────────────────────────────
+
+// Send (or re-send) the customer-facing invoice email via QBO's built-in
+// mail endpoint.
+//   POST /v3/company/<realmId>/invoice/<invoiceId>/send?sendTo=<email>
+//
+// When `sendTo` is provided, QBO updates Invoice.BillEmail.Address to
+// that value and delivers to it; otherwise it falls back to the
+// existing Invoice.BillEmail.Address (auto-populated from
+// Customer.PrimaryEmailAddr at invoice creation). After a successful
+// send, QBO sets Invoice.EmailStatus = "EmailSent" and stamps
+// DeliveryInfo. The email always reflects the CURRENT invoice state,
+// so re-sending after recordPayment shows the updated balance + paid
+// amount automatically — no separate "payment receipt" channel is
+// needed.
+//
+// Idempotency note: QBO does NOT dedup calls to /send — calling twice
+// delivers two emails. Callers must gate on local state (e.g.
+// invoiceEmailSentAt / invoiceEmailedAmountPaid / invoiceEmailedStatus)
+// to avoid duplicate deliveries on retry. This function intentionally
+// throws on QBO errors so callers can record the failure; the higher-
+// level dispatcher in invoice.service.js swallows the throw to keep
+// email failures from blocking payment sync.
+export async function sendInvoiceEmail({ qboInvoiceId, sendTo }) {
+  if (!qboInvoiceId) throw new Error('sendInvoiceEmail: qboInvoiceId is required')
+  const query = sendTo ? { sendTo } : undefined
+  console.log(
+    `\n[QBO email] sending invoice Id=${qboInvoiceId}${sendTo ? ` to ${sendTo}` : ' (using BillEmail)'}`,
+  )
+  log.info('invoice.send.request', { qboInvoiceId, sendTo: sendTo || '(billEmail)' })
+  const res = await qbo.send(`/invoice/${encodeURIComponent(qboInvoiceId)}/send`, query)
+  const updated = res?.Invoice
+  console.log(
+    `[QBO email] sent invoice Id=${updated?.Id} EmailStatus=${updated?.EmailStatus} ` +
+      `BillEmail=${updated?.BillEmail?.Address || '(unset)'}`,
+  )
+  log.info('invoice.send.success', {
+    qboInvoiceId: updated?.Id,
+    emailStatus: updated?.EmailStatus,
+    billEmail: updated?.BillEmail?.Address,
+  })
+  return updated
+}
+
 // ── Payment ──────────────────────────────────────────────────────────
 
 // Record a payment against a QBO invoice. Called after a successful NMI

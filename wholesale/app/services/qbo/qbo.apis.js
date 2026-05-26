@@ -157,7 +157,7 @@ function buildUrl(path, query, { requestId, method } = {}) {
   return url.toString()
 }
 
-async function rawRequest({ method, path, query, body, requestId, retryOn401 = true }) {
+async function rawRequest({ method, path, query, body, contentType, requestId, retryOn401 = true }) {
   const accessToken = await getAccessToken()
   const url = buildUrl(path, query, { requestId, method })
 
@@ -165,13 +165,20 @@ async function rawRequest({ method, path, query, body, requestId, retryOn401 = t
   console.log(`        url: ${url}`)
   if (body) console.log(`        body: ${truncate(JSON.stringify(body), 1000)}`)
 
+  // QBO's `/invoice/<id>/send` and `/payment/<id>/send` endpoints require
+  // Content-Type: application/octet-stream on an empty POST. Callers pass
+  // `contentType` explicitly for that. Default for JSON POSTs is set
+  // automatically below.
+  const effectiveContentType =
+    contentType || (body ? 'application/json' : undefined)
+
   const startedAt = Date.now()
   const res = await fetch(url, {
     method,
     headers: {
       Accept: 'application/json',
       Authorization: `Bearer ${accessToken}`,
-      ...(body ? { 'Content-Type': 'application/json' } : {}),
+      ...(effectiveContentType ? { 'Content-Type': effectiveContentType } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
   })
@@ -201,7 +208,7 @@ async function rawRequest({ method, path, query, body, requestId, retryOn401 = t
     log.warn('token.invalid_retry', { path })
     const doc = await readTokenDoc()
     if (doc) await refreshAccessToken(doc.refreshToken)
-    return rawRequest({ method, path, query, body, requestId, retryOn401: false })
+    return rawRequest({ method, path, query, body, contentType, requestId, retryOn401: false })
   }
 
   if (!res.ok) {
@@ -228,6 +235,7 @@ export async function qboRequest(opts) {
   // Callers can pin a specific id via opts.requestId if they want
   // cross-process idempotency (e.g. resuming a crashed job); otherwise
   // we make one up.
+  //
   const requestId = opts.requestId || randomUUID()
   return retry(() => rawRequest({ ...opts, requestId }), {
     attempts: paymentConfig.httpRetryAttempts,
@@ -297,6 +305,17 @@ export const qbo = {
   post: (path, body, query) => qboRequest({ method: 'POST', path, body, query }),
   // QBO uses POST for updates with a sparse=true flag.
   update: (path, body) => qboRequest({ method: 'POST', path, body }),
+  // QBO's email-send endpoints (/invoice/<id>/send, /payment/<id>/send)
+  // require an empty POST body with Content-Type: application/octet-stream.
+  // Routed through this helper so the special content type is the only
+  // difference from a normal post().
+  send: (path, query) =>
+    qboRequest({
+      method: 'POST',
+      path,
+      query,
+      contentType: 'application/octet-stream',
+    }),
   query: async (statement) => {
     // /query?query=<sql-like>
     return qboRequest({ method: 'GET', path: '/query', query: { query: statement } })

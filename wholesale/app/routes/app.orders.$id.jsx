@@ -400,6 +400,7 @@ export default function OrderDetail() {
   const chequeFetcher = useFetcher();
   const chargeCardFetcher = useFetcher();
   const pdfFetcher = useFetcher();
+  const sendInvoiceFetcher = useFetcher();
   const modalRef = useRef(null);
   const chequeModalRef = useRef(null);
   const chargeCardModalRef = useRef(null);
@@ -412,6 +413,7 @@ export default function OrderDetail() {
   const handledChequeRef = useRef(null);
   const handledChargeCardRef = useRef(null);
   const handledPdfRef = useRef(null);
+  const handledSendInvoiceRef = useRef(null);
   // Holds the window opened synchronously on PDF click; we redirect it
   // to a blob URL once the fetcher returns. Opening *after* the async
   // step would trip popup blockers.
@@ -757,6 +759,42 @@ export default function OrderDetail() {
 
   const pdfLoading =
     pdfFetcher.state === "submitting" || pdfFetcher.state === "loading";
+
+  // "Send invoice" button → POST /api/admin/orders/:id/send-invoice.
+  // QBO mails the CURRENT invoice document, so no client-side payload
+  // is needed.
+  const onSendInvoice = () => {
+    setBannerError(null);
+    setBannerSuccess(null);
+    sendInvoiceFetcher.submit(null, {
+      method: "POST",
+      action: `/api/admin/orders/${order._id}/send-invoice`,
+    });
+  };
+
+  // Resolve the send-invoice fetcher → toast + banner. React Router
+  // auto-revalidates the loader after the action, so the QuickBooks-
+  // invoice section will refresh and the new Email status / Last
+  // updated values reflect the send.
+  useEffect(() => {
+    if (!sendInvoiceFetcher.data) return;
+    if (sendInvoiceFetcher.state !== "idle") return;
+    if (handledSendInvoiceRef.current === sendInvoiceFetcher.data) return;
+    handledSendInvoiceRef.current = sendInvoiceFetcher.data;
+
+    const data = sendInvoiceFetcher.data;
+    if (data.status === "success") {
+      setBannerSuccess(data.message || "Invoice email sent");
+      shopify?.toast?.show(data.message || "Invoice email sent");
+    } else {
+      setBannerError(data.message || "Could not send invoice email");
+      shopify?.toast?.show(data.message || "Send failed", { isError: true });
+    }
+  }, [sendInvoiceFetcher.data, sendInvoiceFetcher.state, shopify]);
+
+  const sendInvoiceLoading =
+    sendInvoiceFetcher.state === "submitting" ||
+    sendInvoiceFetcher.state === "loading";
 
   const outstanding =
     invoice != null
@@ -1360,13 +1398,22 @@ export default function OrderDetail() {
                   </s-link>
                 )}
               </s-stack>
-              <s-button
-                variant="secondary"
-                onClick={onViewPdf}
-                {...(pdfLoading ? { loading: true } : {})}
-              >
-                View invoice PDF
-              </s-button>
+              <s-stack direction="inline" gap="base">
+                <s-button
+                  variant="secondary"
+                  onClick={onSendInvoice}
+                  {...(sendInvoiceLoading ? { loading: true } : {})}
+                >
+                  Send invoice
+                </s-button>
+                <s-button
+                  variant="secondary"
+                  onClick={onViewPdf}
+                  {...(pdfLoading ? { loading: true } : {})}
+                >
+                  View invoice PDF
+                </s-button>
+              </s-stack>
             </s-stack>
 
             {qbo?.error && (

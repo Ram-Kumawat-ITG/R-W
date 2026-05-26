@@ -238,6 +238,51 @@ const invoiceSchema = new mongoose.Schema(
     processingFeeRate: Number,
     processingFeeMethod: { type: String, enum: ['card', 'ach', 'check'] },
     processingFeeAppliedAt: Date,
+
+    // ── Customer email lifecycle (QBO-driven) ────────────────────────
+    //
+    // We send the customer ONE channel of email — the invoice itself —
+    // via QBO's `/invoice/<id>/send` endpoint. QBO mails the CURRENT
+    // invoice document, so a re-send after recordPayment automatically
+    // reflects the new balance + payments list. No separate payment-
+    // receipt channel exists.
+    //
+    // Email fires:
+    //   - once at invoice creation (initial delivery), and
+    //   - again on every successful payment that grew amountPaid OR
+    //     transitioned paymentStatus (pending → partially_paid → paid).
+    //
+    // QBO does not dedup `/send` calls — calling twice delivers two
+    // emails. These fields are the only guard against double-sends.
+    // All writes happen inside services/invoice/invoice.service.dispatch-
+    // InvoiceLifecycleEmails(); nothing outside that helper should touch
+    // them.
+    //
+    //   invoiceEmailSentAt        — first successful invoice email
+    //   invoiceEmailLastSentAt    — most recent invoice email (initial + re-sends)
+    //   invoiceEmailedStatus      — paymentStatus snapshot at last (re)send;
+    //                                re-send fires when this differs from
+    //                                current paymentStatus
+    //   invoiceEmailedAmountPaid  — amountPaid snapshot at last (re)send;
+    //                                re-send fires when current amountPaid
+    //                                exceeds this (catches every partial)
+    //   lastEmailError            — most recent QBO /send error message
+    //                                (best-effort; doesn't block sync)
+    invoiceEmailSentAt: Date,
+    invoiceEmailLastSentAt: Date,
+    invoiceEmailedStatus: {
+      type: String,
+      enum: [
+        'pending',
+        'in_progress',
+        'partially_paid',
+        'paid',
+        'failed',
+        'cancelled',
+      ],
+    },
+    invoiceEmailedAmountPaid: Number,
+    lastEmailError: String,
   },
   { collection: 'invoices', timestamps: true, strict: true },
 )

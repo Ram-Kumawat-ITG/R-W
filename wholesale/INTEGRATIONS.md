@@ -797,6 +797,98 @@ This is the call that flips a QBO invoice from "Open" to "Paid".
 `QBO_ENVIRONMENT=sandbox|production` auto-selects the base URL from
 `QBO_BASE_URLS` in config. Explicit `QBO_API_BASE_URL` override wins if set.
 
+### 7.6 Customer-facing emails — `services/qbo/qbo.service.js` + `services/invoice/invoice.service.dispatchInvoiceLifecycleEmails`
+
+Customer emails are sent by QBO's own mail infrastructure, not the app.
+We hit a single QBO endpoint — the invoice send — and trust QBO to
+deliver, render, and stamp `Invoice.EmailStatus = 'EmailSent'` /
+`DeliveryInfo` on its side. There is no separate payment-receipt
+email channel; the invoice itself is the source of truth and is
+re-sent on every payment so the customer's latest copy always
+reflects the current balance + payments list.
+
+**QBO endpoint used:**
+
+| Endpoint | Purpose | Notes |
+|---|---|---|
+| `POST /v3/company/{realmId}/invoice/{id}/send?sendTo={email}` | Initial + re-send of the invoice document | Customer sees the CURRENT invoice — QBO has already recorded any prior payments by the time we re-send, so the balance + payment list update automatically. `sendTo` is always passed explicitly so we don't depend on QBO's stored `Invoice.BillEmail.Address`. |
+
+The endpoint wants `Content-Type: application/octet-stream` on an
+empty POST body. Wired through a dedicated `qbo.send(path, query)` in
+`qbo.apis.js`; `rawRequest` gained a `contentType` plumb-through so
+the special header doesn't leak into normal POSTs.
+
+**Dispatcher: `dispatchInvoiceLifecycleEmails({ invoice, customerMap, event })`**
+
+Single decision point for every customer email. Best-effort — failures
+mutate `invoice.lastEmailError` and log, but never throw upward. Email
+delivery is decoupled from payment bookkeeping.
+
+| Event | Trigger | Action |
+|---|---|---|
+| `created` | `createInvoiceForOrder` Phase 4 (after the QBO invoice id is stamped, before the first `.save()`) | Sends initial invoice email if `invoiceEmailSentAt` is null. Stamps the timestamp + records the baseline (`invoiceEmailedStatus`, `invoiceEmailedAmountPaid`). |
+| `payment` | `propagateSuccessfulPayment` (just before final `.save()`) | Re-sends the invoice email if **either** `amountPaid > invoiceEmailedAmountPaid` (a new payment was recorded since the last email) **or** `paymentStatus !== invoiceEmailedStatus` (status transitioned). Each partial payment naturally triggers a re-send via the amount check, so the customer sees the new balance after every payment. The status check catches the `pending → partially_paid` and `partially_paid → paid` transitions, plus the case where the creation-time email failed and we never stamped a baseline. |
+
+**Idempotency guards (Invoice doc fields):**
+
+| Field | Role |
+|---|---|
+| `invoiceEmailSentAt` | First successful invoice-email send. Guards `event='created'`. |
+| `invoiceEmailLastSentAt` | Most recent invoice-email send (initial + re-sends). Diagnostic. |
+| `invoiceEmailedStatus` | `paymentStatus` snapshot at last (re)send. One of the two trigger inputs for `event='payment'` re-send. |
+| `invoiceEmailedAmountPaid` | `amountPaid` snapshot at last (re)send. The amount-grew check (current > emailed) is what catches partial payments that don't change status (e.g. a second partial that still leaves a balance). |
+| `lastEmailError` | Most recent QBO `/send` error message (cleared on next success). |
+
+QBO does **not** dedup `/send` calls — calling twice delivers two
+emails. Local guards above are the only protection against double-
+sends, which is why every email path lives inside this single
+dispatcher.
+
+**Flow per payment lifecycle:**
+
+```
+Invoice creation
+  → createInvoiceForOrder
+      → QBO createInvoice (Phase 2)
+      → save QBO ids on local row (Phase 3)
+      → dispatchInvoiceLifecycleEmails({ event: 'created' })
+          → QBO POST /invoice/{id}/send         ✉ invoice (status: pending, balance $100)
+      → save() (persists email-tracking fields)
+
+First partial payment ($30 on $100 invoice)
+  → chargeInvoice / recordManualPayment
+  → propagateSuccessfulPayment
+      → QBO recordPayment                       (qboRecordedTotal=$30)
+      → status: pending → partially_paid
+      → dispatchInvoiceLifecycleEmails({ event: 'payment' })
+          → trigger: amountPaid 0→30 + status pending→partially_paid
+          → QBO POST /invoice/{id}/send         ✉ invoice (status: partially_paid, balance $70)
+      → save()
+
+Second partial payment ($20)
+  → propagateSuccessfulPayment
+      → QBO recordPayment                       (qboRecordedTotal=$50)
+      → status: still partially_paid
+      → dispatchInvoiceLifecycleEmails({ event: 'payment' })
+          → trigger: amountPaid 30→50 (status unchanged)
+          → QBO POST /invoice/{id}/send         ✉ invoice (status: partially_paid, balance $50)
+      → save()
+
+Final payment ($50)
+  → propagateSuccessfulPayment
+      → QBO recordPayment                       (qboRecordedTotal=$100)
+      → status: partially_paid → paid
+      → dispatchInvoiceLifecycleEmails({ event: 'payment' })
+          → trigger: amountPaid 50→100 + status partially_paid→paid
+          → QBO POST /invoice/{id}/send         ✉ invoice (status: paid, balance $0)
+      → save()
+```
+
+CRON PASS 2 sync retries naturally pick up unsent emails — if a prior
+`propagate` call failed at the email step, the next sweep sees
+`amountPaid > invoiceEmailedAmountPaid` (or a status mismatch) and
+re-sends. No separate email-retry queue needed.
+
 ---
 
 ## 8. NMI integration
