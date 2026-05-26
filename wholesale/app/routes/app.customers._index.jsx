@@ -44,6 +44,12 @@ const STATUS_FILTERS = [
   { id: "sync-failed", label: "Sync failed" },
 ];
  
+// Records per page. Filtering and pagination both happen client-side
+// (the loader returns the full list), so we just slice the filtered
+// array. Matches the project's existing list-page pattern (Orders list
+// uses 25).
+const PAGE_SIZE = 15;
+ 
 export default function CustomersList() {
   const { rows } = useLoaderData();
   const navigate = useNavigate();
@@ -91,6 +97,12 @@ export default function CustomersList() {
     revalidator.state === "loading" ||
     declineFetcher.state !== "idle";
  
+  // Whenever the filter inputs change, snap back to page 1 so the user
+  // isn't stranded on (e.g.) page 4 of an empty result set.
+  useEffect(() => {
+    setPage(1);
+  }, [search, statusFilter]);
+ 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     const result = rows.filter((r) => {
@@ -121,13 +133,13 @@ export default function CustomersList() {
  
     return result;
   }, [rows, search, statusFilter, sortOrder]);
-
+ 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const currentPage = Math.min(page, totalPages);
   const firstShown = filtered.length === 0 ? 0 : (currentPage - 1) * PAGE_SIZE + 1;
   const lastShown = Math.min(currentPage * PAGE_SIZE, filtered.length);
   const visibleRows = filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
-
+ 
   // Handle decline result.
   useEffect(() => {
     if (!declineFetcher.data) return;
@@ -148,13 +160,13 @@ export default function CustomersList() {
       setDecliningId(null);
     }
   }, [declineFetcher.data, declineFetcher.state, shopify]);
-
+ 
   useEffect(() => {
     if (!syncFetcher.data) return;
     if (syncFetcher.state !== "idle") return;
     if (handledSyncRef.current === syncFetcher.data) return;
     handledSyncRef.current = syncFetcher.data;
-
+ 
     if (syncFetcher.data.status === "success") {
       const r = syncFetcher.data.result || {};
       shopify?.toast?.show(
@@ -167,10 +179,10 @@ export default function CustomersList() {
       );
     }
   }, [syncFetcher.data, syncFetcher.state, shopify]);
-
+ 
   const runSyncBackfill = () =>
     syncFetcher.submit(null, { method: "POST", action: "/api/admin/sync/backfill" });
-
+ 
   const openDeclineModal = (row) => {
     if (!row?.id) return;
     setPendingDeclineRow(row);
@@ -188,10 +200,10 @@ export default function CustomersList() {
     });
     setPendingDeclineRow(null);
   };
-
+ 
   const syncBusy =
     syncFetcher.state === "submitting" || syncFetcher.state === "loading";
-
+ 
   return (
     <s-page inlineSize="large" heading="Wholesale applications">
       <s-button
@@ -308,7 +320,7 @@ export default function CustomersList() {
               </s-table-header>
             </s-table-header-row>
             <s-table-body>
-              {filtered.map((r) => {
+              {visibleRows.map((r) => {
                 const fullName =
                   `${r.firstName} ${r.lastName}`.trim() || "(no name)";
                 const submitted = r.submittedAt
@@ -355,6 +367,41 @@ export default function CustomersList() {
               })}
             </s-table-body>
           </s-table>
+        )}
+ 
+        {filtered.length > 0 && (
+          <s-box padding="base">
+            <s-stack
+              direction="inline"
+              gap="base"
+              alignItems="center"
+              justifyContent="space-between"
+            >
+              <s-text tone="subdued">
+                Showing {firstShown}–{lastShown} of {filtered.length}
+              </s-text>
+              <s-stack direction="inline" gap="small-200" alignItems="center">
+                <s-button
+                  variant="tertiary"
+                  disabled={currentPage <= 1}
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  icon="arrow-left"
+                >
+                  Previous
+                </s-button>
+                <s-text tone="subdued">
+                  Page {currentPage} of {totalPages}
+                </s-text>
+                <s-button
+                  variant="tertiary"
+                  disabled={currentPage >= totalPages}
+                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                >
+                  Next
+                </s-button>
+              </s-stack>
+            </s-stack>
+          </s-box>
         )}
       </s-section>
  
