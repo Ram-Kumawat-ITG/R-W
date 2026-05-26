@@ -256,6 +256,20 @@
 .rf-textarea.error {
   border-color: var(--color-error);
 }
+.rf-select-disabled,
+.rf-select:disabled {
+  background-color: #f5f5f5;
+  color: var(--color-text-muted);
+  cursor: not-allowed;
+  opacity: 0.75;
+}
+.rf-input-disabled,
+.rf-input:disabled {
+  background-color: #f5f5f5;
+  color: var(--color-text-muted);
+  cursor: not-allowed;
+  opacity: 0.75;
+}
 .rf-input::placeholder { color: var(--color-text-muted); }
 .rf-textarea { resize: vertical; min-height: 80px; }
 

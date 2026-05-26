@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Controller, useWatch } from "react-hook-form";
 import {
   US_STATES,
@@ -15,7 +15,7 @@ const EMPTY_SHIPPING = {
   line2: "",
   city: "",
   state: "",
-  zip: "",  
+  zip: "",
   country: "United States",
 };
 
@@ -26,6 +26,9 @@ function AddressBlock({ name, control, errors, setValue }) {
   const prevCountryRef = useRef(country);
   const states = getStatesForCountry(country);
   const e = errors?.[name] || {};
+
+  // true when city was populated by the ZIP lookup (not typed by the user)
+  const [cityAutoFilled, setCityAutoFilled] = useState(false);
 
   // Track latest city value via ref so the autofill effect can read it
   // without re-firing on every keystroke in the city field.
@@ -45,6 +48,8 @@ function AddressBlock({ name, control, errors, setValue }) {
   // place via Zippopotam and fill the city field if it's still empty. We
   // never overwrite a user-entered city.
   useEffect(() => {
+    // Reset autofill flag whenever zip changes so a new lookup starts fresh
+    setCityAutoFilled(false);
     if (!zip || !country) return;
     let cancelled = false;
     const tid = setTimeout(async () => {
@@ -52,6 +57,7 @@ function AddressBlock({ name, control, errors, setValue }) {
       if (cancelled || !result?.city) return;
       if (!cityRef.current?.trim()) {
         setValue(`${name}.city`, result.city, { shouldValidate: true });
+        setCityAutoFilled(true);
       }
     }, 400);
     return () => {
@@ -188,7 +194,12 @@ function AddressBlock({ name, control, errors, setValue }) {
                 {...field}
                 type="text"
                 placeholder="Portland"
-                className={`rf-input ${e.city ? "error" : ""}`}
+                disabled={cityAutoFilled}
+                className={`rf-input ${e.city ? "error" : ""}${cityAutoFilled ? " rf-input-disabled" : ""}`}
+                onChange={(ev) => {
+                  field.onChange(ev);
+                  setCityAutoFilled(false);
+                }}
               />
             )}
           />
