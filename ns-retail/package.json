@@ -8,6 +8,7 @@
     "generate": "shopify app generate",
     "deploy": "shopify app deploy",
     "config:use": "shopify app config use",
+    "seed:cdo": "node --env-file-if-exists=.env scripts/seed-cdo.js",
     "env": "shopify app env",
     "start": "react-router-serve ./build/server/index.js",
     "docker-start": "npm run setup && npm run start",
