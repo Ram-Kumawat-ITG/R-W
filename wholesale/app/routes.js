@@ -30,4 +30,5 @@ export default [
   route("/api/admin/orders/:id/qbo-invoice-pdf", "api/admin/qbo-invoice-pdf.js"),
   route("/api/sync/retail-order", "api/sync/retail-order.js"),
   route("/api/admin/sync/backfill", "api/admin/sync-backfill.js"),
+  route("/api/admin/sync/inventory-snapshot", "api/admin/sync-inventory-snapshot.js"),
 ];

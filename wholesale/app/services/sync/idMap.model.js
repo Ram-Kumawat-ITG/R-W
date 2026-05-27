@@ -12,6 +12,9 @@ const idMapSchema = new mongoose.Schema(
     },
     wholesaleId: { type: String, required: true },
     retailId: { type: String, required: true },
+    // Only on productVariant rows: the wholesale inventory_item_id for that variant.
+    // Used by deductWholesaleInventoryForOrder to bridge variant → inventoryItem lookup.
+    wholesaleInventoryItemId: { type: String, default: null },
     // Last-known wholesale available quantity — used by inventory_levels/update
     // handler to distinguish restocks (delta > 0) from order deductions.
     available: { type: Number, default: null },

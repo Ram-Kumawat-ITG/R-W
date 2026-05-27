@@ -84,10 +84,10 @@ export async function deductWholesaleInventoryForOrder(order, wholesaleShop) {
     }
     const inventoryMap = await IdMap.findOne({
       entityType: 'inventoryItem',
-      wholesaleId: String(variantMap.wholesaleId),
+      wholesaleId: String(variantMap.wholesaleInventoryItemId),
     })
     if (!inventoryMap) {
-      log.warn('deduct_wholesale.no_inventory_map', { wholesaleVariantId: variantMap.wholesaleId })
+      log.warn('deduct_wholesale.no_inventory_map', { wholesaleVariantId: variantMap.wholesaleId, wholesaleInventoryItemId: variantMap.wholesaleInventoryItemId })
       continue
     }
     const qty = item.quantity || 1
@@ -138,10 +138,11 @@ export async function syncInventoryRestockToRetail(inventoryItemId, locationId, 
     { $set: { available } },
   )
 
-  // Only sync to retail when the quantity increased (restock) or when we
-  // have no previous baseline (first time seeing this item after mapping).
-  if (delta !== null && delta <= 0) {
-    log.info('restock_sync.skip_decrease', { wiId, prev, available, delta })
+  // Only sync to retail when quantity definitely increased (delta > 0).
+  // Null delta = no baseline yet — skip to avoid double-deduction race
+  // with orders/create webhook which already handles deductions.
+  if (!delta || delta <= 0) {
+    log.info('restock_sync.skip', { wiId, prev, available, delta })
     return
   }
 

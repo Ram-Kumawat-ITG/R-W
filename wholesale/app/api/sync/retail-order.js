@@ -6,6 +6,14 @@ import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('api.sync.retail_order')
 
+const _dedupedRetailOrderIds = new Set()
+function claimRetailOrder(id) {
+  if (!id || _dedupedRetailOrderIds.has(id)) return false
+  _dedupedRetailOrderIds.add(id)
+  setTimeout(() => _dedupedRetailOrderIds.delete(id), 5 * 60 * 1000)
+  return true
+}
+
 // POST /api/sync/retail-order
 //
 // Called by the retail store's orders/create webhook (via a thin retail
@@ -48,6 +56,11 @@ export async function action({ request }) {
 
   if (!order?.id || !wholesaleShop) {
     return sendResponse(400, 'error', 'Missing order or wholesaleShop', null)
+  }
+
+  if (!claimRetailOrder(String(order.id))) {
+    log.warn('duplicate_retail_order.skipped', { orderId: order.id })
+    return sendResponse(200, 'success', 'Duplicate — already processing', { orderId: order.id })
   }
 
   log.info('received', { orderId: order.id, wholesaleShop, lineItemCount: order.line_items?.length })
