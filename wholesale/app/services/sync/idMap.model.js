@@ -18,6 +18,13 @@ const idMapSchema = new mongoose.Schema(
     // Last-known wholesale available quantity — used by inventory_levels/update
     // handler to distinguish restocks (delta > 0) from order deductions.
     available: { type: Number, default: null },
+    // Last-known retail available quantity — same role as `available` but
+    // for the retail store side. Used by the reverse-direction sync (retail
+    // inventory_levels/update webhook) to detect retail restocks and mirror
+    // them back to wholesale. Both fields are kept in lock-step by each
+    // sync handler so the next webhook sees delta=0 and skips, preventing
+    // infinite mirror loops.
+    retailAvailable: { type: Number, default: null },
   },
   { collection: 'sync_id_maps', timestamps: true },
 )

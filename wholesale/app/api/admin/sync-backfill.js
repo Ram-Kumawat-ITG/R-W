@@ -33,7 +33,6 @@ const PRODUCTS_QUERY = `
                 taxable
                 barcode
                 inventoryPolicy
-                inventoryQuantity
                 inventoryItem { legacyResourceId }
               }
             }
@@ -82,7 +81,6 @@ function gqlToRestProduct(node) {
       barcode: v.barcode ?? null,
       inventory_policy: v.inventoryPolicy?.toLowerCase() ?? 'deny',
       inventory_item_id: parseInt(v.inventoryItem?.legacyResourceId),
-      inventory_quantity: v.inventoryQuantity ?? null,
     }
   })
 

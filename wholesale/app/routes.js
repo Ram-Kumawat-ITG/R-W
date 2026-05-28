@@ -19,6 +19,7 @@ if (webhookRoutes.length) {
 export default [
   ...fsRoutes,
   route("/api/registration-form", "api/registration-form.js"),
+  route("/api/auth/check-email", "api/auth/check-email.js"),
   route("/api/update-profile",   "api/update-profile.js"),
   route("/api/admin/customers", "api/admin/customers.js"),
   route("/api/admin/customers/:id", "api/admin/customer.js"),
@@ -29,6 +30,8 @@ export default [
   route("/api/admin/orders/:id/preview-payment", "api/admin/preview-payment.js"),
   route("/api/admin/orders/:id/qbo-invoice-pdf", "api/admin/qbo-invoice-pdf.js"),
   route("/api/sync/retail-order", "api/sync/retail-order.js"),
+  route("/api/sync/retail-inventory-update", "api/sync/retail-inventory-update.js"),
   route("/api/admin/sync/backfill", "api/admin/sync-backfill.js"),
   route("/api/admin/sync/inventory-snapshot", "api/admin/sync-inventory-snapshot.js"),
+  route("/api/admin/backfill-customer-tags", "api/admin/backfill-customer-tags.js"),
 ];
