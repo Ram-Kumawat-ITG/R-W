@@ -4,4 +4,5 @@ export {
   deductRetailInventoryForOrder,
   deductWholesaleInventoryForOrder,
   syncInventoryRestockToRetail,
+  syncWholesaleRestockFromRetail,
 } from './inventory.sync'

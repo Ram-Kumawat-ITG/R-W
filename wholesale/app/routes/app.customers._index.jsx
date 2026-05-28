@@ -67,8 +67,10 @@ export default function CustomersList() {
   const declineFetcher = useFetcher();
   const syncFetcher = useFetcher();
   const invFetcher = useFetcher();
+  const tagFetcher = useFetcher();
   const handledSyncRef = useRef(null);
   const handledInvRef = useRef(null);
+  const handledTagRef = useRef(null);
   const declineModalRef = useRef(null);
   const loadedToastShown = useRef(false);
   // Track which response payload we've already handled so React-Router's
@@ -215,6 +217,31 @@ export default function CustomersList() {
       action: "/api/admin/sync/inventory-snapshot",
     });
 
+  const runTagBackfill = () =>
+    tagFetcher.submit(null, {
+      method: "POST",
+      action: "/api/admin/backfill-customer-tags",
+    });
+
+  useEffect(() => {
+    if (!tagFetcher.data) return;
+    if (tagFetcher.state !== "idle") return;
+    if (handledTagRef.current === tagFetcher.data) return;
+    handledTagRef.current = tagFetcher.data;
+    if (tagFetcher.data.status === "success") {
+      const r = tagFetcher.data.result || {};
+      shopify?.toast?.show(
+        `Tagged ${r.tagged ?? 0} / ${r.totalScanned ?? 0} customers ` +
+          `(already tagged: ${r.alreadyTagged ?? 0}, failed: ${r.failed ?? 0})`,
+      );
+    } else {
+      shopify?.toast?.show(
+        tagFetcher.data.message || "Customer tag backfill failed.",
+        { isError: true },
+      );
+    }
+  }, [tagFetcher.data, tagFetcher.state, shopify]);
+
   const openDeclineModal = (row) => {
     if (!row?.id) return;
     setPendingDeclineRow(row);
@@ -237,6 +264,8 @@ export default function CustomersList() {
     syncFetcher.state === "submitting" || syncFetcher.state === "loading";
   const invBusy =
     invFetcher.state === "submitting" || invFetcher.state === "loading";
+  const tagBusy =
+    tagFetcher.state === "submitting" || tagFetcher.state === "loading";
 
   return (
     <s-page inlineSize="large" heading="Wholesale applications">
@@ -255,6 +284,14 @@ export default function CustomersList() {
         {...(syncBusy ? { loading: true } : {})}
       >
         {syncBusy ? "Syncing…" : "Sync products to retail"}
+      </s-button>
+      <s-button
+        slot="secondary-actions"
+        variant="secondary"
+        onClick={runTagBackfill}
+        {...(tagBusy ? { loading: true } : {})}
+      >
+        {tagBusy ? "Backfilling…" : "Backfill customer tags"}
       </s-button>
       <s-section padding="none">
         <s-box padding="base">

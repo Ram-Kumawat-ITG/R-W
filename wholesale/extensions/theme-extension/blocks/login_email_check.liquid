@@ -1,0 +1,346 @@
+{% comment %}
+  Custom login email-check block.
+  Customer enters email → backend tells us if they exist → we redirect:
+    - existing  → Shopify OTP login (passwordless new customer accounts)
+    - new       → registration form page
+    - rejected  → inline "contact support" message
+{% endcomment %}
+
+{%- assign resolved_shop_id = block.settings.shop_id | strip -%}
+{%- if resolved_shop_id == blank -%}
+  {%- assign resolved_shop_id = shop.id -%}
+{%- endif -%}
+
+<div id="ns-login-root"
+  data-shop-id="{{ resolved_shop_id }}"
+  data-storefront-login-url="{{ routes.storefront_login_url }}"
+  data-register-url="{{ block.settings.register_page_url }}"
+  data-support-email="{{ block.settings.support_email }}"
+  data-proxy-base="{{ block.settings.proxy_base }}">
+
+  <div class="ns-login-card">
+    <h1 class="ns-login-title">{{ block.settings.heading }}</h1>
+    <p class="ns-login-subtitle">{{ block.settings.subheading }}</p>
+
+    <form id="ns-login-form" novalidate>
+      <label for="ns-login-email" class="ns-login-label">Email address</label>
+      <input
+        id="ns-login-email"
+        type="email"
+        name="email"
+        autocomplete="email"
+        autocapitalize="off"
+        autocorrect="off"
+        spellcheck="false"
+        placeholder="you@example.com"
+        required
+      />
+
+      <div id="ns-login-error" class="ns-login-error" hidden></div>
+
+      <button type="submit" id="ns-login-submit" class="ns-login-button">
+        <span class="ns-login-button-label">Continue</span>
+        <span class="ns-login-spinner" aria-hidden="true" hidden></span>
+      </button>
+
+      <div id="ns-login-status" class="ns-login-status" hidden></div>
+    </form>
+  </div>
+</div>
+
+<style>
+  #ns-login-root {
+    min-height: 70vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px 16px;
+    font-family: var(--font-family, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif);
+    color: var(--color-text, #1a1a1a);
+    box-sizing: border-box;
+  }
+  #ns-login-root *, #ns-login-root *::before, #ns-login-root *::after { box-sizing: border-box; }
+  .ns-login-card {
+    width: 100%;
+    max-width: 440px;
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 2px 20px rgba(0,0,0,0.06);
+    padding: 40px 32px;
+  }
+  .ns-login-title {
+    margin: 0 0 8px 0;
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--color-primary, #2d6a4f);
+    text-align: center;
+  }
+  .ns-login-subtitle {
+    margin: 0 0 28px 0;
+    text-align: center;
+    color: #555;
+    font-size: 15px;
+    line-height: 1.5;
+  }
+  .ns-login-label {
+    display: block;
+    margin-bottom: 8px;
+    font-size: 14px;
+    font-weight: 500;
+  }
+  #ns-login-email {
+    width: 100%;
+    padding: 12px 14px;
+    font-size: 15px;
+    border: 1px solid #d0d0d0;
+    border-radius: 8px;
+    outline: none;
+    transition: border-color 120ms;
+    font-family: inherit;
+  }
+  #ns-login-email:focus {
+    border-color: var(--color-primary, #2d6a4f);
+  }
+  #ns-login-email.invalid {
+    border-color: #d4351c;
+  }
+  .ns-login-error {
+    margin-top: 10px;
+    padding: 10px 12px;
+    background: #fef2f2;
+    border: 1px solid #fecaca;
+    border-radius: 8px;
+    color: #991b1b;
+    font-size: 14px;
+    line-height: 1.4;
+  }
+  .ns-login-button {
+    margin-top: 20px;
+    width: 100%;
+    padding: 14px 20px;
+    background: var(--color-primary, #2d6a4f);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    transition: background-color 120ms, opacity 120ms;
+    font-family: inherit;
+  }
+  .ns-login-button:hover:not(:disabled) {
+    background: var(--color-primary-hover, #245741);
+  }
+  .ns-login-button:disabled {
+    opacity: 0.7;
+    cursor: not-allowed;
+  }
+  .ns-login-spinner {
+    width: 16px;
+    height: 16px;
+    border: 2px solid rgba(255,255,255,0.4);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: nsLoginSpin 700ms linear infinite;
+  }
+  @keyframes nsLoginSpin { to { transform: rotate(360deg); } }
+  .ns-login-status {
+    margin-top: 16px;
+    padding: 12px;
+    background: #f0f9ff;
+    border: 1px solid #bae6fd;
+    border-radius: 8px;
+    color: #075985;
+    font-size: 14px;
+    text-align: center;
+  }
+</style>
+
+<script>
+(function () {
+  var root = document.getElementById('ns-login-root');
+  if (!root) return;
+
+  var SHOP_ID = root.dataset.shopId;
+  // Shopify's official login URL — built by Liquid from {{ routes.storefront_login_url }}.
+  // This is the ONLY URL that survives the OAuth redirect chain with query params intact.
+  var STOREFRONT_LOGIN_URL = root.dataset.storefrontLoginUrl || '/account/login';
+  var REGISTER_URL = root.dataset.registerUrl || '/pages/contact';
+  var SUPPORT_EMAIL = root.dataset.supportEmail || 'support@naturalsolutions.com';
+  var PROXY_BASE = root.dataset.proxyBase || 'wholesale-application';
+
+  var form = document.getElementById('ns-login-form');
+  var emailInput = document.getElementById('ns-login-email');
+  var errorBox = document.getElementById('ns-login-error');
+  var statusBox = document.getElementById('ns-login-status');
+  var button = document.getElementById('ns-login-submit');
+  var buttonLabel = button.querySelector('.ns-login-button-label');
+  var spinner = button.querySelector('.ns-login-spinner');
+
+  var EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+  function showError(message) {
+    errorBox.textContent = message;
+    errorBox.hidden = false;
+    statusBox.hidden = true;
+  }
+  function clearError() {
+    errorBox.hidden = true;
+    errorBox.textContent = '';
+    emailInput.classList.remove('invalid');
+  }
+  function showStatus(message) {
+    statusBox.textContent = message;
+    statusBox.hidden = false;
+  }
+  function setLoading(isLoading) {
+    button.disabled = isLoading;
+    spinner.hidden = !isLoading;
+    buttonLabel.textContent = isLoading ? 'Verifying...' : 'Continue';
+  }
+
+  emailInput.addEventListener('input', clearError);
+
+  // Reset form when page is restored from browser back/forward cache (bfcache).
+  // Without this, the loader stays spinning and the email field stays filled
+  // when the user clicks "Back" from Shopify's login page.
+  function resetFormState() {
+    setLoading(false);
+    statusBox.hidden = true;
+    statusBox.textContent = '';
+    errorBox.hidden = true;
+    errorBox.textContent = '';
+    emailInput.value = '';
+    emailInput.classList.remove('invalid');
+  }
+  window.addEventListener('pageshow', function (event) {
+    if (event.persisted) resetFormState();
+  });
+  window.addEventListener('pagehide', function () {
+    // Pre-emptively reset so if bfcache snapshots the page mid-redirect,
+    // the snapshot has a clean state.
+    resetFormState();
+  });
+
+  form.addEventListener('submit', async function (e) {
+    e.preventDefault();
+    clearError();
+
+    var email = String(emailInput.value || '').trim().toLowerCase();
+    if (!EMAIL_RE.test(email)) {
+      emailInput.classList.add('invalid');
+      showError('Please enter a valid email address.');
+      return;
+    }
+
+    setLoading(true);
+
+    var data;
+    try {
+      var res = await fetch('/apps/' + PROXY_BASE + '/api/auth/check-email', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email }),
+      });
+      data = await res.json();
+
+      if (res.status === 429) {
+        showError('Too many requests. Please wait a minute and try again.');
+        setLoading(false);
+        return;
+      }
+      if (!res.ok || data.status === 'error') {
+        showError(data.message || 'Something went wrong. Please try again.');
+        setLoading(false);
+        return;
+      }
+    } catch (err) {
+      console.error('[ns-login] network error:', err);
+      showError('Network error. Please check your connection and try again.');
+      setLoading(false);
+      return;
+    }
+
+    var result = data && data.result ? data.result : {};
+
+    if (result.exists === false) {
+      showStatus('No account found — taking you to the application form...');
+      window.location.href = REGISTER_URL;
+      return;
+    }
+
+    if (result.status === 'rejected') {
+      setLoading(false);
+      showError(
+        'Your wholesale application was not approved. ' +
+        'Please contact ' + SUPPORT_EMAIL + ' for assistance.'
+      );
+      return;
+    }
+
+    // Approved / pending / unknown → send to Shopify passwordless login.
+    // Use the storefront /account/login route — Shopify auto-redirects to
+    // the new customer accounts OAuth flow with the correct redirect_uri
+    // and client_id. Hitting shopify.com/authentication/.../login directly
+    // produces "Invalid redirect_uri" because OAuth params are missing.
+    showStatus('Account found — sending you to login...');
+    // Build the URL exactly as Shopify's docs show. STOREFRONT_LOGIN_URL may already
+    // contain query parameters (return_url, locale, etc.) — those must be preserved.
+    // Use '&' if a '?' already exists in the base URL, otherwise use '?'.
+    var sep = STOREFRONT_LOGIN_URL.indexOf('?') >= 0 ? '&' : '?';
+    var loginUrl = STOREFRONT_LOGIN_URL + sep + 'login_hint=' + encodeURIComponent(email);
+    console.log('[ns-login] redirecting to:', loginUrl);
+    window.location.href = loginUrl;
+  });
+})();
+</script>
+
+{% schema %}
+{
+  "name": "Login (Email Check)",
+  "target": "section",
+  "settings": [
+    {
+      "type": "text",
+      "id": "shop_id",
+      "label": "Shopify Shop ID (numeric)",
+      "info": "Find at Settings → Customer accounts. URL looks like shopify.com/authentication/{ID}/account"
+    },
+    {
+      "type": "text",
+      "id": "register_page_url",
+      "label": "Registration page URL",
+      "default": "/pages/contact"
+    },
+    {
+      "type": "text",
+      "id": "support_email",
+      "label": "Support contact email",
+      "default": "support@naturalsolutions.com"
+    },
+    {
+      "type": "text",
+      "id": "proxy_base",
+      "label": "App proxy subpath",
+      "default": "wholesale-application",
+      "info": "Must match shopify.app.toml [app_proxy].subpath"
+    },
+    {
+      "type": "text",
+      "id": "heading",
+      "label": "Heading",
+      "default": "Welcome to NS Wholesale"
+    },
+    {
+      "type": "text",
+      "id": "subheading",
+      "label": "Subheading",
+      "default": "Enter your email to continue"
+    }
+  ]
+}
+{% endschema %}

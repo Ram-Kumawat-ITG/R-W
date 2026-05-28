@@ -150,14 +150,131 @@ export async function syncInventoryRestockToRetail(inventoryItemId, locationId, 
   if (!retailLocationId) return
 
   try {
+    const finalQty = Math.max(0, available)
     await retailClient.post('inventory_levels/set.json', {
       inventory_item_id: Number(itemMap.retailId),
       location_id: Number(retailLocationId),
-      available: Math.max(0, available),
+      available: finalQty,
     })
-    log.info('restock_sync.done', { wiId, retailItemId: itemMap.retailId, available })
+    // Mirror the new value into retailAvailable so the reverse-direction
+    // webhook (retail inventory_levels/update) sees delta=0 and skips,
+    // preventing an infinite restock loop wholesale → retail → wholesale.
+    await IdMap.updateOne(
+      { entityType: 'inventoryItem', wholesaleId: wiId },
+      { $set: { retailAvailable: finalQty } },
+    )
+    log.info('restock_sync.done', { wiId, retailItemId: itemMap.retailId, available: finalQty })
   } catch (err) {
     log.error('restock_sync.set_failed', { wiId, err })
+    throw err
+  }
+}
+
+// ── Restock sync: retail → wholesale ────────────────────────────────────
+
+// Called from the retail store's inventory_levels/update webhook (forwarded
+// to /api/sync/retail-inventory-update). Mirrors syncInventoryRestockToRetail
+// in reverse — only syncs increases (refunds, restocks, manual adjustments
+// that ADD inventory). Decreases are skipped because the retail orders/create
+// webhook already handles cross-store deductions.
+//
+// Loop prevention: each direction updates BOTH stored values (available and
+// retailAvailable) after a successful sync, so the next webhook coming back
+// the other way sees delta=0 and skips.
+export async function syncWholesaleRestockFromRetail({
+  retailInventoryItemId,
+  retailLocationId,
+  available,
+  wholesaleShop,
+}) {
+  const riId = String(retailInventoryItemId)
+
+  // Reverse lookup: retail inventory item → wholesale inventory item
+  const itemMap = await IdMap.findOne({ entityType: 'inventoryItem', retailId: riId })
+  if (!itemMap) {
+    log.info('reverse_restock.no_mapping', { riId })
+    return // not a mirrored product — skip silently
+  }
+
+  const prev = itemMap.retailAvailable ?? null
+  const delta = prev !== null ? available - prev : null
+
+  // Always update the stored retail quantity (even if we skip the sync).
+  await IdMap.updateOne(
+    { entityType: 'inventoryItem', retailId: riId },
+    { $set: { retailAvailable: available } },
+  )
+
+  // Same logic as the forward direction:
+  //   null delta = no baseline yet → skip (will establish baseline on next event)
+  //   delta <= 0 = deduction (already handled by retail-order webhook) → skip
+  if (!delta || delta <= 0) {
+    log.info('reverse_restock.skip', { riId, prev, available, delta })
+    return
+  }
+
+  // Resolve wholesale location + admin client
+  const { getUnauthenticatedAdmin } = await import('../shopify/shopify.apis')
+  const { resolveWholesaleLocationId } = await import('./sync.utils')
+  const { admin } = await getUnauthenticatedAdmin(wholesaleShop)
+  const wholesaleLocationId = await resolveWholesaleLocationId(admin)
+  if (!wholesaleLocationId) {
+    log.warn('reverse_restock.no_wholesale_location', { shop: wholesaleShop })
+    return
+  }
+
+  // Use inventoryAdjustQuantities with a POSITIVE delta to restock wholesale.
+  const wholesaleInventoryGid = `gid://shopify/InventoryItem/${itemMap.wholesaleId}`
+  const wholesaleLocationGid = `gid://shopify/Location/${wholesaleLocationId}`
+
+  try {
+    const res = await admin.graphql(
+      `mutation inventoryAdjustQuantities($input: InventoryAdjustQuantitiesInput!) {
+        inventoryAdjustQuantities(input: $input) {
+          userErrors { field message }
+        }
+      }`,
+      {
+        variables: {
+          input: {
+            reason: 'restock',
+            name: 'available',
+            changes: [
+              {
+                inventoryItemId: wholesaleInventoryGid,
+                locationId: wholesaleLocationGid,
+                delta,
+              },
+            ],
+          },
+        },
+      },
+    )
+    const json = await res.json()
+    const errs = json?.data?.inventoryAdjustQuantities?.userErrors
+    if (errs?.length) {
+      log.error('reverse_restock.user_errors', { riId, errs })
+      return
+    }
+
+    // Mirror the new value into wholesale `available` to prevent the
+    // wholesale inventory_levels/update webhook (which will fire from
+    // the GraphQL mutation above) from triggering an infinite loop.
+    // We add the delta to whatever was stored previously.
+    const newWholesaleAvailable = (itemMap.available ?? 0) + delta
+    await IdMap.updateOne(
+      { entityType: 'inventoryItem', retailId: riId },
+      { $set: { available: newWholesaleAvailable } },
+    )
+
+    log.info('reverse_restock.done', {
+      riId,
+      wholesaleItemId: itemMap.wholesaleId,
+      delta,
+      newWholesaleAvailable,
+    })
+  } catch (err) {
+    log.error('reverse_restock.failed', { riId, err })
     throw err
   }
 }

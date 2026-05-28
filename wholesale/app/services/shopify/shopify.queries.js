@@ -45,7 +45,26 @@ export const QUERY_ALL_WEBHOOK_SUBSCRIPTIONS = `#graphql
 
 export const QUERY_CUSTOMER_TAGS = `#graphql
   query CustomerTags($id: ID!) {
-    customer(id: $id) { id tags }
+    customer(id: $id) {
+      id
+      tags
+      numberOfOrders
+    }
+  }
+`
+
+export const QUERY_CUSTOMER_BY_EMAIL = `#graphql
+  query CustomerByEmail($q: String!) {
+    customers(first: 1, query: $q) {
+      edges {
+        node {
+          id
+          email
+          tags
+          numberOfOrders
+        }
+      }
+    }
   }
 `
 
