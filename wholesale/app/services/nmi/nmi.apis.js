@@ -78,12 +78,24 @@ export async function nmiTransact(params, { sensitiveKeys = [] } = {}) {
   })
 }
 
-// query.php returns XML, not the key=value form transact.php uses. Callers
-// substring-match the field they need rather than parsing the XML — adding
-// a parser dependency for one field isn't worth it.
+// query.php returns XML, not the key=value form transact.php uses.
+// Server-side helpers in nmi.utils.js extract fields via regex block
+// matching — that approach works for the shallow report shapes NMI
+// emits but is sensitive to wrapper-element variations across gateway
+// versions. The truncated response log below is the diagnostic for
+// "list shows empty" bugs — compare what the parser expects against
+// what NMI actually returned.
 export async function nmiQuery(params) {
   assertNmiConfigured()
   const body = encodeForm({ security_key: nmiConfig.securityKey, ...params })
+  // Safe to log — the only sensitive value (security_key) was added by
+  // us and is already known. Echoing params helps correlate request →
+  // response in logs without leaking PAN/CVV (transact.php sensitive
+  // values aren't relevant on this code path).
+  const op = params.report_type || '(unknown)'
+  console.log(`\n[NMI query →] ${nmiConfig.queryUrl}`)
+  console.log(`            report: ${op}`)
+  console.log(`            params: ${JSON.stringify({ ...params, security_key: '***redacted***' })}`)
   let res
   try {
     res = await fetch(nmiConfig.queryUrl, {
@@ -98,6 +110,12 @@ export async function nmiQuery(params) {
     throw new TransientError(`NMI query fetch failed: ${reason}`, { cause: err })
   }
   const text = await res.text()
+  // Always log the status + a truncated preview so we can verify the
+  // parser is working against the wrapper shape NMI actually returned.
+  // 1.5KB is enough to see the wrapper element + a few fields without
+  // flooding the console on multi-thousand-row responses.
+  console.log(`[NMI query ←] status=${res.status}  bytes=${text.length}`)
+  console.log(`            body: ${text.length > 1500 ? `${text.slice(0, 1500)}… (+${text.length - 1500} chars)` : text}`)
   if (!res.ok) {
     const ErrorClass = res.status >= 500 ? TransientError : PermanentError
     throw new ErrorClass(`NMI query HTTP ${res.status}`, { status: res.status, body: text })

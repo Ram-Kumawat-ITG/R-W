@@ -1087,6 +1087,106 @@ The parsed result includes `transactionId`, `responseCode`, `responseText`,
 `authCode`, `avsResponse`, `cvvResponse` — all persisted on the
 `payment_attempts` audit row.
 
+### 8.5 Read-only list helpers — admin NMI section
+
+The NMI admin tabs (Dashboard / Customers / Payments / Transactions /
+Failed / Refunds — see `app/routes/app.nmi.*.jsx`) pull live data from
+NMI's `query.php`. These helpers live in `services/nmi/nmi.service.js`
+and follow the project rule "no NMI calls outside `services/nmi/`".
+
+**XML parsing — no parser dependency.** NMI's `query.php` returns XML
+(unlike `transact.php`'s key=value form-encoded response). The
+response shape is shallow + well-known, so we use a small regex-based
+block extractor rather than pulling in `xml2js` / `fast-xml-parser`:
+
+```js
+parseNmiTransactions(xml)
+  // <nm_response>
+  //   <transaction>
+  //     <transaction_id>…</transaction_id>
+  //     <transaction_type>cc</transaction_type>
+  //     <condition>complete</condition>
+  //     <action>
+  //       <action_type>sale</action_type>
+  //       <amount>100.00</amount>
+  //       <success>1</success>
+  //       <response_text>SUCCESS</response_text>
+  //       …
+  //     </action>
+  //   </transaction>
+  // </nm_response>
+  //
+  // → [{ ...flatFields, actions: [{ ...actionFields }] }, …]
+
+parseNmiCustomerVaults(xml)
+  // <customer_vault>
+  //   <customer>
+  //     <customer_vault_id>…</customer_vault_id>
+  //     <first_name>…</first_name>
+  //     <cc_number>4xxxxxxxxxxx1111</cc_number>
+  //     <created>20260101010000</created>
+  //   </customer>
+  // </customer_vault>
+  //
+  // → [{ ...flatFields }, …]
+```
+
+The extractor pulls top-level `<transaction>` / `<customer>` blocks
+out of the XML, strips nested `<action>` blocks before extracting the
+flat fields (so action-level keys don't leak onto the transaction
+record), then re-extracts each action's flat fields separately. Lazy
+match `[\s\S]*?` is used to bracket each block — fragile if NMI ever
+nests the same tag inside itself, but the report XML we consume
+doesn't.
+
+`<error_response>…</error_response>` payloads (auth failure, malformed
+date range, etc.) resolve to an empty array — callers can detect
+"empty response" but won't see the error reason inline. The underlying
+`nmiQuery` throws on HTTP errors, which IS surfaced.
+
+**Date format.** NMI uses contiguous `YYYYMMDDhhmmss` on every date
+field (filter inputs + `<date>` outputs). `toNmiDate(Date)` /
+`fromNmiDate(string)` are pure helpers exported for callers that need
+to render the dates locally.
+
+**Public helpers:**
+
+| Function | Wraps | Notes |
+|---|---|---|
+| `listNmiTransactions({ startDate?, endDate?, condition?, transactionType?, actionType?, result?, customerVaultId?, transactionId?, orderId?, invoiceId? })` | `nmiQuery({ report_type: 'transaction', … })` | Date window defaults to last 30 days when neither bound is supplied. Returns `{ records, startDate, endDate }`. Records are sorted newest-first on the latest action's date. |
+| `listNmiCustomerVaults({ email?, customerVaultId? })` | `nmiQuery({ report_type: 'customer_vault', … })` | Returns `{ records }`. No date filter — NMI's vault report carries every active vault entry. Sorted newest-first on `created`. |
+| `getNmiDashboardSnapshot({ periodDays = 30 })` | parallel `listNmiTransactions` + `listNmiCustomerVaults` | Per-metric `safe()` wrapping → `null` on failure, surfaced via `errors[]`. Aggregates counts in JS (no SUM/COUNT in NMI QL). |
+| `latestAction(tx)` | — | Returns the last action in the lifecycle. By NMI convention actions are oldest-first, so the last one is the current state. |
+| `toNmiDate` / `fromNmiDate` | — | Convert between JS `Date` and NMI's `YYYYMMDDhhmmss`. |
+
+**Pagination model.** `query.php` has no STARTPOSITION / MAXRESULTS
+equivalent — every matching row in the window comes back in one
+response. Loaders use a bounded `start_date` / `end_date` (default
+last 30 days) to keep the response size manageable, then paginate the
+parsed array client-side at 50 rows/page. For high-volume merchants
+this could lag — surface that with a "showing first N of M" message
+if it becomes a problem.
+
+**Aggregation rules** (used by `getNmiDashboardSnapshot`):
+
+| Bucket | Rule |
+|---|---|
+| Successful payments | latest action's `action_type ∈ {sale, capture, credit}` AND `success = '1'` |
+| Failed payments | latest action's `success != '1'` AND latest action's `action_type ∉ {refund}` |
+| Refund count + total | latest action's `action_type = 'refund'`; total sums successful refund amounts only |
+| ACH count | transaction's `transaction_type = 'ck'` |
+| Credit card count | transaction's `transaction_type = 'cc'` |
+| Payments collected total | sum of `sale + capture` action amounts where `success = '1'` |
+
+`condition='failed'` on the transaction record is also a signal but
+we don't double-count — the action-level outcome already covers it.
+
+**No DB caching.** Every page render hits NMI live. Per-tab "Refresh"
+buttons call `useRevalidator().revalidate()`. NMI's query.php is
+typically faster than QBO's `/query` (single roundtrip, no OAuth
+refresh dance), but for 90-day windows on a busy merchant the
+parse + sort can dominate render time.
+
 ---
 
 ## 9. Cheque / ACH payment handling
