@@ -30,9 +30,17 @@ export function registerProcessPendingPaymentsJob(agenda) {
       // sit on `paymentStatus: 'pending'` until an admin records a
       // manual cheque receipt or falls back to charging the card from
       // the Order Details page.
+      //
+      // The `autoChargePaused: { $ne: true }` term excludes invoices an
+      // admin has explicitly paused from the Order Details page. The
+      // `$ne` (not `false`) covers legacy rows where the field is
+      // absent entirely — those default to "not paused". When an admin
+      // hits Resume the flag flips back to false and the next tick
+      // picks the invoice up again.
       const pendingCursor = Invoice.find({
         paymentStatus: 'pending',
         paymentMethod: 'card',
+        autoChargePaused: { $ne: true },
         $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
       }).cursor()
 
@@ -114,7 +122,12 @@ export function registerProcessPendingPaymentsJob(agenda) {
       // the Order List "Remarks" column and can act manually (mark
       // cheque paid / charge card on file). No customer-facing
       // notifications are sent here — operator-visible log only.
+      //
+      // Paused invoices are excluded from reminders too — pausing is
+      // an explicit "leave this one alone" signal. Surfacing a
+      // recurring reminder would defeat that intent.
       const reminderCursor = Invoice.find({
+        autoChargePaused: { $ne: true },
         $or: [
           { paymentStatus: 'pending', paymentMethod: { $in: ['check', 'ach'] } },
           { paymentStatus: 'failed' },
@@ -124,8 +137,18 @@ export function registerProcessPendingPaymentsJob(agenda) {
       for await (const invoice of reminderCursor) {
         const outstanding = Number((invoice.amountDue - invoice.amountPaid).toFixed(2))
         const isFailed = invoice.paymentStatus === 'failed'
-        const kind = isFailed ? 'cron_failed_followup' : 'cron_cheque_reminder'
-        const methodLabel = invoice.paymentMethod === 'ach' ? 'ACH' : 'Cheque'
+        const isAch = invoice.paymentMethod === 'ach'
+        // Per-method kind so the Order Details badge renders the right
+        // label (ACH vs Cheque) without having to walk back through
+        // the invoice's current paymentMethod — which a later cheque →
+        // card override could have flipped, leaving the audit row's
+        // label inconsistent with what was true at write time.
+        const kind = isFailed
+          ? 'cron_failed_followup'
+          : isAch
+            ? 'cron_ach_reminder'
+            : 'cron_cheque_reminder'
+        const methodLabel = isAch ? 'ACH' : 'Cheque'
         const message = isFailed
           ? `Failed payment follow-up — $${outstanding.toFixed(2)} outstanding after ${invoice.attemptCount} attempt(s)`
           : `${methodLabel} payment reminder — $${outstanding.toFixed(2)} still outstanding`

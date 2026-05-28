@@ -48,6 +48,7 @@ const RETRYABLE_PAYMENT_STATUSES = new Set([
 const REMARK_KIND_META = {
   cron_card_attempt: { label: "CRON charge", tone: "info" },
   cron_cheque_reminder: { label: "Cheque reminder", tone: "warning" },
+  cron_ach_reminder: { label: "ACH reminder", tone: "warning" },
   cron_failed_followup: { label: "Failed follow-up", tone: "critical" },
   admin_action: { label: "Admin action", tone: "default" },
   system_note: { label: "Note", tone: "default" },
@@ -410,19 +411,27 @@ export default function OrderDetail() {
   const chargeCardFetcher = useFetcher();
   const pdfFetcher = useFetcher();
   const sendInvoiceFetcher = useFetcher();
+  const pauseAutoChargeFetcher = useFetcher();
+  const resumeAutoChargeFetcher = useFetcher();
   const modalRef = useRef(null);
   const chequeModalRef = useRef(null);
   const chargeCardModalRef = useRef(null);
+  const pauseAutoChargeModalRef = useRef(null);
+  const resumeAutoChargeModalRef = useRef(null);
   const [bannerError, setBannerError] = useState(null);
   const [bannerSuccess, setBannerSuccess] = useState(null);
   const [chequeReference, setChequeReference] = useState("");
   const [chequeAmount, setChequeAmount] = useState("");
   const [chequeReceivedAt, setChequeReceivedAt] = useState("");
+  const [pauseNote, setPauseNote] = useState("");
+  const [resumeNote, setResumeNote] = useState("");
   const handledRetryRef = useRef(null);
   const handledChequeRef = useRef(null);
   const handledChargeCardRef = useRef(null);
   const handledPdfRef = useRef(null);
   const handledSendInvoiceRef = useRef(null);
+  const handledPauseAutoChargeRef = useRef(null);
+  const handledResumeAutoChargeRef = useRef(null);
   // Holds the window opened synchronously on PDF click; we redirect it
   // to a blob URL once the fetcher returns. Opening *after* the async
   // step would trip popup blockers.
@@ -559,6 +568,35 @@ export default function OrderDetail() {
     isManualInvoice &&
     statusAllowsAction &&
     !!customerMap?.nmiCustomerVaultId;
+
+  // Auto-charge pause is gated to card-preferred invoices — the CRON
+  // PASS 1 sweep only auto-charges card invoices anyway, so a pause
+  // flag on a cheque/ACH invoice would be a silent no-op. The check
+  // uses `customerPaymentPreference` (immutable order-time snapshot)
+  // rather than `paymentMethod` (mutable; flips when admins use the
+  // cheque → card fallback) so a cheque-preferred customer whose
+  // invoice was overridden to card still doesn't see the pause UI —
+  // their preference hasn't changed.
+  const isCardPreferredInvoice = orderTimePreference === "card";
+  const autoChargePaused = invoice?.autoChargePaused === true;
+  // Settled / cancelled invoices have nothing to pause; show neither
+  // button. While in flight ('in_progress' lock held by chargeInvoice)
+  // we also hide both — the action wouldn't be safe to apply mid-NMI.
+  const pauseActionable =
+    !!invoice &&
+    isCardPreferredInvoice &&
+    invoice.paymentStatus !== "paid" &&
+    invoice.paymentStatus !== "cancelled" &&
+    invoice.paymentStatus !== "in_progress";
+  const canPauseAutoCharge = pauseActionable && !autoChargePaused;
+  const canResumeAutoCharge = pauseActionable && autoChargePaused;
+
+  const pauseAutoChargeSubmitting =
+    pauseAutoChargeFetcher.state === "submitting" ||
+    pauseAutoChargeFetcher.state === "loading";
+  const resumeAutoChargeSubmitting =
+    resumeAutoChargeFetcher.state === "submitting" ||
+    resumeAutoChargeFetcher.state === "loading";
 
   // Surface retry result via banner + toast. Don't auto-revalidate manually —
   // React Router 7 does that after the fetcher action settles.
@@ -700,6 +738,83 @@ export default function OrderDetail() {
       shopify?.toast?.show(data.message || "Charge failed", { isError: true });
     }
   }, [chargeCardFetcher.data, chargeCardFetcher.state, shopify]);
+
+  // Auto-charge pause/resume submission handlers. Both endpoints
+  // accept an optional `note` body for the remarks ledger. Loader
+  // auto-revalidates after the action settles so the on-page status
+  // display + button reflect the new state without manual refresh.
+  const onConfirmPauseAutoCharge = () => {
+    setBannerError(null);
+    setBannerSuccess(null);
+    pauseAutoChargeModalRef.current?.hideOverlay?.();
+    const body = {};
+    const trimmed = pauseNote.trim();
+    if (trimmed) body.note = trimmed;
+    pauseAutoChargeFetcher.submit(body, {
+      method: "POST",
+      action: `/api/admin/orders/${order._id}/pause-auto-charge`,
+      encType: "application/json",
+    });
+  };
+
+  const onConfirmResumeAutoCharge = () => {
+    setBannerError(null);
+    setBannerSuccess(null);
+    resumeAutoChargeModalRef.current?.hideOverlay?.();
+    const body = {};
+    const trimmed = resumeNote.trim();
+    if (trimmed) body.note = trimmed;
+    resumeAutoChargeFetcher.submit(body, {
+      method: "POST",
+      action: `/api/admin/orders/${order._id}/resume-auto-charge`,
+      encType: "application/json",
+    });
+  };
+
+  // Pause result → banner + toast. Same handled-ref idempotency
+  // pattern as the other fetchers (React Router auto-revalidates after
+  // an action, which can replay this effect).
+  useEffect(() => {
+    if (!pauseAutoChargeFetcher.data) return;
+    if (pauseAutoChargeFetcher.state !== "idle") return;
+    if (handledPauseAutoChargeRef.current === pauseAutoChargeFetcher.data) return;
+    handledPauseAutoChargeRef.current = pauseAutoChargeFetcher.data;
+
+    const data = pauseAutoChargeFetcher.data;
+    if (data.status === "success") {
+      setBannerSuccess(
+        data.result?.reapplied
+          ? "Auto-charge pause refreshed"
+          : "Auto-charge paused — CRON will skip this invoice",
+      );
+      setPauseNote("");
+      shopify?.toast?.show("Auto-charge paused");
+    } else {
+      setBannerError(data.message || "Could not pause auto-charge");
+      shopify?.toast?.show(data.message || "Pause failed", { isError: true });
+    }
+  }, [pauseAutoChargeFetcher.data, pauseAutoChargeFetcher.state, shopify]);
+
+  useEffect(() => {
+    if (!resumeAutoChargeFetcher.data) return;
+    if (resumeAutoChargeFetcher.state !== "idle") return;
+    if (handledResumeAutoChargeRef.current === resumeAutoChargeFetcher.data) return;
+    handledResumeAutoChargeRef.current = resumeAutoChargeFetcher.data;
+
+    const data = resumeAutoChargeFetcher.data;
+    if (data.status === "success") {
+      setBannerSuccess(
+        data.result?.wasAlreadyRunning
+          ? "Auto-charge was already running — confirmation recorded"
+          : "Auto-charge resumed — CRON will charge on the next tick",
+      );
+      setResumeNote("");
+      shopify?.toast?.show("Auto-charge resumed");
+    } else {
+      setBannerError(data.message || "Could not resume auto-charge");
+      shopify?.toast?.show(data.message || "Resume failed", { isError: true });
+    }
+  }, [resumeAutoChargeFetcher.data, resumeAutoChargeFetcher.state, shopify]);
 
   // Click handler must open the new window *synchronously* — that's the
   // only way it counts as a user-gesture and survives popup blockers.
@@ -879,6 +994,30 @@ export default function OrderDetail() {
           {...(chargeCardSubmitting ? { loading: true } : {})}
         >
           Charge card on file
+        </s-button>
+      )}
+      {/* Pause / Resume auto-charge — card-preferred invoices only.
+          One button at a time: the live `autoChargePaused` flag picks
+          which one to render so admins always see the action that
+          moves the invoice. */}
+      {invoice && isCardPreferredInvoice && !autoChargePaused && (
+        <s-button
+          slot="secondary-actions"
+          disabled={!canPauseAutoCharge}
+          onClick={() => pauseAutoChargeModalRef.current?.showOverlay?.()}
+          {...(pauseAutoChargeSubmitting ? { loading: true } : {})}
+        >
+          Pause auto-charge
+        </s-button>
+      )}
+      {invoice && isCardPreferredInvoice && autoChargePaused && (
+        <s-button
+          slot="secondary-actions"
+          disabled={!canResumeAutoCharge}
+          onClick={() => resumeAutoChargeModalRef.current?.showOverlay?.()}
+          {...(resumeAutoChargeSubmitting ? { loading: true } : {})}
+        >
+          Resume auto-charge
         </s-button>
       )}
 
@@ -1123,7 +1262,46 @@ export default function OrderDetail() {
               <s-text tone="subdued">
                 {invoice.attemptCount}/{invoice.maxAttempts} attempts
               </s-text>
+              {/* Auto-charge badge — only meaningful for card-
+                  preferred invoices. Cheque/ACH invoices are already
+                  CRON-excluded by paymentMethod filter, so showing
+                  "Active" there would imply something it doesn't. */}
+              {isCardPreferredInvoice && (
+                <s-badge tone={autoChargePaused ? "warning" : "success"}>
+                  {autoChargePaused
+                    ? "Auto-charge paused"
+                    : "Auto-charge active"}
+                </s-badge>
+              )}
             </s-stack>
+
+            {/* Paused-state context banner — surfaces who paused it,
+                when, and the optional pause note so admins reviewing
+                the order know why CRON is being skipped without
+                digging into the remarks ledger. */}
+            {isCardPreferredInvoice && autoChargePaused && (
+              <s-banner tone="warning" heading="Auto-charge is paused">
+                <s-paragraph>
+                  The CRON scheduler will skip this invoice on every tick
+                  until an admin resumes it. Manual settlement actions
+                  (Retry payment, Mark cheque paid, Charge card on file)
+                  remain available.
+                </s-paragraph>
+                <s-paragraph tone="subdued">
+                  Paused{" "}
+                  {invoice.autoChargePausedAt
+                    ? `on ${new Date(invoice.autoChargePausedAt).toLocaleString()}`
+                    : ""}
+                  {invoice.autoChargePausedBy
+                    ? ` by ${invoice.autoChargePausedBy}`
+                    : ""}
+                  {invoice.autoChargePauseNote
+                    ? ` — "${invoice.autoChargePauseNote}"`
+                    : ""}
+                  .
+                </s-paragraph>
+              </s-banner>
+            )}
 
             <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
               <s-grid-item>
@@ -1229,6 +1407,54 @@ export default function OrderDetail() {
                   value={invoice.shopifyMarkedPaid ? "Yes" : "No"}
                 />
               </s-grid-item>
+              {isCardPreferredInvoice && (
+                <>
+                  <s-grid-item>
+                    <KV
+                      label="Auto-charge status"
+                      value={
+                        autoChargePaused ? (
+                          <s-text tone="critical">Paused</s-text>
+                        ) : (
+                          <s-text tone="success">Active</s-text>
+                        )
+                      }
+                    />
+                  </s-grid-item>
+                  <s-grid-item>
+                    {/* Show whichever timestamp is more recent so the
+                        single row tells the right story without
+                        cluttering the grid with two columns. */}
+                    {autoChargePaused ? (
+                      <KV
+                        label="Paused at"
+                        value={
+                          invoice.autoChargePausedAt
+                            ? `${new Date(invoice.autoChargePausedAt).toLocaleString()}${
+                                invoice.autoChargePausedBy
+                                  ? ` by ${invoice.autoChargePausedBy}`
+                                  : ""
+                              }`
+                            : null
+                        }
+                      />
+                    ) : (
+                      <KV
+                        label="Last resumed"
+                        value={
+                          invoice.autoChargeResumeAt
+                            ? `${new Date(invoice.autoChargeResumeAt).toLocaleString()}${
+                                invoice.autoChargeResumedBy
+                                  ? ` by ${invoice.autoChargeResumedBy}`
+                                  : ""
+                              }`
+                            : null
+                        }
+                      />
+                    )}
+                  </s-grid-item>
+                </>
+              )}
             </s-grid>
 
             {invoice.lastAttemptError && (
@@ -1942,6 +2168,90 @@ export default function OrderDetail() {
         <s-button
           slot="secondary-actions"
           onClick={() => chargeCardModalRef.current?.hideOverlay?.()}
+        >
+          Cancel
+        </s-button>
+      </s-modal>
+
+      <s-modal
+        ref={pauseAutoChargeModalRef}
+        id="pause-auto-charge-modal"
+        heading="Pause auto-charge for this order?"
+        accessibilityLabel="Pause auto-charge confirmation"
+      >
+        <s-stack direction="block" gap="base">
+          <s-paragraph>
+            The CRON scheduler will stop including this invoice in the
+            auto-charge sweep until you resume it. The customer&apos;s
+            card on file is not touched, and the rest of the
+            practitioner&apos;s orders (and their broader payment
+            preference) are unaffected.
+          </s-paragraph>
+          <s-paragraph tone="subdued">
+            Manual settlement (Retry payment, Charge card on file, Mark
+            cheque paid) remains available while paused.
+          </s-paragraph>
+          <s-text-area
+            label="Note (optional)"
+            placeholder="Reason for pausing — visible in the remarks ledger"
+            value={pauseNote}
+            rows={3}
+            onChange={(e) => setPauseNote(e.currentTarget.value)}
+            maxLength={500}
+          />
+        </s-stack>
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          onClick={onConfirmPauseAutoCharge}
+          {...(pauseAutoChargeSubmitting ? { loading: true } : {})}
+        >
+          Pause auto-charge
+        </s-button>
+        <s-button
+          slot="secondary-actions"
+          onClick={() => pauseAutoChargeModalRef.current?.hideOverlay?.()}
+        >
+          Cancel
+        </s-button>
+      </s-modal>
+
+      <s-modal
+        ref={resumeAutoChargeModalRef}
+        id="resume-auto-charge-modal"
+        heading="Resume auto-charge for this order?"
+        accessibilityLabel="Resume auto-charge confirmation"
+      >
+        <s-stack direction="block" gap="base">
+          <s-paragraph>
+            This invoice will be included in the CRON auto-charge sweep
+            again. The card on file will be charged on the next
+            scheduler tick — no charge happens right now.
+          </s-paragraph>
+          <s-paragraph tone="subdued">
+            To charge immediately, use the &quot;Retry payment&quot;
+            action instead.
+          </s-paragraph>
+          <s-text-area
+            label="Note (optional)"
+            placeholder="Reason for resuming — visible in the remarks ledger"
+            value={resumeNote}
+            rows={3}
+            onChange={(e) => setResumeNote(e.currentTarget.value)}
+            maxLength={500}
+          />
+        </s-stack>
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          onClick={onConfirmResumeAutoCharge}
+          {...(resumeAutoChargeSubmitting ? { loading: true } : {})}
+        >
+          Resume auto-charge
+        </s-button>
+        <s-button
+          slot="secondary-actions"
+          onClick={() => resumeAutoChargeModalRef.current?.hideOverlay?.()}
         >
           Cancel
         </s-button>

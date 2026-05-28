@@ -160,8 +160,15 @@ const invoiceSchema = new mongoose.Schema(
     // kinds:
     //   cron_card_attempt    — PASS 1 CRON tried to charge a card
     //   cron_cheque_reminder — PASS 1.5 CRON logged a reminder for a
-    //                          pending cheque / ACH invoice (no charge
+    //                          pending cheque invoice (no charge
     //                          attempted — admins still need to act)
+    //   cron_ach_reminder    — same as above but for ACH-method
+    //                          invoices. Distinct enum so the Order
+    //                          Details badge can render the right
+    //                          label without inspecting the linked
+    //                          invoice's paymentMethod (which could
+    //                          have been flipped post-remark by the
+    //                          cheque → card admin override).
     //   cron_failed_followup — PASS 1.5 CRON noted a failed card
     //                          invoice that exhausted retries
     //   admin_action         — admin-driven settlement event (retry,
@@ -176,6 +183,7 @@ const invoiceSchema = new mongoose.Schema(
               enum: [
                 'cron_card_attempt',
                 'cron_cheque_reminder',
+                'cron_ach_reminder',
                 'cron_failed_followup',
                 'admin_action',
                 'system_note',
@@ -224,6 +232,37 @@ const invoiceSchema = new mongoose.Schema(
     shopifyRecordedTotal: { type: Number, default: 0 },
     shopifyTransactionIds: { type: [String], default: [] },
     lastSyncError: String,
+
+    // ── Auto-charge pause control ────────────────────────────────────
+    //
+    // Admin-controlled flag that takes an individual invoice out of the
+    // CRON auto-charge sweep without affecting any other invoice or the
+    // customer's broader payment preference. While `autoChargePaused`
+    // is true:
+    //   - PASS 1 (card charge) skips the invoice via the
+    //     `autoChargePaused: { $ne: true }` filter
+    //   - PASS 1.5 (reminders) also skips it — a paused invoice is
+    //     intentionally muted, not waiting for follow-up
+    //   - Admin actions (Retry payment / Charge card / Mark cheque
+    //     paid) remain available — pause is CRON-only, never blocks
+    //     deliberate admin settlement
+    //
+    // Feature is gated to card-preferred invoices in the UI
+    // (`customerPaymentPreference === 'card'`). Cheque/ACH invoices
+    // are already skipped by PASS 1 so a pause flag would be a no-op
+    // there.
+    //
+    // `autoChargeResumeAt` records the timestamp of the most recent
+    // resume action (NOT a scheduled future-resume date — there is no
+    // background job that auto-resumes). Kept distinct from
+    // `autoChargePausedAt` so the audit trail captures both the latest
+    // pause and the latest resume independently.
+    autoChargePaused: { type: Boolean, default: false, index: true },
+    autoChargePausedAt: Date,
+    autoChargePausedBy: String,
+    autoChargeResumeAt: Date,
+    autoChargeResumedBy: String,
+    autoChargePauseNote: String,
 
     // Processing-fee state — captures the per-method surcharge added to
     // the invoice at settlement time (card=3%, ach=1%, check=0% by

@@ -1079,25 +1079,110 @@ Invoice fields; `cheque`, `ach` on the manualPayments ledger.
 
 ### 9.2 Scheduler gating
 
-PASS 1 of `process-pending-payments` filters by `paymentMethod: 'card'`:
+PASS 1 of `process-pending-payments` filters by `paymentMethod: 'card'`
+**and** `autoChargePaused: { $ne: true }`:
 
 ```js
 Invoice.find({
   paymentStatus: 'pending',
   paymentMethod: 'card',
+  autoChargePaused: { $ne: true },
   $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
 })
 ```
 
+PASS 1.5 (cheque/ACH + failed-card reminder logger) carries the same
+`autoChargePaused: { $ne: true }` term — pausing is an explicit "leave
+this one alone" signal, and surfacing a recurring reminder for a paused
+invoice would defeat that intent.
+
+`$ne: true` (not `false`) is deliberate so legacy rows without the field
+default to "not paused".
+
 Cheque / ACH invoices sit on `pending` indefinitely until an admin acts.
-PASS 2 (downstream sync retry) is NOT gated by method — once an invoice
-is `paid`, any failed QBO/Shopify sync is replayed regardless of how
-the invoice was paid.
+PASS 2 (downstream sync retry) is NOT gated by method or by the pause
+flag — once an invoice has money on it (paid / partially_paid), any
+failed QBO/Shopify sync is replayed regardless of how the invoice was
+paid or whether new charges are currently paused. That's intentional:
+sync retry never starts new charges, it only reconciles money that
+already landed.
 
 The same gate applies to the immediate-charge path in
 `order.service.processShopifyOrder`: even with
 `PAYMENT_CHARGE_IMMEDIATELY=true`, only `card` invoices fire the inline
-NMI sale.
+NMI sale. The pause flag does not affect immediate-charge today (a new
+order can't be paused before it exists), but the same `autoChargePaused`
+condition should be added if that path ever loops over existing invoices.
+
+#### 9.2.1 Per-invoice auto-charge pause control
+
+Card-preferred invoices can be individually excluded from PASS 1 without
+affecting any other invoice, the customer's broader preference, or the
+stored NMI vault.
+
+**Storage** — six fields on the Invoice doc:
+
+| Field | Type | Notes |
+|---|---|---|
+| `autoChargePaused` | Boolean (indexed) | the CRON filter looks at this |
+| `autoChargePausedAt` | Date | most recent pause timestamp |
+| `autoChargePausedBy` | String | session email of the admin who paused |
+| `autoChargePauseNote` | String | optional pause reason (admin-supplied, max 500 chars) |
+| `autoChargeResumeAt` | Date | most recent resume timestamp (NOT a scheduled future-resume date) |
+| `autoChargeResumedBy` | String | session email of the admin who resumed |
+
+The previous pause-side fields (`autoChargePausedAt` / `By` /
+`PauseNote`) are deliberately preserved after a resume — they remain
+useful as the "last paused" audit trail. A subsequent pause overwrites
+them.
+
+**Endpoints** — both are admin-authenticated, both accept an optional
+JSON `{ note }` body that is mirrored into `Invoice.remarks[]`
+(`kind: 'admin_action'`, `source: 'admin'`):
+
+```
+POST /api/admin/orders/:id/pause-auto-charge
+  → app/api/admin/pause-auto-charge.js
+    - guards: customerPaymentPreference === 'card',
+      paymentStatus ∉ {paid, cancelled}
+    - sets autoChargePaused=true + timestamps + admin email
+    - appends "Auto-charge paused by <admin> [— note]" remark
+  → returns { autoChargePaused, autoChargePausedAt, autoChargePausedBy,
+              autoChargePauseNote, reapplied }
+
+POST /api/admin/orders/:id/resume-auto-charge
+  → app/api/admin/resume-auto-charge.js
+    - sets autoChargePaused=false + resume timestamps + admin email
+    - appends "Auto-charge resumed by <admin> [— note]" remark
+  → returns { autoChargePaused, autoChargeResumeAt, autoChargeResumedBy,
+              wasAlreadyRunning }
+```
+
+**Gating** — the feature is restricted to invoices whose
+`customerPaymentPreference === 'card'` (the immutable order-time
+snapshot, NOT the mutable `paymentMethod` that the cheque → card
+fallback can flip). Reasoning: pausing a cheque/ACH invoice would be a
+silent no-op (PASS 1 already skips it by method), so the UI hides the
+control there. The server re-checks the same condition so an
+out-of-band POST cannot pause a non-card invoice.
+
+**Resume is NOT a charge** — clearing the pause flag just unblocks the
+next CRON tick. Admins who want to charge immediately keep using the
+existing Retry payment / Charge card on file actions.
+
+**Idempotence** —
+- re-pausing an already-paused invoice refreshes the timestamps + admin
+  identity and appends a "pause refreshed" remark
+- resuming an invoice that wasn't paused records a "resume confirmation
+  (was already running)" remark — lets ops confirm intended state
+  without first verifying live state
+
+**Manual settlement remains available while paused** — the pause flag
+only blocks the CRON. Retry payment, Mark cheque paid, and Charge card
+on file are deliberate admin actions and never consult
+`autoChargePaused`. The Order Details page surfaces a warning banner +
+status badge so admins know the auto-side is paused before they take a
+manual action.
 
 ### 9.3 Manual cheque receipt — admin "Mark cheque paid"
 
@@ -1778,7 +1863,7 @@ All in MongoDB, single database from `MONGODB_URI`.
 | `qbo_tokens` | `models/qboToken.server.js` | One row per realm — current access + refresh token |
 | `customer_maps` | `models/customerMap.server.js` | Shopify email ↔ QBO customer ↔ NMI vault; carries `paymentMethod` preference |
 | `shopify_orders` | `models/order.server.js` | Local mirror of every received Shopify order |
-| `invoices` | `models/invoice.server.js` | Local invoice mirror + sync state; carries `paymentMethod` (active, mutable), `customerPaymentPreference` (immutable order-time snapshot), `paymentSettledVia` + `paymentSettledAt` (recorded on each successful payment), `qboDueDate`, `manualPayments[]` ledger, and `remarks[]` ledger (append-only CRON + admin follow-up entries — `kind` ∈ `cron_card_attempt` / `cron_cheque_reminder` / `cron_failed_followup` / `admin_action` / `system_note`; powers the Order List **Remarks** column) |
+| `invoices` | `models/invoice.server.js` | Local invoice mirror + sync state; carries `paymentMethod` (active, mutable), `customerPaymentPreference` (immutable order-time snapshot), `paymentSettledVia` + `paymentSettledAt` (recorded on each successful payment), `qboDueDate`, `manualPayments[]` ledger, `remarks[]` ledger (append-only CRON + admin follow-up entries — `kind` ∈ `cron_card_attempt` / `cron_cheque_reminder` / `cron_failed_followup` / `admin_action` / `system_note`; powers the Order List **Remarks** column), and the auto-charge pause control (`autoChargePaused` Boolean + `autoChargePausedAt` / `autoChargePausedBy` / `autoChargePauseNote` / `autoChargeResumeAt` / `autoChargeResumedBy` — §9.2.1) |
 | `payment_attempts` | `models/paymentAttempt.server.js` | Append-only charge ledger (NMI + manual cheque receipts as `outcome: 'manual_paid'`) |
 | `wholesale_applications` | `models/wholesaleApplication.server.js` | Wholesale signups (pre-existing) |
 
@@ -1792,6 +1877,7 @@ shopify_orders    unique on (shop, shopifyOrderId)
 invoices          unique on (shop, shopifyOrderId)
                   + (paymentStatus, attemptCount)  for scheduler cursor
                   + (paymentMethod)                for cheque/ACH filter
+                  + (autoChargePaused)             for CRON pause skip (§9.2.1)
 payment_attempts  (invoiceRef, attemptedAt)
 ```
 
