@@ -382,16 +382,25 @@ export default function OrdersList() {
               <s-table-header>Due</s-table-header>
               <s-table-header>Remarks</s-table-header>
               <s-table-header>Order date</s-table-header>
+              {/* Dedicated action column — replaces the previous
+                  whole-row click navigation. See the inline comment on
+                  the View button below for the rationale. */}
+              <s-table-header>Actions</s-table-header>
             </s-table-header-row>
             <s-table-body>
               {rows.map((r) => {
-                const go = () => navigate(`/app/orders/${r.id}`);
                 const orderLabel =
                   r.shopifyOrderName ||
                   (r.shopifyOrderNumber ? `#${r.shopifyOrderNumber}` : r.shopifyOrderId);
-                const orderTooltip = `Order ${orderLabel}`;
+                // Row click navigation was removed (per usability
+                // feedback): clicking anywhere on the row used to open
+                // the Order Details page, which fired accidentally
+                // when admins were trying to interact with chips, the
+                // pagination footer, or text inside cells. Navigation
+                // is now gated to an explicit "View" button in the
+                // Actions column at the row's right edge.
                 return (
-                  <s-table-row key={r.id} onClick={go} title={orderTooltip}>
+                  <s-table-row key={r.id}>
                     <s-table-cell>
                       <s-text>{orderLabel}</s-text>
                     </s-table-cell>
@@ -438,6 +447,15 @@ export default function OrdersList() {
                       {r.receivedAt
                         ? new Date(r.receivedAt).toLocaleString()
                         : "—"}
+                    </s-table-cell>
+                    <s-table-cell>
+                      <s-button
+                        variant="tertiary"
+                        accessibilityLabel={`View order ${orderLabel}`}
+                        onClick={() => navigate(`/app/orders/${r.id}`)}
+                      >
+                        View
+                      </s-button>
                     </s-table-cell>
                   </s-table-row>
                 );
