@@ -18,6 +18,17 @@ import { processShopifyOrder } from '../services/order/order.service'
 import { isSyncEnabled, deductRetailInventoryForOrder } from '../services/sync/index'
 import { createLogger } from '../utils/logger.utils'
 
+// Module-level dedup for retail deduction — guards against Shopify's
+// at-least-once webhook delivery firing deductRetailInventoryForOrder twice
+// for the same order. Each entry auto-expires after 5 minutes.
+const _dedupedWebhookIds = new Set()
+function claimWebhookForSync(id) {
+  if (!id || _dedupedWebhookIds.has(id)) return false
+  _dedupedWebhookIds.add(id)
+  setTimeout(() => _dedupedWebhookIds.delete(id), 5 * 60 * 1000)
+  return true
+}
+
 const log = createLogger('webhook.orders_create')
 
 // inline = process the order directly in this Node process (fire-and-forget
@@ -125,7 +136,9 @@ export const action = async ({ request }) => {
 
   // Cross-store sync: deduct retail inventory for the same quantities.
   // Fire-and-forget — sync failure must never affect the 200 response.
-  if (isSyncEnabled()) {
+  // claimWebhookForSync prevents double-deduction when Shopify retries the
+  // same webhook (at-least-once delivery).
+  if (isSyncEnabled() && claimWebhookForSync(webhookId)) {
     deductRetailInventoryForOrder(payload)
       .catch((err) => log.error('retail_inventory_deduct.failed', { shop, orderId: payload.id, err }))
   }

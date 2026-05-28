@@ -1,5 +1,6 @@
 import IdMap from './idMap.model'
 import { retailClient } from './retailApi'
+import { resolveRetailLocationId } from './sync.utils'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('sync.product')
@@ -35,6 +36,32 @@ function buildRetailPayload(p) {
   }
 }
 
+// Set inventory levels on the retail store for each variant after product creation.
+// Uses the wholesale location_id (from the product or null) to resolve the retail location.
+async function setRetailInventoryForProduct(wholesaleVariants, retailVariants, wholesaleLocationId) {
+  const retailLocationId = await resolveRetailLocationId(wholesaleLocationId ?? null)
+  if (!retailLocationId) {
+    log.warn('set_retail_inventory.no_location')
+    return
+  }
+  for (let i = 0; i < wholesaleVariants.length && i < retailVariants.length; i++) {
+    const wv = wholesaleVariants[i]
+    const rv = retailVariants[i]
+    const qty = wv.inventory_quantity ?? 0
+    if (!rv.inventory_item_id) continue
+    try {
+      await retailClient.post('inventory_levels/set.json', {
+        inventory_item_id: Number(rv.inventory_item_id),
+        location_id: Number(retailLocationId),
+        available: qty,
+      })
+      log.info('set_retail_inventory.done', { wholesaleVariantId: wv.id, qty })
+    } catch (err) {
+      log.warn('set_retail_inventory.failed', { wholesaleVariantId: wv.id, err })
+    }
+  }
+}
+
 // Store variant + inventory item mappings after a create or update.
 async function upsertVariantMappings(wholesaleVariants, retailVariants) {
   for (let i = 0; i < wholesaleVariants.length && i < retailVariants.length; i++) {
@@ -42,18 +69,27 @@ async function upsertVariantMappings(wholesaleVariants, retailVariants) {
     const rv = retailVariants[i]
     await IdMap.updateOne(
       { entityType: 'productVariant', wholesaleId: String(wv.id) },
-      { $set: { entityType: 'productVariant', wholesaleId: String(wv.id), retailId: String(rv.id) } },
-      { upsert: true },
-    )
-    await IdMap.updateOne(
-      { entityType: 'inventoryItem', wholesaleId: String(wv.inventory_item_id) },
       {
         $set: {
-          entityType: 'inventoryItem',
-          wholesaleId: String(wv.inventory_item_id),
-          retailId: String(rv.inventory_item_id),
+          entityType: 'productVariant',
+          wholesaleId: String(wv.id),
+          retailId: String(rv.id),
+          wholesaleInventoryItemId: String(wv.inventory_item_id),
         },
       },
+      { upsert: true },
+    )
+    const invSet = {
+      entityType: 'inventoryItem',
+      wholesaleId: String(wv.inventory_item_id),
+      retailId: String(rv.inventory_item_id),
+    }
+    // inventory_quantity is present in both webhook payloads and backfill data.
+    // Save it as available so the restock-detection delta has a baseline immediately.
+    if (wv.inventory_quantity != null) invSet.available = wv.inventory_quantity
+    await IdMap.updateOne(
+      { entityType: 'inventoryItem', wholesaleId: String(wv.inventory_item_id) },
+      { $set: invSet },
       { upsert: true },
     )
   }
@@ -76,6 +112,11 @@ export async function syncProductCreate(wholesaleProduct) {
 
   await IdMap.create({ entityType: 'product', wholesaleId, retailId: String(retailProduct.id) })
   await upsertVariantMappings(wholesaleProduct.variants || [], retailProduct.variants || [])
+  await setRetailInventoryForProduct(
+    wholesaleProduct.variants || [],
+    retailProduct.variants || [],
+    wholesaleProduct.location_id ?? null,
+  )
 
   log.info('product_create.done', { wholesaleId, retailId: String(retailProduct.id) })
   return retailProduct

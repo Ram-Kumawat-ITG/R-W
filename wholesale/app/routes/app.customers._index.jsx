@@ -66,7 +66,9 @@ export default function CustomersList() {
   const [pendingDeclineRow, setPendingDeclineRow] = useState(null);
   const declineFetcher = useFetcher();
   const syncFetcher = useFetcher();
+  const invFetcher = useFetcher();
   const handledSyncRef = useRef(null);
+  const handledInvRef = useRef(null);
   const declineModalRef = useRef(null);
   const loadedToastShown = useRef(false);
   // Track which response payload we've already handled so React-Router's
@@ -136,10 +138,14 @@ export default function CustomersList() {
  
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const currentPage = Math.min(page, totalPages);
-  const firstShown = filtered.length === 0 ? 0 : (currentPage - 1) * PAGE_SIZE + 1;
+  const firstShown =
+    filtered.length === 0 ? 0 : (currentPage - 1) * PAGE_SIZE + 1;
   const lastShown = Math.min(currentPage * PAGE_SIZE, filtered.length);
-  const visibleRows = filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
- 
+  const visibleRows = filtered.slice(
+    (currentPage - 1) * PAGE_SIZE,
+    currentPage * PAGE_SIZE,
+  );
+
   // Handle decline result.
   useEffect(() => {
     if (!declineFetcher.data) return;
@@ -173,16 +179,42 @@ export default function CustomersList() {
         `Sync done: ${r.synced ?? 0} synced, ${r.failed ?? 0} failed`,
       );
     } else {
+      shopify?.toast?.show(syncFetcher.data.message || "Sync failed.", {
+        isError: true,
+      });
+    }
+  }, [syncFetcher.data, syncFetcher.state, shopify]);
+
+  useEffect(() => {
+    if (!invFetcher.data) return;
+    if (invFetcher.state !== "idle") return;
+    if (handledInvRef.current === invFetcher.data) return;
+    handledInvRef.current = invFetcher.data;
+    if (invFetcher.data.status === "success") {
+      const r = invFetcher.data.result || {};
       shopify?.toast?.show(
-        syncFetcher.data.message || "Sync failed.",
+        `Inventory snapshot done: ${r.updated ?? 0} items updated`,
+      );
+    } else {
+      shopify?.toast?.show(
+        invFetcher.data.message || "Inventory snapshot failed.",
         { isError: true },
       );
     }
-  }, [syncFetcher.data, syncFetcher.state, shopify]);
- 
+  }, [invFetcher.data, invFetcher.state, shopify]);
+
   const runSyncBackfill = () =>
-    syncFetcher.submit(null, { method: "POST", action: "/api/admin/sync/backfill" });
- 
+    syncFetcher.submit(null, {
+      method: "POST",
+      action: "/api/admin/sync/backfill",
+    });
+
+  const runInventorySnapshot = () =>
+    invFetcher.submit(null, {
+      method: "POST",
+      action: "/api/admin/sync/inventory-snapshot",
+    });
+
   const openDeclineModal = (row) => {
     if (!row?.id) return;
     setPendingDeclineRow(row);
@@ -203,11 +235,21 @@ export default function CustomersList() {
  
   const syncBusy =
     syncFetcher.state === "submitting" || syncFetcher.state === "loading";
- 
+  const invBusy =
+    invFetcher.state === "submitting" || invFetcher.state === "loading";
+
   return (
     <s-page inlineSize="large" heading="Wholesale applications">
       <s-button
         slot="primary-action"
+        variant="secondary"
+        onClick={runInventorySnapshot}
+        {...(invBusy ? { loading: true } : {})}
+      >
+        {invBusy ? "Snapshotting…" : "Snapshot inventory"}
+      </s-button>
+      <s-button
+        slot="secondary-actions"
         variant="secondary"
         onClick={runSyncBackfill}
         {...(syncBusy ? { loading: true } : {})}
