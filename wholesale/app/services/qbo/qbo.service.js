@@ -273,6 +273,234 @@ export async function sendInvoiceEmail({ qboInvoiceId, sendTo }) {
   return updated
 }
 
+// ── Read-only listing helpers (admin dashboard) ──────────────────────
+//
+// All three list helpers use QBO's QL `/query` endpoint via qbo.query()
+// and share the same response shape so the admin route loaders can
+// treat them interchangeably:
+//
+//   { entities, startPosition, pageSize, returned, totalCount? }
+//
+// QBO returns up to 1,000 records per response (hard cap), but we
+// constrain to a smaller pageSize (default 50) so the loader stays
+// snappy and operators can scan a single page. Pagination uses QBO's
+// 1-based STARTPOSITION token; we do NOT cursor on Id because QBO does
+// not guarantee stable Id ordering across pages on every entity.
+//
+// `where` is a raw QBO QL predicate (no leading WHERE). Callers must
+// escape any embedded values via escapeQboQuery — this function does NOT
+// auto-escape because some callers pass operators / IN clauses.
+//
+// `orderBy` is a raw QBO QL ORDER BY clause (no leading ORDER BY).
+// QBO only supports ordering on indexed fields; the safe ones used here
+// are Id, MetaData.CreateTime, TxnDate, and DisplayName.
+//
+// QBO's `totalCount` field is only reliably populated for `SELECT COUNT(*)`
+// queries — listing queries with STARTPOSITION / MAXRESULTS return the
+// page records but no grand total. We expose a separate `countXxx`
+// helper for that. Loaders that need both a page AND a total run them
+// in parallel via Promise.all.
+
+const DEFAULT_PAGE_SIZE = 50
+const MAX_PAGE_SIZE = 200
+
+function clampPageSize(n) {
+  const v = Number(n)
+  if (!Number.isFinite(v) || v <= 0) return DEFAULT_PAGE_SIZE
+  return Math.min(MAX_PAGE_SIZE, Math.max(1, Math.floor(v)))
+}
+
+async function runListQuery({ entity, fields = '*', where, orderBy, pageSize, startPosition }) {
+  const wherePart = where ? ` WHERE ${where}` : ''
+  const orderPart = orderBy ? ` ORDERBY ${orderBy}` : ''
+  const sp = Math.max(1, Math.floor(Number(startPosition) || 1))
+  const ps = clampPageSize(pageSize)
+  const stmt = `SELECT ${fields} FROM ${entity}${wherePart}${orderPart} STARTPOSITION ${sp} MAXRESULTS ${ps}`
+  const res = await qbo.query(stmt)
+  const entities = res?.QueryResponse?.[entity] || []
+  return {
+    entities,
+    startPosition: sp,
+    pageSize: ps,
+    returned: entities.length,
+    totalCount:
+      typeof res?.QueryResponse?.totalCount === 'number'
+        ? res.QueryResponse.totalCount
+        : null,
+  }
+}
+
+async function runCountQuery({ entity, where }) {
+  const wherePart = where ? ` WHERE ${where}` : ''
+  const stmt = `SELECT COUNT(*) FROM ${entity}${wherePart}`
+  const res = await qbo.query(stmt)
+  // QBO returns the count as `QueryResponse.totalCount`. Fall back to 0
+  // if the field is missing (e.g. when no matching rows).
+  return typeof res?.QueryResponse?.totalCount === 'number'
+    ? res.QueryResponse.totalCount
+    : 0
+}
+
+export async function listCustomers({ pageSize, startPosition, where, orderBy } = {}) {
+  return runListQuery({
+    entity: 'Customer',
+    where,
+    orderBy: orderBy || 'DisplayName',
+    pageSize,
+    startPosition,
+  })
+}
+
+export async function countCustomers({ where } = {}) {
+  return runCountQuery({ entity: 'Customer', where })
+}
+
+export async function listInvoices({ pageSize, startPosition, where, orderBy } = {}) {
+  return runListQuery({
+    entity: 'Invoice',
+    where,
+    // Newest first — TxnDate is the invoice date, MetaData.CreateTime
+    // would also work but QBO QL doesn't always accept dotted paths in
+    // ORDERBY across the older API versions, so TxnDate is the safer bet.
+    orderBy: orderBy || 'TxnDate DESC',
+    pageSize,
+    startPosition,
+  })
+}
+
+export async function countInvoices({ where } = {}) {
+  return runCountQuery({ entity: 'Invoice', where })
+}
+
+export async function listPayments({ pageSize, startPosition, where, orderBy } = {}) {
+  return runListQuery({
+    entity: 'Payment',
+    where,
+    orderBy: orderBy || 'TxnDate DESC',
+    pageSize,
+    startPosition,
+  })
+}
+
+export async function countPayments({ where } = {}) {
+  return runCountQuery({ entity: 'Payment', where })
+}
+
+// Composite metrics for the QBO Dashboard tab. Runs every counter
+// in parallel + pulls the most recent 5 payments and 5 invoices in
+// one round trip via Promise.all. Each individual query is wrapped in
+// `safe` so one failed counter (e.g. permission error on Payment)
+// degrades to `null` rather than taking the whole dashboard down — the
+// route loader surfaces the `errors` array as a warning banner.
+//
+// Date math is done in JS off `new Date()` so we don't rely on QBO's
+// server clock for the "today" pivot used by the Overdue counter.
+//
+// Revenue summary = sum of TotalAmt across invoices with TxnDate in
+// the current calendar month. We list (vs aggregate) because QBO QL
+// does not support SUM() — but the page size is capped at the same
+// MAX_PAGE_SIZE (200) so very high-volume tenants will see a
+// "showing first 200 of N" disclaimer on the dashboard. That's a
+// pragmatic ceiling; if it ever becomes a problem we can paginate.
+export async function getDashboardSnapshot() {
+  const errors = []
+  const safe = async (label, fn) => {
+    try {
+      return await fn()
+    } catch (e) {
+      errors.push({ label, message: e?.message || String(e) })
+      return null
+    }
+  }
+
+  const now = new Date()
+  const todayYmd = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+  const monthStartYmd = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`
+
+  const [
+    customerCount,
+    activeCustomerCount,
+    invoiceCount,
+    paidInvoiceCount,
+    pendingInvoiceCount,
+    overdueInvoiceCount,
+    recentPayments,
+    recentInvoices,
+    monthInvoices,
+  ] = await Promise.all([
+    safe('Total customers', () => countCustomers()),
+    safe('Active customers', () => countCustomers({ where: "Active = true" })),
+    safe('Total invoices', () => countInvoices()),
+    // "Balance = '0'" identifies fully-paid invoices on QBO's side. Voided
+    // invoices also have Balance=0, so we exclude those. QBO QL gives no
+    // direct "is voided" predicate — but the TotalAmt is zeroed on void,
+    // so TotalAmt > 0 + Balance = 0 narrows to real paid invoices.
+    safe('Paid invoices', () => countInvoices({ where: "Balance = '0' AND TotalAmt > '0'" })),
+    safe('Pending invoices', () => countInvoices({ where: "Balance > '0'" })),
+    safe('Overdue invoices', () =>
+      countInvoices({
+        where: `Balance > '0' AND DueDate < '${todayYmd}'`,
+      }),
+    ),
+    safe('Recent payments', () => listPayments({ pageSize: 5 })),
+    safe('Recent invoices', () => listInvoices({ pageSize: 5 })),
+    safe('This month invoices', () =>
+      // ORDERBY omitted — we just need the sum across the window.
+      listInvoices({
+        pageSize: MAX_PAGE_SIZE,
+        where: `TxnDate >= '${monthStartYmd}'`,
+        orderBy: 'TxnDate DESC',
+      }),
+    ),
+  ])
+
+  // Revenue summary — projected from the month's invoices. Two figures:
+  //   billed   — sum of TotalAmt (everything invoiced this month)
+  //   collected— sum of (TotalAmt - Balance) (what's been paid against
+  //              this month's invoices, including partial receipts)
+  let revenueBilled = null
+  let revenueCollected = null
+  let monthInvoicesCount = null
+  let monthInvoicesTruncated = false
+  if (monthInvoices?.entities) {
+    revenueBilled = 0
+    revenueCollected = 0
+    for (const inv of monthInvoices.entities) {
+      const total = Number(inv.TotalAmt || 0)
+      const balance = Number(inv.Balance || 0)
+      revenueBilled += total
+      revenueCollected += total - balance
+    }
+    revenueBilled = Number(revenueBilled.toFixed(2))
+    revenueCollected = Number(revenueCollected.toFixed(2))
+    monthInvoicesCount = monthInvoices.returned
+    monthInvoicesTruncated = monthInvoices.returned >= MAX_PAGE_SIZE
+  }
+
+  return {
+    asOf: now.toISOString(),
+    counts: {
+      customers: customerCount,
+      activeCustomers: activeCustomerCount,
+      invoices: invoiceCount,
+      paidInvoices: paidInvoiceCount,
+      pendingInvoices: pendingInvoiceCount,
+      overdueInvoices: overdueInvoiceCount,
+    },
+    revenue: {
+      billed: revenueBilled,
+      collected: revenueCollected,
+      currency: 'USD', // QBO realm currency — would need /v3/company/{realmId}/companyinfo to surface dynamically
+      periodLabel: now.toLocaleString(undefined, { month: 'long', year: 'numeric' }),
+      sampledInvoiceCount: monthInvoicesCount,
+      truncated: monthInvoicesTruncated,
+    },
+    recentPayments: recentPayments?.entities || [],
+    recentInvoices: recentInvoices?.entities || [],
+    errors,
+  }
+}
+
 // ── Payment ──────────────────────────────────────────────────────────
 
 // Record a payment against a QBO invoice. Called after a successful NMI

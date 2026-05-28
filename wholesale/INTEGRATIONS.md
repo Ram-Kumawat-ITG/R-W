@@ -797,7 +797,77 @@ This is the call that flips a QBO invoice from "Open" to "Paid".
 `QBO_ENVIRONMENT=sandbox|production` auto-selects the base URL from
 `QBO_BASE_URLS` in config. Explicit `QBO_API_BASE_URL` override wins if set.
 
-### 7.6 Customer-facing emails — `services/qbo/qbo.service.js` + `services/invoice/invoice.service.dispatchInvoiceLifecycleEmails`
+### 7.6 Read-only list helpers — admin QBO section
+
+The QBO admin tabs (Dashboard / Customers / Transactions / Invoices —
+see `app/routes/app.qbo.*.jsx`) pull live data via QBO QL `/query`.
+These helpers live in `services/qbo/qbo.service.js` and follow the
+project rule "no QBO calls outside `services/qbo/`".
+
+**Shared internals:**
+
+```js
+runListQuery({ entity, where?, orderBy?, pageSize?, startPosition? })
+  // SELECT * FROM <entity> [WHERE ...] [ORDERBY ...]
+  //   STARTPOSITION <sp> MAXRESULTS <ps>
+  // Returns { entities, startPosition, pageSize, returned, totalCount? }
+
+runCountQuery({ entity, where? })
+  // SELECT COUNT(*) FROM <entity> [WHERE ...]
+  // Returns the integer total
+```
+
+Page size is clamped to `[1, MAX_PAGE_SIZE=200]` (QBO's hard ceiling is
+1,000 but smaller pages keep the UI snappy). Default is 50.
+
+**Public helpers (one pair per entity):**
+
+| Function | QBO entity | Default `orderBy` |
+|---|---|---|
+| `listCustomers({ pageSize?, startPosition?, where?, orderBy? })` | Customer | `DisplayName` |
+| `countCustomers({ where? })` | Customer | — |
+| `listInvoices({ ... })` | Invoice | `TxnDate DESC` |
+| `countInvoices({ where? })` | Invoice | — |
+| `listPayments({ ... })` | Payment | `TxnDate DESC` |
+| `countPayments({ where? })` | Payment | — |
+
+`where` is a raw QBO QL predicate (no leading WHERE). Callers must
+escape embedded values via `escapeQboQuery` — these helpers don't
+auto-escape because some callers compose `IN (…)` or `LIKE '%…%'`
+clauses.
+
+QBO QL doesn't return a grand total on paginated list responses (only
+on `SELECT COUNT(*)` queries), so the admin loaders run the page +
+count in parallel via `Promise.all`.
+
+**Composite: `getDashboardSnapshot()`**
+
+Fans out 9 parallel QBO queries (total/active customers, total/paid/
+pending/overdue invoice counts, recent payments, recent invoices,
+current-month invoices for revenue summary). Each is wrapped in a
+local `safe(label, fn)` helper that catches errors and pushes them
+onto a returned `errors[]` array — so one failed metric (e.g.
+permission error on Payment) degrades to `null` for that field
+rather than failing the whole call. The Dashboard route surfaces the
+errors array as a warning banner above the metrics grid.
+
+Revenue is computed in-app by summing `TotalAmt` and `(TotalAmt –
+Balance)` over the current-month invoice list (QBO QL has no `SUM()`).
+Capped at `MAX_PAGE_SIZE` invoices; the response carries a `truncated:
+true` flag when the cap is hit so the UI can show "sample capped".
+
+**Voided-invoice gotcha** — QBO's `Balance = '0'` matches BOTH paid AND
+voided invoices (voids zero out both `TotalAmt` and `Balance`). The
+"Paid invoices" predicate adds `TotalAmt > '0'` to exclude voids; the
+Invoices tab's Voided filter chip inverts to `TotalAmt = '0'`.
+
+**No DB caching** — every page render hits QBO live. Pros: always
+fresh, no stale-cache invalidation logic. Cons: dashboard renders take
+2–5s in practice (Promise.all caps at the slowest single query). The
+per-tab "Refresh" button is wired to `useRevalidator().revalidate()`
+so admins can re-pull on demand without a navigation.
+
+### 7.7 Customer-facing emails — `services/qbo/qbo.service.js` + `services/invoice/invoice.service.dispatchInvoiceLifecycleEmails`
 
 Customer emails are sent by QBO's own mail infrastructure, not the app.
 We hit a single QBO endpoint — the invoice send — and trust QBO to
