@@ -13,6 +13,15 @@ const customerMapSchema = new mongoose.Schema(
     qboCustomerId: { type: String, index: true },
     nmiCustomerVaultId: { type: String, index: true },
 
+    // NMI billing_id mirrors from WholesaleApplication. Per the multi-billing
+    // design (one vault, multiple billing records inside it), we need to be
+    // able to target either method when charging — the priority-1 billing is
+    // not always the method we want. card billing is always present (card
+    // on file required for every account); ach billing only for customers
+    // whose preferred method was ACH at registration time.
+    nmiCardBillingId: { type: String, default: null },
+    nmiAchBillingId: { type: String, default: null },
+
     // Customer's preferred payment method, sourced from the wholesale
     // registration application at customer-sync time. Drives the default
     // for newly-created invoices; per-invoice overrides (cheque → card

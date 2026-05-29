@@ -217,7 +217,6 @@ export default function Step2AddressTax({
   clearErrors,
 }) {
   const sameAsBilling = useWatch({ control, name: "shippingSameAsBilling" });
-  const resells = useWatch({ control, name: "resellsProducts" });
   const taxIdType = useWatch({ control, name: "tax.taxIdType" });
 
   const isFirstRender = useRef(true);
@@ -235,11 +234,6 @@ export default function Step2AddressTax({
       clearErrors("shippingAddress");
     }
   }, [sameAsBilling, setValue, clearErrors]);
-
-  // Clear tax sub-field errors when the tax section is first revealed
-  useEffect(() => {
-    if (resells) clearErrors("tax");
-  }, [resells, clearErrors]);
 
   return (
     <section className="rf-step">
@@ -333,34 +327,11 @@ export default function Step2AddressTax({
       <div className="rf-divider">
         <h2 className="rf-section-label">Tax status</h2>
         <p className="rf-section-hint">
-          Only applies if you're reselling products to customers.
+          Required for all wholesale applicants.
         </p>
       </div>
 
-      <div className="rf-toggle-row">
-        <div>
-          <strong>Will you resell our products?</strong>
-          <div className="desc">
-            Choose "No" if you use products in-practice only
-          </div>
-        </div>
-        <Controller
-          name="resellsProducts"
-          control={control}
-          render={({ field }) => (
-            <SegmentedToggle
-              value={field.value ? "yes" : "no"}
-              onChange={(v) => field.onChange(v === "yes")}
-              options={[
-                { value: "yes", label: "Yes" },
-                { value: "no", label: "No" },
-              ]}
-            />
-          )}
-        />
-      </div>
-
-      <div className={`rf-conditional ${resells ? "open" : ""}`}>
+      <div className="rf-conditional open">
         <div className="rf-conditional-inner">
           <div className="rf-trust">
             <svg

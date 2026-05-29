@@ -95,7 +95,7 @@ export async function validateCustomerVault(customerVaultId) {
 //   { paymentToken }                              ← Collect.js / hosted form
 //   { cardNumber, cardExpiry: 'MMYY', cardCvv? } ← raw PAN (PCI-scope!)
 //   { achRouting, achAccount, achAccountType }   ← echeck
-export async function createCustomerVault({ profile, paymentDetails }) {
+export async function createCustomerVault({ profile, paymentDetails, billingId }) {
   const params = {
     customer_vault: 'add_customer',
     first_name: profile.firstName,
@@ -103,6 +103,10 @@ export async function createCustomerVault({ profile, paymentDetails }) {
     company: profile.companyName,
     phone: profile.phone,
   }
+  // Optional caller-supplied billing_id for the initial billing record.
+  // If omitted, NMI auto-assigns one (priority 1). Required when you plan
+  // to add a second billing later and need to target either one by ID.
+  if (billingId) params.billing_id = String(billingId)
   if (profile.billingAddress) {
     Object.assign(params, {
       address1: profile.billingAddress.line1,
@@ -150,6 +154,124 @@ export async function createCustomerVault({ profile, paymentDetails }) {
   return res.customer_vault_id
 }
 
+// Add a second (or later) billing record to an existing Customer Vault.
+//
+// Uses NMI's documented `customer_vault=add_billing` action. We initially
+// tried `update_customer` with an unknown billing_id (some sources suggest
+// NMI auto-creates a new billing in that case), but live-tested it on
+// 2026-05-28 and NMI rejected with "Invalid Billing Id". `add_billing` is
+// the correct documented path for this operation.
+//
+// Use cases:
+//   - Customer registered with ACH (priority 1) — add a card billing as
+//     backup (priority 2). chargeInvoice's "Charge card on file" fallback
+//     targets this billing_id.
+//   - Customer registered with card only — could add an ACH billing later
+//     via an admin "Add bank account" action (not yet built).
+//
+// paymentDetails accepts the SAME shape as createCustomerVault.
+export async function addBillingToCustomerVault({
+  customerVaultId,
+  billingId,
+  profile,
+  paymentDetails,
+}) {
+  if (!customerVaultId) {
+    throw new Error('addBillingToCustomerVault: customerVaultId is required')
+  }
+  if (!billingId) {
+    throw new Error('addBillingToCustomerVault: billingId is required')
+  }
+
+  const params = {
+    customer_vault: 'add_billing',
+    customer_vault_id: String(customerVaultId),
+    billing_id: String(billingId),
+  }
+
+  if (profile) {
+    if (profile.firstName) params.first_name = profile.firstName
+    if (profile.lastName) params.last_name = profile.lastName
+    if (profile.companyName) params.company = profile.companyName
+    if (profile.phone) params.phone = profile.phone
+    if (profile.billingAddress) {
+      Object.assign(params, {
+        address1: profile.billingAddress.line1,
+        address2: profile.billingAddress.line2,
+        city: profile.billingAddress.city,
+        state: profile.billingAddress.state,
+        zip: profile.billingAddress.zip,
+        country: profile.billingAddress.country,
+      })
+    }
+  }
+
+  if (paymentDetails?.paymentToken) {
+    params.payment_token = paymentDetails.paymentToken
+  } else if (paymentDetails?.cardNumber) {
+    params.ccnumber = paymentDetails.cardNumber
+    params.ccexp = paymentDetails.cardExpiry
+    if (paymentDetails.cardCvv) params.cvv = paymentDetails.cardCvv
+  } else if (paymentDetails?.achAccount) {
+    params.payment = 'check'
+    params.checkname =
+      paymentDetails.checkName ||
+      `${profile?.firstName || ''} ${profile?.lastName || ''}`.trim()
+    params.checkaba = paymentDetails.achRouting
+    params.checkaccount = paymentDetails.achAccount
+    params.account_type = paymentDetails.achAccountType || 'checking'
+  } else {
+    throw new Error(
+      'addBillingViaUpdateCustomer: paymentDetails must include a card or ACH payment method',
+    )
+  }
+
+  log.info('vault.add_billing.request', {
+    customerVaultId,
+    billingId,
+    hasCard: Boolean(paymentDetails?.paymentToken || paymentDetails?.cardNumber),
+    hasAch: Boolean(paymentDetails?.achAccount),
+  })
+  const res = await nmiTransact(params, { sensitiveKeys: NMI_SENSITIVE_PARAMS })
+  if (res.response !== '1') {
+    const err = new Error(
+      `NMI add_billing failed: ${res.responsetext || 'unknown'}`,
+    )
+    err.permanent = true
+    err.nmiResponse = res
+    throw err
+  }
+  log.info('vault.add_billing.success', { customerVaultId, billingId })
+  return billingId
+}
+
+// Delete a Customer Vault profile. Used as a compensating transaction when
+// a downstream step (e.g. Shopify customerCreate) fails AFTER the vault was
+// created — without this, the vault becomes an orphan and the customer
+// re-submitting the form would create a second one.
+//
+// NMI's `customer_vault=delete_customer` is idempotent on their side —
+// deleting an already-deleted id returns success too. Throws on transport
+// failure or non-1 response; callers can retry.
+export async function deleteCustomerVault(customerVaultId) {
+  if (!customerVaultId) {
+    throw new Error('deleteCustomerVault: customerVaultId is required')
+  }
+  const params = {
+    customer_vault: 'delete_customer',
+    customer_vault_id: String(customerVaultId),
+  }
+  log.info('vault.delete.request', { customerVaultId })
+  const res = await nmiTransact(params, { sensitiveKeys: NMI_SENSITIVE_PARAMS })
+  if (res.response !== '1') {
+    const err = new Error(`NMI delete_customer failed: ${res.responsetext || 'unknown'}`)
+    err.nmiResponse = res
+    throw err
+  }
+  log.info('vault.delete.success', { customerVaultId })
+  return true
+}
+
 export async function findOrCreateCustomerVault({ profile, paymentDetails }) {
   console.log(`\n[customers] NMI vault lookup for ${profile.email}`)
   const existing = await findCustomerVaultByEmail(profile.email)
@@ -168,7 +290,13 @@ export async function findOrCreateCustomerVault({ profile, paymentDetails }) {
 
 // Charge a stored payment method. The vault id MUST already exist —
 // this is the production path used by the recurring scheduler.
-export async function chargeCustomerVault({ customerVaultId, amount, currency, orderId, invoiceNumber }) {
+//
+// `billingId` is OPTIONAL. When omitted, NMI charges the vault's priority-1
+// billing (the first one created). Pass it when the customer has multiple
+// billings (e.g., ACH primary + card backup) and you need to target a
+// specific one — used by the admin "Charge card on file" fallback for ACH
+// customers, where invoice.paymentMethod has been overridden to 'card'.
+export async function chargeCustomerVault({ customerVaultId, amount, currency, orderId, invoiceNumber, billingId }) {
   if (!customerVaultId) throw new Error('chargeCustomerVault: customerVaultId is required')
   if (!Number.isFinite(amount) || amount <= 0) {
     throw new Error(`chargeCustomerVault: amount must be > 0, got ${amount}`)
@@ -182,6 +310,7 @@ export async function chargeCustomerVault({ customerVaultId, amount, currency, o
     orderid: orderId,
     order_description: invoiceNumber ? `Invoice ${invoiceNumber}` : undefined,
   }
+  if (billingId) params.billing_id = String(billingId)
 
   console.log(`\n[NMI charge] vault=${customerVaultId} amount=$${amount.toFixed(2)} order=${orderId}`)
   log.info('charge.request', { customerVaultId, amount, orderId, invoiceNumber })

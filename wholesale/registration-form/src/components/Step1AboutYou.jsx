@@ -1,32 +1,40 @@
-import { useState } from 'react'
-import { Controller, useWatch } from 'react-hook-form'
-import { CREDENTIALS, REFERRALS } from '../constants'
-import CredentialCard from './CredentialCard'
+import { useState } from "react";
+import { Controller, useWatch } from "react-hook-form";
+import { CREDENTIALS, REFERRALS } from "../constants";
+import CredentialCard from "./CredentialCard";
 
-export default function Step1AboutYou({ control, errors, setValue, trigger, clearErrors }) {
-  const [showPassword, setShowPassword] = useState(false)
-  const credentials = useWatch({ control, name: 'credentials' }) || {}
-  const referrals = useWatch({ control, name: 'referrals' }) || {}
-  const selectedCreds = CREDENTIALS.filter((c) => credentials[c.id]?.selected)
+const NAME_INPUT_FILTER = /[^A-Za-zÀ-ÖØ-öø-ÿ' -]/g;
+const PHONE_INPUT_FILTER = /[^0-9+]/g;
+export default function Step1AboutYou({
+  control,
+  errors,
+  setValue,
+  trigger,
+  clearErrors,
+}) {
+  // const [showPassword, setShowPassword] = useState(false);
+  const credentials = useWatch({ control, name: "credentials" }) || {};
+  const referrals = useWatch({ control, name: "referrals" }) || {};
+  const selectedCreds = CREDENTIALS.filter((c) => credentials[c.id]?.selected);
 
   const onToggleCredential = async (id, checked) => {
-    setValue(`credentials.${id}.selected`, checked, { shouldDirty: true })
-    await trigger('credentials')
-    if (checked) clearErrors(`credentials.${id}`)
-  }
+    setValue(`credentials.${id}.selected`, checked, { shouldDirty: true });
+    await trigger("credentials");
+    if (checked) clearErrors(`credentials.${id}`);
+  };
 
   const onToggleReferral = async (id, checked) => {
-    if (id === 'none' && checked) {
+    if (id === "none" && checked) {
       REFERRALS.forEach((r) => {
-        if (r.id !== 'none') setValue(`referrals.${r.id}.selected`, false)
-      })
+        if (r.id !== "none") setValue(`referrals.${r.id}.selected`, false);
+      });
     } else if (checked) {
-      setValue('referrals.none.selected', false)
+      setValue("referrals.none.selected", false);
     }
-    setValue(`referrals.${id}.selected`, checked, { shouldDirty: true })
-    await trigger('referrals')
-    if (checked) clearErrors(`referrals.${id}`)
-  }
+    setValue(`referrals.${id}.selected`, checked, { shouldDirty: true });
+    await trigger("referrals");
+    if (checked) clearErrors(`referrals.${id}`);
+  };
 
   return (
     <section className="rf-step">
@@ -37,7 +45,21 @@ export default function Step1AboutYou({ control, errors, setValue, trigger, clea
 
       <div className="rf-field rf-row rf-row-2">
         <div>
-          <label className="rf-label">First name <span className="rf-req">*</span></label>
+          <label className="rf-label">
+            First name <span className="rf-req">*</span>
+          </label>
+          {/* <Controller
+            name="firstName"
+            control={control}
+            render={({ field }) => (
+              <input
+                {...field}
+                type="text"
+                placeholder="Jane"
+                className={`rf-input ${errors.firstName ? "error" : ""}`}
+              />
+            )}
+          /> */}
           <Controller
             name="firstName"
             control={control}
@@ -46,14 +68,26 @@ export default function Step1AboutYou({ control, errors, setValue, trigger, clea
                 {...field}
                 type="text"
                 placeholder="Jane"
-                className={`rf-input ${errors.firstName ? 'error' : ''}`}
+                className={`rf-input ${errors.firstName ? "error" : ""}`}
+                onChange={(e) => {
+                  const filtered = e.target.value.replace(
+                    NAME_INPUT_FILTER,
+                    "",
+                  );
+                  field.onChange(filtered);
+                }}
               />
             )}
           />
-          {errors.firstName && <p className="rf-help error">{errors.firstName.message}</p>}
+
+          {errors.firstName && (
+            <p className="rf-help error">{errors.firstName.message}</p>
+          )}
         </div>
         <div>
-          <label className="rf-label">Last name <span className="rf-req">*</span></label>
+          <label className="rf-label">
+            Last name <span className="rf-req">*</span>
+          </label>
           <Controller
             name="lastName"
             control={control}
@@ -62,38 +96,43 @@ export default function Step1AboutYou({ control, errors, setValue, trigger, clea
                 {...field}
                 type="text"
                 placeholder="Smith"
-                className={`rf-input ${errors.lastName ? 'error' : ''}`}
+                className={`rf-input ${errors.lastName ? "error" : ""}`}
               />
             )}
           />
-          {errors.lastName && <p className="rf-help error">{errors.lastName.message}</p>}
+          {errors.lastName && (
+            <p className="rf-help error">{errors.lastName.message}</p>
+          )}
         </div>
       </div>
-
-      <div className="rf-field">
-        <label className="rf-label">
-          Email <span className="rf-req">*</span>
-          <span className="rf-hint">We'll save your progress here</span>
-        </label>
-        <Controller
-          name="email"
-          control={control}
-          render={({ field }) => (
-            <input
-              {...field}
-              type="email"
-              placeholder="jane@yourpractice.com"
-              className={`rf-input ${errors.email ? 'error' : ''}`}
-            />
-          )}
-        />
-        {errors.email && <p className="rf-help error">{errors.email.message}</p>}
-      </div>
-
       <div className="rf-field rf-row rf-row-2">
-        <div>
-          <label className="rf-label">Phone <span className="rf-req">*</span></label>
+        <div className="rf-field">
+          <label className="rf-label">
+            Email <span className="rf-req">*</span>
+            <span className="rf-hint">We'll save your progress here</span>
+          </label>
           <Controller
+            name="email"
+            control={control}
+            render={({ field }) => (
+              <input
+                {...field}
+                type="email"
+                placeholder="jane@yourpractice.com"
+                className={`rf-input ${errors.email ? "error" : ""}`}
+              />
+            )}
+          />
+          {errors.email && (
+            <p className="rf-help error">{errors.email.message}</p>
+          )}
+        </div>
+
+        <div>
+          <label className="rf-label">
+            Phone <span className="rf-req">*</span>
+          </label>
+          {/* <Controller
             name="phone"
             control={control}
             render={({ field }) => (
@@ -101,14 +140,41 @@ export default function Step1AboutYou({ control, errors, setValue, trigger, clea
                 {...field}
                 type="tel"
                 placeholder="+1 (555) 123-4567"
-                className={`rf-input ${errors.phone ? 'error' : ''}`}
+                className={`rf-input ${errors.phone ? "error" : ""}`}
+              />
+            )}
+          /> */}
+
+          <Controller
+            name="phone"
+            control={control}
+            render={({ field }) => (
+              <input
+                {...field}
+                type="tel"
+                placeholder="+15146669999"
+                className={`rf-input ${errors.phone ? "error" : ""}`}
+                onChange={(e) => {
+                  let v = e.target.value.replace(PHONE_INPUT_FILTER, "");
+                  if (v.includes("+")) {
+                    const hasLeadingPlus = v.startsWith("+");
+                    v = v.replace(/\+/g, "");
+                    if (hasLeadingPlus) v = "+" + v;
+                  }
+                  field.onChange(v);
+                }}
               />
             )}
           />
-          {errors.phone && <p className="rf-help error">{errors.phone.message}</p>}
+
+          {errors.phone && (
+            <p className="rf-help error">{errors.phone.message}</p>
+          )}
         </div>
-        <div>
-          <label className="rf-label">Create a password <span className="rf-req">*</span></label>
+        {/* <div>
+          <label className="rf-label">
+            Create a password <span className="rf-req">*</span>
+          </label>
           <div className="rf-password-wrap">
             <Controller
               name="password"
@@ -116,9 +182,9 @@ export default function Step1AboutYou({ control, errors, setValue, trigger, clea
               render={({ field }) => (
                 <input
                   {...field}
-                  type={showPassword ? 'text' : 'password'}
+                  type={showPassword ? "text" : "password"}
                   placeholder="At least 8 characters"
-                  className={`rf-input ${errors.password ? 'error' : ''}`}
+                  className={`rf-input ${errors.password ? "error" : ""}`}
                 />
               )}
             />
@@ -126,33 +192,51 @@ export default function Step1AboutYou({ control, errors, setValue, trigger, clea
               type="button"
               className="rf-password-toggle"
               onClick={() => setShowPassword((s) => !s)}
-              aria-label={showPassword ? 'Hide password' : 'Show password'}
+              aria-label={showPassword ? "Hide password" : "Show password"}
             >
               {showPassword ? (
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
                   <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
                   <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24" />
                   <line x1="1" y1="1" x2="23" y2="23" />
                 </svg>
               ) : (
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
                   <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
                   <circle cx="12" cy="12" r="3" />
                 </svg>
               )}
             </button>
           </div>
-          {errors.password && <p className="rf-help error">{errors.password.message}</p>}
-        </div>
+          {errors.password && (
+            <p className="rf-help error">{errors.password.message}</p>
+          )}
+        </div> */}
       </div>
 
       <div className="rf-divider">
         <h2 className="rf-section-label">Your practice</h2>
-        <p className="rf-section-hint">Helps us tailor your wholesale catalog and pricing.</p>
+        <p className="rf-section-hint">
+          Helps us tailor your wholesale catalog and pricing.
+        </p>
       </div>
 
       <div className="rf-field">
-        <label className="rf-label">Business name <span className="rf-opt">Optional</span></label>
+        <label className="rf-label">
+          Business name <span className="rf-opt">Optional</span>
+        </label>
         <Controller
           name="businessName"
           control={control}
@@ -174,24 +258,28 @@ export default function Step1AboutYou({ control, errors, setValue, trigger, clea
         </label>
         <div className="rf-checkbox-grid">
           {CREDENTIALS.map((cred) => {
-            const selected = credentials[cred.id]?.selected
+            const selected = credentials[cred.id]?.selected;
             return (
               <label
                 key={cred.id}
-                className={`rf-check-item ${selected ? 'checked' : ''}`}
+                className={`rf-check-item ${selected ? "checked" : ""}`}
               >
                 <input
                   type="checkbox"
                   checked={Boolean(selected)}
-                  onChange={(e) => onToggleCredential(cred.id, e.target.checked)}
+                  onChange={(e) =>
+                    onToggleCredential(cred.id, e.target.checked)
+                  }
                 />
                 <span>{cred.name}</span>
               </label>
-            )
+            );
           })}
         </div>
         {errors.credentials?.message && (
-          <p className="rf-help error" style={{ marginTop: 8 }}>{errors.credentials.message}</p>
+          <p className="rf-help error" style={{ marginTop: 8 }}>
+            {errors.credentials.message}
+          </p>
         )}
       </div>
 
@@ -199,10 +287,13 @@ export default function Step1AboutYou({ control, errors, setValue, trigger, clea
         <div style={{ marginTop: 20 }}>
           <div className="rf-cred-docs-header">
             <h3>Required documents &amp; details</h3>
-            <span className="rf-cred-counter">{selectedCreds.length} selected</span>
+            <span className="rf-cred-counter">
+              {selectedCreds.length} selected
+            </span>
           </div>
           <p className="rf-section-hint" style={{ marginBottom: 14 }}>
-            A quick verification step for each credential. Files are encrypted and reviewed by our team only.
+            A quick verification step for each credential. Files are encrypted
+            and reviewed by our team only.
           </p>
           {selectedCreds.map((cred) => (
             <CredentialCard
@@ -223,11 +314,11 @@ export default function Step1AboutYou({ control, errors, setValue, trigger, clea
         </label>
         <div className="rf-referral-list">
           {REFERRALS.map((ref) => {
-            const selected = referrals[ref.id]?.selected
-            const fieldError = errors.referrals?.[ref.id]?.value?.message
+            const selected = referrals[ref.id]?.selected;
+            const fieldError = errors.referrals?.[ref.id]?.value?.message;
             return (
               <div key={ref.id} className="rf-referral-item">
-                <label className={`rf-check-item ${selected ? 'checked' : ''}`}>
+                <label className={`rf-check-item ${selected ? "checked" : ""}`}>
                   <input
                     type="checkbox"
                     checked={Boolean(selected)}
@@ -236,7 +327,9 @@ export default function Step1AboutYou({ control, errors, setValue, trigger, clea
                   <span>{ref.name}</span>
                 </label>
                 {ref.field && (
-                  <div className={`rf-referral-followup ${selected ? 'open' : ''}`}>
+                  <div
+                    className={`rf-referral-followup ${selected ? "open" : ""}`}
+                  >
                     <Controller
                       name={`referrals.${ref.id}.value`}
                       control={control}
@@ -246,7 +339,7 @@ export default function Step1AboutYou({ control, errors, setValue, trigger, clea
                           {...field}
                           type="text"
                           placeholder={ref.field.placeholder}
-                          className={`rf-input ${fieldError ? 'error' : ''}`}
+                          className={`rf-input ${fieldError ? "error" : ""}`}
                         />
                       )}
                     />
@@ -258,13 +351,15 @@ export default function Step1AboutYou({ control, errors, setValue, trigger, clea
                   </div>
                 )}
               </div>
-            )
+            );
           })}
         </div>
         {errors.referrals?.message && (
-          <p className="rf-help error" style={{ marginTop: 8 }}>{errors.referrals.message}</p>
+          <p className="rf-help error" style={{ marginTop: 8 }}>
+            {errors.referrals.message}
+          </p>
         )}
       </div>
     </section>
-  )
+  );
 }

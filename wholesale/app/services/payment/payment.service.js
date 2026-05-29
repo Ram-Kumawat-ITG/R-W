@@ -149,11 +149,23 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
       `base=$${baseAmount.toFixed(2)} fee=$${feeAmount.toFixed(2)} total=$${amount.toFixed(2)}`,
   )
 
+  // Resolve the NMI billing_id to target for this charge. Customers with
+  // a single billing (card-or-check preferred) leave billingId undefined —
+  // NMI charges the priority-1 (only) billing. ACH customers have two
+  // billings inside their vault; we pick the one that matches the active
+  // invoice.paymentMethod so the cheque→card / ACH→card admin fallback
+  // hits the card billing instead of the (priority-1) ACH billing.
+  const targetBillingId =
+    invoice.paymentMethod === 'ach'
+      ? customerMap.nmiAchBillingId || undefined
+      : customerMap.nmiCardBillingId || undefined
+
   const attemptNumber = invoice.attemptCount + 1
   let result
   try {
     result = await chargeCustomerVault({
       customerVaultId: customerMap.nmiCustomerVaultId,
+      billingId: targetBillingId,
       amount,
       currency: invoice.currency,
       orderId: invoice.shopifyOrderId,

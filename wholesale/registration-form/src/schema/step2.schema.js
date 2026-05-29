@@ -57,23 +57,18 @@ export const step2Schema = yup.object({
     .required('Required')
     .oneOf(['Residential', 'Commercial'], 'Invalid value'),
   resellsProducts: yup.boolean().required(),
-  tax: yup.object().when('resellsProducts', {
-    is: true,
-    then: () =>
-      yup.object({
-        taxIdType: yup.string().trim().required('Required').oneOf(['ein', 'ssn']),
-        taxId: yup.string().trim().required('Required')
-          .when('taxIdType', {
-            is: 'ein',
-            then: (s) => s.matches(/^\d{2}-?\d{7}$/, 'Enter a valid 9-digit EIN (e.g. 12-3456789)'),
-            otherwise: (s) => s.matches(/^\d{3}-?\d{2}-?\d{4}$/, 'Enter a valid 9-digit SSN (e.g. 123-45-6789)'),
-          }),
-        salesPermit: yup.string().trim().notRequired(),
-        exemptState: yup.string().trim().required('Required'),
-        itemsToResell: yup.string().trim().required('Required'),
-        businessActivity: yup.string().trim().required('Required'),
+  tax: yup.object({
+    taxIdType: yup.string().trim().required('Required').oneOf(['ein', 'ssn']),
+    taxId: yup.string().trim().required('Required')
+      .when('taxIdType', {
+        is: 'ein',
+        then: (s) => s.matches(/^\d{2}-?\d{7}$/, 'Enter a valid 9-digit EIN (e.g. 12-3456789)'),
+        otherwise: (s) => s.matches(/^\d{3}-?\d{2}-?\d{4}$/, 'Enter a valid 9-digit SSN (e.g. 123-45-6789)'),
       }),
-    otherwise: (s) => s.notRequired(),
+    salesPermit: yup.string().trim().notRequired(),
+    exemptState: yup.string().trim().required('Required'),
+    itemsToResell: yup.string().trim().required('Required'),
+    businessActivity: yup.string().trim().required('Required'),
   }),
 })
 

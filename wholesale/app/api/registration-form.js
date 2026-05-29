@@ -10,7 +10,73 @@ import {
   uploadFileToShopify,
   ShopifyUserError,
 } from "../services/shopify/shopify.service";
-import { createCustomerVault } from "../services/nmi/nmi.service"; 
+import {
+  createCustomerVault,
+  deleteCustomerVault,
+  addBillingToCustomerVault,
+} from "../services/nmi/nmi.service";
+
+// Generate a stable, readable NMI billing_id. Random suffix prevents
+// collisions when re-using a customer email; prefix makes logs scannable.
+function generateBillingId(kind) {
+  const rand = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+  return `${kind}_${rand}`;
+}
+
+// ── Helper: NMI vault compensating delete with retry ─────────────────
+//
+// Used when a step AFTER NMI-vault create (Mongo write, Shopify create)
+// fails and we need to roll back. Retries up to 3× with linear backoff,
+// then logs + returns false. Never throws — we don't want vault-cleanup
+// failure to clobber the original error being returned to the user.
+async function deleteNmiVaultWithRetry(vaultId, maxAttempts = 3) {
+  if (!vaultId) return false;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await deleteCustomerVault(vaultId);
+      console.log(`[proxy/submit] NMI vault deleted on attempt ${attempt}: ${vaultId}`);
+      return true;
+    } catch (err) {
+      lastErr = err;
+      console.warn(
+        `[proxy/submit] NMI vault delete attempt ${attempt}/${maxAttempts} failed for ${vaultId}: ${err?.message || err}`,
+      );
+      if (attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 500 * attempt));
+      }
+    }
+  }
+  console.error(
+    `[proxy/submit] NMI vault delete exhausted ${maxAttempts} attempts for ${vaultId}; vault is now orphan — manual cleanup needed. Last error:`,
+    lastErr?.message || lastErr,
+  );
+  return false;
+}
+
+// ── Helper: WholesaleApplication.create with retry ───────────────────
+//
+// Mongo writes are usually fast and reliable, but transient hiccups
+// (network blip, replica-set election) can fail the first try. 3 attempts
+// with linear backoff is more than enough — if all fail, the caller rolls
+// back the NMI vault and surfaces an error.
+async function createMongoDocWithRetry(payload, maxAttempts = 3) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await WholesaleApplication.create(payload);
+    } catch (err) {
+      lastErr = err;
+      console.warn(
+        `[proxy/submit] Mongo create attempt ${attempt}/${maxAttempts} failed: ${err?.message || err}`,
+      );
+      if (attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 500 * attempt));
+      }
+    }
+  }
+  throw lastErr;
+}
 
 // POST /api/registration-form
 // Storefront-proxied wholesale application submit. Parses the multipart
@@ -153,22 +219,78 @@ export async function action({ request }) {
 
   // Step 1 — NMI Customer Vault. CRITICAL. The vault id is required for
   // every future charge against this customer; without it the order pipeline
-  // can't run. If creation fails we abort with no side effects: no Mongo
-  // doc, no Shopify customer, no email. The applicant can retry from the
-  // error screen.
+  // can't run. Vault structure depends on the customer's preferred method:
+  //
+  //   method = 'card' or 'check' → 1 billing (card) — priority 1
+  //   method = 'ach'             → 2 billings: ACH priority 1 + card priority 2
+  //
+  // For ACH customers, the card billing is a backup used by the admin
+  // "Charge card on file" fallback. Card billing is always present because
+  // a card on file is required for all wholesale accounts (per the Step 3
+  // form copy and the project rule).
+  //
+  // We generate the billing_ids ourselves (vs letting NMI auto-assign) so
+  // we can target either billing by ID when charging. If creation fails we
+  // abort with no side effects: no Mongo doc, no Shopify customer, no email.
+  const cardBillingId = generateBillingId("card");
+  const achBillingId =
+    payload.payment?.method === "ach" ? generateBillingId("ach") : null;
+
+  const nmiProfile = {
+    firstName: payload.firstName,
+    lastName: payload.lastName,
+    email: payload.email,
+    phone: payload.phone,
+    companyName: payload.businessName,
+    billingAddress: payload.billingAddress,
+  };
+
   let nmiCustomerVaultId;
   try {
-    nmiCustomerVaultId = await createCustomerVault({
-      profile: {
-        firstName: payload.firstName,
-        lastName: payload.lastName,
-        email: payload.email,
-        phone: payload.phone,
-        companyName: payload.businessName,
-        billingAddress: payload.billingAddress,
-      },
-      paymentDetails: { paymentToken: payload.payment?.paymentToken },
-    });
+    if (payload.payment?.method === "ach") {
+      // Step 1a — Create vault with ACH as the primary billing (priority 1).
+      nmiCustomerVaultId = await createCustomerVault({
+        profile: nmiProfile,
+        paymentDetails: {
+          achRouting: payload.payment.achRoutingNumber,
+          achAccount: payload.payment.achAccountNumber, // full account — needed for NMI
+          achAccountType: (payload.payment.achAccountType || "Checking").toLowerCase(),
+          checkName: payload.payment.achAccountName,
+        },
+        billingId: achBillingId,
+      });
+
+      // Step 1b — Add card as secondary billing (priority 2) for backup
+      // charges. If this fails after vault create, delete the vault to
+      // avoid a half-configured vault (only ACH, no card backup).
+      try {
+        await addBillingToCustomerVault({
+          customerVaultId: nmiCustomerVaultId,
+          billingId: cardBillingId,
+          profile: nmiProfile,
+          paymentDetails: { paymentToken: payload.payment.paymentToken },
+        });
+      } catch (cardBillingErr) {
+        console.error(
+          "[proxy/submit] NMI add card billing failed for ACH customer:",
+          cardBillingErr?.message || cardBillingErr,
+        );
+        await deleteNmiVaultWithRetry(nmiCustomerVaultId);
+        return sendResponse(
+          502,
+          "error",
+          "Could not save your card on file. Please try again.",
+          { detail: cardBillingErr?.message || String(cardBillingErr) },
+        );
+      }
+    } else {
+      // 'card' or 'check' — single card billing as priority 1.
+      nmiCustomerVaultId = await createCustomerVault({
+        profile: nmiProfile,
+        paymentDetails: { paymentToken: payload.payment?.paymentToken },
+        billingId: cardBillingId,
+      });
+    }
   } catch (vaultErr) {
     console.error(
       "[proxy/submit] NMI vault create failed:",
@@ -193,10 +315,14 @@ export async function action({ request }) {
     );
   }
 
-  // Restructure flat payment fields into nested card / ach shape before persisting.
-  // Must run AFTER the NMI vault call which still needs the flat paymentToken.
+  // Restructure flat payment fields into nested card / ach shape before
+  // persisting. The card billing_id is ALWAYS stored (every customer has
+  // a card on file). The ach billing_id is stored ONLY for ACH-preferred
+  // customers. Full ACH account number is NEVER stored in Mongo — only
+  // the last 4 digits, plus the NMI billing_id which is our handle to
+  // charge ACH via NMI's vault.
   if (payload.payment) {
-    const p = payload.payment
+    const p = payload.payment;
     payload.payment = {
       method: p.method,
       card: {
@@ -204,26 +330,36 @@ export async function action({ request }) {
         cardBrand: p.cardBrand,
         cardLast4: p.cardLast4,
         paymentToken: p.paymentToken,
+        nmi_billing_id: cardBillingId,
       },
-      ach: p.method === 'ach' ? {
-        achAccountName: p.achAccountName,
-        achRoutingNumber: p.achRoutingNumber,
-        achAccountLast4: p.achAccountLast4,
-        achAccountType: p.achAccountType,
-      } : null,
-    }
+      ach:
+        p.method === "ach"
+          ? {
+              achAccountName: p.achAccountName,
+              achRoutingNumber: p.achRoutingNumber,
+              achAccountLast4: p.achAccountLast4,
+              achAccountType: p.achAccountType,
+              nmi_billing_id: achBillingId,
+            }
+          : null,
+    };
   }
 
   // Step 2 — persist the wholesale application with the vault id baked in.
   // The most precious piece of data is now safely written to Mongo before
-  // any further side effects.
+  // any further side effects. Retries 3× on transient failures; if all
+  // retries fail, the NMI vault is rolled back so the customer can retry
+  // from a clean state.
   payload.nmiCustomerVaultId = nmiCustomerVaultId;
 
   let app;
   try {
-    app = await WholesaleApplication.create(payload);
+    app = await createMongoDocWithRetry(payload);
   } catch (e) {
-    console.error("[proxy/submit] WholesaleApplication.create failed:", e);
+    console.error("[proxy/submit] WholesaleApplication.create failed after retries:", e);
+    // Roll back the NMI vault — without this, a customer resubmitting would
+    // accumulate a fresh vault each attempt while the failed one orphans.
+    await deleteNmiVaultWithRetry(nmiCustomerVaultId);
     return sendResponse(500, "error", "Failed to save application", {
       detail: e.message,
     });
@@ -278,62 +414,25 @@ export async function action({ request }) {
       );
     }
 
-    // Notify store admin of the new application
-    try {
-      const shopRes = await admin.graphql(`
-        query {
-          shop {
-            email
-            name
-          }
-        }
-      `)
-      const shopData = await shopRes.json()
-      const storeEmail = shopData?.data?.shop?.email
-
-      if (storeEmail) {
-        const notifyRes = await admin.graphql(`
-          mutation sendAdminNotification($input: EmailInput!) {
-            emailSend(input: $input) {
-              userErrors { field message }
-            }
-          }
-        `, {
-          variables: {
-            input: {
-              to: storeEmail,
-              subject: `New Wholesale Application — ${payload.firstName} ${payload.lastName}`,
-              body:
-                `A new wholesale application has been submitted.\n\n` +
-                `Name: ${payload.firstName} ${payload.lastName}\n` +
-                `Email: ${payload.email}\n` +
-                `Phone: ${payload.phone || 'N/A'}\n` +
-                `Business: ${payload.businessName || 'N/A'}\n` +
-                `Payment method: ${payload.payment?.method?.toUpperCase() || 'N/A'}\n\n` +
-                `Review and approve in your admin dashboard.`,
-            },
-          },
-        })
-        const notifyData = await notifyRes.json()
-        const notifyErrors = notifyData?.data?.emailSend?.userErrors
-        if (notifyErrors?.length) {
-          console.error('[proxy/submit] admin notification userErrors:', notifyErrors)
-        } else {
-          console.log(`[proxy/submit] admin notification sent to ${storeEmail}`)
-        }
-      }
-    } catch (adminEmailErr) {
-      console.error('[proxy/submit] admin notification email failed:', adminEmailErr?.message || adminEmailErr)
-    }
+    // (Admin email notification removed — was using a non-existent
+    // `emailSend` mutation. Shopify Admin GraphQL has no generic send-email
+    // mutation. Admins see new applications on the Customers admin page.
+    // If real-time notification becomes important, wire up Resend or
+    // nodemailer — see CLAUDE.md changelog for context.)
   } catch (e) {
     console.error("[proxy/submit] customerCreate failed:", e?.message || e);
 
-    // Shopify returned structured field errors (e.g., email/phone already taken).
-    // Delete the doc we just created so the user can fix and resubmit cleanly.
-    // Note: the NMI vault stays behind. On retry a fresh vault is created;
-    // the orphan can be cleaned up offline if needed.
+    // Shopify returned structured field errors (e.g., email/phone already
+    // taken, invalid format). ALWAYS full rollback: delete both the NMI
+    // vault and the Mongo doc so the customer can resubmit cleanly without
+    // any stale records. Earlier we had a "duplicate phone" exception that
+    // kept both — reversed on the project owner's request: if Shopify
+    // refused to create the customer, we don't want a Mongo doc OR an
+    // NMI vault hanging around either.
     if (e instanceof ShopifyUserError) {
+      await deleteNmiVaultWithRetry(nmiCustomerVaultId);
       await WholesaleApplication.deleteOne({ _id: app._id });
+
       const fieldErrors = e.userErrors.map((ue) => {
         const rawField = Array.isArray(ue.field)
           ? ue.field[ue.field.length - 1]

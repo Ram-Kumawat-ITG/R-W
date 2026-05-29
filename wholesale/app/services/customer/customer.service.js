@@ -125,7 +125,7 @@ export async function ensureCustomerForOrder({ shop, order }) {
   // history. The cheque → card admin fallback mutates
   // `Invoice.paymentMethod`, never this customer-level value.
   const app = await WholesaleApplication.findOne({ shop, email: profile.email })
-    .select('payment.method nmiCustomerVaultId')
+    .select('payment.method payment.card payment.ach nmiCustomerVaultId')
     .lean()
 
   {
@@ -199,6 +199,23 @@ export async function ensureCustomerForOrder({ shop, order }) {
         console.log(`[customers] NMI vault link unchanged on customer_maps: ${sourceVaultId}`)
       }
     }
+  }
+
+  // Mirror NMI billing_ids from the application. Card billing is always
+  // present (card on file required for all wholesale accounts); ACH billing
+  // only for customers whose preferred method was ACH at registration.
+  // chargeInvoice uses these to target a specific billing when the invoice
+  // payment method requires it (e.g., admin "Charge card on file" fallback
+  // on an ACH-default customer).
+  const sourceCardBillingId = app?.payment?.card?.nmi_billing_id || null
+  const sourceAchBillingId = app?.payment?.ach?.nmi_billing_id || null
+  if (mapping.nmiCardBillingId !== sourceCardBillingId) {
+    mapping.nmiCardBillingId = sourceCardBillingId
+    console.log(`[customers] nmi card billing_id updated: ${sourceCardBillingId || '(none)'}`)
+  }
+  if (mapping.nmiAchBillingId !== sourceAchBillingId) {
+    mapping.nmiAchBillingId = sourceAchBillingId
+    console.log(`[customers] nmi ach billing_id updated: ${sourceAchBillingId || '(none)'}`)
   }
 
   mapping.lastSyncedAt = new Date()
