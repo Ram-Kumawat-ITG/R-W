@@ -196,6 +196,20 @@ export function findExistingProcessingFeeLine(qboLines) {
 // derive — at which point the lock is being released, so we want the
 // amount-based status, not the lock state, to win.
 //
+// `awaiting_settlement` IS sticky. It signals that an ACH transaction
+// was accepted at NMI's gateway (response code 100) but the ACH
+// network has not yet confirmed the funds — settlement takes 1–3
+// business days and the transaction can still bounce. We deliberately
+// DO NOT bump amountPaid while in this state; the in-flight credit
+// lives on `pendingSettlementAmount`. The ACH settlement-check CRON
+// pass (PASS 1.7) is the only path that transitions out: settled →
+// applies the amount + lets derivation recompute, failed → clears
+// the pending fields + writes `failed`/`pending` directly. Without
+// the sticky guard a stray `applyDerivedPaymentStatus` call on an
+// invoice with amountPaid=0 would mis-flip awaiting_settlement back
+// to pending and the CRON would attempt to charge the customer
+// again while NMI is still processing the first transaction.
+//
 // `failed` is NOT sticky either. If an invoice has exhausted retries
 // (failed) and then a manual payment arrives, the money is real and
 // the status should reflect that (partially_paid / paid). The CRON
@@ -209,6 +223,7 @@ export function findExistingProcessingFeeLine(qboLines) {
 export function deriveInvoicePaymentStatus(invoice) {
   if (!invoice) return 'pending'
   if (invoice.paymentStatus === 'cancelled') return 'cancelled'
+  if (invoice.paymentStatus === 'awaiting_settlement') return 'awaiting_settlement'
   const due = Number(invoice.amountDue || 0)
   const paid = Number(invoice.amountPaid || 0)
   const EPS = 0.005

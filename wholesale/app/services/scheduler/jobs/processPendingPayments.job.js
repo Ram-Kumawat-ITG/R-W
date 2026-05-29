@@ -1,7 +1,11 @@
 import connectDB from '../../APIService/mongo.service'
 import Invoice from '../../../models/invoice.server'
 import CustomerMap from '../../../models/customerMap.server'
-import { chargeInvoice, propagateSuccessfulPayment } from '../../payment/payment.service'
+import {
+  chargeInvoice,
+  propagateSuccessfulPayment,
+  checkAchSettlement,
+} from '../../payment/payment.service'
 import { createLogger } from '../../../utils/logger.utils'
 
 export const PROCESS_PENDING_PAYMENTS_JOB = 'process-pending-payments'
@@ -89,7 +93,13 @@ export function registerProcessPendingPaymentsJob(agenda) {
           if (result.skipped) {
             remarkMsg = `CRON ${methodLabel} charge skipped: ${result.reason}`
           } else if (result.outcome === 'approved') {
-            remarkMsg = `CRON ${methodLabel} charged successfully (NMI txn ${result.transactionId || '?'})`
+            // ACH approvals mean "accepted into the ACH network",
+            // NOT "funds settled". The settlement-check pass (PASS
+            // 1.7) is what eventually transitions to paid (or back to
+            // pending on a return). Tell the truth in the remark.
+            remarkMsg = result.awaitingSettlement
+              ? `CRON ACH submitted — NMI accepted txn ${result.transactionId || '?'}, awaiting settlement (typically 1–3 business days)`
+              : `CRON ${methodLabel} charged successfully (NMI txn ${result.transactionId || '?'})`
           } else if (result.outcome === 'declined') {
             remarkMsg = `CRON ${methodLabel} charge declined: ${result.responseText || 'no reason given'}`
           } else {
@@ -189,6 +199,120 @@ export function registerProcessPendingPaymentsJob(agenda) {
         console.log(`│ ⓘ reminder logged invoice=${invoice._id} "${message}"`)
       }
 
+      // PASS 1.7 — poll NMI for awaiting-settlement ACH invoices.
+      //
+      // ACH sales return NMI response code 100 ("Approved") at the
+      // gateway level immediately, but funds settle 1–3 business days
+      // later when the ACH network responds. Until then the
+      // transaction can still bounce (NSF, closed account, frozen
+      // funds, etc.). chargeInvoice's ACH branch parks accepted
+      // transactions in paymentStatus='awaiting_settlement' WITHOUT
+      // bumping amountPaid or running downstream sync; this pass calls
+      // checkAchSettlement which queries NMI's query.php for the
+      // transaction's current `condition` and either:
+      //   - applies the credit + propagates to QBO/Shopify (settled)
+      //   - drops the credit + flips back to pending/failed (returned)
+      //   - leaves the invoice as-is (still pending — log a remark at
+      //     most once per day to avoid flooding the Remarks panel)
+      //
+      // PASS 1.5 already runs before this so any failed-then-returned
+      // invoice that flips out of awaiting_settlement back to pending
+      // is picked up by the next tick's PASS 1 for a retry — without
+      // double-billing the customer, since the original transaction
+      // was confirmed as returned by NMI.
+      //
+      // Once-per-day throttle: NMI reads aren't free + the Remarks
+      // panel becomes unreadable if every CRON tick (every 30s in dev,
+      // 15th/last in prod) logs "still pending". The check itself
+      // runs every tick — only the remark write is throttled.
+      const SETTLEMENT_REMARK_THROTTLE_MS = 24 * 60 * 60 * 1000
+      const settlementCursor = Invoice.find({
+        paymentStatus: 'awaiting_settlement',
+        pendingSettlementTxnId: { $exists: true, $ne: null },
+      }).cursor()
+      let settlementChecked = 0
+      let settlementSettled = 0
+      let settlementReturned = 0
+      let settlementStillPending = 0
+      let settlementUnknown = 0
+      for await (const invoice of settlementCursor) {
+        settlementChecked += 1
+        const invId = invoice._id.toString()
+        const lastCheck = invoice.pendingSettlementLastCheckedAt
+        console.log(
+          `│ ✓ settlement-check invoice ${invoice.qboInvoiceId || invId} txn=${invoice.pendingSettlementTxnId} ` +
+            `since=${invoice.pendingSettlementSince?.toISOString?.() || '?'}`,
+        )
+        try {
+          const customerMap = invoice.customerMapRef
+            ? await CustomerMap.findById(invoice.customerMapRef)
+            : null
+          const result = await checkAchSettlement({ invoice, customerMap })
+          let remarkMsg = null
+          if (result.action === 'settled') {
+            settlementSettled += 1
+            console.log(`│     ✓ → SETTLED amount=$${Number(result.amount || 0).toFixed(2)}`)
+            remarkMsg =
+              `ACH settlement confirmed (NMI txn ${result.transactionId || '?'}, ` +
+              `condition=${result.condition || 'complete'}) — ` +
+              `$${Number(result.amount || 0).toFixed(2)} applied to invoice`
+          } else if (result.action === 'returned') {
+            settlementReturned += 1
+            console.log(`│     ✓ → RETURNED condition=${result.condition} reason="${result.reason}"`)
+            remarkMsg =
+              `ACH return — NMI condition=${result.condition}, reason: ${result.reason || 'no detail'}. ` +
+              `Invoice reset to ${invoice.paymentStatus} so a retry / card fallback can be attempted.`
+          } else if (result.action === 'still_pending') {
+            settlementStillPending += 1
+            console.log(`│     ✓ → still pending (condition=${result.condition})`)
+            const since = lastCheck ? Date.now() - new Date(lastCheck).getTime() : Infinity
+            if (since >= SETTLEMENT_REMARK_THROTTLE_MS) {
+              const ageDays = invoice.pendingSettlementSince
+                ? Math.max(
+                    0,
+                    Math.floor(
+                      (Date.now() - new Date(invoice.pendingSettlementSince).getTime()) /
+                        (24 * 60 * 60 * 1000),
+                    ),
+                  )
+                : 0
+              remarkMsg =
+                `ACH still settling — NMI condition=${result.condition || 'pendingsettlement'}, ` +
+                `day ${ageDays} of typical 1–3 business day window`
+            }
+          } else if (result.action === 'unknown') {
+            settlementUnknown += 1
+            console.log(`│     ✓ → UNKNOWN reason="${result.reason}"`)
+            remarkMsg = `ACH settlement lookup failed: ${result.reason || 'unknown'} — will retry next tick`
+          } else {
+            // noop — invoice changed underneath us; just skip.
+            console.log(`│     ✓ → noop reason="${result.reason}"`)
+          }
+          if (remarkMsg) {
+            await Invoice.updateOne(
+              { _id: invoice._id },
+              {
+                $push: {
+                  remarks: {
+                    kind: 'cron_ach_settlement_check',
+                    message: remarkMsg,
+                    amount: result.amount,
+                    currency: invoice.currency,
+                    source: 'cron',
+                    createdAt: new Date(),
+                  },
+                },
+              },
+            )
+          }
+        } catch (err) {
+          settlementUnknown += 1
+          console.log(`│     ✓ → THREW ${err.message}`)
+          console.error(err.stack || err)
+          log.error('settlement.unexpected', { invoiceId: invId, err })
+        }
+      }
+
       // PASS 2 — invoices that have money paid but downstream sync
       // (QBO recordPayment, Shopify SALE transaction, or Shopify
       // orderMarkAsPaid) is behind. Replays just the sync side; never
@@ -281,12 +405,15 @@ export function registerProcessPendingPaymentsJob(agenda) {
         `└─── tick ${tick} done in ${elapsedMs}ms — ` +
           `charges: processed=${processed} approved=${approved} declined=${declined} errored=${errored} skipped=${skipped}` +
           ` | reminders: ${remindersLogged}` +
+          ` | ach-settlement: checked=${settlementChecked} settled=${settlementSettled} returned=${settlementReturned} pending=${settlementStillPending} unknown=${settlementUnknown}` +
           ` | sync-retries: processed=${sweepProcessed} ok=${sweepOk} failed=${sweepFailed}\n`,
       )
       log.info('tick.complete', {
         tick, tickId, elapsedMs,
         processed, approved, declined, errored, skipped,
         remindersLogged,
+        settlementChecked, settlementSettled, settlementReturned,
+        settlementStillPending, settlementUnknown,
         sweepProcessed, sweepOk, sweepFailed,
       })
     },

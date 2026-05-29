@@ -473,6 +473,44 @@ export async function getNmiDashboardSnapshot({ startDate, endDate, periodDays =
   }
 }
 
+// Fetch the current state of a single NMI transaction by id. Used by
+// the ACH settlement-check CRON pass to decide whether an awaiting-
+// settlement invoice has cleared (`condition='complete'`), bounced
+// (`condition='failed'` / `'canceled'`), or is still working through
+// the ACH network (`condition='pendingsettlement'` / `'pending'`).
+//
+// Returns:
+//   { found: true, condition, latestAction, transaction }
+//     where `condition` is the NMI condition string (lowercased) and
+//     `latestAction` is the most-recent action row (may carry settle/
+//     return metadata depending on the gateway's state)
+//   { found: false, reason }
+//     transport / parsing failure, or NMI returned no matching row.
+//     Callers MUST treat this as "no information" — never as a settle
+//     or fail signal.
+export async function getNmiTransactionStatus(transactionId) {
+  if (!transactionId) return { found: false, reason: 'no transactionId provided' }
+  try {
+    const xml = await nmiQuery({ transaction_id: transactionId })
+    if (/<error_response>/i.test(xml)) {
+      const reason = (xml.match(/<error_response>([^<]+)<\/error_response>/i) || [])[1] || 'NMI error_response'
+      log.warn('txn.status.error_response', { transactionId, reason })
+      return { found: false, reason: reason.trim() }
+    }
+    const records = parseNmiTransactions(xml)
+    const transaction = records.find((r) => String(r.transaction_id || '') === String(transactionId)) || records[0]
+    if (!transaction) {
+      return { found: false, reason: 'no transaction records returned' }
+    }
+    const condition = String(transaction.condition || '').toLowerCase()
+    const last = latestAction(transaction)
+    return { found: true, condition, latestAction: last, transaction }
+  } catch (err) {
+    log.warn('txn.status.failed', { transactionId, err: err?.message || String(err) })
+    return { found: false, reason: err?.message || 'transaction status fetch failed' }
+  }
+}
+
 // Optional helper for admin tooling — refund or void a prior transaction.
 export async function refundTransaction({ transactionId, amount }) {
   const params = { type: 'refund', transactionid: transactionId }

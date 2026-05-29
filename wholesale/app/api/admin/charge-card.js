@@ -56,6 +56,18 @@ export async function action({ request, params }) {
   if (invoice.paymentStatus === 'in_progress') {
     return sendResponse(409, 'error', 'A charge is already in progress for this invoice', null)
   }
+  // Charging the card on top of an in-flight ACH would risk double-
+  // billing the customer if the ACH eventually settles. Force the
+  // admin to wait for the settlement decision (or void the ACH
+  // transaction directly in NMI) before running a card fallback.
+  if (invoice.paymentStatus === 'awaiting_settlement') {
+    return sendResponse(
+      409,
+      'error',
+      `An ACH transaction is awaiting settlement (NMI txn ${invoice.pendingSettlementTxnId || '?'}). Wait for the bank to confirm or return it, or void the ACH transaction in NMI first, before charging the card on file.`,
+      null,
+    )
+  }
 
   const customerMap = order.customerEmail
     ? await CustomerMap.findOne({ shop: session.shop, email: order.customerEmail })

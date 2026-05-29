@@ -51,6 +51,7 @@ const RETRYABLE_PAYMENT_STATUSES = new Set([
 const REMARK_KIND_META = {
   cron_card_attempt: { label: "CRON charge", tone: "info" },
   cron_ach_attempt: { label: "ACH charge", tone: "info" },
+  cron_ach_settlement_check: { label: "ACH settlement", tone: "info" },
   cron_cheque_reminder: { label: "Cheque reminder", tone: "warning" },
   // Legacy kind — preserved for back-compat with rows logged before
   // ACH became an auto-charged method. New rows for ACH go to
@@ -88,6 +89,7 @@ function computePipelineSteps({ order, invoice }) {
   const paymentStatus = invoice?.paymentStatus;
   const paid = paymentStatus === "paid";
   const inProgress = paymentStatus === "in_progress";
+  const awaitingSettlement = paymentStatus === "awaiting_settlement";
   const failed = paymentStatus === "failed";
   const cancelled = paymentStatus === "cancelled";
   const pending = paymentStatus === "pending";
@@ -98,19 +100,25 @@ function computePipelineSteps({ order, invoice }) {
   const orderFailed = order?.processingStatus === "failed";
   const completed = order?.processingStatus === "completed";
   const attempts = invoice?.attemptCount ?? 0;
-  const isManual =
-    invoice?.paymentMethod === "check" || invoice?.paymentMethod === "ach";
+  // Only cheque now sits as "awaiting manual settlement"; ACH is
+  // auto-charged in PASS 1 and (when accepted) moves into the
+  // awaiting_settlement state which is handled as a distinct
+  // sub-status below.
+  const isManual = invoice?.paymentMethod === "check";
 
   // "Payment processing" subtitle is the most context-loaded — it has
-  // to convey retries, in-flight charges, manual-wait, and failures all
-  // through one line. Order matters: failed wins over retries.
+  // to convey retries, in-flight charges, manual-wait, ACH settlement
+  // limbo, and failures all through one line. Order matters: failed
+  // wins over retries.
   let processingSubtitle = null;
   if (failed) {
     processingSubtitle = attempts > 0 ? `Failed after ${attempts}` : "Failed";
   } else if (inProgress) {
     processingSubtitle = "In progress";
+  } else if (awaitingSettlement) {
+    processingSubtitle = "ACH submitted — awaiting settlement";
   } else if (isManual && pending) {
-    processingSubtitle = `Awaiting ${invoice.paymentMethod === "ach" ? "ACH" : "cheque"}`;
+    processingSubtitle = "Awaiting cheque";
   } else if (attempts > 0 && !paid) {
     processingSubtitle = `${attempts} attempt${attempts === 1 ? "" : "s"}`;
   } else if (attempts > 1 && paid) {
@@ -125,7 +133,7 @@ function computePipelineSteps({ order, invoice }) {
         ? "active"
         : "pending";
 
-  const pendingStepStatus = paid || inProgress
+  const pendingStepStatus = paid || inProgress || awaitingSettlement
     ? "done"
     : cancelled
       ? "skipped"
@@ -137,7 +145,7 @@ function computePipelineSteps({ order, invoice }) {
 
   const processingStepStatus = paid
     ? "done"
-    : inProgress
+    : inProgress || awaitingSettlement
       ? "active"
       : failed
         ? "failed"
@@ -1517,12 +1525,31 @@ export default function OrderDetail() {
                     ? "This invoice has been cancelled."
                     : invoice.paymentStatus === "in_progress"
                       ? "A charge is currently in progress — wait for it to finish."
-                      : !customerMap?.nmiCustomerVaultId
-                        ? "No NMI customer vault on file for this customer — collect a payment method before retrying."
-                        : isAchInvoice && !customerMap?.nmiAchBillingId
-                          ? "No NMI ACH billing id on file for this customer — capture the ACH billing profile in NMI (or fall back to charging the card on file) before retrying."
-                          : null}
+                      : invoice.paymentStatus === "awaiting_settlement"
+                        ? "An ACH transaction was submitted to NMI and is awaiting settlement (typically 1–3 business days). No new charge can run until the bank confirms or returns the original transaction."
+                        : !customerMap?.nmiCustomerVaultId
+                          ? "No NMI customer vault on file for this customer — collect a payment method before retrying."
+                          : isAchInvoice && !customerMap?.nmiAchBillingId
+                            ? "No NMI ACH billing id on file for this customer — capture the ACH billing profile in NMI (or fall back to charging the card on file) before retrying."
+                            : null}
               </s-paragraph>
+            )}
+            {invoice && invoice.paymentStatus === "awaiting_settlement" && (
+              <s-banner tone="info" heading="ACH awaiting settlement">
+                <s-paragraph>
+                  NMI accepted the ACH submission
+                  {invoice.pendingSettlementTxnId
+                    ? ` (transaction ${invoice.pendingSettlementTxnId})`
+                    : ""}
+                  {invoice.pendingSettlementAmount
+                    ? ` for ${formatAmount(invoice.pendingSettlementAmount, invoice.currency)}`
+                    : ""}
+                  . The ACH network typically takes 1–3 business days to
+                  confirm. The invoice will be marked Paid once NMI
+                  reports the transaction as Complete, or returned to
+                  Pending if the bank rejects the debit.
+                </s-paragraph>
+              </s-banner>
             )}
             {invoice && isManualInvoice && (
               <s-paragraph tone="subdued">

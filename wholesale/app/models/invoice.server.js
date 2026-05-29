@@ -98,19 +98,31 @@ const invoiceSchema = new mongoose.Schema(
     //
     // Derived state — never set ad-hoc. Use deriveInvoicePaymentStatus
     // (invoice.utils.js) so payments feed into a consistent transition:
-    //   pending          — no money received yet
-    //   in_progress      — NMI sale call is currently in flight (lock)
-    //   partially_paid   — 0 < amountPaid < amountDue
-    //   paid             — amountPaid >= amountDue
-    //   failed           — exhausted maxAttempts without settling
-    //   cancelled        — kept for backward compatibility with any
-    //                      pre-existing records; no UI path currently
-    //                      writes this state
+    //   pending             — no money received yet
+    //   in_progress         — NMI sale call is currently in flight (lock)
+    //   awaiting_settlement — NMI accepted an ACH sale (response code 100)
+    //                         but the ACH network has not yet settled the
+    //                         funds. The transaction can still be returned
+    //                         (NSF, closed account, etc.) for 1–3 business
+    //                         days after submission. amountPaid is NOT bumped
+    //                         while in this state — the in-flight amount
+    //                         lives on `pendingSettlementAmount` so we can
+    //                         either credit it on settle or drop it on
+    //                         return. Card-method invoices never enter this
+    //                         state (card sales are funds-captured at NMI's
+    //                         approval).
+    //   partially_paid      — 0 < amountPaid < amountDue
+    //   paid                — amountPaid >= amountDue
+    //   failed              — exhausted maxAttempts without settling
+    //   cancelled           — kept for backward compatibility with any
+    //                          pre-existing records; no UI path currently
+    //                          writes this state
     paymentStatus: {
       type: String,
       enum: [
         'pending',
         'in_progress',
+        'awaiting_settlement',
         'partially_paid',
         'paid',
         'failed',
@@ -119,6 +131,32 @@ const invoiceSchema = new mongoose.Schema(
       default: 'pending',
       index: true,
     },
+
+    // ── ACH settlement tracking ──────────────────────────────────────
+    //
+    // ACH transactions are accepted by NMI immediately (response code
+    // 100 = "Approved" at the gateway) but settled by the ACH network
+    // 1–3 business days later. Until settlement, the transaction can
+    // still be returned (NSF, closed account, frozen funds, etc.) and
+    // the credit unwound. To represent this safely we DO NOT bump
+    // amountPaid on ACH approval — we record the in-flight amount on
+    // these fields and rely on a CRON pass (PASS 1.7) that polls NMI's
+    // query.php for the transaction's current `condition` to:
+    //   - condition='complete'         → bump amountPaid, clear these
+    //                                     fields, propagate to QBO/Shopify
+    //   - condition='failed'/'canceled'→ clear fields, drop the credit,
+    //                                     flip back to pending/failed
+    //   - condition='pendingsettlement'→ leave as-is, log a remark
+    //
+    // pendingSettlementFeeAmount carries the processing-fee component
+    // that was staged on the original charge so the settle pass can
+    // append it to the QBO invoice line only after settlement is
+    // confirmed.
+    pendingSettlementTxnId: { type: String, index: true },
+    pendingSettlementAmount: Number,
+    pendingSettlementFeeAmount: Number,
+    pendingSettlementSince: Date,
+    pendingSettlementLastCheckedAt: Date,
 
     attemptCount: { type: Number, default: 0 },
     maxAttempts: { type: Number, default: 6 },
@@ -168,6 +206,15 @@ const invoiceSchema = new mongoose.Schema(
     //                          without having to peek at the invoice's
     //                          current paymentMethod (which the
     //                          ACH → card admin fallback may flip).
+    //   cron_ach_settlement_check — PASS 1.7 CRON polled NMI for the
+    //                          status of an awaiting-settlement ACH
+    //                          transaction. One entry per state change
+    //                          (settled / failed / still pending after N
+    //                          days). Successful settle / failed return
+    //                          ALWAYS log; "still pending" logs at most
+    //                          once per day to avoid spamming the
+    //                          remarks panel during the normal 1–3 day
+    //                          wait window.
     //   cron_cheque_reminder — PASS 1.5 CRON logged a reminder for a
     //                          pending cheque invoice (no charge
     //                          attempted — admins still need to act)
@@ -191,6 +238,7 @@ const invoiceSchema = new mongoose.Schema(
               enum: [
                 'cron_card_attempt',
                 'cron_ach_attempt',
+                'cron_ach_settlement_check',
                 'cron_cheque_reminder',
                 'cron_ach_reminder',
                 'cron_failed_followup',
@@ -323,6 +371,7 @@ const invoiceSchema = new mongoose.Schema(
       enum: [
         'pending',
         'in_progress',
+        'awaiting_settlement',
         'partially_paid',
         'paid',
         'failed',

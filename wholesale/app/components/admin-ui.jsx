@@ -88,6 +88,12 @@ export function ProcessingBadge({ status, paymentMethod }) {
 const PAYMENT_STATUS_TONE_MAP = {
   pending: { tone: "warning", label: "Pending" },
   in_progress: { tone: "info", label: "In progress" },
+  // ACH-specific transit state: NMI accepted the transaction but the
+  // ACH network has not yet settled the funds (1–3 business day
+  // window during which the bank can still return the debit). The
+  // settlement-check CRON pass transitions this to paid or back to
+  // pending/failed once NMI reports the terminal condition.
+  awaiting_settlement: { tone: "info", label: "Awaiting settlement" },
   partially_paid: { tone: "info", label: "Partially paid" },
   paid: { tone: "success", label: "Paid" },
   failed: { tone: "critical", label: "Failed" },

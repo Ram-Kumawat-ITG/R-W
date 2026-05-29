@@ -93,6 +93,14 @@ export async function action({ request, params }) {
   if (invoice.paymentStatus === 'in_progress') {
     return sendResponse(409, 'error', 'A charge is already in progress for this invoice', null)
   }
+  if (invoice.paymentStatus === 'awaiting_settlement') {
+    return sendResponse(
+      409,
+      'error',
+      `An ACH transaction is awaiting settlement (NMI txn ${invoice.pendingSettlementTxnId || '?'}). Wait for the bank to confirm or return it before retrying, or use the Charge card on file fallback to settle via the card.`,
+      null,
+    )
+  }
   // Cheque invoices have no NMI vault to charge against — admins use
   // mark-cheque-paid instead. Card AND ACH invoices both flow through
   // here; the payment service picks the right vault id based on
@@ -202,7 +210,9 @@ export async function action({ request, params }) {
   if (result.skipped) {
     remarkMsg = `Admin ${methodLabel} retry skipped: ${result.reason}`
   } else if (result.outcome === 'approved') {
-    remarkMsg = `Admin ${methodLabel} retry approved (NMI txn ${result.transactionId || '?'})`
+    remarkMsg = result.awaitingSettlement
+      ? `Admin ACH retry submitted — NMI accepted txn ${result.transactionId || '?'}, awaiting settlement (typically 1–3 business days)`
+      : `Admin ${methodLabel} retry approved (NMI txn ${result.transactionId || '?'})`
   } else if (result.outcome === 'declined') {
     remarkMsg = `Admin ${methodLabel} retry declined: ${result.responseText || 'no reason given'}`
   } else {

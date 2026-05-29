@@ -1520,6 +1520,74 @@ card invoices). The endpoint routes to the ACH billing id via
 `resolveCustomerAchBillingId` and otherwise behaves identically to
 the card retry path.
 
+### 9.5.1 ACH settlement lifecycle (`awaiting_settlement`)
+
+ACH sales are **two-phase** at the gateway:
+
+1. **Submission** — NMI's `transact.php` returns response code 100
+   ("Approved") when the transaction is accepted into the ACH network.
+   This is NOT a confirmation that funds have moved — at this point
+   NMI reports the transaction's `condition` as `pendingsettlement`.
+2. **Settlement** — 1–3 business days later, the ACH network either
+   settles the debit (`condition='complete'`) or returns it (NSF,
+   closed account, frozen funds, etc. → `condition='failed'` or
+   `'canceled'`).
+
+To represent this correctly the Invoice has a dedicated payment status
+`'awaiting_settlement'` and a small set of in-flight fields:
+
+| Field | Notes |
+|---|---|
+| `pendingSettlementTxnId` | NMI transaction id we're waiting on; indexed |
+| `pendingSettlementAmount` | Total amount submitted (base + fee component, if any) |
+| `pendingSettlementFeeAmount` | Fee component staged at submission; applied to QBO only on settle |
+| `pendingSettlementSince` | When we entered the awaiting_settlement state |
+| `pendingSettlementLastCheckedAt` | When PASS 1.7 last polled NMI (throttles the "still pending" remark) |
+
+**Critical invariant** — `amountPaid` is NOT bumped on ACH approval.
+The in-flight amount lives on `pendingSettlementAmount` until
+settlement is confirmed. Downstream sync (QBO `recordPayment`,
+Shopify mark-paid / SALE transaction) does NOT run until settlement
+is confirmed. This avoids the failure mode where an ACH return would
+otherwise leave QBO + Shopify falsely showing the invoice as paid.
+
+The `awaiting_settlement` status is **sticky** in
+`deriveInvoicePaymentStatus` (`invoice.utils.js`) — the same way
+`cancelled` is — so a stray `applyDerivedPaymentStatus` call on an
+invoice with `amountPaid = 0` cannot mis-flip it back to `pending` and
+have the CRON re-submit a second ACH transaction while NMI is still
+processing the first.
+
+**State transitions** are owned exclusively by `checkAchSettlement`
+(`payment.service.js`), which the scheduler PASS 1.7 calls every
+tick:
+
+| NMI `condition` | Action | Result |
+|---|---|---|
+| `complete` | Apply `pendingSettlementAmount` → `amountPaid`, stage fee → QBO, run `propagateSuccessfulPayment`, clear pending fields, set `paymentSettledVia='ach'` + `paidAt`, re-derive status | `paid` (or `partially_paid` on partial) |
+| `failed` / `canceled` | Drop the in-flight credit, write a new `PaymentAttempt` with `outcome='declined'` or `'error'`, bump `attemptCount`, clear pending fields, log `lastAttemptError` | `pending` (next CRON tick will retry ACH), or `failed` if `attemptCount >= maxAttempts` |
+| `pendingsettlement` / `pending` / `in_progress` | No state change | stays `awaiting_settlement` |
+| unknown / lookup failure | No state change | stays `awaiting_settlement`; remark logs the lookup error |
+
+**Admin endpoints** check the state explicitly:
+
+- `POST /api/admin/orders/:id/retry-payment` — 409 with a message
+  pointing the admin at the in-flight transaction. Retrying would
+  either duplicate the debit (if the first settles) or burn an attempt
+  on a transaction NMI hasn't decided on yet.
+- `POST /api/admin/orders/:id/charge-card` — 409 with a message
+  suggesting the admin void the ACH in NMI's dashboard first. We
+  block the card fallback to avoid double-charging the customer if
+  both transactions settle.
+
+**Remarks** are written by PASS 1.7 with kind `cron_ach_settlement_check`:
+
+- "settled" / "returned" log on every state change.
+- "still pending" logs at most once per `SETTLEMENT_REMARK_THROTTLE_MS`
+  (24h) so the Remarks panel doesn't flood during the normal wait
+  window. The settlement check itself runs every tick — only the
+  remark write is throttled.
+
 ---
 
 ## 10. Scheduler & cron workflow

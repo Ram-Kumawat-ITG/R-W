@@ -14,7 +14,11 @@
 
 import Invoice from '../../models/invoice.server'
 import PaymentAttempt from '../../models/paymentAttempt.server'
-import { chargeCustomerVault, validateCustomerVault } from '../nmi/nmi.service'
+import {
+  chargeCustomerVault,
+  validateCustomerVault,
+  getNmiTransactionStatus,
+} from '../nmi/nmi.service'
 import { propagateSuccessfulPayment } from '../invoice/invoice.service'
 import { invoiceConfig } from '../invoice/invoice.config'
 import { computeProcessingFee, applyDerivedPaymentStatus } from '../invoice/invoice.utils'
@@ -88,6 +92,17 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
     invoice.paymentStatus === 'refunded'
   ) {
     return { skipped: true, reason: `invoice already ${invoice.paymentStatus}` }
+  }
+  // An ACH transaction is in flight at the NMI / ACH-network level —
+  // starting a second sale now would either duplicate the debit (if
+  // the first settles) or burn a retry on the same dollar amount.
+  // The settlement-check CRON pass (PASS 1.7) is the only path that
+  // moves invoices out of this state.
+  if (invoice.paymentStatus === 'awaiting_settlement') {
+    return {
+      skipped: true,
+      reason: `awaiting ACH settlement of NMI txn ${invoice.pendingSettlementTxnId || '?'}`,
+    }
   }
   if (invoice.attemptCount >= invoice.maxAttempts) {
     return { skipped: true, reason: 'max attempts reached' }
@@ -259,38 +274,51 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
   invoice.lastAttemptError = result.outcome === 'approved' ? null : result.responseText
 
   if (result.outcome === 'approved') {
-    // Stage processing-fee state locally on the settling charge —
-    // propagateSuccessfulPayment appends the fee line to QBO and sets
-    // processingFeeAppliedAt once QBO confirms. Partial charges
-    // (willSettleNow=false) don't stage the fee; it rides along on the
-    // final charge that closes the invoice.
-    if (feePreview && willSettleNow) {
-      invoice.processingFeeAmount = feePreview.amount
-      invoice.processingFeeRate = feePreview.rate
-      invoice.processingFeeMethod = feePreview.method
-      invoice.amountDue = Number((invoice.amountDue + feeAmount).toFixed(2))
-    }
-    invoice.amountPaid = Number((invoice.amountPaid + amount).toFixed(2))
-    invoice.paidAt = new Date()
-    // Record what actually settled this charge. Reflects the active
-    // `paymentMethod` at the moment of approval, which is 'card' or
-    // 'ach' for NMI-driven settlements. The cheque → card override
-    // flips paymentMethod BEFORE chargeInvoice runs, so a cheque
-    // invoice that fell back to card lands here with paymentMethod
-    // already set to 'card'.
-    invoice.paymentSettledVia = invoice.paymentMethod === 'ach' ? 'ach' : 'card'
-    invoice.paymentSettledAt = invoice.paidAt
-    // Status flows through the derivation helper: partial_paid when
-    // amountPaid < amountDue, paid when settled, paid-with-refund
-    // states once refunds[] is populated. Single source of truth.
-    applyDerivedPaymentStatus(invoice)
+    // ACH branch — NMI response code 100 on an ACH sale means "accepted
+    // into the ACH network", NOT "funds settled". The transaction can
+    // still be returned (NSF, closed account, frozen funds, etc.) for
+    // 1–3 business days. We DO NOT bump amountPaid or run downstream
+    // sync (QBO recordPayment / Shopify markPaid) at this point —
+    // doing so would falsely mark the invoice as paid in QBO and on
+    // Shopify, and a later ACH return would leave those systems out
+    // of sync with reality.
+    //
+    // Instead the in-flight amount lives on pendingSettlementAmount
+    // and the invoice goes to `awaiting_settlement`. The settlement-
+    // check CRON pass (PASS 1.7) polls NMI for the transaction's
+    // condition and applies the credit only after NMI returns
+    // `complete`. The processing fee is staged the same way so the
+    // QBO line append happens only post-settlement.
+    if (invoice.paymentMethod === 'ach') {
+      invoice.pendingSettlementTxnId = result.transactionId
+      invoice.pendingSettlementAmount = amount
+      invoice.pendingSettlementFeeAmount = feePreview && willSettleNow ? feePreview.amount : 0
+      invoice.pendingSettlementSince = new Date()
+      invoice.pendingSettlementLastCheckedAt = null
+      invoice.paymentStatus = 'awaiting_settlement'
+    } else {
+      // Card branch — synchronous settlement. Funds are captured at
+      // NMI's approval, so the existing fast-path applies: bump
+      // amountPaid, stage the fee, run downstream sync, derive status.
+      if (feePreview && willSettleNow) {
+        invoice.processingFeeAmount = feePreview.amount
+        invoice.processingFeeRate = feePreview.rate
+        invoice.processingFeeMethod = feePreview.method
+        invoice.amountDue = Number((invoice.amountDue + feeAmount).toFixed(2))
+      }
+      invoice.amountPaid = Number((invoice.amountPaid + amount).toFixed(2))
+      invoice.paidAt = new Date()
+      invoice.paymentSettledVia = 'card'
+      invoice.paymentSettledAt = invoice.paidAt
+      applyDerivedPaymentStatus(invoice)
 
-    await propagateSuccessfulPayment({
-      invoice,
-      customerMap,
-      amount,
-      transactionId: result.transactionId,
-    })
+      await propagateSuccessfulPayment({
+        invoice,
+        customerMap,
+        amount,
+        transactionId: result.transactionId,
+      })
+    }
   } else {
     if (invoice.attemptCount >= invoice.maxAttempts) invoice.paymentStatus = 'failed'
     else applyDerivedPaymentStatus(invoice)
@@ -305,6 +333,12 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
     baseAmount,
     feeAmount,
     amount,
+    // True when the approval put the invoice into ACH-settlement wait
+    // (no money applied yet, no QBO/Shopify sync run). Callers (CRON,
+    // admin endpoints) use this to log "submitted, awaiting settlement"
+    // rather than "paid" in their remarks / response payloads.
+    awaitingSettlement:
+      result.outcome === 'approved' && invoice.paymentMethod === 'ach',
   }
 }
 
@@ -312,3 +346,163 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
 // "payment" service entry point regardless of whether the work was a
 // fresh charge or just a downstream retry.
 export { propagateSuccessfulPayment } from '../invoice/invoice.service'
+
+// Poll NMI for the current condition of an awaiting-settlement ACH
+// invoice and act on the result. Called by the scheduler PASS 1.7 and
+// can also be invoked manually by an admin "Check settlement" action.
+//
+// Outcomes (all return shape: { action, condition?, ... }):
+//   - { action: 'settled', amount }
+//       NMI condition='complete' — credit the pendingSettlementAmount
+//       to amountPaid, stage the fee, run propagateSuccessfulPayment,
+//       clear pending fields, set paidAt + paymentSettledVia='ach'.
+//   - { action: 'returned', condition, reason }
+//       NMI condition='failed' or 'canceled' — drop the in-flight
+//       credit, clear pending fields, advance attemptCount /
+//       paymentStatus the same way a fresh decline would, log the
+//       reason on lastAttemptError. The invoice goes back to
+//       'pending' (or 'failed' if maxAttempts exhausted) so the next
+//       CRON tick can retry OR the admin can fall back to the card
+//       on file.
+//   - { action: 'still_pending', condition }
+//       Still working through ACH — no state change. Caller decides
+//       whether to log a remark (CRON throttles to once-per-day).
+//   - { action: 'unknown', reason }
+//       NMI returned an unexpected condition or the lookup failed.
+//       Caller logs a warning but does NOT touch invoice state.
+//   - { action: 'noop', reason }
+//       Invoice isn't actually awaiting settlement, or no transaction
+//       id is on file. Defensive guard; should not normally fire.
+export async function checkAchSettlement({ invoice, customerMap }) {
+  if (!invoice) return { action: 'noop', reason: 'no invoice provided' }
+  if (invoice.paymentStatus !== 'awaiting_settlement') {
+    return { action: 'noop', reason: `invoice is not awaiting_settlement (status=${invoice.paymentStatus})` }
+  }
+  if (!invoice.pendingSettlementTxnId) {
+    return { action: 'noop', reason: 'no pendingSettlementTxnId on file' }
+  }
+
+  const status = await getNmiTransactionStatus(invoice.pendingSettlementTxnId)
+  invoice.pendingSettlementLastCheckedAt = new Date()
+
+  if (!status.found) {
+    // Don't change state on a transport / lookup failure. Save the
+    // checked-at timestamp so the next pass throttles correctly.
+    await invoice.save()
+    log.warn('settlement.lookup.failed', {
+      invoiceId: invoice._id.toString(),
+      transactionId: invoice.pendingSettlementTxnId,
+      reason: status.reason,
+    })
+    return { action: 'unknown', reason: status.reason }
+  }
+
+  const condition = status.condition
+  // Map NMI's transaction conditions to one of three terminal outcomes.
+  // NMI's documented condition values for ACH:
+  //   complete           — funds settled, terminal success
+  //   pendingsettlement  — accepted, still waiting on ACH network
+  //   pending            — same as above for some gateway versions
+  //   in_progress        — same idea (rare for ACH)
+  //   failed             — terminal failure (NSF, return code, etc.)
+  //   canceled           — voided / cancelled before settling
+  //   unknown            — gateway lost track; treat as still-pending
+  //                        for safety (don't credit, don't drop)
+  if (condition === 'complete') {
+    const settledAmount = Number(invoice.pendingSettlementAmount || 0)
+    const settledFeeAmount = Number(invoice.pendingSettlementFeeAmount || 0)
+    const transactionId = invoice.pendingSettlementTxnId
+
+    if (settledFeeAmount > 0) {
+      invoice.processingFeeAmount = settledFeeAmount
+      invoice.processingFeeRate = invoiceConfig.processingFeeRates?.ach
+      invoice.processingFeeMethod = 'ach'
+      invoice.amountDue = Number((invoice.amountDue + settledFeeAmount).toFixed(2))
+    }
+    invoice.amountPaid = Number((invoice.amountPaid + settledAmount).toFixed(2))
+    invoice.paidAt = new Date()
+    invoice.paymentSettledVia = 'ach'
+    invoice.paymentSettledAt = invoice.paidAt
+    invoice.pendingSettlementTxnId = undefined
+    invoice.pendingSettlementAmount = undefined
+    invoice.pendingSettlementFeeAmount = undefined
+    invoice.pendingSettlementSince = undefined
+    // Clear the sticky guard before deriving so the helper can move
+    // the invoice to paid / partially_paid based on amountPaid.
+    invoice.paymentStatus = 'pending'
+    applyDerivedPaymentStatus(invoice)
+
+    await propagateSuccessfulPayment({
+      invoice,
+      customerMap,
+      amount: settledAmount,
+      transactionId,
+    })
+    await invoice.save()
+
+    log.info('settlement.settled', {
+      invoiceId: invoice._id.toString(),
+      transactionId,
+      amount: settledAmount,
+      newStatus: invoice.paymentStatus,
+    })
+    return { action: 'settled', condition, amount: settledAmount, transactionId }
+  }
+
+  if (condition === 'failed' || condition === 'canceled') {
+    const failedAmount = Number(invoice.pendingSettlementAmount || 0)
+    const transactionId = invoice.pendingSettlementTxnId
+    const action = status.latestAction
+    const reason =
+      action?.response_text || action?.responsetext || `NMI condition=${condition}`
+
+    // Persist the failure on the payment audit ledger so the
+    // PaymentAttempt count + lastAttemptError reflect the return.
+    // We use a NEW attempt number (the original 'approved' attempt
+    // stays as-is so the audit trail is honest about what NMI's
+    // gateway said at submission time).
+    invoice.attemptCount = (invoice.attemptCount || 0) + 1
+    invoice.lastAttemptAt = new Date()
+    invoice.lastAttemptError = `ACH return — ${reason}`
+    await PaymentAttempt.create({
+      invoiceRef: invoice._id,
+      qboInvoiceId: invoice.qboInvoiceId,
+      attemptNumber: invoice.attemptCount,
+      amount: failedAmount,
+      currency: invoice.currency,
+      outcome: condition === 'canceled' ? 'error' : 'declined',
+      nmiTransactionId: transactionId,
+      nmiResponseText: reason,
+      errorMessage: `ACH settlement ${condition} — ${reason}`,
+    })
+
+    invoice.pendingSettlementTxnId = undefined
+    invoice.pendingSettlementAmount = undefined
+    invoice.pendingSettlementFeeAmount = undefined
+    invoice.pendingSettlementSince = undefined
+    // Move out of awaiting_settlement first so deriving below isn't
+    // pinned by the sticky guard. amountPaid was never bumped so the
+    // derivation falls back to 'pending' (or 'failed' if we hit max
+    // attempts).
+    if (invoice.attemptCount >= invoice.maxAttempts) {
+      invoice.paymentStatus = 'failed'
+    } else {
+      invoice.paymentStatus = 'pending'
+      applyDerivedPaymentStatus(invoice)
+    }
+    await invoice.save()
+
+    log.warn('settlement.returned', {
+      invoiceId: invoice._id.toString(),
+      transactionId,
+      condition,
+      reason,
+      newStatus: invoice.paymentStatus,
+    })
+    return { action: 'returned', condition, reason, transactionId, amount: failedAmount }
+  }
+
+  // pendingsettlement / pending / in_progress / unknown — leave alone.
+  await invoice.save()
+  return { action: 'still_pending', condition: condition || 'unknown' }
+}
