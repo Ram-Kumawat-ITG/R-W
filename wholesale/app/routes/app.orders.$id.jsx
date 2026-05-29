@@ -13,7 +13,10 @@ import Invoice from "../models/invoice.server";
 import PaymentAttempt from "../models/paymentAttempt.server";
 import CustomerMap from "../models/customerMap.server";
 import { getInvoice as getQboInvoice, getInvoiceWebUrl } from "../services/qbo/qbo.service";
-import { resolveCustomerVaultId } from "../services/customer/customer.service";
+import {
+  resolveCustomerVaultId,
+  resolveCustomerAchBillingId,
+} from "../services/customer/customer.service";
 import { invoiceConfig } from "../services/invoice/invoice.config";
 import { computeProcessingFee, processingFeeLabel } from "../services/invoice/invoice.utils";
 import {
@@ -47,7 +50,12 @@ const RETRYABLE_PAYMENT_STATUSES = new Set([
 // the Remarks section never renders an unknown badge.
 const REMARK_KIND_META = {
   cron_card_attempt: { label: "CRON charge", tone: "info" },
+  cron_ach_attempt: { label: "ACH charge", tone: "info" },
   cron_cheque_reminder: { label: "Cheque reminder", tone: "warning" },
+  // Legacy kind — preserved for back-compat with rows logged before
+  // ACH became an auto-charged method. New rows for ACH go to
+  // cron_ach_attempt; this stays in the map so historical rows still
+  // render with a sensible badge.
   cron_ach_reminder: { label: "ACH reminder", tone: "warning" },
   cron_failed_followup: { label: "Failed follow-up", tone: "critical" },
   admin_action: { label: "Admin action", tone: "default" },
@@ -215,15 +223,18 @@ export const loader = async ({ request, params }) => {
 
   const customerMap = order.customerEmail
     ? await CustomerMap.findOne({ shop: session.shop, email: order.customerEmail })
-        .select("qboCustomerId nmiCustomerVaultId profile")
+        .select("qboCustomerId nmiCustomerVaultId nmiAchBillingId profile")
         .lean()
     : null;
 
-  // Cache-or-source-of-truth vault lookup. customer_maps.nmiCustomerVaultId
-  // is populated at order intake; if the customer captured a card AFTER
-  // that ran, only wholesale_applications has the vault id. The resolver
-  // checks both and lazily syncs the cache when the source has more, so
-  // the page (and the action endpoints below) see a consistent view.
+  // Cache-or-source-of-truth lookups for BOTH the card vault and the
+  // ACH billing id. customer_maps caches are populated at order intake;
+  // if the customer captured a card or ACH AFTER that ran, only
+  // wholesale_applications has the id. Resolvers check both sides and
+  // lazily sync the cache when the source has more, so the page (and
+  // the action endpoints) see a consistent view. Card → drives the
+  // "Retry payment" + "Charge card on file" buttons; ACH → drives the
+  // "Retry ACH payment" button.
   const resolvedVaultId = order.customerEmail
     ? await resolveCustomerVaultId({
         shop: session.shop,
@@ -232,9 +243,17 @@ export const loader = async ({ request, params }) => {
       })
     : null;
   if (customerMap && resolvedVaultId && !customerMap.nmiCustomerVaultId) {
-    // Lazily-synced — surface the freshly resolved value on the
-    // already-loaded snapshot so the rest of the loader/UI sees it.
     customerMap.nmiCustomerVaultId = resolvedVaultId;
+  }
+  const resolvedAchBillingId = order.customerEmail
+    ? await resolveCustomerAchBillingId({
+        shop: session.shop,
+        email: order.customerEmail,
+        customerMap,
+      })
+    : null;
+  if (customerMap && resolvedAchBillingId && !customerMap.nmiAchBillingId) {
+    customerMap.nmiAchBillingId = resolvedAchBillingId;
   }
 
   // Extract line items + totals from the raw Shopify webhook payload so we
@@ -451,11 +470,17 @@ export default function OrderDetail() {
 
   const paymentMethod = invoice?.paymentMethod || "card";
   const isCardInvoice = paymentMethod === "card";
+  const isAchInvoice = paymentMethod === "ach";
+  // ACH invoices behave like card invoices for auto-charge purposes
+  // (the CRON PASS 1 sweep charges both) — but the "Charge card on
+  // file" fallback button targets ACH-method invoices too, so it
+  // groups under the broader "manual / non-card-method" umbrella for
+  // UI gating.
   const isManualInvoice = paymentMethod === "check" || paymentMethod === "ach";
-  // "Mark cheque paid" is cheque-specific — ACH-preferred invoices have
-  // their own settlement path (record-ach-paid endpoint when needed) and
-  // shouldn't surface the cheque-receipt action. The cheque → card
-  // fallback ("Charge card on file") remains visible for both.
+  // "Mark cheque paid" is cheque-specific — ACH invoices auto-charge
+  // against the NMI billing id and don't need the manual cheque
+  // receipt path. The "Charge card on file" fallback remains visible
+  // for both cheque AND ACH (it's the cross-method override).
   const isChequeInvoice = paymentMethod === "check";
   // Immutable preference snapshot taken when this invoice was created.
   // Reads ONLY from customerPaymentPreference — never falls back to
@@ -559,11 +584,22 @@ export default function OrderDetail() {
   const statusAllowsAction =
     !!invoice && RETRYABLE_PAYMENT_STATUSES.has(invoice.paymentStatus);
 
+  // "Retry payment" runs the same charge path as the CRON. Every NMI
+  // sale needs the customer vault id; ACH invoices ALSO need the ACH
+  // billing id (the id of the ACH billing profile inside the vault,
+  // stored at wholesale_applications.payment.ach.nmi_billing_id).
+  // Cheque invoices can't be retried via this path — they use Mark
+  // cheque paid instead.
   const canRetry =
-    isCardInvoice &&
     statusAllowsAction &&
-    !!customerMap?.nmiCustomerVaultId;
+    !!customerMap?.nmiCustomerVaultId &&
+    ((isCardInvoice) ||
+      (isAchInvoice && !!customerMap?.nmiAchBillingId));
   const canMarkChequePaid = isChequeInvoice && statusAllowsAction;
+  // "Charge card on file" is the cross-method fallback: cheque or ACH
+  // invoice that needs to be settled by the card on file (e.g. after
+  // an ACH decline). Requires a card vault id regardless of the
+  // invoice's current paymentMethod.
   const canChargeCard =
     isManualInvoice &&
     statusAllowsAction &&
@@ -955,7 +991,7 @@ export default function OrderDetail() {
         Back
       </s-button>
       {invoice &&
-        isCardInvoice &&
+        (isCardInvoice || isAchInvoice) &&
         invoice.paymentStatus !== "paid" &&
         invoice.paymentStatus !== "cancelled" && (
           <s-button
@@ -965,7 +1001,7 @@ export default function OrderDetail() {
             onClick={() => modalRef.current?.showOverlay?.()}
             {...(retrying ? { loading: true } : {})}
           >
-            Retry payment
+            {isAchInvoice ? "Retry ACH payment" : "Retry payment"}
           </s-button>
         )}
       {invoice && isChequeInvoice && (
@@ -1473,7 +1509,7 @@ export default function OrderDetail() {
               </s-banner>
             )}
 
-            {invoice && isCardInvoice && !canRetry && (
+            {invoice && (isCardInvoice || isAchInvoice) && !canRetry && (
               <s-paragraph tone="subdued">
                 {invoice.paymentStatus === "paid"
                   ? "This invoice is already paid."
@@ -1482,8 +1518,10 @@ export default function OrderDetail() {
                     : invoice.paymentStatus === "in_progress"
                       ? "A charge is currently in progress — wait for it to finish."
                       : !customerMap?.nmiCustomerVaultId
-                        ? "No NMI vault on file for this customer — collect a payment method before retrying."
-                        : null}
+                        ? "No NMI customer vault on file for this customer — collect a payment method before retrying."
+                        : isAchInvoice && !customerMap?.nmiAchBillingId
+                          ? "No NMI ACH billing id on file for this customer — capture the ACH billing profile in NMI (or fall back to charging the card on file) before retrying."
+                          : null}
               </s-paragraph>
             )}
             {invoice && isManualInvoice && (
@@ -1494,7 +1532,9 @@ export default function OrderDetail() {
                     ? "This invoice has been cancelled."
                     : invoice.paymentStatus === "in_progress"
                       ? "A charge is currently in progress — wait for it to finish."
-                      : `Customer chose ${PAYMENT_METHOD_LABEL[paymentMethod] || paymentMethod}. The scheduler will not auto-charge — record the cheque manually once received, or fall back to charging the card on file.`}
+                      : isAchInvoice
+                        ? `Customer chose ${PAYMENT_METHOD_LABEL[paymentMethod] || paymentMethod}. The scheduler auto-charges the ACH billing profile on file. If ACH fails, fall back to charging the card on file.`
+                        : `Customer chose ${PAYMENT_METHOD_LABEL[paymentMethod] || paymentMethod}. The scheduler will not auto-charge — record the cheque manually once received, or fall back to charging the card on file.`}
               </s-paragraph>
             )}
             {invoice &&

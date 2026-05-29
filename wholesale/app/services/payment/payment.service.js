@@ -22,9 +22,60 @@ import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('payment.service')
 
+// Pick the right NMI ids for a given invoice. The CUSTOMER VAULT is
+// always sourced from `customerMap.nmiCustomerVaultId` (mirrored from
+// `wholesale_applications.nmiCustomerVaultId`) — every customer has at
+// most one vault. ACH-method invoices additionally need the ACH
+// BILLING id, which targets a specific billing profile inside the
+// vault (NMI's customer vault can hold multiple billings — typically
+// one card + one ACH); it's mirrored from
+// `wholesale_applications.payment.ach.nmi_billing_id`. Card-method
+// invoices omit the billing id, so NMI charges the vault's default
+// (card) billing.
+//
+// Returns `{ vaultId, billingId, methodLabel, missingReason }`:
+//   - vaultId        — customer_vault_id to pass to NMI (never null on
+//                       success; null only when the customer has no
+//                       vault at all)
+//   - billingId      — billing_id to pass alongside vault for ACH; null
+//                       for card invoices (use vault default)
+//   - methodLabel    — human-readable "card" / "ACH" for log lines + the
+//                       skip messages persisted to PaymentAttempt
+//   - missingReason  — populated when EITHER required id is missing; the
+//                       audit-ledger string for the skip
+function resolveInvoiceVault(invoice, customerMap) {
+  const method = invoice.paymentMethod || 'card'
+  const vaultId = customerMap?.nmiCustomerVaultId || null
+  if (method === 'ach') {
+    const billingId = customerMap?.nmiAchBillingId || null
+    let missingReason = null
+    if (!vaultId) missingReason = 'no NMI customer vault on file'
+    else if (!billingId) missingReason = 'no NMI ACH billing id on file'
+    return { vaultId, billingId, methodLabel: 'ACH', missingReason }
+  }
+  // 'card' (and any future card-equivalent path) charges the vault's
+  // default billing — no billing_id needed. Cheque-method invoices
+  // never call chargeInvoice via CRON (PASS 1 filter excludes them)
+  // but if an admin somehow triggers a charge on a cheque invoice we
+  // treat the missing method gracefully — same code path as card with
+  // no vault.
+  return {
+    vaultId,
+    billingId: null,
+    methodLabel: 'card',
+    missingReason: vaultId ? null : 'no NMI customer vault on file',
+  }
+}
+
 // Attempt a single NMI charge against the invoice's outstanding balance.
 // Caller is responsible for picking which invoices are eligible — this
 // function only mutates the single invoice it's given.
+//
+// Routes to the right NMI vault id based on `invoice.paymentMethod`:
+//   - 'card' → customerMap.nmiCustomerVaultId
+//   - 'ach'  → customerMap.nmiAchBillingId (sourced from
+//              wholesale_applications.payment.ach.nmi_billing_id at
+//              order intake)
 //
 // Result shape:
 //   { skipped: true, reason }                                              ← no work attempted
@@ -41,7 +92,9 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
   if (invoice.attemptCount >= invoice.maxAttempts) {
     return { skipped: true, reason: 'max attempts reached' }
   }
-  if (!customerMap?.nmiCustomerVaultId) {
+
+  const { vaultId, billingId, methodLabel, missingReason } = resolveInvoiceVault(invoice, customerMap)
+  if (missingReason) {
     const attemptNumber = invoice.attemptCount + 1
     await PaymentAttempt.create({
       invoiceRef: invoice._id,
@@ -50,28 +103,31 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
       amount: invoice.amountDue - invoice.amountPaid,
       currency: invoice.currency,
       outcome: 'skipped',
-      errorMessage: 'no NMI customer vault on file',
+      errorMessage: missingReason,
     })
     invoice.attemptCount = attemptNumber
     invoice.lastAttemptAt = new Date()
-    invoice.lastAttemptError = 'no NMI customer vault on file'
+    invoice.lastAttemptError = missingReason
     if (invoice.attemptCount >= invoice.maxAttempts) invoice.paymentStatus = 'failed'
     else applyDerivedPaymentStatus(invoice)
     await invoice.save()
-    return { skipped: true, reason: 'no NMI customer vault on file' }
+    return { skipped: true, reason: missingReason }
   }
 
-  // Vault-existence pre-flight against NMI. Vaults are captured once
-  // at registration submit (wholesale_applications.nmiCustomerVaultId)
-  // and mirrored onto CustomerMap. Anything could happen between then
-  // and a charge weeks later — vault deleted from the NMI dashboard,
-  // sandbox→prod environment swap, data import that lost the id — so
-  // we ALWAYS confirm the vault exists before attempting a sale rather
-  // than letting NMI's transact.php reject with a generic decline.
-  const vaultCheck = await validateCustomerVault(customerMap.nmiCustomerVaultId)
+  // Vault-existence pre-flight against NMI. Validates the CUSTOMER VAULT
+  // only (not the ACH billing id) — NMI's query.php exposes
+  // `report_type=customer_vault` but has no billing-level query, so the
+  // billing id can only be confirmed indirectly (it would surface as a
+  // child element in the customer_vault response). We trust the stored
+  // ACH billing id and let NMI reject the sale with a precise error if
+  // it doesn't exist; that error lands on the PaymentAttempt row like
+  // any other decline. The vault check catches the common failure mode
+  // (vault deleted from NMI dashboard, sandbox↔prod env swap, data
+  // import that lost the id).
+  const vaultCheck = await validateCustomerVault(vaultId)
   if (!vaultCheck.valid) {
     const attemptNumber = invoice.attemptCount + 1
-    const reason = `NMI vault ${customerMap.nmiCustomerVaultId} invalid: ${vaultCheck.reason}`
+    const reason = `NMI customer vault ${vaultId} invalid: ${vaultCheck.reason}`
     await PaymentAttempt.create({
       invoiceRef: invoice._id,
       qboInvoiceId: invoice.qboInvoiceId,
@@ -89,7 +145,8 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
     await invoice.save()
     log.warn('charge.skipped.vault_invalid', {
       invoiceId: invoice._id.toString(),
-      customerVaultId: customerMap.nmiCustomerVaultId,
+      vaultId,
+      methodLabel,
       reason: vaultCheck.reason,
     })
     return { skipped: true, reason }
@@ -146,6 +203,7 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
   const amount = Number((baseAmount + feeAmount).toFixed(2))
   console.log(
     `[payment] charging invoice=${invoice._id} method=${invoice.paymentMethod} ` +
+      `vault=${vaultId}${billingId ? ` billing=${billingId}` : ''} (${methodLabel}) ` +
       `base=$${baseAmount.toFixed(2)} fee=$${feeAmount.toFixed(2)} total=$${amount.toFixed(2)}`,
   )
 
@@ -153,7 +211,8 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
   let result
   try {
     result = await chargeCustomerVault({
-      customerVaultId: customerMap.nmiCustomerVaultId,
+      customerVaultId: vaultId,
+      billingId,
       amount,
       currency: invoice.currency,
       orderId: invoice.shopifyOrderId,

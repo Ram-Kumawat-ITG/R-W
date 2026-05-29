@@ -6,7 +6,10 @@ import Invoice from '../../models/invoice.server'
 import CustomerMap from '../../models/customerMap.server'
 import { chargeInvoice } from '../../services/payment/payment.service'
 import { appendInvoiceRemark } from '../../services/invoice/invoice.service'
-import { resolveCustomerVaultId } from '../../services/customer/customer.service'
+import {
+  resolveCustomerVaultId,
+  resolveCustomerAchBillingId,
+} from '../../services/customer/customer.service'
 import { sendResponse } from '../../services/APIService/api.service'
 
 // POST /api/admin/orders/:id/retry-payment
@@ -90,14 +93,16 @@ export async function action({ request, params }) {
   if (invoice.paymentStatus === 'in_progress') {
     return sendResponse(409, 'error', 'A charge is already in progress for this invoice', null)
   }
-  // Cheque / ACH invoices use the dedicated mark-cheque-paid + charge-card
-  // endpoints. Retrying card-charge logic against a cheque invoice would
-  // bypass the per-method workflow on the Order Details page.
-  if (invoice.paymentMethod && invoice.paymentMethod !== 'card') {
+  // Cheque invoices have no NMI vault to charge against — admins use
+  // mark-cheque-paid instead. Card AND ACH invoices both flow through
+  // here; the payment service picks the right vault id based on
+  // invoice.paymentMethod ('card' → nmiCustomerVaultId, 'ach' →
+  // nmiAchBillingId).
+  if (invoice.paymentMethod === 'check') {
     return sendResponse(
       409,
       'error',
-      `Invoice payment method is "${invoice.paymentMethod}" — use the cheque or charge-card actions instead`,
+      `Invoice payment method is "check" — use the Mark cheque paid or Charge card on file actions instead`,
       null,
     )
   }
@@ -105,9 +110,13 @@ export async function action({ request, params }) {
   const customerMap = order.customerEmail
     ? await CustomerMap.findOne({ shop: session.shop, email: order.customerEmail })
     : null
-  // customer_maps is a cache populated at order intake; consult
-  // wholesale_applications (source of truth) as a fallback in case the
-  // customer captured a card after the order ran through customer.service.
+
+  // Resolve the customer vault id (always needed). For ACH invoices we
+  // ALSO need the ACH billing id — NMI's transact.php needs both to
+  // target the ACH billing entry inside the vault. Both reads run the
+  // cache → source-of-truth fallback chain; the response message is
+  // precise about which id is missing so the admin doesn't have to
+  // guess which side to fix.
   const resolvedVaultId = order.customerEmail
     ? await resolveCustomerVaultId({
         shop: session.shop,
@@ -115,16 +124,37 @@ export async function action({ request, params }) {
         customerMap,
       })
     : null
+  if (customerMap && resolvedVaultId && !customerMap.nmiCustomerVaultId) {
+    customerMap.nmiCustomerVaultId = resolvedVaultId
+  }
   if (!resolvedVaultId) {
     return sendResponse(
       409,
       'error',
-      'No NMI vault on file for this customer — collect a payment method before retrying',
+      'No NMI customer vault on file for this customer — collect a payment method before retrying',
       null,
     )
   }
-  if (customerMap && !customerMap.nmiCustomerVaultId) {
-    customerMap.nmiCustomerVaultId = resolvedVaultId
+
+  if (invoice.paymentMethod === 'ach') {
+    const resolvedAchBillingId = order.customerEmail
+      ? await resolveCustomerAchBillingId({
+          shop: session.shop,
+          email: order.customerEmail,
+          customerMap,
+        })
+      : null
+    if (customerMap && resolvedAchBillingId && !customerMap.nmiAchBillingId) {
+      customerMap.nmiAchBillingId = resolvedAchBillingId
+    }
+    if (!resolvedAchBillingId) {
+      return sendResponse(
+        409,
+        'error',
+        'No NMI ACH billing id on file for this customer — capture the ACH billing profile in NMI (and store its id at wholesale_applications.payment.ach.nmi_billing_id) before retrying',
+        null,
+      )
+    }
   }
 
   // Bump the ceiling so chargeInvoice's `attemptCount >= maxAttempts` guard
@@ -167,15 +197,16 @@ export async function action({ request, params }) {
   // admins see follow-up activity without opening the Order Details
   // page. Failure-mode messages mirror what the CRON's PASS 1 writes
   // so the same column reads consistently across origins.
+  const methodLabel = invoice.paymentMethod === 'ach' ? 'ACH' : 'card'
   let remarkMsg
   if (result.skipped) {
-    remarkMsg = `Admin retry skipped: ${result.reason}`
+    remarkMsg = `Admin ${methodLabel} retry skipped: ${result.reason}`
   } else if (result.outcome === 'approved') {
-    remarkMsg = `Admin retry approved (NMI txn ${result.transactionId || '?'})`
+    remarkMsg = `Admin ${methodLabel} retry approved (NMI txn ${result.transactionId || '?'})`
   } else if (result.outcome === 'declined') {
-    remarkMsg = `Admin retry declined: ${result.responseText || 'no reason given'}`
+    remarkMsg = `Admin ${methodLabel} retry declined: ${result.responseText || 'no reason given'}`
   } else {
-    remarkMsg = `Admin retry errored: ${result.error || result.responseText || 'unknown'}`
+    remarkMsg = `Admin ${methodLabel} retry errored: ${result.error || result.responseText || 'unknown'}`
   }
   await appendInvoiceRemark(invoice._id, {
     kind: 'admin_action',

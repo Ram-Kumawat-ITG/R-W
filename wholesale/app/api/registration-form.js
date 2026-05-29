@@ -156,41 +156,61 @@ export async function action({ request }) {
   // can't run. If creation fails we abort with no side effects: no Mongo
   // doc, no Shopify customer, no email. The applicant can retry from the
   // error screen.
-  let nmiCustomerVaultId;
-  try {
-    nmiCustomerVaultId = await createCustomerVault({
-      profile: {
-        firstName: payload.firstName,
-        lastName: payload.lastName,
-        email: payload.email,
-        phone: payload.phone,
-        companyName: payload.businessName,
-        billingAddress: payload.billingAddress,
-      },
-      paymentDetails: { paymentToken: payload.payment?.paymentToken },
-    });
-  } catch (vaultErr) {
-    console.error(
-      "[proxy/submit] NMI vault create failed:",
-      vaultErr?.message || vaultErr,
-    );
-    return sendResponse(
-      502,
-      "error",
-      "Could not save your payment method. Please try again.",
-      {
-        detail: vaultErr?.message || String(vaultErr),
-      },
-    );
-  }
-  if (!nmiCustomerVaultId) {
-    console.error("[proxy/submit] NMI returned no vault id");
-    return sendResponse(
-      502,
-      "error",
-      "Could not save your payment method. Please try again.",
-      null,
-    );
+  //
+  // The same Collect.js paymentToken tokenizes both cards AND ACH on
+  // NMI's side — the resulting vault stores the method (`payment='cc'`
+  // vs `payment='ck'`) so `type=sale` knows what to do at charge time.
+  // The vault id is the SAME shape regardless of method and always
+  // lands at the top-level `wholesale_applications.nmiCustomerVaultId`.
+  //
+  // Cheque-method customers create no vault — their invoices sit on
+  // paymentStatus='pending' until an admin records a manual cheque.
+  //
+  // ACH billing id (`payment.ach.nmi_billing_id`) is the id of a
+  // SPECIFIC billing profile inside the vault — used by chargeInvoice
+  // to target the ACH billing when a vault holds multiple billings.
+  // It is NOT populated here at registration submit; it's set
+  // separately (admin tool, NMI dashboard, or a future add_billing
+  // call) once the ACH billing entry's id is known.
+  const selectedMethod = String(payload.payment?.method || '').toLowerCase();
+  const needsVault = selectedMethod === 'card' || selectedMethod === 'ach';
+  let nmiCustomerVaultId = null;
+  if (needsVault) {
+    try {
+      nmiCustomerVaultId = await createCustomerVault({
+        profile: {
+          firstName: payload.firstName,
+          lastName: payload.lastName,
+          email: payload.email,
+          phone: payload.phone,
+          companyName: payload.businessName,
+          billingAddress: payload.billingAddress,
+        },
+        paymentDetails: { paymentToken: payload.payment?.paymentToken },
+      });
+    } catch (vaultErr) {
+      console.error(
+        "[proxy/submit] NMI vault create failed:",
+        vaultErr?.message || vaultErr,
+      );
+      return sendResponse(
+        502,
+        "error",
+        "Could not save your payment method. Please try again.",
+        {
+          detail: vaultErr?.message || String(vaultErr),
+        },
+      );
+    }
+    if (!nmiCustomerVaultId) {
+      console.error("[proxy/submit] NMI returned no vault id");
+      return sendResponse(
+        502,
+        "error",
+        "Could not save your payment method. Please try again.",
+        null,
+      );
+    }
   }
 
   // Restructure flat payment fields into nested card / ach shape before persisting.
@@ -210,13 +230,20 @@ export async function action({ request }) {
         achRoutingNumber: p.achRoutingNumber,
         achAccountLast4: p.achAccountLast4,
         achAccountType: p.achAccountType,
+        // Billing id within the vault — left null at registration time.
+        // Populated separately when the ACH billing entry's id is
+        // known (admin tool / add_billing call). chargeInvoice will
+        // skip ACH charges with "no NMI ACH billing id on file" until
+        // it's set.
+        nmi_billing_id: p.nmi_billing_id || null,
       } : null,
     }
   }
 
   // Step 2 — persist the wholesale application with the vault id baked in.
   // The most precious piece of data is now safely written to Mongo before
-  // any further side effects.
+  // any further side effects. Vault id always lives at the top-level
+  // field, regardless of payment method (card or ACH).
   payload.nmiCustomerVaultId = nmiCustomerVaultId;
 
   let app;

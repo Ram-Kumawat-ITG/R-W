@@ -581,35 +581,60 @@ for a known customer still hits QBO zero times and NMI once (the
 ### 6.4 NMI Customer Vault sourcing (registration-time only)
 
 The NMI Customer Vault is created **exactly once per customer**, at
-wholesale-registration submit:
+wholesale-registration submit. The resulting `customer_vault_id` always
+lands at the top-level `wholesale_applications.nmiCustomerVaultId`
+regardless of whether the customer's preferred method is card or ACH —
+NMI's vault stores the payment method internally (`payment=cc` for
+card, `payment=ck` for ACH), so a single vault id is enough for the
+default-billing charge path. Cheque-preferred customers create no
+vault.
 
 ```
 POST /api/registration-form      (app/api/registration-form.js)
   │
   ├── WholesaleApplication.create(payload)
   ├── customerCreate() in Shopify (+ Pending tag)
-  └── if payload.payment.paymentToken:        ← Collect.js token from form
-        createCustomerVault({ profile, paymentDetails: { paymentToken } })
-        WholesaleApplication.updateOne({ _id }, { $set: { nmiCustomerVaultId } })
+  └── if payload.payment.paymentToken AND method ∈ {card, ach}:
+        ← Collect.js token from form (tokenizes BOTH cards and ACH;
+          NMI's resulting vault stores payment='cc' or 'ck' so the
+          downstream sale knows what to do)
+        const vaultId = await createCustomerVault({ profile,
+            paymentDetails: { paymentToken } })
+        payload.nmiCustomerVaultId = vaultId
+        WholesaleApplication.updateOne({ _id }, { $set: { ... } })
 ```
 
-`wholesale_applications.nmiCustomerVaultId` is then the **single source
-of truth** for the customer's stored payment method. Every downstream
-flow reads through it:
+**ACH billing id** — `wholesale_applications.payment.ach.nmi_billing_id`
+is the id of a SPECIFIC billing profile INSIDE the customer vault. NMI
+allows multiple billing entries on a single vault (one card + one ACH
+is the common shape); the `billing_id` selects which one a sale
+targets. For ACH-method invoices, the CRON pass passes BOTH
+`customer_vault_id` AND `billing_id` to NMI's transact.php so the
+charge runs against the ACH billing — not the vault's default. Card
+charges omit the billing id and NMI uses the vault's default billing.
 
-| Caller | Behavior |
-|---|---|
-| `customer.service.ensureCustomerForOrder` | Reads `wholesale_applications.nmiCustomerVaultId`, validates via `validateCustomerVault`, mirrors onto `CustomerMap.nmiCustomerVaultId` for fast access during charges. |
-| `payment.service.chargeInvoice` | Reads from `customerMap.nmiCustomerVaultId` (the mirror); re-validates with `validateCustomerVault` before every NMI sale to catch stale ids (vault deleted from NMI dashboard, env swap, etc.). |
-| `api/admin/retry-payment.js` / `charge-card.js` | Same path — read vault from customerMap, charge funnels through `chargeInvoice`'s vault validation. |
+The billing id is NOT created by the registration handler — it's
+populated separately (admin tool, NMI dashboard, or a future
+add_billing call once the ACH billing profile is captured). Until then,
+ACH charges are skipped with `"no NMI ACH billing id on file"`.
+
+Downstream callers source the ids independently:
+
+| Caller | Card path | ACH path |
+|---|---|---|
+| `customer.service.ensureCustomerForOrder` | Reads `wholesale_applications.nmiCustomerVaultId`, validates via `validateCustomerVault`, mirrors onto `CustomerMap.nmiCustomerVaultId`. | Same vault validation as card. Additionally reads `wholesale_applications.payment.ach.nmi_billing_id` and mirrors it onto `CustomerMap.nmiAchBillingId`. The billing id is **not** validated via `validateCustomerVault` — that endpoint queries vaults, not billing entries; the billing id is trusted and any mismatch surfaces as a precise NMI decline on the next sale. |
+| `payment.service.chargeInvoice` | When `invoice.paymentMethod === 'card'`, reads `customerMap.nmiCustomerVaultId`; re-validates the vault before every NMI sale; passes `customer_vault_id` only. | When `invoice.paymentMethod === 'ach'`, reads BOTH `customerMap.nmiCustomerVaultId` (required) AND `customerMap.nmiAchBillingId` (required); validates the vault only; passes both `customer_vault_id` AND `billing_id` to NMI. The internal `resolveInvoiceVault(invoice, customerMap)` helper returns `{ vaultId, billingId, methodLabel, missingReason }` and centralises the per-method dispatch. |
+| `api/admin/retry-payment.js` | Reads vault via `resolveCustomerVaultId`. | Reads vault via `resolveCustomerVaultId` AND ACH billing id via `resolveCustomerAchBillingId`; rejects with a precise 409 if either is missing. Cheque-method invoices are rejected entirely (use mark-cheque-paid). |
+| `api/admin/charge-card.js` | Always routes through `resolveCustomerVaultId` and ignores the ACH billing id — this is the cross-method override path; the goal is "settle this invoice via the customer's card on file" regardless of the invoice's current paymentMethod. |
 
 The order pipeline no longer creates vaults. Customers who registered
 without a payment method (or whose vault create failed in
 [registration-form.js](app/api/registration-form.js)) land in the
-order flow with `nmiCustomerVaultId = null`; their card charges are
-skipped with `"no NMI customer vault on file"` until a vault is
-captured at registration. Cheque / ACH workflows are unaffected since
-they don't need a vault.
+order flow with `nmiCustomerVaultId = null`; all NMI charges are
+skipped with `"no NMI customer vault on file"`. ACH-method invoices
+additionally skip with `"no NMI ACH billing id on file"` when the
+vault is on file but the billing id isn't yet captured. Cheque
+workflows are unaffected since they don't need a vault.
 
 ---
 
@@ -1193,8 +1218,27 @@ parse + sort can dominate render time.
 
 Each customer carries a preferred payment method on their wholesale
 application (`wholesale_applications.payment.method` — one of `check`,
-`ach`, `card`). The CRON only auto-charges `card`; `check` and `ach`
-are held for manual admin action from the Order Details page.
+`ach`, `card`). The CRON auto-charges `card` AND `ach`; `check` is
+held for manual admin action from the Order Details page.
+
+**ACH vault sourcing** — every customer (card OR ACH) has at most one
+NMI customer vault, stored at the top-level
+`wholesale_applications.nmiCustomerVaultId`. NMI's vault model allows
+multiple BILLING PROFILES inside a single vault; the `billing_id`
+selects which one to charge. For ACH-method invoices the CRON passes
+BOTH `customer_vault_id` AND `billing_id` to NMI — the billing id is
+sourced from `wholesale_applications.payment.ach.nmi_billing_id`. Card-
+method invoices omit the billing id and NMI charges the vault's
+default billing.
+
+CustomerMap mirrors both fields (`nmiCustomerVaultId` +
+`nmiAchBillingId`) at order intake. `payment.service.chargeInvoice`
+picks them out via `resolveInvoiceVault` and feeds both to
+`nmi.service.chargeCustomerVault({ customerVaultId, billingId, ... })`.
+Vault validation (`validateCustomerVault`) runs against the
+customer vault id only; the billing id is trusted and any mismatch
+surfaces as a precise NMI decline on the next sale (e.g.
+`"vault id not present in NMI response"`).
 
 ### 9.1 Method propagation
 
@@ -1249,27 +1293,50 @@ Invoice fields; `cheque`, `ach` on the manualPayments ledger.
 
 ### 9.2 Scheduler gating
 
-PASS 1 of `process-pending-payments` filters by `paymentMethod: 'card'`
-**and** `autoChargePaused: { $ne: true }`:
+PASS 1 of `process-pending-payments` filters by
+`paymentMethod: { $in: ['card', 'ach'] }` **and**
+`autoChargePaused: { $ne: true }`:
 
 ```js
 Invoice.find({
   paymentStatus: 'pending',
-  paymentMethod: 'card',
+  paymentMethod: { $in: ['card', 'ach'] },
   autoChargePaused: { $ne: true },
   $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
 })
 ```
 
-PASS 1.5 (cheque/ACH + failed-card reminder logger) carries the same
-`autoChargePaused: { $ne: true }` term — pausing is an explicit "leave
-this one alone" signal, and surfacing a recurring reminder for a paused
-invoice would defeat that intent.
+Both card and ACH invoices flow through the same charge path —
+`payment.service.chargeInvoice` calls `resolveInvoiceVault()`
+internally to pick the right NMI ids by `invoice.paymentMethod`:
+
+- Card → `{ vaultId: customerMap.nmiCustomerVaultId, billingId: null }`
+- ACH → `{ vaultId: customerMap.nmiCustomerVaultId, billingId: customerMap.nmiAchBillingId }`
+
+The vault id is the SAME on both sides — every customer has at most
+one vault. The `billing_id` (ACH only) targets a specific billing
+profile inside the vault so NMI can route to the ACH entry rather
+than the default-billing card entry. `nmi.service.chargeCustomerVault`
+accepts both and threads them into transact.php's `customer_vault_id`
++ optional `billing_id` parameters.
+
+PASS 1.5 (reminder logger) now runs only over cheque-pending invoices
+and failed card/ACH invoices that exhausted retries. ACH no longer
+lands in PASS 1.5 as a pending row — it gets the active charge in
+PASS 1 instead, and lands here only if its `paymentStatus` flips to
+`'failed'` after `maxAttempts` declines. The legacy `cron_ach_reminder`
+remark kind is preserved on the Invoice schema for back-compat with
+rows logged before the change; new ACH activity lands as
+`cron_ach_attempt` (success / decline / error) in PASS 1.
+
+PASS 1.5 also carries the same `autoChargePaused: { $ne: true }` term —
+pausing is an explicit "leave this one alone" signal, and surfacing a
+recurring reminder for a paused invoice would defeat that intent.
 
 `$ne: true` (not `false`) is deliberate so legacy rows without the field
 default to "not paused".
 
-Cheque / ACH invoices sit on `pending` indefinitely until an admin acts.
+Cheque invoices sit on `pending` indefinitely until an admin acts.
 PASS 2 (downstream sync retry) is NOT gated by method or by the pause
 flag — once an invoice has money on it (paid / partially_paid), any
 failed QBO/Shopify sync is replayed regardless of how the invoice was
@@ -1398,7 +1465,7 @@ subsequent ticks if the admin attempt declines (because PASS 1 now
 matches). The next order for the same customer still defaults to the
 original cheque/ACH preference.
 
-### 9.5 ACH transport (existing)
+### 9.5 ACH transport + auto-charge
 
 NMI supports ACH/echeck through the same vault add_customer / sale API.
 When the vault was created with `paymentDetails.achAccount`,
@@ -1412,9 +1479,46 @@ checkaccount=<account number>
 account_type=checking
 ```
 
-This transport is unchanged. The workflow change in this section gates
-*when* we run the sale, not how. Per project decision, ACH invoices are
-treated as manual (same as cheque) and skipped by the CRON.
+ACH invoices ARE auto-charged by the CRON billing pass (PASS 1). Each
+customer has one NMI customer vault (top-level
+`wholesale_applications.nmiCustomerVaultId`); when the customer has an
+ACH billing profile attached to that vault, its id is stored at
+`wholesale_applications.payment.ach.nmi_billing_id`. The cache mirror
+lives on CustomerMap as `nmiCustomerVaultId` + `nmiAchBillingId`. PASS
+1's per-invoice charge path (`payment.service.chargeInvoice →
+resolveInvoiceVault`) reads BOTH ids whenever
+`invoice.paymentMethod === 'ach'` (the vault is the same one the card
+charge uses; the billing id is the discriminator), runs the standard
+`validateCustomerVault` pre-flight against the customer vault, and
+dispatches `nmi.service.chargeCustomerVault({ customerVaultId,
+billingId, ... })` so transact.php targets the ACH billing entry.
+
+**Failure handling** — ACH declines are recorded the same way as card
+declines:
+- a `PaymentAttempt` row with `outcome: 'declined'` or `'error'`,
+  including the NMI `responsetext` / `responsecode`
+- the invoice's `attemptCount` increments; on reaching `maxAttempts`
+  the status flips to `'failed'`
+- PASS 1 logs a `cron_ach_attempt` remark (success or decline) each
+  tick; PASS 1.5 logs `cron_failed_followup` once the invoice exhausts
+  retries
+
+Once an ACH invoice is failed (or anytime before), an admin can fall
+back to the card-on-file via the existing `POST /api/admin/orders/:id/charge-card`
+flow — this is the "Charge card on file" button on the Order Details
+page. The handler flips `Invoice.paymentMethod` to `'card'`,
+unblocks `maxAttempts` if needed, and runs `chargeInvoice` against
+the customer's card vault (`CustomerMap.nmiCustomerVaultId`). The
+ACH billing id is left untouched, so subsequent orders for the same
+customer keep ACH as the default. If the customer has no card vault
+on file, the handler rejects with HTTP 409 — admins capture a card
+out-of-band before the fallback becomes available.
+
+ACH-method invoices can also be retried via `POST /api/admin/orders/:id/retry-payment`
+(the "Retry ACH payment" button, distinct from "Retry payment" on
+card invoices). The endpoint routes to the ACH billing id via
+`resolveCustomerAchBillingId` and otherwise behaves identically to
+the card retry path.
 
 ---
 

@@ -25,6 +25,17 @@ const taxSchema = new mongoose.Schema(
   { _id: false },
 );
 
+// `card`:
+//   { cardholderName, cardBrand, cardLast4, paymentToken }
+// `ach`:
+//   { achAccountName, achRoutingNumber, achAccountLast4, achAccountType,
+//     nmi_billing_id }   ← NMI customer-vault id created for the ACH
+//                          payment method at registration submit. This is
+//                          the identifier the CRON billing pass uses when
+//                          paymentMethod === 'ach'. Distinct from the
+//                          top-level `nmiCustomerVaultId` (which holds the
+//                          card vault id). Snake-case to match the
+//                          domain-spec naming.
 const paymentSchema = new mongoose.Schema(
   {
     method: String,

@@ -159,18 +159,26 @@ const invoiceSchema = new mongoose.Schema(
     //
     // kinds:
     //   cron_card_attempt    — PASS 1 CRON tried to charge a card
+    //   cron_ach_attempt     — PASS 1 CRON tried to charge ACH via the
+    //                          NMI billing id stored at
+    //                          wholesale_applications.payment.ach.nmi_billing_id.
+    //                          Mirrors cron_card_attempt but kept as a
+    //                          distinct enum so the Order Details badge
+    //                          can render "ACH charge" vs "CRON charge"
+    //                          without having to peek at the invoice's
+    //                          current paymentMethod (which the
+    //                          ACH → card admin fallback may flip).
     //   cron_cheque_reminder — PASS 1.5 CRON logged a reminder for a
     //                          pending cheque invoice (no charge
     //                          attempted — admins still need to act)
-    //   cron_ach_reminder    — same as above but for ACH-method
-    //                          invoices. Distinct enum so the Order
-    //                          Details badge can render the right
-    //                          label without inspecting the linked
-    //                          invoice's paymentMethod (which could
-    //                          have been flipped post-remark by the
-    //                          cheque → card admin override).
-    //   cron_failed_followup — PASS 1.5 CRON noted a failed card
-    //                          invoice that exhausted retries
+    //   cron_ach_reminder    — Legacy enum kept for back-compat with
+    //                          rows logged before ACH became
+    //                          auto-charged. Once ACH moved into
+    //                          PASS 1 as an active charge path, the
+    //                          reminder kind is no longer written;
+    //                          new ACH rows use cron_ach_attempt.
+    //   cron_failed_followup — PASS 1.5 CRON noted a failed card OR
+    //                          ACH invoice that exhausted retries
     //   admin_action         — admin-driven settlement event (retry,
     //                          charge-card fallback, mark cheque paid)
     //   system_note          — any other system-generated note
@@ -182,6 +190,7 @@ const invoiceSchema = new mongoose.Schema(
               type: String,
               enum: [
                 'cron_card_attempt',
+                'cron_ach_attempt',
                 'cron_cheque_reminder',
                 'cron_ach_reminder',
                 'cron_failed_followup',

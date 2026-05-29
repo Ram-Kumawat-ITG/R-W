@@ -11,7 +11,19 @@ const customerMapSchema = new mongoose.Schema(
     email: { type: String, required: true, lowercase: true, trim: true, index: true },
 
     qboCustomerId: { type: String, index: true },
+    // NMI customer-vault id for the customer's CARD payment method.
+    // Source of truth lives at `wholesale_applications.nmiCustomerVaultId`;
+    // this is a runtime cache populated by ensureCustomerForOrder. Used by
+    // chargeInvoice when invoice.paymentMethod === 'card'.
     nmiCustomerVaultId: { type: String, index: true },
+
+    // NMI customer-vault id for the customer's ACH payment method.
+    // Source of truth lives at `wholesale_applications.payment.ach.nmi_billing_id`;
+    // mirrored here at order intake so chargeInvoice can pick the right
+    // vault id by `invoice.paymentMethod` without a second collection
+    // hit per CRON tick. Always null for customers whose preference was
+    // card or cheque at registration time.
+    nmiAchBillingId: { type: String, index: true },
 
     // Customer's preferred payment method, sourced from the wholesale
     // registration application at customer-sync time. Drives the default

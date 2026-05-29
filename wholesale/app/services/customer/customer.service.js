@@ -125,7 +125,7 @@ export async function ensureCustomerForOrder({ shop, order }) {
   // history. The cheque → card admin fallback mutates
   // `Invoice.paymentMethod`, never this customer-level value.
   const app = await WholesaleApplication.findOne({ shop, email: profile.email })
-    .select('payment.method nmiCustomerVaultId')
+    .select('payment.method payment.ach nmiCustomerVaultId')
     .lean()
 
   {
@@ -201,6 +201,36 @@ export async function ensureCustomerForOrder({ shop, order }) {
     }
   }
 
+  // NMI ACH billing id — the id of a specific billing profile WITHIN the
+  // customer vault above (NMI vaults can hold multiple billings; the
+  // billing_id selects which one to charge). Sourced from
+  // `wholesale_applications.payment.ach.nmi_billing_id`. We do NOT call
+  // validateCustomerVault on it — that endpoint queries customer vaults,
+  // and a billing id is a child of a vault, not a vault itself. The
+  // customer vault validation above already confirmed the parent exists;
+  // if the billing id is stale or wrong, NMI's transact.php rejects the
+  // sale with a precise error that lands on the PaymentAttempt ledger
+  // like any other decline.
+  const sourceAchBillingId = app?.payment?.ach?.nmi_billing_id || null
+  if (!sourceAchBillingId) {
+    if (mapping.nmiAchBillingId) {
+      console.log(
+        `[customers] WARN — customer_maps.nmiAchBillingId=${mapping.nmiAchBillingId} but ` +
+          `wholesale_applications.payment.ach has no nmi_billing_id; clearing cache so the source of truth wins`,
+      )
+      log.warn('nmi.ach_billing.cleared_stale_cache', { email: profile.email })
+      mapping.nmiAchBillingId = undefined
+    }
+  } else if (mapping.nmiAchBillingId !== sourceAchBillingId) {
+    console.log(
+      `[customers] NMI ACH billing link updated on customer_maps: ${mapping.nmiAchBillingId || '(none)'} → ${sourceAchBillingId}`,
+    )
+    log.info('nmi.ach_billing.linked', { email: profile.email, nmiBillingId: sourceAchBillingId })
+    mapping.nmiAchBillingId = sourceAchBillingId
+  } else {
+    console.log(`[customers] NMI ACH billing link unchanged on customer_maps: ${sourceAchBillingId}`)
+  }
+
   mapping.lastSyncedAt = new Date()
   await mapping.save()
   console.log(`[customers] customer_maps saved _id=${mapping._id}`)
@@ -261,5 +291,50 @@ export async function resolveCustomerVaultId({ shop, email, customerMap }) {
     { upsert: true },
   )
   return sourceVaultId
+}
+
+// Resolve the NMI ACH billing id for a customer at a specific shop.
+// Sibling of `resolveCustomerVaultId` but consults
+// `wholesale_applications.payment.ach.nmi_billing_id` instead of the
+// top-level vault id. Used by:
+//   - payment.service.chargeInvoice when invoice.paymentMethod === 'ach'
+//   - the Order Details loader to gate the "Retry ACH" / "Charge card on
+//     file" buttons correctly (an ACH-failed invoice with a card vault
+//     gets the card-fallback button; without a card vault it doesn't).
+//
+// Cache-then-source fallback identical to resolveCustomerVaultId:
+//   1. customer_maps.nmiAchBillingId (fast path)
+//   2. wholesale_applications.payment.ach.nmi_billing_id (source of truth)
+//   3. lazy sync on miss
+export async function resolveCustomerAchBillingId({ shop, email, customerMap }) {
+  if (!shop || !email) return null
+  const normalizedEmail = String(email).toLowerCase()
+
+  const cached = customerMap?.nmiAchBillingId || null
+  if (cached) return cached
+
+  const app = await WholesaleApplication.findOne({
+    shop,
+    email: normalizedEmail,
+  })
+    .select('payment.ach')
+    .lean()
+  const sourceBillingId = app?.payment?.ach?.nmi_billing_id || null
+  if (!sourceBillingId) return null
+
+  console.log(
+    `[customers] lazy ACH billing sync — copying nmi_billing_id=${sourceBillingId} ` +
+      `from wholesale_applications.payment.ach → customer_maps for ${normalizedEmail}`,
+  )
+  log.info('vault.ach_billing.lazy_sync', { shop, email: normalizedEmail, nmiBillingId: sourceBillingId })
+  await CustomerMap.updateOne(
+    { shop, email: normalizedEmail },
+    {
+      $setOnInsert: { shop, email: normalizedEmail },
+      $set: { nmiAchBillingId: sourceBillingId, lastSyncedAt: new Date() },
+    },
+    { upsert: true },
+  )
+  return sourceBillingId
 }
 

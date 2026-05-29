@@ -26,10 +26,15 @@ export function registerProcessPendingPaymentsJob(agenda) {
 
       // PASS 1 — pending invoices that still need to be charged.
       //
-      // Card-only: cheque and ACH invoices are skipped by the CRON. Those
-      // sit on `paymentStatus: 'pending'` until an admin records a
-      // manual cheque receipt or falls back to charging the card from
-      // the Order Details page.
+      // Card AND ACH invoices both flow through here. The actual NMI
+      // vault id is picked by payment.service.chargeInvoice based on
+      // `invoice.paymentMethod`:
+      //   - 'card' → customerMap.nmiCustomerVaultId
+      //   - 'ach'  → customerMap.nmiAchBillingId (mirrored from
+      //              wholesale_applications.payment.ach.nmi_billing_id)
+      // Cheque invoices remain skipped — they sit on `paymentStatus:
+      // 'pending'` until an admin records a manual cheque receipt or
+      // falls back to charging the card on file.
       //
       // The `autoChargePaused: { $ne: true }` term excludes invoices an
       // admin has explicitly paused from the Order Details page. The
@@ -39,7 +44,7 @@ export function registerProcessPendingPaymentsJob(agenda) {
       // picks the invoice up again.
       const pendingCursor = Invoice.find({
         paymentStatus: 'pending',
-        paymentMethod: 'card',
+        paymentMethod: { $in: ['card', 'ach'] },
         autoChargePaused: { $ne: true },
         $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
       }).cursor()
@@ -70,22 +75,32 @@ export function registerProcessPendingPaymentsJob(agenda) {
           // because chargeInvoice mutates amountDue / fee state.
           const after = await Invoice.findById(invoice._id).select('amountDue amountPaid currency')
           const outstanding = after ? Number((after.amountDue - after.amountPaid).toFixed(2)) : null
+          // Method-aware remark kind + label. The kind is captured at
+          // write time off the invoice's CURRENT paymentMethod so the
+          // Order Details badge ("CRON charge" vs "ACH charge") stays
+          // accurate even if the admin later flips the method via the
+          // ACH → card fallback. The label inside the message echoes
+          // the same source so log scrapers don't need to peek at the
+          // kind enum to know what failed.
+          const methodIsAch = invoice.paymentMethod === 'ach'
+          const remarkKind = methodIsAch ? 'cron_ach_attempt' : 'cron_card_attempt'
+          const methodLabel = methodIsAch ? 'ACH' : 'card'
           let remarkMsg
           if (result.skipped) {
-            remarkMsg = `CRON skipped: ${result.reason}`
+            remarkMsg = `CRON ${methodLabel} charge skipped: ${result.reason}`
           } else if (result.outcome === 'approved') {
-            remarkMsg = `CRON charged successfully (NMI txn ${result.transactionId || '?'})`
+            remarkMsg = `CRON ${methodLabel} charged successfully (NMI txn ${result.transactionId || '?'})`
           } else if (result.outcome === 'declined') {
-            remarkMsg = `CRON charge declined: ${result.responseText || 'no reason given'}`
+            remarkMsg = `CRON ${methodLabel} charge declined: ${result.responseText || 'no reason given'}`
           } else {
-            remarkMsg = `CRON charge errored: ${result.error || result.responseText || 'unknown'}`
+            remarkMsg = `CRON ${methodLabel} charge errored: ${result.error || result.responseText || 'unknown'}`
           }
           await Invoice.updateOne(
             { _id: invoice._id },
             {
               $push: {
                 remarks: {
-                  kind: 'cron_card_attempt',
+                  kind: remarkKind,
                   message: remarkMsg,
                   amount: outstanding,
                   currency: after?.currency || invoice.currency,
@@ -116,12 +131,19 @@ export function registerProcessPendingPaymentsJob(agenda) {
         }
       }
 
-      // PASS 1.5 — non-card pending invoices (cheque + ACH) and failed
-      // card invoices. CRON cannot auto-charge these, so we log a
-      // "reminder" remark each tick. Admins see the follow-up trail on
-      // the Order List "Remarks" column and can act manually (mark
-      // cheque paid / charge card on file). No customer-facing
+      // PASS 1.5 — cheque-pending invoices (no NMI vault to charge
+      // against) and failed card/ACH invoices that exhausted retries.
+      // CRON cannot auto-charge these, so we log a "reminder" / "follow-up"
+      // remark each tick. Admins see the trail on the Order List
+      // "Remarks" column and can act manually (mark cheque paid, charge
+      // card on file as a fallback, etc.). No customer-facing
       // notifications are sent here — operator-visible log only.
+      //
+      // ACH-pending invoices NO LONGER land here — they now flow through
+      // PASS 1 as an active charge path against the NMI billing id.
+      // The legacy `cron_ach_reminder` enum is preserved on the Invoice
+      // schema for back-compat with rows written before that change;
+      // PASS 1.5 will not emit it anymore.
       //
       // Paused invoices are excluded from reminders too — pausing is
       // an explicit "leave this one alone" signal. Surfacing a
@@ -129,7 +151,7 @@ export function registerProcessPendingPaymentsJob(agenda) {
       const reminderCursor = Invoice.find({
         autoChargePaused: { $ne: true },
         $or: [
-          { paymentStatus: 'pending', paymentMethod: { $in: ['check', 'ach'] } },
+          { paymentStatus: 'pending', paymentMethod: 'check' },
           { paymentStatus: 'failed' },
         ],
       }).cursor()
@@ -137,20 +159,16 @@ export function registerProcessPendingPaymentsJob(agenda) {
       for await (const invoice of reminderCursor) {
         const outstanding = Number((invoice.amountDue - invoice.amountPaid).toFixed(2))
         const isFailed = invoice.paymentStatus === 'failed'
-        const isAch = invoice.paymentMethod === 'ach'
-        // Per-method kind so the Order Details badge renders the right
-        // label (ACH vs Cheque) without having to walk back through
-        // the invoice's current paymentMethod — which a later cheque →
-        // card override could have flipped, leaving the audit row's
-        // label inconsistent with what was true at write time.
-        const kind = isFailed
-          ? 'cron_failed_followup'
-          : isAch
-            ? 'cron_ach_reminder'
-            : 'cron_cheque_reminder'
-        const methodLabel = isAch ? 'ACH' : 'Cheque'
+        // Failed invoices keep the "Failed follow-up" kind regardless
+        // of original method so the Order List filter stays clean.
+        // Pending invoices land here only when paymentMethod==='check',
+        // so the kind is fixed at cron_cheque_reminder.
+        const kind = isFailed ? 'cron_failed_followup' : 'cron_cheque_reminder'
+        const methodLabel = isFailed
+          ? (invoice.paymentMethod === 'ach' ? 'ACH' : 'Card')
+          : 'Cheque'
         const message = isFailed
-          ? `Failed payment follow-up — $${outstanding.toFixed(2)} outstanding after ${invoice.attemptCount} attempt(s)`
+          ? `Failed ${methodLabel.toLowerCase()} payment follow-up — $${outstanding.toFixed(2)} outstanding after ${invoice.attemptCount} attempt(s)`
           : `${methodLabel} payment reminder — $${outstanding.toFixed(2)} still outstanding`
         await Invoice.updateOne(
           { _id: invoice._id },

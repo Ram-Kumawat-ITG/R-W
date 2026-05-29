@@ -168,7 +168,16 @@ export async function findOrCreateCustomerVault({ profile, paymentDetails }) {
 
 // Charge a stored payment method. The vault id MUST already exist —
 // this is the production path used by the recurring scheduler.
-export async function chargeCustomerVault({ customerVaultId, amount, currency, orderId, invoiceNumber }) {
+//
+// `billingId` is OPTIONAL. NMI's Customer Vault model lets a single
+// vault hold multiple billing profiles (e.g. one card + one ACH); each
+// billing entry has its own `billing_id`. When omitted, NMI charges
+// the vault's DEFAULT billing. When supplied, NMI targets that
+// specific billing entry — this is how we route ACH-method invoices
+// against the ACH billing profile (id stored at
+// wholesale_applications.payment.ach.nmi_billing_id) while card-method
+// invoices on the same vault stay on the default card billing.
+export async function chargeCustomerVault({ customerVaultId, billingId, amount, currency, orderId, invoiceNumber }) {
   if (!customerVaultId) throw new Error('chargeCustomerVault: customerVaultId is required')
   if (!Number.isFinite(amount) || amount <= 0) {
     throw new Error(`chargeCustomerVault: amount must be > 0, got ${amount}`)
@@ -182,9 +191,13 @@ export async function chargeCustomerVault({ customerVaultId, amount, currency, o
     orderid: orderId,
     order_description: invoiceNumber ? `Invoice ${invoiceNumber}` : undefined,
   }
+  if (billingId) params.billing_id = billingId
 
-  console.log(`\n[NMI charge] vault=${customerVaultId} amount=$${amount.toFixed(2)} order=${orderId}`)
-  log.info('charge.request', { customerVaultId, amount, orderId, invoiceNumber })
+  console.log(
+    `\n[NMI charge] vault=${customerVaultId}${billingId ? ` billing=${billingId}` : ''} ` +
+      `amount=$${amount.toFixed(2)} order=${orderId}`,
+  )
+  log.info('charge.request', { customerVaultId, billingId: billingId || null, amount, orderId, invoiceNumber })
 
   const res = await nmiTransact(params)
   const result = classifyNmiResponse(res)
