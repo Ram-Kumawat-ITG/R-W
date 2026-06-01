@@ -62,6 +62,15 @@ function resolveDateRange(rangeId) {
   return { dateFrom, dateTo: null };
 }
 
+// The referral-code mutations on this tab submit via `fetcher.submit(...,
+// { method: "POST" })` with NO explicit action, so React Router targets the
+// leaf route for this URL — which is THIS index route, not the parent layout.
+// The CRUD action implementation lives on the layout ($id.jsx) as the single
+// source of truth; we re-export it here so the leaf route can actually serve
+// the submission. After it settles, RR auto-revalidates both this loader and
+// the layout loader, so the code list refreshes without manual orchestration.
+export { action } from "./app.cdo-program.customers.$id.jsx";
+
 export const loader = async ({ request, params }) => {
   await authenticate.admin(request);
   const url = new URL(request.url);

@@ -5,14 +5,24 @@
 // Reports, and per-tab list pages. Each function ensures the shared
 // Mongo connection (connectDB is cached + idempotent) before querying.
 //
-// `cdo_*` collections are owned by this module. CDO practitioners are
-// read from the wholesale workspace's `wholesale_applications`
-// collection (approved applicants who resell) — the same source the
-// standalone CDO Practitioners page uses.
+// User-type model (two collections, two roles):
+//   • Practitioners → `wholesale_applications` (approved applicants who
+//     resell). These own referral codes. The CDO Program admin's
+//     "Customers" list + detail pages surface practitioners from here.
+//   • Customers (Retailer + Patient) → `cdo_applications`. A customer
+//     application may carry a referral code that maps back to a
+//     practitioner in wholesale_applications, making the customer
+//     eligible for that code's discount.
+//
+// Referral codes live in `cdo_practitioner_codes`, keyed to the owning
+// practitioner via `practitionerId` + `practitionerSource` ("wholesale").
+// The practitioner↔customer relationship is tracked through this code
+// mapping — see validateReferralCode() / buildReferralSnapshot() below.
 
 import mongoose from "mongoose";
 import connectDB from "../../db/mongo.server";
 import WholesaleApplication from "../../models/wholesaleApplication.server";
+import CdoApplication from "../../models/cdoApplication.server";
 import CdoOrder from "../../models/cdoOrder.server";
 import CdoCommission from "../../models/cdoCommission.server";
 import CdoPayout from "../../models/cdoPayout.server";
@@ -20,11 +30,33 @@ import CdoReferral from "../../models/cdoReferral.server";
 import CdoTransaction from "../../models/cdoTransaction.server";
 import CdoSetting from "../../models/cdoSetting.server";
 import CdoPractitionerCode from "../../models/cdoPractitionerCode.server";
+import {
+  findOrCreateVendor,
+  createBill,
+  createBillPayment,
+  billWebUrl,
+} from "../qbo/qbo.service";
 
+// Practitioners are approved wholesale applicants who resell. Real
+// registration data records "resells" inconsistently: some rows set the
+// boolean `resellsProducts`, others leave it false but describe what they
+// resell in the free-text `tax.itemsToResell` (e.g. "yes", "Herbal
+// supplements"). So we treat an approved applicant as a practitioner when
+// EITHER signal is present — `resellsProducts === true`, OR
+// `tax.itemsToResell` holds a real value (present, not empty / a
+// negation). Matching only the literal "yes" missed legitimate
+// practitioners who typed what they resell.
+const RESELL_NEGATIVES = ["", "no", "No", "NO", "none", "None", "n/a", "N/A", null];
 const PRACTITIONER_FILTER = {
-  "tax.itemsToResell": "yes",
   status: "approved",
+  $or: [
+    { resellsProducts: true },
+    { "tax.itemsToResell": { $exists: true, $nin: RESELL_NEGATIVES } },
+  ],
 };
+
+// Codes minted for CDO Program practitioners point at wholesale_applications.
+const PRACTITIONER_SOURCE = "wholesale";
 
 function sum(rows, field) {
   return rows.reduce((acc, r) => acc + (Number(r[field]) || 0), 0);
@@ -109,6 +141,10 @@ export async function listPayouts() {
     periodEnd: r.periodEnd || null,
     reference: r.reference || "",
     paidAt: r.paidAt || null,
+    commissionCount: Array.isArray(r.commissionIds) ? r.commissionIds.length : 0,
+    qboBillId: r.qboBillId || null,
+    qboBillUrl: r.qboBillId ? billWebUrl(r.qboBillId) : null,
+    lastError: r.lastError || null,
   }));
 }
 
@@ -266,8 +302,8 @@ export async function getTopPractitioners({ limit = 5 } = {}) {
 //
 // Drive the CDO Customers detail page (`/app/cdo-program/customers/:id`).
 // Every helper takes the practitioner's wholesale_applications `_id` as
-// its primary key — that's the same id the CDO Customers list page
-// hands to the row link.
+// its primary key — that's the same id the CDO Customers list page hands
+// to the row link.
 
 function isValidObjectId(id) {
   return typeof id === "string" && mongoose.isValidObjectId(id);
@@ -286,6 +322,7 @@ export async function getPractitionerProfile(id) {
   if (!row) return null;
   return {
     id: row._id.toString(),
+    shop: row.shop || null,
     firstName: row.firstName || "",
     lastName: row.lastName || "",
     name: `${row.firstName || ""} ${row.lastName || ""}`.trim(),
@@ -400,9 +437,14 @@ export async function createPractitionerCode({
 
   await connectDB();
 
-  // Cheap pre-check for the per-shop-uniqueness — surfaces a friendly
+  // A code's shop follows its owning practitioner — the DB uniqueness
+  // guarantee is the partial index { shop, code }, so the dup pre-check
+  // and the insert must both be shop-scoped to stay consistent with it.
+  const shop = profile.shop ?? null;
+
+  // Cheap pre-check for the per-shop uniqueness — surfaces a friendly
   // error before the DB layer throws E11000.
-  const clash = await CdoPractitionerCode.findOne({ code: normalized }).lean();
+  const clash = await CdoPractitionerCode.findOne({ shop, code: normalized }).lean();
   if (clash) {
     throw new Error(
       `Code "${normalized}" is already in use by another practitioner`,
@@ -427,7 +469,9 @@ export async function createPractitionerCode({
   }
 
   const doc = await CdoPractitionerCode.create({
+    shop,
     practitionerId: profile.id,
+    practitionerSource: PRACTITIONER_SOURCE,
     practitionerEmail: profile.email,
     practitionerName: profile.name,
     code: normalized,
@@ -467,7 +511,9 @@ export async function updatePractitionerCode({
   if (code !== undefined && code !== null && String(code).trim() !== "") {
     const normalized = normalizeAndValidateCode(code);
     if (normalized !== existing.code) {
+      // Scope by the code's own shop to match the { shop, code } index.
       const clash = await CdoPractitionerCode.findOne({
+        shop: existing.shop ?? null,
         code: normalized,
         _id: { $ne: existing._id },
       }).lean();
@@ -547,6 +593,154 @@ export async function setPrimaryPractitionerCode({
   target.updatedBy = actor || "system";
   await target.save();
   return target.toObject();
+}
+
+// ── Customer applications + referral-code mapping ────────────────────
+//
+// Customers (Retailer + Patient) live in `cdo_applications`. When a
+// customer applies with a referral code, the code is validated against
+// the practitioner-owned `cdo_practitioner_codes` catalogue and the
+// resolved practitioner + discount is snapshotted onto the customer
+// record (`referral`). This is the practitioner↔customer link the
+// program tracks. Customers without a code carry `referral: null` and
+// get no discount.
+
+const CUSTOMER_TYPES = ["retailer", "patient"];
+
+// Resolve a raw referral code to its owning practitioner + discount.
+// Returns { valid:false, reason } when the code is unknown / not active,
+// otherwise the full mapping the registration flow snapshots onto the
+// customer. Validates the practitioner still exists in the collection
+// named by the code's `practitionerSource`.
+//
+// `opts.shop` scopes the lookup to one shop — pass it from the customer's
+// registration context so a code only resolves within its own shop,
+// matching the { shop, code } uniqueness index. Omit it for single-tenant
+// callers (the lookup then ignores shop).
+export async function validateReferralCode(rawCode, { shop } = {}) {
+  const code = String(rawCode || "").trim().toUpperCase();
+  if (!code) return { valid: false, reason: "empty" };
+  await connectDB();
+
+  const codeQuery = { code };
+  if (shop !== undefined) codeQuery.shop = shop;
+  const codeDoc = await CdoPractitionerCode.findOne(codeQuery).lean();
+  if (!codeDoc) return { valid: false, reason: "not_found", code };
+  if (codeDoc.status !== "active") {
+    return { valid: false, reason: "inactive", code, status: codeDoc.status };
+  }
+
+  // Confirm the code points at a still-ELIGIBLE practitioner — not just
+  // an existing document. We re-apply the same eligibility gate the rest
+  // of the service uses (PRACTITIONER_FILTER for wholesale practitioners:
+  // approved + resells) so a code owned by a rejected / revoked /
+  // non-reselling applicant stops granting a discount. Without this, a
+  // code could outlive its owner's practitioner status.
+  const source = codeDoc.practitionerSource || "wholesale";
+  const Model = source === "cdo" ? CdoApplication : WholesaleApplication;
+  const eligibility = source === "cdo" ? { status: "approved" } : PRACTITIONER_FILTER;
+  const practitioner = isValidObjectId(codeDoc.practitionerId)
+    ? await Model.findOne({ _id: codeDoc.practitionerId, ...eligibility })
+        .select("firstName lastName email status")
+        .lean()
+    : null;
+  if (!practitioner) {
+    // Either the record is gone or it no longer qualifies as a practitioner.
+    return { valid: false, reason: "practitioner_ineligible", code };
+  }
+
+  // Discount the customer becomes eligible for; commissionRate falls
+  // back to the program default so callers always have a usable number.
+  const settings = await getSettings();
+  const discountPercent = codeDoc.discountPercent ?? 0;
+  const commissionRate =
+    codeDoc.commissionRate != null
+      ? codeDoc.commissionRate
+      : settings.defaultCommissionRate;
+
+  return {
+    valid: true,
+    code: codeDoc.code,
+    codeId: codeDoc._id.toString(),
+    practitionerId: codeDoc.practitionerId,
+    practitionerSource: source,
+    practitionerName:
+      codeDoc.practitionerName ||
+      `${practitioner.firstName || ""} ${practitioner.lastName || ""}`.trim() ||
+      practitioner.email ||
+      "—",
+    practitionerEmail: (practitioner.email || codeDoc.practitionerEmail || "").toLowerCase(),
+    discountPercent,
+    commissionRate,
+  };
+}
+
+// Build the immutable `referral` snapshot stored on a cdo_applications
+// record at submit time. `null` when no (valid) code was supplied — the
+// caller can decide whether an invalid code is a hard error or a silent
+// "no discount" depending on the registration UX. Pass `opts.shop` to
+// scope the code lookup to the customer's shop (multi-tenant safe).
+export async function buildReferralSnapshot(rawCode, { when, shop } = {}) {
+  if (!rawCode) return null;
+  const result = await validateReferralCode(rawCode, { shop });
+  if (!result.valid) return null;
+  return {
+    code: result.code,
+    codeId: result.codeId,
+    practitionerId: result.practitionerId,
+    practitionerSource: result.practitionerSource,
+    practitionerName: result.practitionerName,
+    practitionerEmail: result.practitionerEmail,
+    discountPercent: result.discountPercent,
+    commissionRate: result.commissionRate,
+    linkedAt: when || new Date(),
+  };
+}
+
+// List customer applications, optionally scoped by applicant type. Used
+// by the (future) CDO customer-applications admin screens + by tests
+// validating the referral / non-referral seed scenarios.
+export async function listCustomerApplications({ type } = {}) {
+  await connectDB();
+  const filter = {};
+  if (type && CUSTOMER_TYPES.includes(type)) filter.applicantType = type;
+  const rows = await CdoApplication.find(filter)
+    .sort({ submittedAt: -1 })
+    .lean();
+  return rows.map((r) => ({
+    id: r._id.toString(),
+    applicantType: r.applicantType || null,
+    firstName: r.firstName || "",
+    lastName: r.lastName || "",
+    name: `${r.firstName || ""} ${r.lastName || ""}`.trim(),
+    email: (r.email || "").toLowerCase(),
+    businessName: r.businessName || "",
+    status: r.status || "pending",
+    submittedAt: r.submittedAt || null,
+    referral: r.referral || null,
+    discountPercent: r.referral?.discountPercent ?? 0,
+  }));
+}
+
+// Customers referred by a given practitioner — the reverse of the
+// referral mapping (practitioner → their referred customers).
+export async function listCustomersForPractitioner(practitionerId) {
+  if (!isValidObjectId(practitionerId)) return [];
+  await connectDB();
+  const rows = await CdoApplication.find({
+    "referral.practitionerId": practitionerId,
+  })
+    .sort({ submittedAt: -1 })
+    .lean();
+  return rows.map((r) => ({
+    id: r._id.toString(),
+    applicantType: r.applicantType || null,
+    name: `${r.firstName || ""} ${r.lastName || ""}`.trim(),
+    email: (r.email || "").toLowerCase(),
+    referralCode: r.referral?.code || null,
+    discountPercent: r.referral?.discountPercent ?? 0,
+    submittedAt: r.submittedAt || null,
+  }));
 }
 
 // ── Per-practitioner aggregations (Statistics + tab loaders) ─────────
@@ -698,6 +892,10 @@ export async function listPractitionerPayouts(practitionerId) {
     periodEnd: r.periodEnd || null,
     reference: r.reference || "",
     paidAt: r.paidAt || null,
+    commissionCount: Array.isArray(r.commissionIds) ? r.commissionIds.length : 0,
+    qboBillId: r.qboBillId || null,
+    qboBillUrl: r.qboBillId ? billWebUrl(r.qboBillId) : null,
+    lastError: r.lastError || null,
   }));
 }
 
@@ -735,4 +933,442 @@ export async function listPractitionerTransactions(practitionerId) {
     description: r.description || "",
     occurredAt: r.occurredAt || r.createdAt || null,
   }));
+}
+
+// ── Commission payout engine (accrual → batch → approve → execute) ───
+//
+// Lifecycle:
+//   cdo_orders ──accrueCommissionsForOrders──▶ cdo_commissions
+//   approved commissions ──buildPayoutBatch──▶ cdo_payouts(awaiting_approval)
+//   admin ──approvePayout──▶ approved ──executeApprovedPayout──▶
+//     QBO findOrCreateVendor → createBill → createBillPayment
+//     → commissions(paid) + cdo_transactions(ledger) + status(paid)
+//
+// Every write is idempotent / safely retryable: commissions are reserved
+// via `payoutId`, QBO writes carry stable `requestid`s, and each step is
+// guarded by the presence of its result id on the payout.
+
+function roundMoney(n) {
+  return Math.round((Number(n) || 0) * 100) / 100;
+}
+
+// Append a running-balance ledger entry for a practitioner. Balance is
+// derived from the most recent prior entry (chronological append model —
+// fine for the CRON / admin single-writer flow).
+async function appendLedgerEntry({
+  shop,
+  practitionerId,
+  practitionerEmail,
+  practitionerName,
+  currency,
+  type,
+  amount,
+  relatedType,
+  relatedId,
+  description,
+  occurredAt,
+}) {
+  const last = await CdoTransaction.findOne({ practitionerId })
+    .sort({ occurredAt: -1, createdAt: -1 })
+    .lean();
+  const prev = last?.balanceAfter ?? 0;
+  const balanceAfter = roundMoney(prev + amount);
+  return CdoTransaction.create({
+    shop,
+    practitionerId,
+    practitionerEmail,
+    practitionerName,
+    type,
+    currency: currency || "USD",
+    amount: roundMoney(amount),
+    balanceAfter,
+    relatedType,
+    relatedId,
+    description,
+    occurredAt: occurredAt || new Date(),
+  });
+}
+
+function pushPayoutRemark(payout, { kind, message, actor, source }) {
+  payout.remarks.push({
+    kind,
+    message,
+    actor: actor || "system",
+    source: source || "system",
+    createdAt: new Date(),
+  });
+}
+
+// ── Phase 2: commission accrual + eligibility ────────────────────────
+
+// Generate cdo_commissions for attributed orders that don't have one yet.
+// Idempotent: skips orders that already have a linked commission. Rate is
+// derived from the order (commissionAmount / amount) or the program
+// default; status follows cdo_settings.autoApproveCommissions. Each new
+// commission also posts a "commission" credit to the practitioner ledger.
+export async function accrueCommissionsForOrders({ shop } = {}) {
+  await connectDB();
+  const settings = await getSettings();
+  const autoApprove = settings.autoApproveCommissions === true;
+
+  const orderFilter = { status: { $ne: "cancelled" } };
+  if (shop) orderFilter.shop = shop;
+  const orders = await CdoOrder.find(orderFilter).lean();
+
+  const existing = await CdoCommission.find({
+    orderId: { $in: orders.map((o) => o._id) },
+  })
+    .select("orderId")
+    .lean();
+  const seen = new Set(existing.map((c) => String(c.orderId)));
+
+  let createdCount = 0;
+  for (const o of orders) {
+    if (seen.has(String(o._id))) continue;
+    const amount = roundMoney(o.commissionAmount);
+    if (amount <= 0) continue;
+    const rate =
+      Number(o.amount) > 0
+        ? Number((amount / Number(o.amount)).toFixed(4))
+        : settings.defaultCommissionRate;
+    const earnedAt = o.placedAt || o.createdAt || new Date();
+    const commission = await CdoCommission.create({
+      shop: o.shop,
+      practitionerId: o.practitionerId,
+      practitionerEmail: o.practitionerEmail,
+      practitionerName: o.practitionerName,
+      orderId: o._id,
+      orderName: o.orderName,
+      currency: o.currency || settings.currency,
+      amount,
+      rate,
+      status: autoApprove ? "approved" : "pending",
+      earnedAt,
+    });
+    await appendLedgerEntry({
+      shop: o.shop,
+      practitionerId: o.practitionerId,
+      practitionerEmail: o.practitionerEmail,
+      practitionerName: o.practitionerName,
+      currency: o.currency || settings.currency,
+      type: "commission",
+      amount,
+      relatedType: "CdoCommission",
+      relatedId: commission._id,
+      description: `Commission earned on ${o.orderName || o.shopifyOrderId || "order"}`,
+      occurredAt: earnedAt,
+    });
+    createdCount += 1;
+  }
+  return { createdCount, autoApprove };
+}
+
+export async function approveCommission(commissionId) {
+  if (!isValidObjectId(commissionId)) throw new Error("Invalid commission id");
+  await connectDB();
+  const c = await CdoCommission.findById(commissionId);
+  if (!c) throw new Error("Commission not found");
+  if (c.status === "paid") throw new Error("Cannot approve a paid commission");
+  c.status = "approved";
+  await c.save();
+  return c.toObject();
+}
+
+export async function reverseCommission(commissionId) {
+  if (!isValidObjectId(commissionId)) throw new Error("Invalid commission id");
+  await connectDB();
+  const c = await CdoCommission.findById(commissionId);
+  if (!c) throw new Error("Commission not found");
+  if (c.status === "paid" || c.payoutId) {
+    throw new Error("Cannot reverse a commission that is paid or attached to a payout");
+  }
+  c.status = "reversed";
+  await c.save();
+  return c.toObject();
+}
+
+// Approved, not-yet-paid, not-yet-batched commissions earned on/before
+// the period end. The batch builder applies the per-practitioner minimum.
+export async function getEligibleCommissions({ practitionerId, periodEnd } = {}) {
+  await connectDB();
+  const filter = { status: "approved", payoutId: null };
+  if (practitionerId) filter.practitionerId = practitionerId;
+  if (periodEnd) filter.earnedAt = { $lte: new Date(periodEnd) };
+  return CdoCommission.find(filter).sort({ earnedAt: 1 }).lean();
+}
+
+// ── Phase 3: payout batch + approval workflow ────────────────────────
+
+// Aggregate eligible commissions per practitioner into awaiting_approval
+// payouts. Reserves the commissions (sets payoutId) so a second run won't
+// double-batch them. Skips practitioners below the minimum payout amount
+// or who already have an open payout for the period.
+export async function buildPayoutBatch({ periodStart, periodEnd, practitionerId, actor } = {}) {
+  await connectDB();
+  const settings = await getSettings();
+  const minAmount = Number(settings.minimumPayoutAmount) || 0;
+  const periodEndDate = periodEnd ? new Date(periodEnd) : new Date();
+  const periodStartDate = periodStart ? new Date(periodStart) : null;
+
+  const eligible = await getEligibleCommissions({
+    practitionerId,
+    periodEnd: periodEndDate,
+  });
+
+  // Group by practitioner.
+  const groups = new Map();
+  for (const c of eligible) {
+    const key = c.practitionerId;
+    if (!key) continue;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(c);
+  }
+
+  const created = [];
+  const skipped = [];
+  for (const [pid, commissions] of groups.entries()) {
+    const total = roundMoney(commissions.reduce((s, c) => s + (Number(c.amount) || 0), 0));
+    if (total < minAmount) {
+      skipped.push({ practitionerId: pid, total, reason: "below_minimum", minAmount });
+      continue;
+    }
+
+    // Idempotency: don't open a second payout for the same practitioner +
+    // period while one is still in flight.
+    const open = await CdoPayout.findOne({
+      practitionerId: pid,
+      periodEnd: periodEndDate,
+      status: { $in: ["draft", "awaiting_approval", "approved", "processing"] },
+    }).lean();
+    if (open) {
+      skipped.push({ practitionerId: pid, total, reason: "open_payout_exists" });
+      continue;
+    }
+
+    const first = commissions[0];
+    const reference = `CDO-${periodEndDate.toISOString().slice(0, 7).replace("-", "")}-${String(pid).slice(-6)}`;
+    const payout = new CdoPayout({
+      shop: first.shop,
+      practitionerId: pid,
+      practitionerSource: "wholesale",
+      practitionerEmail: first.practitionerEmail,
+      practitionerName: first.practitionerName,
+      currency: first.currency || settings.currency,
+      amount: total,
+      method: "ach",
+      status: "awaiting_approval",
+      commissionIds: commissions.map((c) => c._id),
+      periodStart: periodStartDate,
+      periodEnd: periodEndDate,
+      reference,
+    });
+    pushPayoutRemark(payout, {
+      kind: "batch_created",
+      message: `Batched ${commissions.length} commission(s) totalling ${total} ${payout.currency}`,
+      actor,
+      source: actor ? "admin" : "system",
+    });
+    await payout.save();
+
+    // Reserve the commissions so they aren't batched again.
+    await CdoCommission.updateMany(
+      { _id: { $in: payout.commissionIds } },
+      { $set: { payoutId: payout._id } },
+    );
+
+    created.push(payout.toObject());
+  }
+
+  return { created, skipped, minAmount, periodEnd: periodEndDate };
+}
+
+export async function approvePayout(payoutId, actor) {
+  if (!isValidObjectId(payoutId)) throw new Error("Invalid payout id");
+  await connectDB();
+  const payout = await CdoPayout.findById(payoutId);
+  if (!payout) throw new Error("Payout not found");
+  if (!["draft", "awaiting_approval"].includes(payout.status)) {
+    throw new Error(`Cannot approve a payout in status "${payout.status}"`);
+  }
+  payout.status = "approved";
+  payout.approvedBy = actor || "admin";
+  payout.approvedAt = new Date();
+  pushPayoutRemark(payout, {
+    kind: "approved",
+    message: "Payout approved for execution",
+    actor,
+    source: "admin",
+  });
+  await payout.save();
+  return payout.toObject();
+}
+
+export async function rejectPayout(payoutId, actor, reason) {
+  if (!isValidObjectId(payoutId)) throw new Error("Invalid payout id");
+  await connectDB();
+  const payout = await CdoPayout.findById(payoutId);
+  if (!payout) throw new Error("Payout not found");
+  if (!["draft", "awaiting_approval", "approved"].includes(payout.status)) {
+    throw new Error(`Cannot reject a payout in status "${payout.status}"`);
+  }
+  // Release the reserved commissions so they can be re-batched.
+  await CdoCommission.updateMany(
+    { _id: { $in: payout.commissionIds } },
+    { $set: { payoutId: null } },
+  );
+  payout.status = "rejected";
+  payout.rejectedBy = actor || "admin";
+  payout.rejectedAt = new Date();
+  payout.rejectionReason = reason || null;
+  pushPayoutRemark(payout, {
+    kind: "rejected",
+    message: reason ? `Rejected: ${reason}` : "Payout rejected",
+    actor,
+    source: "admin",
+  });
+  await payout.save();
+  return payout.toObject();
+}
+
+// Execute an approved payout against QBO: ensure Vendor → create Bill →
+// record BillPayment → settle commissions + ledger. Each step is guarded
+// by its result id on the payout, so a re-run after a mid-way failure
+// resumes rather than duplicating. QBO writes use stable requestids.
+export async function executeApprovedPayout(payoutId, { actor } = {}) {
+  if (!isValidObjectId(payoutId)) throw new Error("Invalid payout id");
+  await connectDB();
+  const payout = await CdoPayout.findById(payoutId);
+  if (!payout) throw new Error("Payout not found");
+  if (!["approved", "processing", "failed"].includes(payout.status)) {
+    throw new Error(`Cannot execute a payout in status "${payout.status}"`);
+  }
+
+  payout.status = "processing";
+  payout.lastError = null;
+  await payout.save();
+
+  try {
+    // 1) Vendor (find-or-create, cached in cdo_qbo_vendors).
+    if (!payout.qboVendorId) {
+      const profile = await getPractitionerProfile(payout.practitionerId);
+      const { qboVendorId } = await findOrCreateVendor({
+        practitionerId: payout.practitionerId,
+        practitionerSource: payout.practitionerSource,
+        displayName: profile?.name || payout.practitionerName,
+        email: profile?.email || payout.practitionerEmail,
+        firstName: profile?.firstName,
+        lastName: profile?.lastName,
+        companyName: profile?.businessName,
+      });
+      payout.qboVendorId = qboVendorId;
+      await payout.save();
+    }
+
+    // 2) Bill (one expense line per commission).
+    if (!payout.qboBillId) {
+      const commissions = await CdoCommission.find({
+        _id: { $in: payout.commissionIds },
+      }).lean();
+      const lines = commissions.map((c) => ({
+        amount: c.amount,
+        description: `Commission — ${c.orderName || "order"} (rate ${(Number(c.rate) * 100).toFixed(1)}%)`,
+      }));
+      const bill = await createBill({
+        vendorId: payout.qboVendorId,
+        lines,
+        docNumber: payout.reference,
+        privateNote: `CDO commission payout ${payout.reference} (period ending ${payout.periodEnd?.toISOString().slice(0, 10)})`,
+        txnDate: new Date(),
+        requestId: `cdo-bill-${payout._id}`,
+      });
+      payout.qboBillId = String(bill.Id);
+      payout.billCreatedAt = new Date();
+      pushPayoutRemark(payout, {
+        kind: "bill_created",
+        message: `QBO Bill ${bill.Id} created (${payout.amount} ${payout.currency})`,
+        actor,
+        source: actor ? "admin" : "cron",
+      });
+      await payout.save();
+    }
+
+    // 3) BillPayment (records the disbursement in QBO).
+    if (!payout.qboBillPaymentId) {
+      const payment = await createBillPayment({
+        vendorId: payout.qboVendorId,
+        billId: payout.qboBillId,
+        amount: payout.amount,
+        requestId: `cdo-pay-${payout._id}`,
+      });
+      payout.qboBillPaymentId = String(payment.Id);
+      payout.paymentRecordedAt = new Date();
+      pushPayoutRemark(payout, {
+        kind: "payment_recorded",
+        message: `QBO BillPayment ${payment.Id} recorded`,
+        actor,
+        source: actor ? "admin" : "cron",
+      });
+      await payout.save();
+    }
+
+    // 4) Settle commissions + ledger, finalize.
+    await CdoCommission.updateMany(
+      { _id: { $in: payout.commissionIds } },
+      { $set: { status: "paid", payoutId: payout._id } },
+    );
+    const paidAt = new Date();
+    await appendLedgerEntry({
+      shop: payout.shop,
+      practitionerId: payout.practitionerId,
+      practitionerEmail: payout.practitionerEmail,
+      practitionerName: payout.practitionerName,
+      currency: payout.currency,
+      type: "payout",
+      amount: -roundMoney(payout.amount),
+      relatedType: "CdoPayout",
+      relatedId: payout._id,
+      description: `Payout ${payout.reference} via QBO Bill ${payout.qboBillId}`,
+      occurredAt: paidAt,
+    });
+
+    payout.status = "paid";
+    payout.paidAt = paidAt;
+    await payout.save();
+    return payout.toObject();
+  } catch (err) {
+    payout.status = "failed";
+    payout.lastError = err?.message || String(err);
+    pushPayoutRemark(payout, {
+      kind: "failed",
+      message: `Execution failed: ${payout.lastError}`,
+      actor,
+      source: actor ? "admin" : "cron",
+    });
+    await payout.save();
+    throw err;
+  }
+}
+
+// Full payout detail for the admin UI — the payout, its settled
+// commissions, and a QBO deep link to the Bill.
+export async function getPayoutDetail(payoutId) {
+  if (!isValidObjectId(payoutId)) return null;
+  await connectDB();
+  const payout = await CdoPayout.findById(payoutId).lean();
+  if (!payout) return null;
+  const commissions = await CdoCommission.find({
+    _id: { $in: payout.commissionIds || [] },
+  }).lean();
+  return {
+    ...payout,
+    id: payout._id.toString(),
+    commissions: commissions.map((c) => ({
+      id: c._id.toString(),
+      orderName: c.orderName,
+      amount: c.amount,
+      rate: c.rate,
+      status: c.status,
+    })),
+    qboBillUrl: payout.qboBillId ? billWebUrl(payout.qboBillId) : null,
+  };
 }

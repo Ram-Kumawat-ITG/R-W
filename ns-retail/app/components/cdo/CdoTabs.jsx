@@ -12,7 +12,7 @@ export const CDO_BASE = "/app/cdo-program";
 
 export const CDO_TABS = [
   { label: "Dashboard", path: CDO_BASE },
-  { label: "CDO Customers", path: `${CDO_BASE}/customers` },
+  { label: "CDO Practitioners", path: `${CDO_BASE}/customers` },
   { label: "Orders", path: `${CDO_BASE}/orders` },
   { label: "Commissions", path: `${CDO_BASE}/commissions` },
   { label: "Payouts", path: `${CDO_BASE}/payouts` },

@@ -15,8 +15,14 @@
 // existing cdo_orders / cdo_commissions are immutable history.
 //
 // Practitioner identification:
-//   - `practitionerId` is the wholesale_applications document `_id`
-//     (the same string the CDO Customers list uses as a row id).
+//   - `practitionerId` is the owning application document `_id` (the same
+//     string the CDO Customers list uses as a row id).
+//   - `practitionerSource` says WHICH collection that id lives in:
+//     "wholesale" → wholesale_applications (the default — practitioners
+//     live here) or "cdo" → cdo_applications. This lets a referral code
+//     map back to an application record without a separate user
+//     collection. Customers (cdo_applications) consume these codes; they
+//     don't own them.
 //   - `practitionerEmail` is denormalized for fast lookups + matches
 //     the rest of the cdo_* collections' field naming.
 
@@ -27,6 +33,12 @@ const cdoPractitionerCodeSchema = new mongoose.Schema(
     shop: { type: String, index: true },
 
     practitionerId: { type: String, required: true, index: true },
+    practitionerSource: {
+      type: String,
+      enum: ["cdo", "wholesale"],
+      default: "wholesale",
+      index: true,
+    },
     practitionerEmail: { type: String, lowercase: true, index: true },
     practitionerName: String,
 
