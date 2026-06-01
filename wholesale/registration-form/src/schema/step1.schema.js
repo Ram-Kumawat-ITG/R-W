@@ -2,9 +2,13 @@ import * as yup from "yup";
 import {
   MAX_FILE_SIZE,
   ACCEPTED_MIME_TYPES,
-  CREDENTIALS,  
+  CREDENTIALS,
   REFERRALS,
 } from "../constants";
+
+const NAME_REGEX = /^[A-Za-zÀ-ÖØ-öø-ÿ' -]+$/;
+const PHONE_REGEX = /^\+?[0-9]+$/;
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const fileWhenSelected = (message = "File is required") =>
   yup.mixed().when("selected", {
@@ -64,29 +68,52 @@ export const step1Schema = yup.object({
     .string()
     .trim()
     .required("Required")
-    .min(2, "Too short")
-    .matches(/^[A-Za-z\s'-]+$/, "Letters only"),
-  lastName: yup.string().trim().required("Required").min(2, "Too short"),
+    .min(3, "Too short")
+    .matches(
+      NAME_REGEX,
+      "Only letters, spaces, hyphens, and apostrophes allowed",
+    ),
+  lastName: yup
+    .string()
+    .trim()
+    .required("Required")
+    .min(3, "Too short")
+    .matches(
+      NAME_REGEX,
+      "Only letters, spaces, hyphens, and apostrophes allowed",
+    ),
   email: yup
     .string()
     .trim()
     .required("Required")
-    .email("Enter a valid email"),
+    .matches(EMAIL_REGEX, "Enter a valid email"),
   phone: yup
     .string()
     .trim()
     .required("Required")
     .matches(
-      /^\+?1?[-.\s]?\(?([2-9][0-9]{2})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})$/,
-      "Enter a valid US phone number (e.g. (555) 123-4567 or +1 555 123-4567)",
+      PHONE_REGEX,
+      "Only digits and an optional '+' at the start (e.g., +15146669999)",
+    )
+    .test(
+      "needs-country-code",
+      "Phone must include country code (e.g., +15146669999 for US, +919887484997 for India)",
+      (val) => {
+        if (!val) return false;
+        const digits = String(val).replace(/\D/g, "");
+        // Require >=11 digits so country code is always included.
+        // 11 = 1 country code + 10 number (NANP); up to 15 per E.164 spec.
+        return digits.length >= 11 && digits.length <= 15;
+      },
     ),
-  password: yup
-    .string()
-    .trim()
-    .required("Required")
-    .min(8, "At least 8 characters")
-    .matches(/[A-Za-z]/, "Must include a letter")
-    .matches(/\d/, "Must include a number"),
+
+  // password: yup
+  //   .string()
+  //   .trim()
+  //   .required("Required")
+  //   .min(8, "At least 8 characters")
+  //   .matches(/[A-Za-z]/, "Must include a letter")
+  //   .matches(/\d/, "Must include a number"),
   businessName: yup.string().trim().notRequired(),
   credentials: yup
     .object(credentialShape)
@@ -105,7 +132,7 @@ export const step1Fields = [
   "lastName",
   "email",
   "phone",
-  "password",
+  // "password",
   "businessName",
   "credentials",
   "referrals",

@@ -53,7 +53,7 @@ const defaultValues = {
   shippingSameAsBilling: true,
   shippingAddress: null,
   shippingPropertyType: "Residential",
-  resellsProducts: false,
+  resellsProducts: true,
   tax: {
     taxIdType: "ein",
     taxId: "",
@@ -133,10 +133,6 @@ function SuccessScreen() {
               </svg>
             </div>
             <h2>Application received</h2>
-            <p>
-              Thanks! We've sent a confirmation to your email. Our team will
-              review your application.
-            </p>
             <div className="rf-next-steps">
               <h3>What happens next</h3>
               <ol>
@@ -144,6 +140,25 @@ function SuccessScreen() {
                 <li>We may reach out if we have any questions</li>
                 <li>Start shopping at wholesale pricing</li>
               </ol>
+              <button
+                onClick={() => {
+                  window.location.href = "/account/login";
+                }}
+                style={{
+                  background: "var(--color-primary)",
+                  color: "#fff",
+                  border: "none",
+                  padding: "10px 20px",
+                  fontSize: 14,
+                  fontWeight: 500,
+                  borderRadius: 5,
+                  cursor: "pointer",
+                  fontFamily: "var(--font-family)",
+                  marginTop: 16,
+                }}
+              >
+                Go to login
+              </button>
             </div>
           </div>
         </div>
@@ -253,12 +268,23 @@ function FormBody({ onBack }) {
         cardLast4: tokenResult.cardLast4,
       };
 
-      // Include ACH details when ACH is the preferred method.
-      // Full account number is stripped to last 4 — never sent to the server.
-      if (values.payment.method === 'ach') {
+      // Include ACH details when ACH is the preferred method. We need the
+      // FULL routing + account number so the backend can create an ACH
+      // billing in NMI's Customer Vault. The backend uses the full number
+      // for NMI only — it stores only the last 4 in MongoDB (the full
+      // account number is never persisted in our DB).
+      //
+      // ACH bank account numbers are NOT in PCI scope (PCI applies to card
+      // data only); they're governed by NACHA, which our payment processor
+      // (NMI) is responsible for handling. Passing the full number through
+      // our backend to NMI is the standard pattern.
+      if (values.payment.method === "ach") {
         cardPayload.achAccountName = values.payment.achAccountName;
         cardPayload.achRoutingNumber = values.payment.achRoutingNumber;
-        cardPayload.achAccountLast4 = (values.payment.achAccountNumber || '').slice(-4);
+        cardPayload.achAccountNumber = values.payment.achAccountNumber; // full — needed for NMI
+        cardPayload.achAccountLast4 = (
+          values.payment.achAccountNumber || ""
+        ).slice(-4); // kept for backwards compat / DB display
         cardPayload.achAccountType = values.payment.achAccountType;
       }
 

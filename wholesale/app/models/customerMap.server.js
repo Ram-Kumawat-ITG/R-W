@@ -17,13 +17,14 @@ const customerMapSchema = new mongoose.Schema(
     // chargeInvoice when invoice.paymentMethod === 'card'.
     nmiCustomerVaultId: { type: String, index: true },
 
-    // NMI customer-vault id for the customer's ACH payment method.
-    // Source of truth lives at `wholesale_applications.payment.ach.nmi_billing_id`;
-    // mirrored here at order intake so chargeInvoice can pick the right
-    // vault id by `invoice.paymentMethod` without a second collection
-    // hit per CRON tick. Always null for customers whose preference was
-    // card or cheque at registration time.
-    nmiAchBillingId: { type: String, index: true },
+    // NMI billing_id mirrors from WholesaleApplication. Per the multi-billing
+    // design (one vault, multiple billing records inside it), we need to be
+    // able to target either method when charging — the priority-1 billing is
+    // not always the method we want. card billing is always present (card
+    // on file required for every account); ach billing only for customers
+    // whose preferred method was ACH at registration time.
+    nmiCardBillingId: { type: String, default: null },
+    nmiAchBillingId: { type: String, default: null },
 
     // Customer's preferred payment method, sourced from the wholesale
     // registration application at customer-sync time. Drives the default

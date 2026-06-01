@@ -6,41 +6,65 @@ import {
   PROPERTY_TYPE_KEY,
   CREDENTIAL_MAP,
   REFERRAL_MAP,
-} from './shopify.constants'
+} from "./shopify.constants";
 
 // US 10-digit phone (what our schema stores) → E.164 (+1XXXXXXXXXX) for Shopify.
+// export function toE164US(phone) {
+//   if (!phone) return null
+//   const digits = String(phone).replace(/\D/g, '')
+//   if (digits.length === 10) return `+1${digits}`
+//   if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`
+//   if (digits.length > 0) return `+${digits}`
+//   return null
+// }
+
 export function toE164US(phone) {
-  if (!phone) return null
-  const digits = String(phone).replace(/\D/g, '')
-  if (digits.length === 10) return `+1${digits}`
-  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`
-  if (digits.length > 0) return `+${digits}`
-  return null
+  if (!phone) return null;
+  const trimmed = String(phone).trim();
+  const digits = trimmed.replace(/\D/g, "");
+
+  // If user typed leading +, trust them and pass through
+  if (trimmed.startsWith("+")) return `+${digits}`;
+
+  // 11 digits starting with 1 → US/Canada
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+
+  // 10 digits with no + and no leading 1 → AMBIGUOUS, reject
+  if (digits.length === 10) {
+    throw new Error(
+      "Phone number must include country code (e.g., +1 for US, +91 for India)",
+    );
+  }
+
+  // Anything else (12-15 digits) → assume country code is included
+  if (digits.length >= 11) return `+${digits}`;
+
+  return null;
 }
 
 // Map our internal address shape to Shopify's customer-address input shape.
 export function mapAddress(a) {
-  if (!a) return null
+  if (!a) return null;
   return {
-    address1: a.line1 || '',
-    address2: a.line2 || '',
-    city: a.city || '',
-    province: a.state || '',
-    zip: a.zip || '',
-    country: a.country || '',
-  }
+    address1: a.line1 || "",
+    address2: a.line2 || "",
+    city: a.city || "",
+    province: a.state || "",
+    zip: a.zip || "",
+    country: a.country || "",
+  };
 }
 
 // Build a Shopify order GraphQL id (gid://) from either a numeric id or
 // an already-formatted gid. Idempotent.
 export function toOrderGid(orderId) {
-  return String(orderId).startsWith('gid://')
+  return String(orderId).startsWith("gid://")
     ? String(orderId)
-    : `gid://shopify/Order/${orderId}`
+    : `gid://shopify/Order/${orderId}`;
 }
 
 function pyBool(v) {
-  return v ? 'True' : 'False'
+  return v ? "True" : "False";
 }
 
 // Composes the customer's note in the exact "Key: Value\n" format the spec
@@ -48,37 +72,37 @@ function pyBool(v) {
 // as-is. License lines only appear when a file URL is present for that
 // credential. No JSON, no blank lines, no trailing newline.
 export function buildShopifyNote(application = {}) {
-  const lines = []
+  const lines = [];
 
-  const sameAsBilling = application.shippingSameAsBilling === true
-  lines.push(`${SAME_AS_BILLING.true}: ${pyBool(sameAsBilling)}`)
-  lines.push(`${SAME_AS_BILLING.false}: ${pyBool(!sameAsBilling)}`)
+  const sameAsBilling = application.shippingSameAsBilling === true;
+  lines.push(`${SAME_AS_BILLING.true}: ${pyBool(sameAsBilling)}`);
+  lines.push(`${SAME_AS_BILLING.false}: ${pyBool(!sameAsBilling)}`);
 
   const propertyType = sameAsBilling
     ? null
-    : application.shippingAddress?.type || application.shippingPropertyType
-  lines.push(`${PROPERTY_TYPE_KEY}: ${propertyType || ''}`)
+    : application.shippingAddress?.type || application.shippingPropertyType;
+  lines.push(`${PROPERTY_TYPE_KEY}: ${propertyType || ""}`);
 
-  const creds = application.credentials || {}
+  const creds = application.credentials || {};
   // Credential booleans first
   for (const c of CREDENTIAL_MAP) {
-    const selected = creds[c.id]?.selected === true
-    lines.push(`${c.credKey}: ${pyBool(selected)}`)
+    const selected = creds[c.id]?.selected === true;
+    lines.push(`${c.credKey}: ${pyBool(selected)}`);
   }
   // Then license URLs for credentials that have one stored
   for (const c of CREDENTIAL_MAP) {
-    if (!c.fileKey) continue
-    const fileVal = creds[c.id]?.[`file${c.fileIndex}`]
-    if (typeof fileVal === 'string' && fileVal.startsWith('http')) {
-      lines.push(`${c.fileKey}: ${fileVal}`)
+    if (!c.fileKey) continue;
+    const fileVal = creds[c.id]?.[`file${c.fileIndex}`];
+    if (typeof fileVal === "string" && fileVal.startsWith("http")) {
+      lines.push(`${c.fileKey}: ${fileVal}`);
     }
   }
 
-  const refs = application.referrals || {}
+  const refs = application.referrals || {};
   for (const r of REFERRAL_MAP) {
-    const selected = refs[r.id]?.selected === true
-    lines.push(`${r.key}: ${pyBool(selected)}`)
+    const selected = refs[r.id]?.selected === true;
+    lines.push(`${r.key}: ${pyBool(selected)}`);
   }
 
-  return lines.join('\n')
+  return lines.join("\n");
 }

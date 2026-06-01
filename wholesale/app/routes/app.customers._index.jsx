@@ -10,18 +10,18 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import connectDB from "../services/APIService/mongo.service";
 import WholesaleApplication from "../models/wholesaleApplication.server";
- 
+
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
   await connectDB();
- 
+
   const rows = await WholesaleApplication.find({})
     .sort({ submittedAt: -1 })
     .select(
       "firstName lastName email phone submittedAt customerId shopifyCreateFailed businessName status reviewedAt",
     )
     .lean();
- 
+
   return {
     rows: rows.map((r) => ({
       id: r._id.toString(),
@@ -38,25 +38,25 @@ export const loader = async ({ request }) => {
     })),
   };
 };
- 
+
 const STATUS_FILTERS = [
   { id: "all", label: "All" },
   { id: "sync-failed", label: "Sync failed" },
 ];
- 
+
 // Records per page. Filtering and pagination both happen client-side
 // (the loader returns the full list), so we just slice the filtered
 // array. Matches the project's existing list-page pattern (Orders list
 // uses 25).
 const PAGE_SIZE = 15;
- 
+
 export default function CustomersList() {
   const { rows } = useLoaderData();
   const navigate = useNavigate();
   const navigation = useNavigation();
   const shopify = useAppBridge();
   const revalidator = useRevalidator();
- 
+
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
   const [sortOrder, setSortOrder] = useState("desc");
@@ -77,7 +77,7 @@ export default function CustomersList() {
   // automatic post-action revalidation doesn't re-fire toast / state resets
   // on every subsequent render.
   const handledDeclineRef = useRef(null);
- 
+
   // One-time toast on initial mount confirming data was fetched.
   useEffect(() => {
     if (loadedToastShown.current) return;
@@ -87,26 +87,26 @@ export default function CustomersList() {
       `Loaded ${n} ${n === 1 ? "application" : "applications"}`,
     );
   }, [rows.length, shopify]);
- 
+
   // Brief artificial loading so search + chip clicks feel responsive even
   // though the actual filter runs client-side in useMemo.
   const flashFilterLoading = () => {
     setFilterPending(true);
     setTimeout(() => setFilterPending(false), 220);
   };
- 
+
   const tableLoading =
     filterPending ||
     navigation.state === "loading" ||
     revalidator.state === "loading" ||
     declineFetcher.state !== "idle";
- 
+
   // Whenever the filter inputs change, snap back to page 1 so the user
   // isn't stranded on (e.g.) page 4 of an empty result set.
   useEffect(() => {
     setPage(1);
   }, [search, statusFilter]);
- 
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     const result = rows.filter((r) => {
@@ -127,17 +127,17 @@ export default function CustomersList() {
         .toLowerCase();
       return haystack.includes(q);
     });
- 
+
     result.sort((a, b) => {
       const tA = a.submittedAt ? new Date(a.submittedAt).getTime() : 0;
       const tB = b.submittedAt ? new Date(b.submittedAt).getTime() : 0;
       const cmp = tA - tB;
       return sortOrder === "asc" ? cmp : -cmp;
     });
- 
+
     return result;
   }, [rows, search, statusFilter, sortOrder]);
- 
+
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const currentPage = Math.min(page, totalPages);
   const firstShown =
@@ -154,7 +154,7 @@ export default function CustomersList() {
     if (declineFetcher.state !== "idle") return;
     if (handledDeclineRef.current === declineFetcher.data) return;
     handledDeclineRef.current = declineFetcher.data;
- 
+
     if (declineFetcher.data.status === "success") {
       shopify?.toast?.show("Customer declined and removed.");
       setDecliningId(null);
@@ -168,13 +168,13 @@ export default function CustomersList() {
       setDecliningId(null);
     }
   }, [declineFetcher.data, declineFetcher.state, shopify]);
- 
+
   useEffect(() => {
     if (!syncFetcher.data) return;
     if (syncFetcher.state !== "idle") return;
     if (handledSyncRef.current === syncFetcher.data) return;
     handledSyncRef.current = syncFetcher.data;
- 
+
     if (syncFetcher.data.status === "success") {
       const r = syncFetcher.data.result || {};
       shopify?.toast?.show(
@@ -259,7 +259,7 @@ export default function CustomersList() {
     });
     setPendingDeclineRow(null);
   };
- 
+
   const syncBusy =
     syncFetcher.state === "submitting" || syncFetcher.state === "loading";
   const invBusy =
@@ -371,7 +371,7 @@ export default function CustomersList() {
             </s-stack>
           </s-stack>
         </s-box>
- 
+
         {filtered.length === 0 ? (
           <EmptyState
             rowsTotal={rows.length}
@@ -405,11 +405,15 @@ export default function CustomersList() {
                 const submitted = r.submittedAt
                   ? new Date(r.submittedAt).toLocaleString()
                   : "";
-                const go = () => navigate(`/app/customers/${r.id}`);
                 return (
-                  <s-table-row key={r.id} onClick={go}>
+                  <s-table-row key={r.id} clickDelegate={`row-link-${r.id}  `}>
                     <s-table-cell>
-                      <s-text>{fullName}</s-text>
+                      <s-link
+                        id={`row-link-${r.id}`}
+                        href={`/app/customers/${r.id}`}
+                      >
+                        <s-text>{fullName}</s-text>
+                      </s-link>
                     </s-table-cell>
                     <s-table-cell>{r.email}</s-table-cell>
                     <s-table-cell>{r.phone || "-"}</s-table-cell>
@@ -447,7 +451,7 @@ export default function CustomersList() {
             </s-table-body>
           </s-table>
         )}
- 
+
         {filtered.length > 0 && (
           <s-box padding="base">
             <s-stack
@@ -483,7 +487,7 @@ export default function CustomersList() {
           </s-box>
         )}
       </s-section>
- 
+
       <s-modal
         ref={declineModalRef}
         id="decline-customer-modal"
@@ -510,7 +514,7 @@ export default function CustomersList() {
     </s-page>
   );
 }
- 
+
 function EmptyState({
   rowsTotal,
   statusFilter,
@@ -523,9 +527,9 @@ function EmptyState({
     "Once customers submit the wholesale form, their applications will show up here.";
   let actionLabel = null;
   let actionHandler = null;
- 
+
   const hasSearch = (search || "").trim().length > 0;
- 
+
   if (rowsTotal === 0) {
     heading = "No applications yet";
     body =
@@ -545,7 +549,7 @@ function EmptyState({
     heading = "No applications match the current filters";
     body = "Try changing the filters or clearing the search.";
   }
- 
+
   return (
     <s-box padding="large-500">
       <s-stack
@@ -563,5 +567,3 @@ function EmptyState({
     </s-box>
   );
 }
- 
- 
