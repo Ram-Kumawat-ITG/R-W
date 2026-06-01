@@ -226,11 +226,15 @@ async function rawRequest({ method, path, query, body, contentType, requestId, r
   }
 
   if (!res.ok) {
-    // QBO returns a structured `Fault` block for business errors.
+    // QBO returns a structured `Fault` block for business errors. The
+    // top-level Message is often generic ("A business validation error
+    // has occurred") — the actionable bit is in `Detail`, so include it.
     const fault = json?.Fault || json?.fault;
     const errorDetail = fault?.Error?.[0] || fault?.error?.[0];
-    const msg =
+    const baseMsg =
       errorDetail?.Message || errorDetail?.message || `CDO QBO ${method} ${path} failed: ${res.status}`;
+    const detail = errorDetail?.Detail || errorDetail?.detail;
+    const msg = detail ? `${baseMsg}: ${detail}` : baseMsg;
     const ErrorClass = res.status >= 500 || res.status === 429 ? TransientError : PermanentError;
     throw new ErrorClass(msg, { status: res.status, body: json ?? text });
   }
