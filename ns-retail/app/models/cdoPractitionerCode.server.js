@@ -42,11 +42,12 @@ const cdoPractitionerCodeSchema = new mongoose.Schema(
     practitionerEmail: { type: String, lowercase: true, index: true },
     practitionerName: String,
 
-    // The code string itself — uppercase, alphanumeric + dashes only,
-    // unique per shop. Storefront / Shopify discount engines match on
-    // this value case-insensitively, but we normalise to uppercase on
-    // write so the lookup index is deterministic.
-    code: { type: String, required: true, uppercase: true, trim: true },
+    // The code string itself — lowercase, alphanumeric + underscore.
+    // Locked format from the CDO roadmap is `<firstname>_<8-char-hex>`,
+    // e.g. `john_a3f1c8e2`. Unique per shop. Storefront / Shopify
+    // discount engines match case-insensitively so display case is
+    // user-friendly but storage is canonical lowercase.
+    code: { type: String, required: true, lowercase: true, trim: true },
 
     // Exactly one code per practitioner should be `isPrimary: true`.
     // Enforced by a partial unique index below + the setPrimary helper

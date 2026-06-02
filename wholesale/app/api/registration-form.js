@@ -15,6 +15,7 @@ import {
   deleteCustomerVault,
   addBillingToCustomerVault,
 } from "../services/nmi/nmi.service";
+import { generatePractitionerCode } from "../services/cdo/cdo.service";
 
 // Generate a stable, readable NMI billing_id. Random suffix prevents
 // collisions when re-using a customer email; prefix makes logs scannable.
@@ -395,6 +396,30 @@ export async function action({ request }) {
         },
       },
     );
+
+    // CDO Phase 1 — auto-generate a practitioner referral code for this
+    // newly-approved practitioner. Failure here is log-only by design:
+    // the customer + NMI vault + application are already persisted, and
+    // an admin can re-generate manually from the ns-retail CDO admin if
+    // this throws. We do NOT want a transient DB blip in the CDO
+    // collection to fail an otherwise-successful registration.
+    try {
+      const cdoResult = await generatePractitionerCode({
+        applicationId: app._id,
+        firstName: payload.firstName,
+        lastName: payload.lastName,
+        email: payload.email,
+        shop: payload.shop,
+      });
+      console.log(
+        `[proxy/submit] CDO code ${cdoResult.code} ${cdoResult.alreadyExisted ? "reused (idempotent)" : "generated"} for application=${app._id}`,
+      );
+    } catch (cdoErr) {
+      console.error(
+        "[proxy/submit] CDO code generation failed (non-fatal):",
+        cdoErr?.message || cdoErr,
+      );
+    }
 
     try {
       await sendCustomerInvite(admin, {

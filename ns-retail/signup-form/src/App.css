@@ -1,0 +1,231 @@
+/* ── Layout ─────────────────────────────────────────────────────────── */
+.ns-signup-page {
+  min-height: 70vh;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 16px;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  box-sizing: border-box;
+  color: #1a1a1a;
+}
+.ns-signup-page *,
+.ns-signup-page *::before,
+.ns-signup-page *::after {
+  box-sizing: border-box;
+}
+.ns-signup-card {
+  width: 100%;
+  max-width: 720px;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 2px 20px rgba(0, 0, 0, 0.06);
+  padding: 40px 36px;
+}
+
+/* ── Heading ────────────────────────────────────────────────────────── */
+.ns-signup-card h1 {
+  margin: 0 0 8px 0;
+  font-size: 32px;
+  font-weight: 700;
+  color: #2d6a4f;
+  text-align: center;
+}
+.ns-signup-subtitle {
+  margin: 0 0 28px 0;
+  color: #555;
+  font-size: 15px;
+  line-height: 1.5;
+  text-align: center;
+}
+.ns-signup-link {
+  color: #2d6a4f;
+  text-decoration: underline;
+}
+.ns-signup-link:hover {
+  color: #245741;
+}
+
+/* ── Field layout ───────────────────────────────────────────────────── */
+.ns-row {
+  display: grid;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+.ns-row-2 {
+  grid-template-columns: 1fr 1fr;
+}
+@media (max-width: 540px) {
+  .ns-row-2 {
+    grid-template-columns: 1fr;
+  }
+}
+.ns-field {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 12px;
+}
+.ns-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: #333;
+  margin-bottom: 6px;
+}
+
+/* ── Inputs ─────────────────────────────────────────────────────────── */
+.ns-input {
+  width: 100%;
+  padding: 12px 14px;
+  font-size: 15px;
+  border: 1px solid #d0d0d0;
+  border-radius: 8px;
+  outline: none;
+  transition: border-color 120ms;
+  font-family: inherit;
+  background: #fff;
+  color: #1a1a1a;
+}
+.ns-input:focus {
+  border-color: #2d6a4f;
+}
+.ns-input.error {
+  border-color: #d4351c;
+}
+.ns-input.verified {
+  border-color: #16a34a;
+  background: #f0fdf4;
+}
+.ns-input::placeholder {
+  color: #999;
+}
+
+/* ── Email check status ─────────────────────────────────────────────── */
+.ns-email-wrap {
+  position: relative;
+}
+.ns-input-status {
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 13px;
+  font-weight: 500;
+  pointer-events: none;
+}
+.ns-input-status.ns-checking {
+  color: #6b7280;
+}
+.ns-input-status.ns-ok {
+  color: #16a34a;
+  font-size: 18px;
+}
+
+/* ── Practitioner code row (input + Verify button) ──────────────────── */
+.ns-code-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.ns-code-input {
+  flex: 1;
+}
+.ns-verify-btn {
+  padding: 0 18px;
+  background: #fff;
+  color: #2d6a4f;
+  border: 1px solid #2d6a4f;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 120ms;
+  font-family: inherit;
+  white-space: nowrap;
+}
+.ns-verify-btn:hover:not(:disabled) {
+  background: #f0fdf4;
+}
+.ns-verify-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* ── Help / error text ──────────────────────────────────────────────── */
+.ns-help {
+  margin: 6px 0 0 0;
+  font-size: 13px;
+  line-height: 1.4;
+}
+.ns-help.error {
+  color: #d4351c;
+}
+.ns-help.ok {
+  color: #16a34a;
+}
+
+/* ── Top banner ─────────────────────────────────────────────────────── */
+.ns-signup-banner {
+  margin-bottom: 18px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  font-size: 14px;
+  line-height: 1.4;
+}
+.ns-signup-banner.ns-error {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #991b1b;
+}
+
+/* ── Submit button ──────────────────────────────────────────────────── */
+.ns-submit {
+  margin-top: 12px;
+  width: 100%;
+  padding: 14px 20px;
+  background: #2d6a4f;
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 120ms, opacity 120ms;
+  font-family: inherit;
+  text-decoration: none;
+}
+.ns-submit:hover:not(:disabled) {
+  background: #245741;
+}
+.ns-submit:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+.ns-submit-link {
+  margin-top: 24px;
+}
+
+/* ── Footer ─────────────────────────────────────────────────────────── */
+.ns-signup-footer {
+  margin: 24px 0 0 0;
+  padding-top: 18px;
+  border-top: 1px solid #eee;
+  text-align: center;
+  color: #555;
+  font-size: 14px;
+}
+
+/* ── Success screen ─────────────────────────────────────────────────── */
+.ns-success-icon {
+  width: 64px;
+  height: 64px;
+  margin: 0 auto 16px;
+  background: #16a34a;
+  border-radius: 50%;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
