@@ -45,6 +45,33 @@ function buildAgenda() {
 }
 
 async function ensureRecurring(agenda) {
+  // ── Daily Check-payment reminder job ─────────────────────────────
+  // Registered independently of the payment-retry ticks so it always
+  // runs once a day (dev + prod). REMINDER_INTERVAL gives a fast dev
+  // cadence; otherwise the cron from config (default 02:00).
+  if (schedulerConfig.reminderIntervalOverride) {
+    await agenda.cancel({ name: JOB_NAMES.PROCESS_CHECK_REMINDERS })
+    await agenda.every(
+      schedulerConfig.reminderIntervalOverride,
+      JOB_NAMES.PROCESS_CHECK_REMINDERS,
+      { tick: 'dev' },
+    )
+    console.log(
+      `\n[scheduler] DEV MODE — process-check-reminders running every ${schedulerConfig.reminderIntervalOverride}\n`,
+    )
+  } else {
+    await agenda.every(
+      schedulerConfig.reminderCron,
+      JOB_NAMES.PROCESS_CHECK_REMINDERS,
+      { tick: 'daily' },
+      { timezone: schedulerConfig.scheduleTimezone },
+    )
+  }
+  log.info('scheduler.reminder_registered', {
+    mode: schedulerConfig.reminderIntervalOverride ? 'dev-interval' : 'cron',
+    schedule: schedulerConfig.reminderIntervalOverride || schedulerConfig.reminderCron,
+  })
+
   // Dev override: PAYMENT_RETRY_INTERVAL replaces the production cron
   // with a fast interval so the retry job can be exercised locally.
   // Cancel the production ticks first so a switch from cron → interval

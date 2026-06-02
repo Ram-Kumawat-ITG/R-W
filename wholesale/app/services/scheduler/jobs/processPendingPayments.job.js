@@ -141,51 +141,41 @@ export function registerProcessPendingPaymentsJob(agenda) {
         }
       }
 
-      // PASS 1.5 — cheque-pending invoices (no NMI vault to charge
-      // against) and failed card/ACH invoices that exhausted retries.
-      // CRON cannot auto-charge these, so we log a "reminder" / "follow-up"
-      // remark each tick. Admins see the trail on the Order List
-      // "Remarks" column and can act manually (mark cheque paid, charge
-      // card on file as a fallback, etc.). No customer-facing
-      // notifications are sent here — operator-visible log only.
+      // PASS 1.5 — failed card/ACH invoices that exhausted retries.
+      // CRON can no longer auto-charge these, so we log a payment
+      // "follow-up" remark each tick as part of this CRON's payment
+      // audit history. Admins see the trail on the Order List "Remarks"
+      // column and can act manually (charge card on file as a fallback,
+      // etc.). No customer-facing notifications are sent here.
       //
-      // ACH-pending invoices NO LONGER land here — they now flow through
-      // PASS 1 as an active charge path against the NMI billing id.
-      // The legacy `cron_ach_reminder` enum is preserved on the Invoice
-      // schema for back-compat with rows written before that change;
-      // PASS 1.5 will not emit it anymore.
+      // CHEQUE REMINDERS DO NOT LIVE HERE. Customer-facing payment
+      // reminders for unpaid cheque invoices are owned exclusively by the
+      // dedicated reminder CRON (`process-check-reminders` /
+      // services/reminder), which sends QBO emails on the Day 9 / 11 / 13
+      // ladder + recurring phase. This payment CRON is responsible only
+      // for charging, status updates, and payment/audit logs — keeping
+      // the two concerns separate avoids duplicate reminders. The legacy
+      // `cron_cheque_reminder` / `cron_ach_reminder` enum values remain on
+      // the Invoice schema for back-compat with historical rows; this
+      // pass no longer emits them.
       //
-      // Paused invoices are excluded from reminders too — pausing is
-      // an explicit "leave this one alone" signal. Surfacing a
-      // recurring reminder would defeat that intent.
-      const reminderCursor = Invoice.find({
+      // Paused invoices are excluded — pausing is an explicit "leave this
+      // one alone" signal.
+      const followupCursor = Invoice.find({
         autoChargePaused: { $ne: true },
-        $or: [
-          { paymentStatus: 'pending', paymentMethod: 'check' },
-          { paymentStatus: 'failed' },
-        ],
+        paymentStatus: 'failed',
       }).cursor()
-      let remindersLogged = 0
-      for await (const invoice of reminderCursor) {
+      let followupsLogged = 0
+      for await (const invoice of followupCursor) {
         const outstanding = Number((invoice.amountDue - invoice.amountPaid).toFixed(2))
-        const isFailed = invoice.paymentStatus === 'failed'
-        // Failed invoices keep the "Failed follow-up" kind regardless
-        // of original method so the Order List filter stays clean.
-        // Pending invoices land here only when paymentMethod==='check',
-        // so the kind is fixed at cron_cheque_reminder.
-        const kind = isFailed ? 'cron_failed_followup' : 'cron_cheque_reminder'
-        const methodLabel = isFailed
-          ? (invoice.paymentMethod === 'ach' ? 'ACH' : 'Card')
-          : 'Cheque'
-        const message = isFailed
-          ? `Failed ${methodLabel.toLowerCase()} payment follow-up — $${outstanding.toFixed(2)} outstanding after ${invoice.attemptCount} attempt(s)`
-          : `${methodLabel} payment reminder — $${outstanding.toFixed(2)} still outstanding`
+        const methodLabel = invoice.paymentMethod === 'ach' ? 'ACH' : 'Card'
+        const message = `Failed ${methodLabel.toLowerCase()} payment follow-up — $${outstanding.toFixed(2)} outstanding after ${invoice.attemptCount} attempt(s)`
         await Invoice.updateOne(
           { _id: invoice._id },
           {
             $push: {
               remarks: {
-                kind,
+                kind: 'cron_failed_followup',
                 message,
                 amount: outstanding,
                 currency: invoice.currency,
@@ -195,8 +185,8 @@ export function registerProcessPendingPaymentsJob(agenda) {
             },
           },
         )
-        remindersLogged += 1
-        console.log(`│ ⓘ reminder logged invoice=${invoice._id} "${message}"`)
+        followupsLogged += 1
+        console.log(`│ ⓘ failed-payment follow-up logged invoice=${invoice._id} "${message}"`)
       }
 
       // PASS 1.7 — poll NMI for awaiting-settlement ACH invoices.
@@ -404,14 +394,14 @@ export function registerProcessPendingPaymentsJob(agenda) {
       console.log(
         `└─── tick ${tick} done in ${elapsedMs}ms — ` +
           `charges: processed=${processed} approved=${approved} declined=${declined} errored=${errored} skipped=${skipped}` +
-          ` | reminders: ${remindersLogged}` +
+          ` | failed-followups: ${followupsLogged}` +
           ` | ach-settlement: checked=${settlementChecked} settled=${settlementSettled} returned=${settlementReturned} pending=${settlementStillPending} unknown=${settlementUnknown}` +
           ` | sync-retries: processed=${sweepProcessed} ok=${sweepOk} failed=${sweepFailed}\n`,
       )
       log.info('tick.complete', {
         tick, tickId, elapsedMs,
         processed, approved, declined, errored, skipped,
-        remindersLogged,
+        followupsLogged,
         settlementChecked, settlementSettled, settlementReturned,
         settlementStillPending, settlementUnknown,
         sweepProcessed, sweepOk, sweepFailed,

@@ -18,4 +18,10 @@ export const schedulerConfig = {
   //   PAYMENT_RETRY_INTERVAL=30 seconds
   // Leave unset in production.
   retryIntervalOverride: readEnv('PAYMENT_RETRY_INTERVAL'),
+
+  // Daily Check-payment reminder CRON (separate job from the payment
+  // retry ticks). Default 02:00 in the scheduler timezone.
+  reminderCron: readEnv('REMINDER_CRON', { fallback: '0 2 * * *' }),
+  // Dev-only override for the reminder job (e.g. REMINDER_INTERVAL="1 minute").
+  reminderIntervalOverride: readEnv('REMINDER_INTERVAL'),
 }

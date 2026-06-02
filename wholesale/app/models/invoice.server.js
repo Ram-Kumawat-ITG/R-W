@@ -241,6 +241,11 @@ const invoiceSchema = new mongoose.Schema(
                 'cron_ach_settlement_check',
                 'cron_cheque_reminder',
                 'cron_ach_reminder',
+                // Daily Check-payment reminder CRON (services/reminder) —
+                // distinct from the legacy log-only PASS 1.5
+                // `cron_cheque_reminder`: this one is written when an
+                // actual QBO invoice reminder EMAIL was triggered.
+                'cron_payment_reminder',
                 'cron_failed_followup',
                 'admin_action',
                 'system_note',
@@ -321,6 +326,24 @@ const invoiceSchema = new mongoose.Schema(
     autoChargeResumedBy: String,
     autoChargePauseNote: String,
 
+    // Admin-controlled flag that mutes the Check-payment reminder CRON
+    // (services/reminder) for this invoice only. Distinct from
+    // `autoChargePaused` above: that gates the card auto-charge sweep
+    // (card-preferred invoices); THIS gates reminder EMAILS (cheque
+    // invoices). While `reminderPaused` is true the reminder job's
+    // eligibility filter (`reminderPaused: { $ne: true }`) skips the
+    // invoice entirely — no further automated reminder emails are sent
+    // — until an admin resumes. Surfaced via the "Pause auto email
+    // notifications" control on Order Details. Audit fields mirror the
+    // auto-charge pause set: `*PausedAt/By` capture the latest pause,
+    // `*ResumeAt/By` the latest resume, `*PauseNote` the optional reason.
+    reminderPaused: { type: Boolean, default: false, index: true },
+    reminderPausedAt: Date,
+    reminderPausedBy: String,
+    reminderResumeAt: Date,
+    reminderResumedBy: String,
+    reminderPauseNote: String,
+
     // Processing-fee state — captures the per-method surcharge added to
     // the invoice at settlement time (card=3%, ach=1%, check=0% by
     // default). The fee is decided by the **actual settlement method**
@@ -381,6 +404,47 @@ const invoiceSchema = new mongoose.Schema(
     invoiceEmailedAmountPaid: Number,
     lastEmailError: String,
 
+    // ── Check-payment reminder history (daily reminder CRON) ──────────
+    //
+    // Notification log for the standalone Check-reminder job
+    // (services/reminder). One entry per reminder EMAIL we asked QBO to
+    // send, keyed by `stage`. The named ladder stages (first / second /
+    // card) each send at most once — a 'sent' entry suppresses re-send.
+    // The 'recurring' stage is the exception: it repeats after the final
+    // ladder stage, throttled by the most recent entry's `sentAt` to the
+    // configured interval, so multiple 'recurring' rows accumulate (one
+    // per cycle) until the invoice is paid. A 'failed' entry is retryable
+    // on the next run. This is both the dedup source of truth and the
+    // per-invoice audit log.
+    paymentReminders: {
+      type: [
+        new mongoose.Schema(
+          {
+            // 'first' / 'second' / 'card' are the live ladder stage keys
+            // (semantic, ladder-position independent of the threshold
+            // value). 'recurring' is the post-final-stage reminder that
+            // repeats at the configured interval until paid — its entries
+            // accumulate (one per cycle). 'day7' / 'day9' / 'day13' are
+            // legacy keys kept so .save() doesn't fail enum validation on
+            // any pre-existing dev rows.
+            stage: {
+              type: String,
+              enum: ['first', 'second', 'card', 'recurring', 'day7', 'day9', 'day13'],
+              required: true,
+            },
+            sentAt: { type: Date, default: Date.now },
+            daysSinceOrder: Number,
+            recipient: String,
+            status: { type: String, enum: ['sent', 'failed'], required: true },
+            qboEmailStatus: String,
+            errorMessage: String,
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+
     // Append-only history of every QBO `/invoice/<id>/send` attempt.
     // Powers the "Email history" panel on the Order Details page and
     // gives ops a full audit trail of who sent what, when, and whether
@@ -431,6 +495,8 @@ const invoiceSchema = new mongoose.Schema(
                 'payment_recorded',
                 'status_changed',
                 'manual_resend',
+                // Daily Check-payment reminder CRON (services/reminder).
+                'payment_reminder',
               ],
               required: true,
             },

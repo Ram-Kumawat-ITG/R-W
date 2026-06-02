@@ -440,11 +440,15 @@ export default function OrderDetail() {
   const sendInvoiceFetcher = useFetcher();
   const pauseAutoChargeFetcher = useFetcher();
   const resumeAutoChargeFetcher = useFetcher();
+  const pauseRemindersFetcher = useFetcher();
+  const resumeRemindersFetcher = useFetcher();
   const modalRef = useRef(null);
   const chequeModalRef = useRef(null);
   const chargeCardModalRef = useRef(null);
   const pauseAutoChargeModalRef = useRef(null);
   const resumeAutoChargeModalRef = useRef(null);
+  const pauseRemindersModalRef = useRef(null);
+  const resumeRemindersModalRef = useRef(null);
   const [bannerError, setBannerError] = useState(null);
   const [bannerSuccess, setBannerSuccess] = useState(null);
   const [chequeReference, setChequeReference] = useState("");
@@ -452,6 +456,8 @@ export default function OrderDetail() {
   const [chequeReceivedAt, setChequeReceivedAt] = useState("");
   const [pauseNote, setPauseNote] = useState("");
   const [resumeNote, setResumeNote] = useState("");
+  const [reminderPauseNote, setReminderPauseNote] = useState("");
+  const [reminderResumeNote, setReminderResumeNote] = useState("");
   const handledRetryRef = useRef(null);
   const handledChequeRef = useRef(null);
   const handledChargeCardRef = useRef(null);
@@ -459,6 +465,8 @@ export default function OrderDetail() {
   const handledSendInvoiceRef = useRef(null);
   const handledPauseAutoChargeRef = useRef(null);
   const handledResumeAutoChargeRef = useRef(null);
+  const handledPauseRemindersRef = useRef(null);
+  const handledResumeRemindersRef = useRef(null);
   // Holds the window opened synchronously on PDF click; we redirect it
   // to a blob URL once the fetcher returns. Opening *after* the async
   // step would trip popup blockers.
@@ -641,6 +649,25 @@ export default function OrderDetail() {
   const resumeAutoChargeSubmitting =
     resumeAutoChargeFetcher.state === "submitting" ||
     resumeAutoChargeFetcher.state === "loading";
+
+  // Email-reminder pause/resume. Gated to cheque invoices — the reminder
+  // CRON only emails Check-method invoices, so a pause flag on a card/ACH
+  // invoice would be a silent no-op. Paid/cancelled invoices already drop
+  // out of the reminder sweep, so neither button is offered there.
+  const reminderPaused = invoice?.reminderPaused === true;
+  const reminderPauseActionable =
+    !!invoice &&
+    isChequeInvoice &&
+    invoice.paymentStatus !== "paid" &&
+    invoice.paymentStatus !== "cancelled";
+  const canPauseReminders = reminderPauseActionable && !reminderPaused;
+  const canResumeReminders = reminderPauseActionable && reminderPaused;
+  const pauseRemindersSubmitting =
+    pauseRemindersFetcher.state === "submitting" ||
+    pauseRemindersFetcher.state === "loading";
+  const resumeRemindersSubmitting =
+    resumeRemindersFetcher.state === "submitting" ||
+    resumeRemindersFetcher.state === "loading";
 
   // Surface retry result via banner + toast. Don't auto-revalidate manually —
   // React Router 7 does that after the fetcher action settles.
@@ -860,6 +887,79 @@ export default function OrderDetail() {
     }
   }, [resumeAutoChargeFetcher.data, resumeAutoChargeFetcher.state, shopify]);
 
+  // Email-reminder pause/resume submission handlers. Both endpoints
+  // accept an optional `note` body for the remarks ledger; loader
+  // auto-revalidates after the action settles.
+  const onConfirmPauseReminders = () => {
+    setBannerError(null);
+    setBannerSuccess(null);
+    pauseRemindersModalRef.current?.hideOverlay?.();
+    const body = {};
+    const trimmed = reminderPauseNote.trim();
+    if (trimmed) body.note = trimmed;
+    pauseRemindersFetcher.submit(body, {
+      method: "POST",
+      action: `/api/admin/orders/${order._id}/pause-reminders`,
+      encType: "application/json",
+    });
+  };
+
+  const onConfirmResumeReminders = () => {
+    setBannerError(null);
+    setBannerSuccess(null);
+    resumeRemindersModalRef.current?.hideOverlay?.();
+    const body = {};
+    const trimmed = reminderResumeNote.trim();
+    if (trimmed) body.note = trimmed;
+    resumeRemindersFetcher.submit(body, {
+      method: "POST",
+      action: `/api/admin/orders/${order._id}/resume-reminders`,
+      encType: "application/json",
+    });
+  };
+
+  useEffect(() => {
+    if (!pauseRemindersFetcher.data) return;
+    if (pauseRemindersFetcher.state !== "idle") return;
+    if (handledPauseRemindersRef.current === pauseRemindersFetcher.data) return;
+    handledPauseRemindersRef.current = pauseRemindersFetcher.data;
+
+    const data = pauseRemindersFetcher.data;
+    if (data.status === "success") {
+      setBannerSuccess(
+        data.result?.reapplied
+          ? "Email reminders pause refreshed"
+          : "Email reminders paused — CRON will skip this invoice",
+      );
+      setReminderPauseNote("");
+      shopify?.toast?.show("Email reminders paused");
+    } else {
+      setBannerError(data.message || "Could not pause email reminders");
+      shopify?.toast?.show(data.message || "Pause failed", { isError: true });
+    }
+  }, [pauseRemindersFetcher.data, pauseRemindersFetcher.state, shopify]);
+
+  useEffect(() => {
+    if (!resumeRemindersFetcher.data) return;
+    if (resumeRemindersFetcher.state !== "idle") return;
+    if (handledResumeRemindersRef.current === resumeRemindersFetcher.data) return;
+    handledResumeRemindersRef.current = resumeRemindersFetcher.data;
+
+    const data = resumeRemindersFetcher.data;
+    if (data.status === "success") {
+      setBannerSuccess(
+        data.result?.wasAlreadyRunning
+          ? "Email reminders were already running — confirmation recorded"
+          : "Email reminders resumed — CRON will evaluate the ladder on the next run",
+      );
+      setReminderResumeNote("");
+      shopify?.toast?.show("Email reminders resumed");
+    } else {
+      setBannerError(data.message || "Could not resume email reminders");
+      shopify?.toast?.show(data.message || "Resume failed", { isError: true });
+    }
+  }, [resumeRemindersFetcher.data, resumeRemindersFetcher.state, shopify]);
+
   // Click handler must open the new window *synchronously* — that's the
   // only way it counts as a user-gesture and survives popup blockers.
   // We open with "about:blank", then redirect to a blob URL once the
@@ -1062,6 +1162,28 @@ export default function OrderDetail() {
           {...(resumeAutoChargeSubmitting ? { loading: true } : {})}
         >
           Resume auto-charge
+        </s-button>
+      )}
+      {/* Pause / Resume email reminders — cheque invoices only. One
+          button at a time, picked by the live `reminderPaused` flag. */}
+      {invoice && isChequeInvoice && !reminderPaused && (
+        <s-button
+          slot="secondary-actions"
+          disabled={!canPauseReminders}
+          onClick={() => pauseRemindersModalRef.current?.showOverlay?.()}
+          {...(pauseRemindersSubmitting ? { loading: true } : {})}
+        >
+          Pause auto email notifications
+        </s-button>
+      )}
+      {invoice && isChequeInvoice && reminderPaused && (
+        <s-button
+          slot="secondary-actions"
+          disabled={!canResumeReminders}
+          onClick={() => resumeRemindersModalRef.current?.showOverlay?.()}
+          {...(resumeRemindersSubmitting ? { loading: true } : {})}
+        >
+          Resume auto email notifications
         </s-button>
       )}
 
@@ -1317,6 +1439,15 @@ export default function OrderDetail() {
                     : "Auto-charge active"}
                 </s-badge>
               )}
+              {/* Email-reminder badge — only meaningful for cheque
+                  invoices (the only ones the reminder CRON emails). */}
+              {isChequeInvoice && (
+                <s-badge tone={reminderPaused ? "warning" : "success"}>
+                  {reminderPaused
+                    ? "Email reminders paused"
+                    : "Email reminders active"}
+                </s-badge>
+              )}
             </s-stack>
 
             {/* Paused-state context banner — surfaces who paused it,
@@ -1341,6 +1472,33 @@ export default function OrderDetail() {
                     : ""}
                   {invoice.autoChargePauseNote
                     ? ` — "${invoice.autoChargePauseNote}"`
+                    : ""}
+                  .
+                </s-paragraph>
+              </s-banner>
+            )}
+
+            {/* Email-reminder paused banner — surfaces who muted the
+                reminder CRON, when, and why, so admins know automated
+                emails are intentionally stopped for this invoice. */}
+            {isChequeInvoice && reminderPaused && (
+              <s-banner tone="warning" heading="Auto email reminders are paused">
+                <s-paragraph>
+                  The reminder scheduler will not send any further payment
+                  reminder emails (Day 9 / 11 / 13) for this invoice until
+                  an admin resumes. Payment collection is unaffected — this
+                  pauses notifications only.
+                </s-paragraph>
+                <s-paragraph tone="subdued">
+                  Paused{" "}
+                  {invoice.reminderPausedAt
+                    ? `on ${new Date(invoice.reminderPausedAt).toLocaleString()}`
+                    : ""}
+                  {invoice.reminderPausedBy
+                    ? ` by ${invoice.reminderPausedBy}`
+                    : ""}
+                  {invoice.reminderPauseNote
+                    ? ` — "${invoice.reminderPauseNote}"`
                     : ""}
                   .
                 </s-paragraph>
@@ -2319,6 +2477,86 @@ export default function OrderDetail() {
         <s-button
           slot="secondary-actions"
           onClick={() => resumeAutoChargeModalRef.current?.hideOverlay?.()}
+        >
+          Cancel
+        </s-button>
+      </s-modal>
+
+      <s-modal
+        ref={pauseRemindersModalRef}
+        id="pause-reminders-modal"
+        heading="Pause auto email notifications?"
+        accessibilityLabel="Pause email reminders confirmation"
+      >
+        <s-stack direction="block" gap="base">
+          <s-paragraph>
+            The reminder scheduler will stop sending automated payment
+            reminder emails (Day 9 / 11 / 13) for this invoice until you
+            resume. This affects notifications only — it does not change
+            the invoice, the balance, or any payment action.
+          </s-paragraph>
+          <s-paragraph tone="subdued">
+            Reminders resume automatically once you re-enable them; they
+            also stop on their own once the invoice is paid.
+          </s-paragraph>
+          <s-text-area
+            label="Note (optional)"
+            placeholder="Reason for pausing — visible in the remarks ledger"
+            value={reminderPauseNote}
+            rows={3}
+            onChange={(e) => setReminderPauseNote(e.currentTarget.value)}
+            maxLength={500}
+          />
+        </s-stack>
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          onClick={onConfirmPauseReminders}
+          {...(pauseRemindersSubmitting ? { loading: true } : {})}
+        >
+          Pause notifications
+        </s-button>
+        <s-button
+          slot="secondary-actions"
+          onClick={() => pauseRemindersModalRef.current?.hideOverlay?.()}
+        >
+          Cancel
+        </s-button>
+      </s-modal>
+
+      <s-modal
+        ref={resumeRemindersModalRef}
+        id="resume-reminders-modal"
+        heading="Resume auto email notifications?"
+        accessibilityLabel="Resume email reminders confirmation"
+      >
+        <s-stack direction="block" gap="base">
+          <s-paragraph>
+            This invoice will be included in the reminder scheduler again.
+            The next CRON run evaluates the Day 9 / 11 / 13 ladder and
+            sends any reminder that is now due and not yet sent — no email
+            is sent right now.
+          </s-paragraph>
+          <s-text-area
+            label="Note (optional)"
+            placeholder="Reason for resuming — visible in the remarks ledger"
+            value={reminderResumeNote}
+            rows={3}
+            onChange={(e) => setReminderResumeNote(e.currentTarget.value)}
+            maxLength={500}
+          />
+        </s-stack>
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          onClick={onConfirmResumeReminders}
+          {...(resumeRemindersSubmitting ? { loading: true } : {})}
+        >
+          Resume notifications
+        </s-button>
+        <s-button
+          slot="secondary-actions"
+          onClick={() => resumeRemindersModalRef.current?.hideOverlay?.()}
         >
           Cancel
         </s-button>

@@ -29,7 +29,7 @@ import {
   recordOrderTransaction as recordShopifyOrderTransaction,
 } from '../shopify/shopify.service'
 import { paymentConfig } from '../payment/payment.config'
-import { invoiceConfig } from './invoice.config'
+import { invoiceConfig, dueDaysForMethod } from './invoice.config'
 import {
   syncWithRetry,
   shopifyLinesToQboLines,
@@ -107,21 +107,25 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
   // and ACH receipts. See propagateSuccessfulPayment + recordManual-
   // Payment for the append flow.
   const lines = shopifyLinesToQboLines(order)
-  // Due date = order date + termsDays. Sending DueDate explicitly makes
+  // Due date = order date + per-method terms. The term length is
+  // selected by the invoice's locked paymentMethod (cheque →
+  // CHEQUE_DUE_DATE, ACH → ACH_DUE_DATE, card → CARD_DUE_DATE; each
+  // falls back to INVOICE_TERMS_DAYS). Sending DueDate explicitly makes
   // us the source of truth and overrides any QBO customer-level
   // SalesTerm. Falls back to localOrder.receivedAt if Shopify's
   // created_at is missing; if both are unparseable, we omit DueDate
   // and let QBO compute it from its own defaults.
   const orderDateBasis = order?.created_at || localOrder?.receivedAt
-  const dueDate = computeInvoiceDueDate(orderDateBasis, invoiceConfig.termsDays)
+  const termsDays = dueDaysForMethod(invoice.paymentMethod)
+  const dueDate = computeInvoiceDueDate(orderDateBasis, termsDays)
   const dueAt = computeInvoiceDueAt(
     orderDateBasis,
-    invoiceConfig.termsDays,
+    termsDays,
     invoiceConfig.termsMinutes,
   )
   console.log(
     `[invoice] dueDate = ${dueDate || '(QBO default)'} ` +
-      `(order date ${orderDateBasis || '(unknown)'} + ${invoiceConfig.termsDays} days` +
+      `(order date ${orderDateBasis || '(unknown)'} + ${termsDays} days [method=${invoice.paymentMethod}]` +
       (invoiceConfig.termsMinutes ? ` + ${invoiceConfig.termsMinutes} min` : '') +
       `) dueAt = ${dueAt ? dueAt.toISOString() : '(none)'}`,
   )

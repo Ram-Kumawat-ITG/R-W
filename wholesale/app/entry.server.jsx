@@ -52,7 +52,12 @@ function printBootBanner() {
     : "(not set)";
   console.log(`  NMI test card (dev only)  : ${tcStatus}`);
   console.log("  --- Invoicing ---");
-  console.log(`  INVOICE_TERMS_DAYS        : ${invoiceConfig.termsDays} (order date + N → QBO DueDate)`);
+  console.log(`  INVOICE_TERMS_DAYS        : ${invoiceConfig.termsDays} (generic fallback)`);
+  console.log(
+    `  Due-date terms by method  : cheque=${invoiceConfig.dueDaysByMethod.check}d ` +
+      `ach=${invoiceConfig.dueDaysByMethod.ach}d card=${invoiceConfig.dueDaysByMethod.card}d ` +
+      `(order date + N → QBO DueDate)`,
+  );
   console.log("  --- Payments ---");
   console.log(`  PAYMENT_CHARGE_IMMEDIATELY: ${paymentConfig.chargeImmediately}`);
   console.log(`  PAYMENT_MAX_RETRY_ATTEMPTS: ${paymentConfig.maxRetryAttempts}`);

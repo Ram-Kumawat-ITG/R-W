@@ -236,12 +236,11 @@ Design rules:
 │     on approved: propagateSuccessfulPayment                           │
 │     always: push Invoice.remarks[] entry (cron_card_attempt)          │
 │                                                                       │
-│ PASS 1.5 — reminders for invoices CRON can't auto-charge              │
-│   for each Invoice where (pending && paymentMethod ∈ {check,ach})     │
-│                       OR paymentStatus='failed':                      │
-│     push Invoice.remarks[] entry (cron_cheque_reminder /              │
-│                                   cron_failed_followup)               │
+│ PASS 1.5 — failed-payment follow-up logs (payment audit)             │
+│   for each Invoice where paymentStatus='failed':                      │
+│     push Invoice.remarks[] entry (cron_failed_followup)               │
 │     no charge / no customer notification                              │
+│   (cheque reminders live in the process-check-reminders CRON, §10.5)  │
 │                                                                       │
 │ PASS 2 — paid invoices with broken downstream sync                    │
 │   for each Invoice where paymentStatus='paid' and                     │
@@ -708,11 +707,24 @@ Line items mirror Shopify's: per-product line + Shipping line + Tax
 line. Every line needs an `Item` reference — `QBO_DEFAULT_ITEM_ID`
 (default `"1"`) is used unless `line.qboItemId` is set.
 
-`DueDate` is computed in this app as **order date + `INVOICE_TERMS_DAYS`**
-(default 15) by `invoice.utils.computeInvoiceDueDate`, then sent
-explicitly to QBO. This makes us the source of truth for terms and
-overrides any customer-level `SalesTerm` configured in QBO. The
-returned `DueDate` is captured on the local invoice as `qboDueDate`
+`DueDate` is computed in this app as **order date + per-method terms**,
+then sent explicitly to QBO. This makes us the source of truth for terms
+and overrides any customer-level `SalesTerm` configured in QBO. The term
+length is selected by the invoice's locked `paymentMethod` via
+`invoiceConfig.dueDaysForMethod`:
+
+| Payment method | Env var | Default |
+|---|---|---|
+| Cheque | `CHEQUE_DUE_DATE` | `INVOICE_TERMS_DAYS` (15) |
+| ACH | `ACH_DUE_DATE` | `INVOICE_TERMS_DAYS` (15) |
+| Card | `CARD_DUE_DATE` | `INVOICE_TERMS_DAYS` (15) |
+
+Each falls back to the generic `INVOICE_TERMS_DAYS` when its var is unset,
+so single-terms setups keep working. Example: order June 1 +
+`CHEQUE_DUE_DATE=15` → due June 16. The same per-method term feeds the
+local full-datetime `Invoice.dueAt` (plus `INVOICE_TERMS_MINUTES`). The
+date-only result is sent to QBO by `invoice.utils.computeInvoiceDueDate`;
+the returned `DueDate` is captured on the local invoice as `qboDueDate`
 ("YYYY-MM-DD" string) for display in the Order List + Order Details.
 
 If both `order.created_at` and `localOrder.receivedAt` are unparseable,
@@ -1320,18 +1332,26 @@ than the default-billing card entry. `nmi.service.chargeCustomerVault`
 accepts both and threads them into transact.php's `customer_vault_id`
 + optional `billing_id` parameters.
 
-PASS 1.5 (reminder logger) now runs only over cheque-pending invoices
-and failed card/ACH invoices that exhausted retries. ACH no longer
-lands in PASS 1.5 as a pending row — it gets the active charge in
-PASS 1 instead, and lands here only if its `paymentStatus` flips to
-`'failed'` after `maxAttempts` declines. The legacy `cron_ach_reminder`
-remark kind is preserved on the Invoice schema for back-compat with
-rows logged before the change; new ACH activity lands as
-`cron_ach_attempt` (success / decline / error) in PASS 1.
+PASS 1.5 (payment follow-up logger) runs only over invoices whose
+`paymentStatus` is `'failed'` (card/ACH that exhausted retries). It logs
+a `cron_failed_followup` remark as part of this CRON's payment audit
+history — no charge, no customer notification.
+
+**Cheque reminders are NOT logged here.** Customer-facing payment
+reminders for unpaid cheque invoices are owned exclusively by the
+dedicated reminder CRON (`process-check-reminders` / services/reminder —
+§10.5), which sends the QBO ladder + recurring emails. This payment CRON
+is responsible only for charging, status updates, and payment/audit
+logs; keeping the concerns separate is what prevents the duplicate
+reminder entries that used to appear when PASS 1.5 also logged a
+`cron_cheque_reminder` every tick. The legacy `cron_cheque_reminder` /
+`cron_ach_reminder` remark kinds are preserved on the Invoice schema for
+back-compat with rows logged before this change; PASS 1.5 no longer
+emits them. New ACH activity lands as `cron_ach_attempt` (success /
+decline / error) in PASS 1.
 
 PASS 1.5 also carries the same `autoChargePaused: { $ne: true }` term —
-pausing is an explicit "leave this one alone" signal, and surfacing a
-recurring reminder for a paused invoice would defeat that intent.
+pausing is an explicit "leave this one alone" signal.
 
 `$ne: true` (not `false`) is deliberate so legacy rows without the field
 default to "not paused".
@@ -1641,6 +1661,112 @@ or in prod:
 ```
 {scope:"scheduler","event":"scheduler.recurring_registered","mode":"cron","primary":"30 0 15 * *","secondary":"30 0 L * *","timezone":"America/Los_Angeles"}
 ```
+
+### 10.5 Check-payment reminder CRON (notification-only)
+
+A **separate job** — `process-check-reminders` — distinct from the
+payment-retry ticks. It only *notifies*; it never charges. Registered in
+`scheduler.service.ensureRecurring` (dev + prod) alongside the retry job.
+Cadence is the daily cron in production, or a fast `REMINDER_INTERVAL`
+sweep in dev/test (currently every minute).
+
+```
+REMINDER_CRON=0 2 * * *        # default: 02:00 daily (scheduler timezone)
+REMINDER_INTERVAL=1 minute     # dev/test override (Agenda "every" expression)
+REMINDER_USE_MINUTES=true      # TEST knob: use the MINUTE ladder, count minutes
+# Production (day) ladder — defaults:
+REMINDER_DAY_FIRST=9  REMINDER_DAY_SECOND=11  REMINDER_DAY_CARD=13
+# Testing (minute) ladder — defaults, live only when REMINDER_USE_MINUTES=true:
+REMINDER_MIN_FIRST=1  REMINDER_MIN_SECOND=3   REMINDER_MIN_CARD=4
+# Recurring cadence AFTER the final stage (repeats until paid):
+REMINDER_REPEAT_DAYS=2  REMINDER_REPEAT_MINUTES=1
+```
+
+**Code:** `services/reminder/reminder.service.js`
+(`processCheckPaymentReminders()`) + `reminder.config.js`; thin Agenda
+wrapper `services/scheduler/jobs/processCheckReminders.job.js`.
+
+**Eligibility filter** (the only invoices it touches):
+
+```js
+{ paymentMethod: 'check',
+  paymentStatus: { $in: ['pending', 'partially_paid'] },
+  qboCreationStatus: 'created',
+  qboInvoiceId: { $exists: true, $ne: null },
+  reminderPaused: { $ne: true } }
+```
+
+Once an invoice is paid it drops out of the `paymentStatus` set, so
+reminders stop automatically. `reminderPaused` is the admin mute switch
+(see "Pause control" below) — distinct from `autoChargePaused`, which
+gates the card auto-charge sweep, not email reminders.
+
+**Reminder ladder** (elapsed measured from `qboTxnDate`, fallback
+`createdAt`; the active threshold column is chosen by `REMINDER_USE_MINUTES`):
+
+| Stage | Prod threshold | Test threshold | Meaning |
+|---|---|---|---|
+| `first`  | 9 days  | 1 min | First payment reminder |
+| `second` | 11 days | 3 min | Second payment reminder |
+| `card`   | 13 days | 4 min | Final card-on-file notice (balance may be charged to card on file — admin does the charge) |
+| `recurring` | every 2 days *after* `card` | every 1 min *after* `card` | Repeats until paid — keeps reminding the customer the balance is still outstanding |
+
+Prod thresholds are env-tunable (`REMINDER_DAY_FIRST/SECOND/CARD`); the
+test ladder via `REMINDER_MIN_FIRST/SECOND/CARD`; the recurring cadence
+via `REMINDER_REPEAT_DAYS` (prod, default 2) / `REMINDER_REPEAT_MINUTES`
+(test, default 1).
+
+Stage keys are semantic (`first` / `second` / `card` / `recurring`),
+independent of the threshold value, so the same keys dedup correctly
+whether the day or minute ladder is live. (Legacy `day7` / `day9` /
+`day13` keys remain in the `paymentReminders[].stage` enum only for
+back-compat with old rows.)
+
+"Current level wins": each run sends only the highest-threshold named
+stage reached **and not yet sent**, so a CRON outage jumps straight to
+the most advanced reminder instead of replaying earlier ones. Each named
+stage fires at most once, in order.
+
+**Recurring phase:** once the final (`card`) stage has been sent and the
+invoice is still unpaid, the job keeps sending the `recurring` reminder,
+throttled to `recurringIntervalUnits()` (the `REMINDER_REPEAT_*` cadence)
+since the most recent reminder of any stage. This is independent of how
+often the CRON ticks — a daily cron with `REMINDER_REPEAT_DAYS=2` emails
+every other day; the every-minute test sweep with
+`REMINDER_REPEAT_MINUTES=1` emails each minute. `recurring` entries
+accumulate in `paymentReminders[]` (one per cycle) as the audit trail.
+Because a paid invoice leaves the eligibility filter, the recurring
+reminders stop automatically the moment the balance is settled.
+
+**Email:** triggers the QBO invoice email via
+`qbo.service.sendInvoiceEmail({ qboInvoiceId, sendTo: invoice.customerEmail })`
+(`POST /invoice/<id>/send`). QBO delivers the standard invoice email; the
+stage governs *our* logging/intent, not the email body.
+
+**Dedup + audit:**
+- `Invoice.paymentReminders[]` — one entry per stage (`{ stage, sentAt,
+  daysSinceOrder, recipient, status: 'sent'|'failed', qboEmailStatus,
+  errorMessage }`). Only a `sent` entry suppresses a stage; a `failed`
+  entry is retried on the next run.
+- `Invoice.emailEvents[]` — append a row with `source: 'payment_reminder'`
+  (surfaces in the Order Details "Email history" panel).
+- `Invoice.remarks[]` — append `kind: 'cron_payment_reminder'`
+  (operator timeline; distinct from the legacy log-only PASS 1.5
+  `cron_cheque_reminder`).
+
+**Pause control** (admin mute switch): the Order Details page exposes a
+**Pause / Resume auto email notifications** button (cheque invoices only),
+backed by `POST /api/admin/orders/:id/pause-reminders` +
+`/resume-reminders`. Pausing sets `Invoice.reminderPaused = true` (+
+`reminderPausedAt/By`, `reminderPauseNote`); the eligibility filter's
+`reminderPaused: { $ne: true }` clause then skips the invoice on every
+run until an admin resumes (`reminderResumeAt/By`). Both endpoints append
+an `admin_action` remark and are idempotent. This is independent of the
+auto-charge pause (`autoChargePaused`) — different flag, different sweep.
+
+**Guarantees:** never processes payments / charges methods; only Check
+invoices; idempotent per stage; safe to re-run; paid or paused invoices
+are skipped.
 
 ---
 
@@ -2169,7 +2295,10 @@ required values throw immediately.
 | `NMI_TEST_CCEXP` | (optional) | Dev test card expiry MMYY |
 | `NMI_TEST_CVV` | (optional) | Dev test card CVV |
 | **Invoicing** | | |
-| `INVOICE_TERMS_DAYS` | `15` | Days from order date to invoice due date — sent as `DueDate` to QBO (overrides any customer-level SalesTerm) |
+| `INVOICE_TERMS_DAYS` | `15` | Generic fallback: days from order date to invoice due date when no per-method override is set. Sent as `DueDate` to QBO (overrides any customer-level SalesTerm) |
+| `CHEQUE_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **cheque** invoices (§7.3) |
+| `ACH_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **ACH** invoices (§7.3) |
+| `CARD_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **card** invoices (§7.3) |
 | `INVOICE_TERMS_MINUTES` | `0` | Extra minutes added on top of `INVOICE_TERMS_DAYS` for the local full-datetime `Invoice.dueAt` field. **Testing knob** — set to `1` to flag invoices Overdue ~1 minute after creation without waiting whole days. The QBO date-only `DueDate` ignores this offset (it still rounds to `termsDays`); only the local Order List "Overdue" indicator + cheque-reminder UI uses `dueAt`. |
 | `INVOICE_FEE_RATE_CARD` | `0.03` | Per-method processing fee (decimal): card. Appended as a line at settlement when an NMI card charge approves or the cheque → card admin fallback runs. `0` disables. |
 | `INVOICE_FEE_RATE_ACH` | `0.01` | Per-method processing fee (decimal): ACH. Appended on `kind='ach'` manual receipts. `0` disables. |
@@ -2205,7 +2334,7 @@ All in MongoDB, single database from `MONGODB_URI`.
 | `qbo_tokens` | `models/qboToken.server.js` | One row per realm — current access + refresh token |
 | `customer_maps` | `models/customerMap.server.js` | Shopify email ↔ QBO customer ↔ NMI vault; carries `paymentMethod` preference |
 | `shopify_orders` | `models/order.server.js` | Local mirror of every received Shopify order |
-| `invoices` | `models/invoice.server.js` | Local invoice mirror + sync state; carries `paymentMethod` (active, mutable), `customerPaymentPreference` (immutable order-time snapshot), `paymentSettledVia` + `paymentSettledAt` (recorded on each successful payment), `qboDueDate`, `manualPayments[]` ledger, `remarks[]` ledger (append-only CRON + admin follow-up entries — `kind` ∈ `cron_card_attempt` / `cron_cheque_reminder` / `cron_failed_followup` / `admin_action` / `system_note`; powers the Order List **Remarks** column), and the auto-charge pause control (`autoChargePaused` Boolean + `autoChargePausedAt` / `autoChargePausedBy` / `autoChargePauseNote` / `autoChargeResumeAt` / `autoChargeResumedBy` — §9.2.1) |
+| `invoices` | `models/invoice.server.js` | Local invoice mirror + sync state; carries `paymentMethod` (active, mutable), `customerPaymentPreference` (immutable order-time snapshot), `paymentSettledVia` + `paymentSettledAt` (recorded on each successful payment), `qboDueDate`, `manualPayments[]` ledger, `remarks[]` ledger (append-only CRON + admin follow-up entries — `kind` ∈ `cron_card_attempt` / `cron_cheque_reminder` / `cron_failed_followup` / `admin_action` / `system_note`; powers the Order List **Remarks** column), and the auto-charge pause control (`autoChargePaused` Boolean + `autoChargePausedAt` / `autoChargePausedBy` / `autoChargePauseNote` / `autoChargeResumeAt` / `autoChargeResumedBy` — §9.2.1), and the email-reminder pause control (`reminderPaused` Boolean + `reminderPausedAt` / `reminderPausedBy` / `reminderPauseNote` / `reminderResumeAt` / `reminderResumedBy` — §10.5) |
 | `payment_attempts` | `models/paymentAttempt.server.js` | Append-only charge ledger (NMI + manual cheque receipts as `outcome: 'manual_paid'`) |
 | `wholesale_applications` | `models/wholesaleApplication.server.js` | Wholesale signups (pre-existing) |
 
