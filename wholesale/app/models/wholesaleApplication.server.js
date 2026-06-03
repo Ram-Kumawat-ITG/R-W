@@ -10,7 +10,7 @@ const addressSchema = new mongoose.Schema(
     country: String,
     type: String,
   },
-  { _id: false }, 
+  { _id: false },
 );
 
 const taxSchema = new mongoose.Schema(
@@ -97,6 +97,18 @@ const wholesaleApplicationSchema = new mongoose.Schema(
     customerInviteSentAt: { type: Date, default: null },
     shopifyCreateFailed: { type: Boolean, default: false, index: true },
     shopifyCreateError: { type: String, default: null },
+
+    // CDO Phase 1 — set when a practitioner referral code is auto-generated
+    // at the end of a successful registration. Used as the idempotency key
+    // to skip re-generation on retried submits and as the pointer to the
+    // cdo_practitioner_codes row.
+    cdoPractitionerCodeId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "CdoPractitionerCode",
+      default: null,
+      index: true,
+    },
+    cdoPractitionerCode: { type: String, default: null },
   },
   { collection: "wholesale_applications", timestamps: true, strict: false },
 );

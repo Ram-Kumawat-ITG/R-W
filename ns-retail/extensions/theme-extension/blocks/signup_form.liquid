@@ -1,0 +1,30 @@
+{% comment %}
+  Retail-store signup form block. Loads the Vite-built signup-bundle.{js,css}
+  from the theme extension's assets folder and mounts the React app into
+  #ns-signup-root.
+
+  The companion source lives at: ns-retail/signup-form/
+  After editing source, run from ns-retail/: npm run build:signup
+  (or just run shopify app deploy — the predeploy hook does it automatically)
+{% endcomment %}
+
+{% assign bundle_url = 'signup-bundle.js' | asset_url %}
+{% assign asset_base = bundle_url | split: 'signup-bundle.js' | first %}
+
+<script>
+  window.__SIGNUP_ASSET_BASE__ = {{ asset_base | json }};
+</script>
+
+{{ 'signup-bundle.css' | asset_url | stylesheet_tag }}
+
+<div id="ns-signup-root"></div>
+
+<script src="{{ 'signup-bundle.js' | asset_url }}" type="module"></script>
+
+{% schema %}
+{
+  "name": "Signup form",
+  "target": "section",
+  "settings": []
+}
+{% endschema %}

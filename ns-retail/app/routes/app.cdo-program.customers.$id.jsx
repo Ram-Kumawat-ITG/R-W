@@ -18,20 +18,22 @@ import { formatDateTime } from "../utils/format";
 //     the sub-tab bar.
 //   - Child routes (_index, commissions, downline, network, sales,
 //     payments, transactions, settings) render into the <Outlet />.
-//   - This file also owns the `action` handler for referral-code CRUD
+//   - This file owns the `action` IMPLEMENTATION for referral-code CRUD
 //     used by the Details tab — co-located here so a single form
 //     submission can dispatch to any of the create / update / delete /
 //     set-primary code operations via an `_action` field.
 //
-// The action HANDLER lives on the layout (not the tab) so:
-//   1. Forms submitted from the Details tab don't need their own
-//      route action (less duplication).
-//   2. After a mutation, React Router auto-revalidates the layout's
-//      loader AND the active child loader — the Details tab sees the
-//      fresh code list without manual fetcher orchestration.
-//   3. Future tabs (e.g. Settings) can reuse the same action endpoint
-//      via fetcher.submit({ ...body }, { action: "/app/cdo-program/
-//      customers/:id" }).
+// NOTE on routing: React Router runs a submission's action on the LEAF
+// matched route. For the URL `/app/cdo-program/customers/:id` the leaf is
+// the `_index` route, NOT this layout — so the Details tab re-exports this
+// `action` from `app.cdo-program.customers.$id._index.jsx` to serve its
+// `fetcher.submit({ ...body }, { method: "POST" })` calls. We keep the
+// implementation here as the single source of truth:
+//   1. After a mutation, React Router auto-revalidates the active child
+//      loader AND this layout's loader — the Details tab sees the fresh
+//      code list without manual fetcher orchestration.
+//   2. Future tabs that need code CRUD can re-export this same `action`
+//      from their own route module the same way the `_index` tab does.
 
 export const loader = async ({ request, params }) => {
   await authenticate.admin(request);

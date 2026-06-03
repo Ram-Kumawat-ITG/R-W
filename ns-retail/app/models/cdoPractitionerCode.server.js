@@ -15,8 +15,14 @@
 // existing cdo_orders / cdo_commissions are immutable history.
 //
 // Practitioner identification:
-//   - `practitionerId` is the wholesale_applications document `_id`
-//     (the same string the CDO Customers list uses as a row id).
+//   - `practitionerId` is the owning application document `_id` (the same
+//     string the CDO Customers list uses as a row id).
+//   - `practitionerSource` says WHICH collection that id lives in:
+//     "wholesale" → wholesale_applications (the default — practitioners
+//     live here) or "cdo" → cdo_applications. This lets a referral code
+//     map back to an application record without a separate user
+//     collection. Customers (cdo_applications) consume these codes; they
+//     don't own them.
 //   - `practitionerEmail` is denormalized for fast lookups + matches
 //     the rest of the cdo_* collections' field naming.
 
@@ -27,14 +33,21 @@ const cdoPractitionerCodeSchema = new mongoose.Schema(
     shop: { type: String, index: true },
 
     practitionerId: { type: String, required: true, index: true },
+    practitionerSource: {
+      type: String,
+      enum: ["cdo", "wholesale"],
+      default: "wholesale",
+      index: true,
+    },
     practitionerEmail: { type: String, lowercase: true, index: true },
     practitionerName: String,
 
-    // The code string itself — uppercase, alphanumeric + dashes only,
-    // unique per shop. Storefront / Shopify discount engines match on
-    // this value case-insensitively, but we normalise to uppercase on
-    // write so the lookup index is deterministic.
-    code: { type: String, required: true, uppercase: true, trim: true },
+    // The code string itself — lowercase, alphanumeric + underscore.
+    // Locked format from the CDO roadmap is `<firstname>_<8-char-hex>`,
+    // e.g. `john_a3f1c8e2`. Unique per shop. Storefront / Shopify
+    // discount engines match case-insensitively so display case is
+    // user-friendly but storage is canonical lowercase.
+    code: { type: String, required: true, lowercase: true, trim: true },
 
     // Exactly one code per practitioner should be `isPrimary: true`.
     // Enforced by a partial unique index below + the setPrimary helper
