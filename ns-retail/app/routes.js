@@ -27,5 +27,6 @@ export default [
   // Path strings are relative to the app/ directory.
   route("/api/auth/check-email", "api/auth/check-email.js"),
   route("/api/cdo/validate-code", "api/cdo/validate-code.js"),
+  route("/api/cdo/checkout-validate-code", "api/cdo/checkout-validate-code.js"),
   route("/api/signup-form", "api/signup-form.js"),
 ];
