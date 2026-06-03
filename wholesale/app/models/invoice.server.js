@@ -158,6 +158,62 @@ const invoiceSchema = new mongoose.Schema(
     pendingSettlementSince: Date,
     pendingSettlementLastCheckedAt: Date,
 
+    // ── ACH status synchronization (services/payment/achStatusSync) ───
+    //
+    // The dedicated ACH Status Synchronization CRON
+    // (`process-ach-status-sync`) polls NMI for the latest condition of
+    // every awaiting-settlement ACH transaction and records the outcome
+    // here. `achReturnCode` / `achReturnReason` capture the NACHA return
+    // detail when a debit is returned or voided (e.g. R01 — insufficient
+    // funds); `achStatusHistory[]` is the append-only audit trail of every
+    // detected status CHANGE — one entry per transition, so a re-poll that
+    // sees no change adds nothing (keeps the sync idempotent).
+    achReturnCode: String,
+    achReturnReason: String,
+    achReturnedAt: Date,
+    achStatusHistory: {
+      type: [
+        new mongoose.Schema(
+          {
+            at: { type: Date, default: Date.now },
+            // Normalized lifecycle status we transitioned TO, derived from
+            // NMI's transaction condition: pending_settlement | settled |
+            // returned | voided | failed | unknown.
+            status: { type: String, required: true },
+            previousStatus: String, // our paymentStatus before the change
+            nmiCondition: String, // raw NMI condition string
+            nmiTransactionId: String,
+            returnCode: String, // NACHA return code, when applicable
+            returnReason: String,
+            amount: Number,
+            source: { type: String, default: 'cron_ach_status_sync' },
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+
+    // ── Manual "Sync ACH Status" admin action ─────────────────────────
+    //
+    // The Order Details page exposes an on-demand "Sync ACH status"
+    // button that runs the SAME reconciliation as the CRON, for a single
+    // invoice, without waiting for the scheduled `process-ach-status-sync`
+    // tick. `achSyncInProgress` is an atomic lock (set via findOneAndUpdate)
+    // that prevents two syncs racing on the same invoice — a double-click
+    // or an overlapping CRON+manual run. `achSyncLastAt` / `achSyncLastStatus`
+    // / `achSyncLastCondition` / `achSyncLastSource` capture the most recent
+    // sync result (from EITHER the CRON or the manual button) so the UI can
+    // show "last synced X — status Y"; `achSyncLastBy` records the admin
+    // email when the sync was triggered manually.
+    achSyncInProgress: { type: Boolean, default: false },
+    achSyncStartedAt: Date,
+    achSyncLastAt: Date,
+    achSyncLastStatus: String, // normalized: settled|returned|voided|failed|pending_settlement|unknown|error
+    achSyncLastCondition: String, // raw NMI condition
+    achSyncLastSource: String, // 'cron_ach_status_sync' | 'admin_manual_sync'
+    achSyncLastBy: String,
+
     attemptCount: { type: Number, default: 0 },
     maxAttempts: { type: Number, default: 6 },
     lastAttemptAt: Date,

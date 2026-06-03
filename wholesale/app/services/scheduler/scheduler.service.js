@@ -6,6 +6,7 @@
 
 import Agenda from 'agenda'
 import { schedulerConfig } from './scheduler.config'
+import { achSyncConfig } from '../payment/achStatusSync.config'
 import { createLogger } from '../../utils/logger.utils'
 import { registerJobs, JOB_NAMES } from './jobs'
 
@@ -70,6 +71,37 @@ async function ensureRecurring(agenda) {
   log.info('scheduler.reminder_registered', {
     mode: schedulerConfig.reminderIntervalOverride ? 'dev-interval' : 'cron',
     schedule: schedulerConfig.reminderIntervalOverride || schedulerConfig.reminderCron,
+  })
+
+  // ── ACH status-synchronization job ───────────────────────────────
+  // Independent of the payment-retry ticks: ACH settles 1–3 business
+  // days after submission, so settlement status must be polled on its
+  // own (frequent) cadence rather than only on the monthly charge
+  // ticks. Registered here (before the retry dev-override early-return
+  // below) so it runs in dev mode too. ACH_SYNC_INTERVAL gives a fast
+  // testing cadence (every minute); otherwise the cron from config
+  // (production default: once per day at 03:00).
+  if (achSyncConfig.intervalOverride) {
+    await agenda.cancel({ name: JOB_NAMES.PROCESS_ACH_STATUS_SYNC })
+    await agenda.every(
+      achSyncConfig.intervalOverride,
+      JOB_NAMES.PROCESS_ACH_STATUS_SYNC,
+      { tick: 'dev' },
+    )
+    console.log(
+      `\n[scheduler] DEV MODE — process-ach-status-sync running every ${achSyncConfig.intervalOverride}\n`,
+    )
+  } else {
+    await agenda.every(
+      achSyncConfig.cron,
+      JOB_NAMES.PROCESS_ACH_STATUS_SYNC,
+      { tick: 'scheduled' },
+      { timezone: achSyncConfig.timezone },
+    )
+  }
+  log.info('scheduler.ach_sync_registered', {
+    mode: achSyncConfig.intervalOverride ? 'dev-interval' : 'cron',
+    schedule: achSyncConfig.intervalOverride || achSyncConfig.cron,
   })
 
   // Dev override: PAYMENT_RETRY_INTERVAL replaces the production cron

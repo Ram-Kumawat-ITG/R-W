@@ -12,7 +12,6 @@
 // services/scheduler/jobs/processPendingPayments.job.js — that's what
 // calls into this service per-invoice.
 
-import Invoice from '../../models/invoice.server'
 import PaymentAttempt from '../../models/paymentAttempt.server'
 import {
   chargeCustomerVault,
@@ -457,7 +456,13 @@ export async function checkAchSettlement({ invoice, customerMap }) {
       amount: settledAmount,
       newStatus: invoice.paymentStatus,
     })
-    return { action: 'settled', condition, amount: settledAmount, transactionId }
+    return {
+      action: 'settled',
+      condition,
+      amount: settledAmount,
+      transactionId,
+      newStatus: invoice.paymentStatus,
+    }
   }
 
   if (condition === 'failed' || condition === 'canceled') {
@@ -466,6 +471,15 @@ export async function checkAchSettlement({ invoice, customerMap }) {
     const action = status.latestAction
     const reason =
       action?.response_text || action?.responsetext || `NMI condition=${condition}`
+    const returnCode = action?.response_code || action?.responsecode || undefined
+
+    // Persist the NACHA return detail on the invoice so the ACH
+    // status-sync layer + admin UI can surface it (code + reason +
+    // when). These are distinct from the PaymentAttempt row below: this
+    // is the "latest return" snapshot on the invoice itself.
+    invoice.achReturnCode = returnCode
+    invoice.achReturnReason = reason
+    invoice.achReturnedAt = new Date()
 
     // Persist the failure on the payment audit ledger so the
     // PaymentAttempt count + lastAttemptError reflect the return.
@@ -510,7 +524,15 @@ export async function checkAchSettlement({ invoice, customerMap }) {
       reason,
       newStatus: invoice.paymentStatus,
     })
-    return { action: 'returned', condition, reason, transactionId, amount: failedAmount }
+    return {
+      action: 'returned',
+      condition,
+      reason,
+      returnCode,
+      transactionId,
+      amount: failedAmount,
+      newStatus: invoice.paymentStatus,
+    }
   }
 
   // pendingsettlement / pending / in_progress / unknown — leave alone.

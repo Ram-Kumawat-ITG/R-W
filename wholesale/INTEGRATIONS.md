@@ -1562,7 +1562,7 @@ To represent this correctly the Invoice has a dedicated payment status
 | `pendingSettlementAmount` | Total amount submitted (base + fee component, if any) |
 | `pendingSettlementFeeAmount` | Fee component staged at submission; applied to QBO only on settle |
 | `pendingSettlementSince` | When we entered the awaiting_settlement state |
-| `pendingSettlementLastCheckedAt` | When PASS 1.7 last polled NMI (throttles the "still pending" remark) |
+| `pendingSettlementLastCheckedAt` | When the ACH status-sync CRON last polled NMI (throttles the "still pending" remark) |
 
 **Critical invariant** — `amountPaid` is NOT bumped on ACH approval.
 The in-flight amount lives on `pendingSettlementAmount` until
@@ -1578,9 +1578,23 @@ invoice with `amountPaid = 0` cannot mis-flip it back to `pending` and
 have the CRON re-submit a second ACH transaction while NMI is still
 processing the first.
 
+**Reconciliation runs in a dedicated CRON.** A separate, independent job
+— `process-ach-status-sync` (`services/payment/achStatusSync.service.js`)
+— polls NMI for every `awaiting_settlement` ACH invoice and reconciles its
+status. Its cadence is **environment-configurable** with no code change:
+production runs once per day (`ACH_SYNC_CRON`, default `0 3 * * *`), while
+testing runs every minute (`ACH_SYNC_INTERVAL`, e.g. `1 minute`) for rapid
+validation of status updates and reconciliation. When `ACH_SYNC_INTERVAL`
+is set it takes precedence over the cron; leave it unset in production. This is intentionally **separate from the payment-processing CRON**
+(`process-pending-payments`, which only charges) so there is a single owner
+of the `awaiting_settlement → paid/pending/failed` transition (no race) and
+so settlement is polled frequently rather than only on the twice-monthly
+charge ticks. *(Historically this was "PASS 1.7" inside the payment CRON;
+it was extracted into its own job.)*
+
 **State transitions** are owned exclusively by `checkAchSettlement`
-(`payment.service.js`), which the scheduler PASS 1.7 calls every
-tick:
+(`payment.service.js`), which the ACH status-sync CRON calls for each
+in-flight invoice:
 
 | NMI `condition` | Action | Result |
 |---|---|---|
@@ -1599,14 +1613,57 @@ tick:
   suggesting the admin void the ACH in NMI's dashboard first. We
   block the card fallback to avoid double-charging the customer if
   both transactions settle.
+- `POST /api/admin/orders/:id/sync-ach-status` — **on-demand sync**
+  (see below). Runs the same reconciliation as the CRON for this one
+  invoice so an admin doesn't have to wait for the next scheduled tick.
 
-**Remarks** are written by PASS 1.7 with kind `cron_ach_settlement_check`:
+**On-demand sync — "Sync ACH status" button.** The per-invoice
+reconciliation body is factored into `reconcileAchInvoice`
+(`services/payment/achStatusSync.service.js`), shared verbatim by the
+CRON sweep (`syncAchTransactionStatuses`) and the admin button so both
+do exactly the same thing — NMI lookup → `checkAchSettlement` → audit
+row + remark + critical-alert + "last sync" display fields. The button
+is rendered on Order Details **only for ACH invoices in
+`awaiting_settlement` with a `pendingSettlementTxnId`** (the exact set
+the CRON sweeps); for any other invoice the endpoint returns 409. The
+service entry point `manualSyncAchInvoice` takes an **atomic per-invoice
+lock** (`Invoice.findOneAndUpdate({ achSyncInProgress: { $ne: true } },
+{ $set: { achSyncInProgress: true } })`) before reconciling and releases
+it in a `finally` block, so a double-click — or an overlapping CRON tick
+— can never reconcile the same invoice twice at once (a blocked request
+gets a 409 "already in progress"). Every sync (CRON or manual, any
+outcome incl. still-pending) records the display fields `achSyncLastAt`
+/ `achSyncLastStatus` (normalized: settled / returned / voided / failed /
+pending_settlement / unknown / error) / `achSyncLastCondition` (raw NMI
+condition) / `achSyncLastSource` (`cron_ach_status_sync` |
+`admin_manual_sync`); a manual run also stamps `achSyncLastBy` (admin
+email). Order Details surfaces these as "Last ACH sync: <time> · <status
+badge> · via manual/scheduled sync". The manual remark text reads
+"Manual ACH status sync — …" (source `admin`) vs the CRON's "ACH status
+sync — …" (source `cron`); both reuse the `cron_ach_settlement_check`
+remark kind so the badge map is unchanged. A manual sync bypasses the
+once-per-day "still settling" remark throttle (the admin explicitly
+asked for an update).
+
+**Remarks** are written by the ACH status-sync CRON with kind
+`cron_ach_settlement_check`:
 
 - "settled" / "returned" log on every state change.
-- "still pending" logs at most once per `SETTLEMENT_REMARK_THROTTLE_MS`
+- "still pending" logs at most once per `STILL_PENDING_REMARK_THROTTLE_MS`
   (24h) so the Remarks panel doesn't flood during the normal wait
   window. The settlement check itself runs every tick — only the
   remark write is throttled.
+
+**Audit trail + return capture.** On every detected status CHANGE the
+sync CRON appends an `Invoice.achStatusHistory[]` entry (`status`,
+`previousStatus`, `nmiCondition`, `nmiTransactionId`, `returnCode`,
+`returnReason`, `amount`) — idempotent, since a no-change poll writes
+nothing. On a return/void it also persists the NACHA detail on the
+invoice itself (`achReturnCode`, `achReturnReason`, `achReturnedAt`) and
+raises a **critical admin alert** (`log.error('ach.alert', …)` + console
+banner, plus an optional outbound webhook when `ACH_ALERT_WEBHOOK_URL`
+is configured). A transaction still awaiting settlement past
+`ACH_SYNC_STUCK_DAYS` (default 5) raises a throttled "stuck" alert.
 
 ---
 
@@ -2310,6 +2367,11 @@ required values throw immediately.
 | `PAYMENT_RETRY_CRON_PRIMARY` | `30 0 15 * *` | Primary monthly cron expression |
 | `PAYMENT_RETRY_CRON_SECONDARY` | `30 0 L * *` | Secondary monthly cron expression |
 | `PAYMENT_RETRY_INTERVAL` | (unset) | Dev override, e.g. `30 seconds` |
+| **ACH status-sync CRON** | | |
+| `ACH_SYNC_CRON` | `0 3 * * *` | Production cron for the dedicated ACH status-sync job (once per day at 03:00) |
+| `ACH_SYNC_INTERVAL` | (unset) | Testing override, e.g. `1 minute` — runs the sweep every minute; takes precedence over `ACH_SYNC_CRON` when set |
+| `ACH_SYNC_STUCK_DAYS` | `5` | Days awaiting settlement before a "stuck" admin alert |
+| `ACH_ALERT_WEBHOOK_URL` | (unset) | Optional outbound webhook for critical ACH alerts (off unless set) |
 | **HTTP retries** | | |
 | `HTTP_RETRY_ATTEMPTS` | `4` | Per-request retry cap (QBO + NMI) |
 | `HTTP_RETRY_BASE_MS` | `500` | Base backoff |

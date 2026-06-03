@@ -45,6 +45,19 @@ const RETRYABLE_PAYMENT_STATUSES = new Set([
   "failed",
 ]);
 
+// Label + Polaris badge tone for the normalized status returned by the
+// last ACH status sync (manual button or CRON). Mirrors the values
+// achStatusSync.service writes to Invoice.achSyncLastStatus.
+const ACH_SYNC_STATUS_META = {
+  settled: { label: "Settled", tone: "success" },
+  returned: { label: "Returned", tone: "critical" },
+  voided: { label: "Voided", tone: "critical" },
+  failed: { label: "Failed", tone: "critical" },
+  pending_settlement: { label: "Awaiting settlement", tone: "info" },
+  unknown: { label: "Status unknown", tone: "warning" },
+  error: { label: "Sync error", tone: "warning" },
+};
+
 // Human-readable label + Polaris badge tone for each Invoice.remarks[]
 // kind. Keep in lockstep with the enum in models/invoice.server.js so
 // the Remarks section never renders an unknown badge.
@@ -442,6 +455,7 @@ export default function OrderDetail() {
   const resumeAutoChargeFetcher = useFetcher();
   const pauseRemindersFetcher = useFetcher();
   const resumeRemindersFetcher = useFetcher();
+  const syncAchFetcher = useFetcher();
   const modalRef = useRef(null);
   const chequeModalRef = useRef(null);
   const chargeCardModalRef = useRef(null);
@@ -451,6 +465,10 @@ export default function OrderDetail() {
   const resumeRemindersModalRef = useRef(null);
   const [bannerError, setBannerError] = useState(null);
   const [bannerSuccess, setBannerSuccess] = useState(null);
+  // Dedicated feedback for the ACH status sync action (its own banner so
+  // the wording is accurate — it reflects NMI state, it's not a "retry").
+  // Shape: { tone: 'success'|'critical'|'info', heading, text }.
+  const [achSyncBanner, setAchSyncBanner] = useState(null);
   const [chequeReference, setChequeReference] = useState("");
   const [chequeAmount, setChequeAmount] = useState("");
   const [chequeReceivedAt, setChequeReceivedAt] = useState("");
@@ -467,6 +485,7 @@ export default function OrderDetail() {
   const handledResumeAutoChargeRef = useRef(null);
   const handledPauseRemindersRef = useRef(null);
   const handledResumeRemindersRef = useRef(null);
+  const handledSyncAchRef = useRef(null);
   // Holds the window opened synchronously on PDF click; we redirect it
   // to a blob URL once the fetcher returns. Opening *after* the async
   // step would trip popup blockers.
@@ -669,6 +688,25 @@ export default function OrderDetail() {
     resumeRemindersFetcher.state === "submitting" ||
     resumeRemindersFetcher.state === "loading";
 
+  // "Sync ACH status" — on-demand reconciliation against NMI for an ACH
+  // invoice that's awaiting settlement. Only meaningful while there's an
+  // in-flight transaction to poll (paymentStatus 'awaiting_settlement'
+  // with a pendingSettlementTxnId) — the exact set the CRON sweeps.
+  const syncingAch =
+    syncAchFetcher.state === "submitting" || syncAchFetcher.state === "loading";
+  const isAchAwaitingSettlement =
+    isAchInvoice &&
+    invoice?.paymentStatus === "awaiting_settlement" &&
+    !!invoice?.pendingSettlementTxnId;
+  // Disable while a sync is in flight from THIS tab (fetcher submitting) or
+  // already running server-side (achSyncInProgress, e.g. another tab / a
+  // concurrent CRON tick) — the server also enforces this with an atomic
+  // lock, this just reflects it in the UI.
+  const canSyncAch =
+    isAchAwaitingSettlement &&
+    !syncingAch &&
+    invoice?.achSyncInProgress !== true;
+
   // Surface retry result via banner + toast. Don't auto-revalidate manually —
   // React Router 7 does that after the fetcher action settles.
   useEffect(() => {
@@ -742,6 +780,48 @@ export default function OrderDetail() {
       action: `/api/admin/orders/${order._id}/charge-card`,
     });
   };
+
+  // Fire an on-demand ACH status sync. No confirmation modal — it only
+  // reflects what NMI already decided (it never initiates a new charge),
+  // and duplicate clicks are blocked by the disabled state + the server
+  // lock. React Router auto-revalidates the loader after the action, so
+  // the on-page status / badges / last-sync timestamp refresh themselves.
+  const onSyncAch = () => {
+    setAchSyncBanner(null);
+    syncAchFetcher.submit(null, {
+      method: "POST",
+      action: `/api/admin/orders/${order._id}/sync-ach-status`,
+    });
+  };
+
+  useEffect(() => {
+    if (!syncAchFetcher.data) return;
+    if (syncAchFetcher.state !== "idle") return;
+    if (handledSyncAchRef.current === syncAchFetcher.data) return;
+    handledSyncAchRef.current = syncAchFetcher.data;
+
+    const data = syncAchFetcher.data;
+    if (data.status === "success") {
+      const act = data.result?.action;
+      if (act === "settled") {
+        setAchSyncBanner({ tone: "success", heading: "ACH settled", text: data.message });
+        shopify?.toast?.show("ACH settlement confirmed");
+      } else if (act === "returned") {
+        setAchSyncBanner({ tone: "critical", heading: "ACH returned", text: data.message });
+        shopify?.toast?.show("ACH returned", { isError: true });
+      } else {
+        setAchSyncBanner({ tone: "info", heading: "ACH status synced", text: data.message });
+        shopify?.toast?.show("ACH status synced");
+      }
+    } else if (data.status === "error") {
+      setAchSyncBanner({
+        tone: "critical",
+        heading: "Sync did not complete",
+        text: data.message || "ACH status sync failed",
+      });
+      shopify?.toast?.show(data.message || "Sync failed", { isError: true });
+    }
+  }, [syncAchFetcher.data, syncAchFetcher.state, shopify]);
 
   useEffect(() => {
     if (!chequeFetcher.data) return;
@@ -1138,6 +1218,20 @@ export default function OrderDetail() {
           {...(chargeCardSubmitting ? { loading: true } : {})}
         >
           Charge card on file
+        </s-button>
+      )}
+      {/* Sync ACH status — on-demand reconciliation with NMI. Shown only
+          for ACH invoices that have an in-flight transaction awaiting
+          settlement (the same set the CRON sweeps). Disabled while a sync
+          is already running (this tab, another tab, or a CRON tick). */}
+      {invoice && isAchAwaitingSettlement && (
+        <s-button
+          slot="secondary-actions"
+          disabled={!canSyncAch}
+          onClick={onSyncAch}
+          {...(syncingAch ? { loading: true } : {})}
+        >
+          Sync ACH status
         </s-button>
       )}
       {/* Pause / Resume auto-charge — card-preferred invoices only.
@@ -1708,6 +1802,40 @@ export default function OrderDetail() {
                   Pending if the bank rejects the debit.
                 </s-paragraph>
               </s-banner>
+            )}
+            {/* Result of the most recent on-demand "Sync ACH status" click. */}
+            {achSyncBanner && (
+              <s-banner tone={achSyncBanner.tone} heading={achSyncBanner.heading}>
+                <s-paragraph>{achSyncBanner.text}</s-paragraph>
+              </s-banner>
+            )}
+            {/* Last synchronization timestamp + latest status NMI returned —
+                covers BOTH the manual button and the scheduled CRON sweep. */}
+            {invoice && isAchInvoice && invoice.achSyncLastAt && (
+              <s-stack direction="inline" gap="base" alignItems="center" wrap>
+                <s-text tone="subdued">
+                  Last ACH sync:{" "}
+                  {new Date(invoice.achSyncLastAt).toLocaleString()}
+                </s-text>
+                {(() => {
+                  const meta =
+                    ACH_SYNC_STATUS_META[invoice.achSyncLastStatus] || {
+                      label: invoice.achSyncLastStatus,
+                      tone: "default",
+                    };
+                  return <s-badge tone={meta.tone}>{meta.label}</s-badge>;
+                })()}
+                <s-text tone="subdued">
+                  via{" "}
+                  {invoice.achSyncLastSource === "admin_manual_sync"
+                    ? "manual sync"
+                    : "scheduled sync"}
+                  {invoice.achSyncLastSource === "admin_manual_sync" &&
+                  invoice.achSyncLastBy
+                    ? ` (${invoice.achSyncLastBy})`
+                    : ""}
+                </s-text>
+              </s-stack>
             )}
             {invoice && isManualInvoice && (
               <s-paragraph tone="subdued">
