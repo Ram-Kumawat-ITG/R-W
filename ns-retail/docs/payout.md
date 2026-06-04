@@ -520,25 +520,42 @@ pipeline.
    referral/commission records.
 
 ```
-orders/create ─▶ ingestShopifyOrder({ shop, payload, rawCode, attributionSource })
+orders/create | orders/paid | orders/updated ─▶ ingestShopifyOrder(...)
    │  resolveOrderReferral()   // cdo_applications mapping → else catalogue (rawCode)
    ▼
    upsert cdo_orders (by shop+shopifyOrderId, full snapshot)   ← EVERY order
         │  attributed? (eligible code resolved)
         ├─ no  ─▶ done (attributed:false, commissionAmount:0)
         └─ yes ─▶ upsert cdo_referrals (converted, links orderId)
-                  createCommissionForOrder → cdo_commissions + cdo_transactions credit
                   first-touch cdo_applications mapping (customer → practitioner)
+                  ── commission gated on PAYMENT ──
+                    PAID            → createCommissionForOrder → cdo_commissions + ledger credit
+                    refunded/void/cancel → reverseOrderCommission (if not paid/batched) → ledger debit
+                    unpaid/pending  → deferred (no commission yet)
                   tag Shopify customer `code:<canonical>`
 ```
 
-- **Commission base** = order **subtotal** (product revenue, excl. tax + shipping) × the code's `commissionRate`. `amount` on the order = gross `total_price` (revenue figure read by dashboards).
-- **Idempotency**: orders upsert by `(shop, shopifyOrderId)`; commissions are guarded by `orderId`; referral conversion is one row per `(referralCode, referredEmail)`. Shopify's at-least-once delivery + replays don't duplicate. (An in-memory 5-min webhook-id cache is a fast-path on top.)
-- **Audit**: each order stores the `attribution{source,code,matchedAt}` and `referral` snapshot; commission accrual + reversal post `cdo_transactions` ledger entries with running `balanceAfter`.
+**Commissions only for paid orders.** A commission RECORD is created only once
+the order is `financial_status = paid` (and not cancelled). Referral mapping +
+conversion are captured at any payment state (attribution survives before
+payment), but the money record waits for payment:
+- `orders/create` with an already-paid order → commission now.
+- `orders/create` unpaid → no commission; **`orders/paid`** later → commission created.
+- **`orders/updated`** detecting `refunded`/`voided` (or `orders/cancelled`) →
+  `reverseOrderCommission` reverses the commission **unless** it's already paid or
+  reserved into a payout (posted money is never silently clawed back); a `reversal`
+  ledger debit is posted. *Partial refunds are left intact (still a paid sale) —
+  proration is a future enhancement.*
+- The payout CRON (`accrueCommissionsForOrders` + `getEligibleCommissions`) only
+  ever sees commissions, which by construction exist only for paid orders; accrual
+  additionally filters orders to `financialStatus = "paid"` as a safety net.
 
-**Cancellation** ([webhooks.orders.cancelled.jsx](../app/routes/webhooks.orders.cancelled.jsx) → `cancelShopifyOrder`): marks the `cdo_order` `cancelled` and reverses its commission **only if** it isn't `paid` or reserved into a payout (`payoutId` set) — posting a `reversal` ledger debit. Posted/batched money is never silently reversed.
+- **Commission base** = order **subtotal** (product revenue, excl. tax + shipping) × the code's `commissionRate`. `amount` on the order = gross `total_price`.
+- **Eligibility helpers** (`cdo.service.js`): `isOrderCommissionable` (paid, not cancelled) gates creation; `isOrderClawback` (refunded/voided/cancelled) gates `reverseOrderCommission`.
+- **Idempotency**: orders upsert by `(shop, shopifyOrderId)`; commissions are guarded by `orderId` (so the create + paid + updated webhooks all converge without duplicating); referral conversion is one row per `(referralCode, referredEmail)`.
+- **Audit**: each order stores `attribution{source,code,matchedAt}` + the `referral` snapshot; commission creation + reversal post `cdo_transactions` ledger entries with running `balanceAfter`.
 
-> **Scopes:** receiving `orders/*` requires `read_orders` and Shopify **protected customer data** approval. `shopify.app.toml` subscribes both topics; production stores must be approved before delivery starts.
+> **Scopes:** receiving `orders/*` requires `read_orders` and Shopify **protected customer data** approval. `shopify.app.toml` subscribes `orders/create`, `orders/paid`, `orders/updated`, `orders/cancelled`; production stores must be approved before delivery starts.
 
 ---
 

@@ -1234,7 +1234,17 @@ export async function accrueCommissionsForOrders({ shop } = {}) {
   await connectDB();
   const settings = await getSettings();
 
-  const orderFilter = { status: { $ne: "cancelled" }, commissionAmount: { $gt: 0 } };
+  // Commissions accrue only for PAID orders (never unpaid / cancelled /
+  // refunded). Legacy/seeded orders without a financialStatus snapshot fall
+  // back to the CDO order status === "paid".
+  const orderFilter = {
+    status: { $ne: "cancelled" },
+    commissionAmount: { $gt: 0 },
+    $or: [
+      { financialStatus: "paid" },
+      { financialStatus: { $in: [null, undefined] }, status: "paid" },
+    ],
+  };
   if (shop) orderFilter.shop = shop;
   const orders = await CdoOrder.find(orderFilter).lean();
 
@@ -1983,26 +1993,105 @@ export async function ingestShopifyOrder({ shop, payload, rawCode, attributionSo
     );
   }
 
-  // Commission + ledger (idempotent by orderId).
+  // Commission lifecycle is gated on PAYMENT. The referral mapping +
+  // conversion above are captured regardless (attribution survives before
+  // payment), but the commission RECORD is only created once the order is
+  // paid, reversed if the order is later refunded/voided/cancelled, and
+  // deferred while the order is still unpaid.
   const settings = await getSettings();
-  const { created } = await createCommissionForOrder(order, settings);
-  console.log(
-    `[cdo.ingest] order ${order.orderName || shopifyOrderId} commission ${
-      created ? "created" : "already existed"
-    } (${order.commissionAmount} ${order.currency}, practitioner=${referral.practitionerEmail})`,
-  );
+  if (isOrderCommissionable(order)) {
+    const { created } = await createCommissionForOrder(order, settings);
+    console.log(
+      `[cdo.ingest] order ${order.orderName || shopifyOrderId} PAID — commission ${
+        created ? "created" : "already existed"
+      } (${order.commissionAmount} ${order.currency}, practitioner=${referral.practitionerEmail})`,
+    );
+  } else if (isOrderClawback(order)) {
+    const reversed = await reverseOrderCommission(
+      order,
+      `order ${order.financialStatus || order.status}`,
+    );
+    console.log(
+      `[cdo.ingest] order ${order.orderName || shopifyOrderId} ${order.financialStatus || order.status} — commission ${reversed ? "reversed" : "not reversible / none"}`,
+    );
+  } else {
+    console.log(
+      `[cdo.ingest] order ${order.orderName || shopifyOrderId} not yet paid (financial=${order.financialStatus || "—"}) — commission deferred until paid`,
+    );
+  }
 
-  // First-touch customer → practitioner mapping.
+  // First-touch customer → practitioner mapping (regardless of payment).
   await upsertCustomerApplication({ shop, payload, referral });
 
   const customerGid = payload?.customer?.admin_graphql_api_id || null;
   return { ok: true, attributed: true, referralCode: referral.code, customerGid };
 }
 
+// ── Commission eligibility by payment state ──────────────────────────
+//
+// Commissions are MONEY and only attach to orders that actually collected
+// money. `isOrderCommissionable` gates creation (fully paid, not cancelled);
+// `isOrderClawback` gates reversal (refunded / voided / cancelled). Anything
+// else (pending / authorized / partially_paid / partially_refunded) is a
+// no-op — the commission is deferred or left as-is, awaiting a terminal state.
+//
+// NOTE on partial refunds: a `partially_refunded` order is left intact (it's
+// still a paid sale); only a FULL `refunded`/`voided` claws back. Proration
+// of partial refunds is a deliberate future enhancement, not done here.
+const ORDER_CLAWBACK_FINANCIAL = ["refunded", "voided"];
+
+function isOrderCommissionable(order) {
+  if (order.status === "cancelled") return false;
+  if (order.financialStatus) return order.financialStatus === "paid";
+  // Legacy / seeded orders without a financialStatus snapshot: fall back to
+  // the CDO order status.
+  return order.status === "paid";
+}
+
+function isOrderClawback(order) {
+  return order.status === "cancelled" || ORDER_CLAWBACK_FINANCIAL.includes(order.financialStatus);
+}
+
+// Reverse an order's commission IF it isn't already paid or reserved into a
+// payout — posting a `reversal` ledger debit. Shared by the cancel webhook +
+// the payment reconcile (refund/void). Idempotent. Returns true if reversed
+// (or already reversed), false if there's nothing reversible.
+async function reverseOrderCommission(order, reason) {
+  const commission = await CdoCommission.findOne({ orderId: order._id });
+  if (!commission) return false;
+  if (commission.status === "paid" || commission.payoutId) {
+    console.warn(
+      `[cdo] order ${order.shopifyOrderId} ${reason} but commission ${commission._id} is ${commission.status}${commission.payoutId ? " (batched)" : ""} — NOT reversing (already posted/reserved)`,
+    );
+    return false;
+  }
+  if (commission.status === "reversed") return true;
+
+  commission.status = "reversed";
+  commission.payoutStatus = "cancelled";
+  await commission.save();
+  await appendLedgerEntry({
+    shop: order.shop,
+    practitionerId: order.practitionerId,
+    practitionerEmail: order.practitionerEmail,
+    practitionerName: order.practitionerName,
+    currency: order.currency,
+    type: "reversal",
+    amount: -roundMoney(commission.amount),
+    relatedType: "CdoCommission",
+    relatedId: commission._id,
+    description: `Commission reversed — ${reason} (${order.orderName || order.shopifyOrderId})`,
+    occurredAt: new Date(),
+  });
+  console.log(
+    `[cdo] order ${order.shopifyOrderId} commission ${commission._id} reversed — ${reason} (${commission.amount} ${order.currency})`,
+  );
+  return true;
+}
+
 // Handle orders/cancelled: mark the cdo_order cancelled and reverse its
-// commission IF it isn't already paid or reserved into a payout. A paid /
-// batched commission is left intact (logged) — reversals never touch
-// posted money. Idempotent.
+// commission (via reverseOrderCommission — paid/batched commissions are left
+// intact). Idempotent.
 export async function cancelShopifyOrder({ shop, shopifyOrderId } = {}) {
   await connectDB();
   if (!shopifyOrderId) return { ok: false, reason: "no_order_id" };
@@ -2020,40 +2109,8 @@ export async function cancelShopifyOrder({ shop, shopifyOrderId } = {}) {
     await order.save();
   }
 
-  const commission = await CdoCommission.findOne({ orderId: order._id });
-  if (!commission) {
-    return { ok: true, cancelled: true, reversed: false };
-  }
-  if (commission.status === "paid" || commission.payoutId) {
-    console.warn(
-      `[cdo.cancel] order ${shopifyOrderId} cancelled but its commission ${commission._id} is ${commission.status}${commission.payoutId ? " (batched)" : ""} — NOT reversing`,
-    );
-    return { ok: true, cancelled: true, reversed: false };
-  }
-  if (commission.status === "reversed") {
-    return { ok: true, cancelled: true, reversed: true };
-  }
-
-  commission.status = "reversed";
-  commission.payoutStatus = "cancelled";
-  await commission.save();
-  await appendLedgerEntry({
-    shop: order.shop,
-    practitionerId: order.practitionerId,
-    practitionerEmail: order.practitionerEmail,
-    practitionerName: order.practitionerName,
-    currency: order.currency,
-    type: "reversal",
-    amount: -roundMoney(commission.amount),
-    relatedType: "CdoCommission",
-    relatedId: commission._id,
-    description: `Commission reversed — order ${order.orderName || shopifyOrderId} cancelled`,
-    occurredAt: new Date(),
-  });
-  console.log(
-    `[cdo.cancel] order ${shopifyOrderId} cancelled, commission ${commission._id} reversed (${commission.amount} ${order.currency})`,
-  );
-  return { ok: true, cancelled: true, reversed: true };
+  const reversed = await reverseOrderCommission(order, "order cancelled");
+  return { ok: true, cancelled: true, reversed };
 }
 
 // ── Pause / resume controls ──────────────────────────────────────────

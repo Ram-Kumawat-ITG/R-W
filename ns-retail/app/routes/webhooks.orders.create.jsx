@@ -1,5 +1,6 @@
 import { authenticate, unauthenticated } from "../shopify.server";
 import { ingestShopifyOrder } from "../services/cdo/cdo.service";
+import { extractPractitionerCode, extractCodeFromTags } from "../utils/orderCode";
 
 // In-memory dedup of webhook ids — Shopify delivers at-least-once and
 // can fire the same payload multiple times in a short window. 5 min TTL
@@ -8,14 +9,6 @@ import { ingestShopifyOrder } from "../services/cdo/cdo.service";
 // a fast-path so retries don't re-run the whole pipeline.)
 const _seenWebhookIds = new Set();
 const SEEN_TTL_MS = 5 * 60 * 1000;
-
-const CODE_PATTERN = /^[a-z]+_[a-f0-9]{8}$/i;
-
-// Customer-tag convention for carrying a referral code, e.g.
-// "CODE:DURGESH10" or "REFERRAL:DURGESH10" (prefix case-insensitive). The
-// value after the colon is the practitioner code, resolved downstream
-// against cdo_practitioner_codes.
-const TAG_CODE_PATTERN = /^\s*(?:code|referral)\s*:\s*(.+?)\s*$/i;
 
 // Handler for retail Shopify orders/create.
 //
@@ -113,39 +106,9 @@ async function processOrder({ shop, payload }) {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
-
-// Returns { code, source } where source is "note_attribute" |
-// "discount_code" | null — recorded on the order for attribution audit.
-function extractPractitionerCode(order) {
-  // 1. Preferred: the cart attribute our checkout UI extension stamps
-  //    on the order before discount apply. Reliable signal even if the
-  //    discount itself was later removed by another code.
-  const noteAttrs = order?.note_attributes || [];
-  for (const attr of noteAttrs) {
-    if (attr?.name === "cdo_practitioner_code" && attr?.value) {
-      const v = String(attr.value).trim();
-      if (v) return { code: v, source: "note_attribute" };
-    }
-  }
-  // 2. Fallback: scan discount_codes for one that matches the
-  //    practitioner-code shape.
-  const dcs = order?.discount_codes || [];
-  for (const dc of dcs) {
-    const c = String(dc?.code || "").trim();
-    if (c && CODE_PATTERN.test(c)) return { code: c, source: "discount_code" };
-  }
-  return { code: null, source: null };
-}
-
-// Scan a customer's tags for a referral code carried as "CODE:<code>" or
-// "REFERRAL:<code>". Returns the first match's code value, or null.
-function extractCodeFromTags(tags) {
-  for (const t of tags || []) {
-    const m = String(t).match(TAG_CODE_PATTERN);
-    if (m && m[1]) return m[1].trim();
-  }
-  return null;
-}
+// extractPractitionerCode + extractCodeFromTags live in ../utils/orderCode
+// (shared with the orders/paid + orders/updated handlers). Customer-tag
+// fetching + tagging stay here (Shopify Admin API).
 
 async function fetchCustomerTags(shop, customerGid) {
   const { admin } = await unauthenticated.admin(shop);
