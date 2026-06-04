@@ -195,22 +195,115 @@ Discover with `npm run cdo:qbo-accounts` (lists every account + `Id`).
 
 ---
 
-## 7. Payout Automation (CRON) — Phase 5 (designed, not yet wired)
+## 7. Payout Automation (CRON) — IMPLEMENTED
 
-The orchestration services are CRON-ready; automation is a thin scheduling layer to add later (mirroring the wholesale Agenda scheduler).
+The full lifecycle is automated on a schedule via **Agenda** (MongoDB-backed,
+ported from the wholesale workspace). **No manual approval** — the run
+auto-approves eligible commissions, batches, approves, and executes payouts to
+QBO end-to-end. The manual buttons on the Payouts page remain for ad-hoc/retry.
 
 ```
-Agenda job  process-cdo-payouts        cron: 30 0 15 * *  +  30 0 L * *
-   │                                    (15th & last day, America/Los_Angeles)
-   ▼
- 1. accrueCommissionsForOrders()        // calculate new commissions
- 2. buildPayoutBatch({ periodEnd })     // aggregate eligible → awaiting_approval
- 3. (policy) auto-approve OR notify     // honor approve-then-execute
- 4. executeApprovedPayout() for each approved
- 5. reconcile: re-check QBO bill/payment status
+Agenda job  process-commission-payouts
+   prod cron: 30 0 25 * *  (00:30 on the 25th, CDO_PAYOUT_TZ)
+   dev:       every CDO_PAYOUT_INTERVAL   (e.g. "3 minutes")
+   │
+   ▼  cdo.service.runAutomatedPayouts()
+ 1. accrueCommissionsForOrders()          // safety net (inline accrual already runs)
+ 2. autoApproveEligibleCommissions()      // pending → approved (skips paused / held)
+ 3. buildPayoutBatch({ periodEnd })        // aggregate eligible → awaiting_approval
+ 4. for each batched payout:
+      approvePayout(system) → executeApprovedPayout(system)   // QBO Bill + BillPayment
+ 5. summary { accrued, approved, batched, paid, failed[] }  + failure alerts
 ```
 
-**Planned wiring:** port `services/scheduler/*` (Agenda singleton + config) + boot it fire-and-forget from `app/entry.server.jsx`; dev override `CDO_PAYOUT_INTERVAL`. Today the same steps run via the **"Generate payout batch"** admin action (which already does accrue → batch) + per-row Approve/Execute.
+**Wiring:** `app/services/scheduler/{scheduler.config,scheduler.service}.js` +
+`jobs/processCommissionPayouts.job.js`; the Agenda singleton is booted
+fire-and-forget from [app/entry.server.jsx](../app/entry.server.jsx) (guarded —
+never blocks SSR; skipped in `test` and when `CDO_SCHEDULER_DISABLED=true`).
+`agenda.every(interval|cron, name)` is idempotent on (interval, name), so reboots
+don't duplicate the recurring job.
+
+**Idempotency / no duplicate payouts:** accrual is guarded by `orderId`;
+auto-approve only flips `pending → approved`; `buildPayoutBatch` reserves
+commissions via `payoutId` and is partial-unique on `(practitionerId, periodEnd)`;
+`executeApprovedPayout` resumes-not-duplicates via per-step QBO id guards + stable
+`requestid`s. The whole run is safely re-runnable.
+
+**Status / date / references:** tracked on `cdo_payouts` — `status`, `paidAt`
+(payout date), `reference` (`CDO-YYYYMM-…`), `qboBillId`, `qboBillPaymentId`.
+
+**Failure alerts:** any payout that ends `failed` raises a high-visibility
+`log.error("cdo.payout.alert", …)` + console banner, and — only when
+`CDO_PAYOUT_ALERT_WEBHOOK_URL` is set — an outbound JSON webhook (never includes
+bank details). One failed payout never stops the rest of the batch.
+
+> **Production note:** Agenda coordinates job locks in Mongo, but each app
+> process boots its own scheduler. Run a single scheduler-owning process (or
+> set `CDO_SCHEDULER_DISABLED=true` on the others) to avoid redundant ticks.
+
+### 7.1 Pause / resume controls
+
+Two independent admin switches hold money out of the automated run (mirrors the
+wholesale auto-charge pause pattern — a boolean flag + `{ $ne: true }` eligibility
+filter + who/when/why audit fields). Neither unwinds already-paid or already-batched
+payouts; they only gate future runs.
+
+| Scope | Where | Storage | Effect |
+|---|---|---|---|
+| One commission | Commissions page (per-row Pause/Resume) | `cdo_commissions.paused` (+ `pausedAt/By`, `pauseNote`, `resumedAt/By`) | Excluded from auto-approve + `getEligibleCommissions` (so never batched) |
+| All of a practitioner's payouts | Practitioner → Settings tab toggle (status badge also shown on the CDO Practitioners list + the practitioner detail header) | `cdo_practitioner_holds.paused` (one row per `practitionerId`) | Every one of their commissions excluded from auto-approve + batching; commissions keep accruing and are tracked, and resume returns all eligible unpaid commissions to the next cycle |
+
+Service API: `pauseCommission` / `resumeCommission`,
+`pausePractitionerPayouts` / `resumePractitionerPayouts`, `getPractitionerHold`,
+`isPractitionerPaused`, `getHeldPractitionerIds` (all idempotent, in
+`cdo.service.js`). `getEligibleCommissions` applies `paused: { $ne: true }` +
+`practitionerId ∉ heldIds`, so `buildPayoutBatch` is pause/hold-aware for free.
+
+### 7.2 Batch tracking + per-commission status (traceability)
+
+Every run of `runAutomatedPayouts` (CRON or manual reprocess) persists a durable
+**`cdo_payout_batches`** record — the audit/reconciliation layer over the
+(unchanged, idempotent) money path. Lifecycle: `running → completed |
+completed_with_errors | failed`.
+
+The batch captures: `reference` (CDOB-…), `mode` (`cron` | `manual_reprocess`),
+`executionTime` / `startedAt` / `completedAt`, totals (`totalCommissions`,
+`totalAmount`, `successCount`, `failedCount`, `skippedCount`), `payoutIds[]`, an
+`items[]` snapshot — one entry per commission processed: `{ commissionId,
+practitionerId, amount, status (processing|paid|failed|skipped|cancelled),
+attempt, failureReason, txnRef (QBO BillPayment/Bill id), payoutId, payoutDate }`,
+and a `practitionerPayouts[]` rollup — **one entry per practitioner** (not per
+commission): `{ practitionerId, practitionerName/Email, payoutId, commissionCount,
+totalAmount, status, txnRef }`.
+
+**One aggregated payout per practitioner.** `buildPayoutBatch` groups eligible
+commissions by practitioner and creates a SINGLE `cdo_payouts` row per practitioner
+for the summed total (`amount`), linking every underlying commission via
+`commissionIds[]` (and each commission's `payoutId`). Three commissions of
+$10/$15/$25 for Dr. Parker ⇒ one $50 payout, not three. `practitionerPayouts[]`
+surfaces that rollup on the batch; `items[]` is the per-commission audit beneath it.
+
+Each commission also carries a latest-state **payout rollup** on
+`cdo_commissions`: `payoutStatus` (pending|processing|paid|failed|skipped|
+paused|cancelled), `payoutAttemptCount`, `lastPayoutAttemptAt`, `payoutDate`,
+`payoutFailureReason`, `payoutTxnRef`, `lastBatchId`. (`payoutStatus` is the
+payout dimension — distinct from the accrual `status`.)
+
+Run flow inside a batch: snapshot eligible pool → `buildPayoutBatch` reserves the
+batched ones (→ **processing**, attempt++); eligible-but-unreserved (below-minimum
+/ open payout) → **skipped**; each payout `approve → execute` → its commissions
+**paid** (txnRef + payoutDate) or **failed** (failureReason). Counts + final
+status are written on completion.
+
+**Reprocess** — `reprocessBatch(batchId)` spawns a fresh `manual_reprocess` batch
+that re-runs only the source batch's **failed** payouts via the resumable
+`executeApprovedPayout` (per-step QBO id guards + stable `requestid` ⇒ never
+double-pays), incrementing `payoutAttemptCount`. Service API: `listPayoutBatches`,
+`getPayoutBatch`, `getCommissionPayoutHistory`, `reprocessBatch`.
+
+**Admin view** — the **Payout Batches** tab lists every run; the detail page shows
+the rollup + the per-commission items table (status / attempt / failure reason /
+txn ref / payout date) and a **Reprocess failed** action.
 
 ---
 
@@ -254,8 +347,13 @@ wholesale_applications (practitioner)        cdo_qbo_tokens (singleton/realm)
 
 ### 9.2 Collections
 
+**`cdo_orders`** — every Shopify order, synced by the `orders/create` webhook (see §15). Holds a complete snapshot: order identity, customer, `lineItems[]`, `pricing{subtotal,totalDiscounts,totalTax,totalShipping,total}`, `discountCodes[]`, `taxLines[]`, `shippingLines[]`, billing/shipping addresses, `payment{gateways[],financialStatus}`, `financialStatus`, `fulfillmentStatus`, `status[pending|approved|paid|cancelled]`, `placedAt`.
+`attributed:Boolean` flags orders that resolved to an eligible practitioner code; those also carry `practitionerId/Email/Name`, the immutable `referral` snapshot, `referralCode`, `referralId`, `commissionAmount`, and an `attribution{source,code,matchedAt}` audit. *Indexes:* unique `(shop, shopifyOrderId)` (idempotent upsert). **Program-wide order aggregations scope to attributed orders only** (`practitionerId != null`) so dashboards mean "referral revenue".
+
 **`cdo_commissions`** — one per attributed order.
-`practitionerId, practitionerEmail, practitionerName, orderId, orderName, currency, amount, rate, status[pending|approved|paid|reversed], payoutId, earnedAt`
+`practitionerId, practitionerEmail, practitionerName, orderId, orderName, currency, amount, rate, status[pending|approved|paid|reversed], paused (+ pausedAt/By, pauseNote, resumedAt/By), payoutStatus[pending|processing|paid|failed|skipped|paused|cancelled] (+ payoutAttemptCount, lastPayoutAttemptAt, payoutDate, payoutFailureReason, payoutTxnRef, lastBatchId), payoutId, earnedAt`
+
+**`cdo_payout_batches`** — one per automated run (CRON) or manual reprocess of the payout pipeline. The audit/reconciliation record. `reference, mode[cron|manual_reprocess], trigger, executionTime, startedAt, completedAt, status[running|completed|completed_with_errors|failed], totalCommissions, totalAmount, successCount, failedCount, skippedCount, payoutIds[], error, practitionerPayouts[{ practitionerId, practitionerName, practitionerEmail, payoutId, commissionCount, totalAmount, status, txnRef }] (one per practitioner — one aggregated payout each), items[{ commissionId, practitionerId, amount, status[processing|paid|failed|skipped|cancelled], attempt, failureReason, txnRef, payoutId, payoutDate }] (per-commission detail)`. *Indexes:* `(shop, createdAt)`, `(items.commissionId)`.
 
 **`cdo_payouts`** — a disbursement batch.
 `practitionerId, practitionerSource, practitionerEmail, practitionerName, currency, amount, method[ach|bank|paypal|check|manual], status[draft|awaiting_approval|approved|processing|paid|failed|rejected|cancelled], commissionIds[], qboVendorId, qboBillId, qboBillPaymentId, billCreatedAt, paymentRecordedAt, approvedBy/At, rejectedBy/At, rejectionReason, lastError, remarks[], periodStart, periodEnd, reference, paidAt`
@@ -263,6 +361,9 @@ wholesale_applications (practitioner)        cdo_qbo_tokens (singleton/realm)
 
 **`cdo_transactions`** — append-only practitioner ledger.
 `practitionerId, type[commission|payout|adjustment|reversal], amount (+credit/−debit), balanceAfter, relatedType, relatedId, description, occurredAt`
+
+**`cdo_practitioner_holds`** — admin payout hold, one row per practitioner.
+`practitionerId (unique), paused, pausedAt, pausedBy, note, resumedAt, resumedBy`. When `paused`, the automated run excludes all of the practitioner's commissions.
 
 **`cdo_qbo_vendors`** — practitioner → QBO vendor cache.
 `practitionerId, practitionerSource, qboVendorId, displayName, email, syncedAt` *(unique on `(practitionerId, practitionerSource)`)*
@@ -388,6 +489,98 @@ execute → qboVendorId present (skip) → qboBillId present (skip)
 
 ---
 
+## 15. Order Ingestion (orders/create → cdo_orders)
+
+The upstream of the whole commission pipeline. The `orders/create` webhook
+([webhooks.orders.create.jsx](../app/routes/webhooks.orders.create.jsx)) verifies
+HMAC, dedups the webhook id, returns `200` immediately, then fire-and-forgets
+`cdo.service.ingestShopifyOrder`. Per the §3 layering rule, **all `cdo_*` writes
+happen in the service**; the route only resolves the code (incl. Shopify API
+reads) + tags the customer.
+
+**Code discovery** (the referral code isn't always on the order). The route
+gathers a candidate code, in order: (1) the `cdo_practitioner_code` order/cart
+**note attribute**; (2) a practitioner-shaped **discount code** on the order;
+(3) a `CODE:<code>` / `REFERRAL:<code>` **tag on the Shopify customer** (fetched
+via the Admin API). It passes the candidate + its discovery source into the
+pipeline.
+
+**Referral resolution** — `cdo_applications` is the **primary source of truth**;
+`cdo_practitioner_codes` is the catalogue fallback (`resolveOrderReferral`):
+1. **Existing mapping (primary).** If the buyer already has a non-rejected
+   `cdo_applications` record carrying a `referral`, that frozen snapshot *is* the
+   customer→practitioner relationship — use it directly (`attribution.source =
+   "cdo_application"`). No catalogue lookup needed.
+2. **First-touch (fallback).** No mapping yet but a code was discovered: validate
+   it case-insensitively against `cdo_practitioner_codes` (active + still-eligible
+   practitioner). On success the pipeline attributes the order **and** creates the
+   `cdo_applications` mapping, so order #1 is attributed and the relationship is
+   established from then on.
+3. **Neither** ⇒ the order is stored unattributed — a standard retail order, no
+   referral/commission records.
+
+```
+orders/create ─▶ ingestShopifyOrder({ shop, payload, rawCode, attributionSource })
+   │  resolveOrderReferral()   // cdo_applications mapping → else catalogue (rawCode)
+   ▼
+   upsert cdo_orders (by shop+shopifyOrderId, full snapshot)   ← EVERY order
+        │  attributed? (eligible code resolved)
+        ├─ no  ─▶ done (attributed:false, commissionAmount:0)
+        └─ yes ─▶ upsert cdo_referrals (converted, links orderId)
+                  createCommissionForOrder → cdo_commissions + cdo_transactions credit
+                  first-touch cdo_applications mapping (customer → practitioner)
+                  tag Shopify customer `code:<canonical>`
+```
+
+- **Commission base** = order **subtotal** (product revenue, excl. tax + shipping) × the code's `commissionRate`. `amount` on the order = gross `total_price` (revenue figure read by dashboards).
+- **Idempotency**: orders upsert by `(shop, shopifyOrderId)`; commissions are guarded by `orderId`; referral conversion is one row per `(referralCode, referredEmail)`. Shopify's at-least-once delivery + replays don't duplicate. (An in-memory 5-min webhook-id cache is a fast-path on top.)
+- **Audit**: each order stores the `attribution{source,code,matchedAt}` and `referral` snapshot; commission accrual + reversal post `cdo_transactions` ledger entries with running `balanceAfter`.
+
+**Cancellation** ([webhooks.orders.cancelled.jsx](../app/routes/webhooks.orders.cancelled.jsx) → `cancelShopifyOrder`): marks the `cdo_order` `cancelled` and reverses its commission **only if** it isn't `paid` or reserved into a payout (`payoutId` set) — posting a `reversal` ledger debit. Posted/batched money is never silently reversed.
+
+> **Scopes:** receiving `orders/*` requires `read_orders` and Shopify **protected customer data** approval. `shopify.app.toml` subscribes both topics; production stores must be approved before delivery starts.
+
+---
+
+## 16. Reporting + analytics
+
+**Analytics definitions** (`getDashboardMetrics` / `getPractitionerKpis`):
+- **Total Commission Earned** = Σ commissions with `status ≠ reversed`.
+- **Total Commission Paid** = Σ commissions with `status = paid`.
+- **Outstanding Liability** = Earned − Paid (the unpaid, non-reversed accrued balance).
+- **Pending Payouts** = Σ `cdo_payouts` in `{awaiting_approval, approved, processing}`.
+  (There is **no** `pending` payout status — the prior filter `status ∈ {pending,processing}`
+  silently matched nothing; fixed.)
+- **Failed Payouts** = count + Σ of `cdo_payouts.status = failed`.
+
+**Upcoming payout preview** (`getUpcomingPayouts`) — a no-write dry-run of the batch
+grouping: eligible commissions (`getEligibleCommissions` — approved, unpaid, not paused, not
+on practitioner hold) grouped by practitioner; practitioners clearing `minimumPayoutAmount`
+form the breakdown. Returns `{ estimatedDate (next 25th), totalAmount, practitionerCount,
+commissionCount, breakdown[], belowMinimumCount }`. Shown on the Dashboard so admins see
+next-cycle spend before the CRON runs. Per-practitioner KPIs (`getPractitionerKpis`) add
+earned / paid / pending / upcoming / referred-customers / referral-orders / lifetime-revenue /
+last-payout-date / next-expected, plus a payout-history table on the practitioner page.
+
+**Batch detail** enriches each `practitionerPayouts` entry (via `getPayoutBatch`) with the
+QBO **vendor-bill** deep link, method, `paidAt`, and the payout `remarks[]` audit trail.
+
+## 17. Orders module (`/app/orders`)
+
+A top-level admin view over the **entire** `cdo_orders` collection (attributed + retail),
+distinct from the attributed-only CDO Program → Orders tab. Server-side
+pagination/filter/sort via `listCdoOrders({ page, pageSize, sort, dir, filters })` — filters:
+orderNumber, customer, practitioner, referralCode, status (order), financialStatus (payment),
+commissionStatus (attributed/unattributed), dateFrom/dateTo; sort by placedAt|amount|
+commissionAmount. `getCdoOrderDetail(id)` returns the full snapshot (customer, referral,
+practitioner, line items, pricing/discounts/taxes/shipping, payment, commission record(s),
+timeline + attribution audit) for the detail page.
+
+**Service API additions:** `getUpcomingPayouts` · `listCdoOrders` · `getCdoOrderDetail`
+(reporting/reads, in `cdo.service.js`).
+
+---
+
 ### Appendix — Environment variables
 
 ```
@@ -400,4 +593,11 @@ CDO_QBO_PAYMENT_ACCOUNT_ID=
 CDO_QBO_AP_ACCOUNT_ID=                      # optional
 # optional retry tuning
 CDO_QBO_HTTP_RETRY_ATTEMPTS=4  CDO_QBO_HTTP_RETRY_BASE_MS=500  CDO_QBO_HTTP_RETRY_MAX_MS=4000
+
+# ── Payout scheduler (§7) ──
+CDO_PAYOUT_CRON=30 0 25 * *                 # prod: 00:30 on the 25th
+CDO_PAYOUT_TZ=America/Los_Angeles
+CDO_PAYOUT_INTERVAL=3 minutes               # DEV ONLY — overrides the cron; leave unset in prod
+CDO_SCHEDULER_DISABLED=                     # set "true" to never boot the scheduler
+CDO_PAYOUT_ALERT_WEBHOOK_URL=               # optional — POSTed on a failed payout
 ```

@@ -1,11 +1,17 @@
-import { useLoaderData } from "react-router";
+/* eslint-disable react/prop-types */
+import { useEffect, useRef } from "react";
+import { useFetcher, useLoaderData } from "react-router";
+import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import {
   getPractitionerProfile,
   listPractitionerCodes,
   getSettings,
+  getPractitionerHold,
+  pausePractitionerPayouts,
+  resumePractitionerPayouts,
 } from "../services/cdo/cdo.service";
-import { formatPercent } from "../utils/format";
+import { formatPercent, formatDate } from "../utils/format";
 
 // Settings tab — practitioner-scoped configuration. Today this is a
 // read-only surface that summarises the values driving this
@@ -20,27 +26,121 @@ import { formatPercent } from "../utils/format";
 
 export const loader = async ({ request, params }) => {
   await authenticate.admin(request);
-  const [profile, codes, settings] = await Promise.all([
+  const [profile, codes, settings, hold] = await Promise.all([
     getPractitionerProfile(params.id),
     listPractitionerCodes(params.id),
     getSettings(),
+    getPractitionerHold(params.id),
   ]);
   if (!profile) {
     throw new Response("Practitioner not found", { status: 404 });
   }
-  return { profile, codes, settings };
+  return { profile, codes, settings, hold };
+};
+
+// Pause / resume ALL future payouts for this practitioner. The automated
+// payout pipeline excludes a held practitioner's commissions from accrual
+// approval + batching until resumed.
+export const action = async ({ request, params }) => {
+  const { session } = await authenticate.admin(request);
+  const actor =
+    session?.onlineAccessInfo?.associated_user?.email || session?.shop || "admin";
+  const shop = session?.shop || null;
+  const formData = await request.formData();
+  const op = String(formData.get("_action") || "").trim();
+
+  try {
+    switch (op) {
+      case "pause-practitioner": {
+        await pausePractitionerPayouts(params.id, {
+          actor,
+          shop,
+          note: formData.get("note") || "",
+        });
+        return { status: "success", op, message: "All payouts paused for this practitioner." };
+      }
+      case "resume-practitioner": {
+        await resumePractitionerPayouts(params.id, { actor });
+        return { status: "success", op, message: "Payouts resumed for this practitioner." };
+      }
+      default:
+        return { status: "error", op, message: `Unknown action: ${op}` };
+    }
+  } catch (e) {
+    console.error(`[cdo-program/customers/settings] action ${op} failed:`, e?.message || e);
+    return { status: "error", op, message: e?.message || "Action failed" };
+  }
 };
 
 export default function CdoCustomerSettings() {
-  const { profile, codes, settings } = useLoaderData();
+  const { profile, codes, settings, hold } = useLoaderData();
+  const shopify = useAppBridge();
+  const fetcher = useFetcher();
+  const handledRef = useRef(null);
   const primary = codes.find((c) => c.isPrimary && c.status === "active");
   const effectiveCommission =
     primary?.commissionRate != null
       ? primary.commissionRate
       : settings.defaultCommissionRate;
 
+  const busy = fetcher.state === "submitting" || fetcher.state === "loading";
+
+  useEffect(() => {
+    if (!fetcher.data || fetcher.state !== "idle") return;
+    if (handledRef.current === fetcher.data) return;
+    handledRef.current = fetcher.data;
+    if (fetcher.data.status === "success") {
+      shopify?.toast?.show(fetcher.data.message || "Done");
+    } else {
+      shopify?.toast?.show(fetcher.data.message || "Action failed", { isError: true });
+    }
+  }, [fetcher.data, fetcher.state, shopify]);
+
+  const togglePayouts = () =>
+    fetcher.submit(
+      { _action: hold.paused ? "resume-practitioner" : "pause-practitioner" },
+      { method: "POST" },
+    );
+
   return (
     <s-stack direction="block" gap="base">
+      <s-section heading="Payout automation">
+        <s-stack direction="block" gap="tight">
+          {hold.paused ? (
+            <s-banner tone="warning">
+              All payouts for {profile.name || "this practitioner"} are paused. The
+              automated payout run skips their commissions until resumed
+              {hold.pausedBy ? ` (paused by ${hold.pausedBy}` : ""}
+              {hold.pausedBy && hold.pausedAt ? ` on ${formatDate(hold.pausedAt)})` : hold.pausedBy ? ")" : ""}.
+            </s-banner>
+          ) : null}
+          <s-stack direction="inline" gap="base" alignItems="center" justifyContent="space-between">
+            <s-stack direction="block" gap="none">
+              <s-text tone="subdued">Automated payouts</s-text>
+              <s-stack direction="inline" gap="small-200" alignItems="center">
+                {hold.paused ? (
+                  <s-badge tone="warning">Paused</s-badge>
+                ) : (
+                  <s-badge tone="success">Active</s-badge>
+                )}
+              </s-stack>
+              <s-text tone="subdued">
+                Pause holds every one of this practitioner&apos;s commissions out of the
+                automated payout run. Already-paid or batched payouts are unaffected.
+              </s-text>
+            </s-stack>
+            <s-button
+              variant={hold.paused ? "primary" : "tertiary"}
+              tone={hold.paused ? undefined : "critical"}
+              {...(busy ? { loading: true } : {})}
+              onClick={togglePayouts}
+            >
+              {hold.paused ? "Resume payouts" : "Pause all payouts"}
+            </s-button>
+          </s-stack>
+        </s-stack>
+      </s-section>
+
       <s-section heading="Referral settings">
         <s-stack direction="block" gap="tight">
           <Row

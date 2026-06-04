@@ -30,12 +30,18 @@ import CdoReferral from "../../models/cdoReferral.server";
 import CdoTransaction from "../../models/cdoTransaction.server";
 import CdoSetting from "../../models/cdoSetting.server";
 import CdoPractitionerCode from "../../models/cdoPractitionerCode.server";
+import CdoPractitionerHold from "../../models/cdoPractitionerHold.server";
+import CdoPayoutBatch from "../../models/cdoPayoutBatch.server";
 import {
   findOrCreateVendor,
   createBill,
   createBillPayment,
   billWebUrl,
 } from "../qbo/qbo.service";
+import { schedulerConfig } from "../scheduler/scheduler.config";
+import { createLogger } from "../../utils/logger.utils";
+
+const log = createLogger("cdo.service");
 
 // Practitioners are approved wholesale applicants who resell. Real
 // registration data records "resells" inconsistently: some rows set the
@@ -64,12 +70,16 @@ function sum(rows, field) {
 
 export async function listPractitioners() {
   await connectDB();
-  const rows = await WholesaleApplication.find(PRACTITIONER_FILTER)
-    .sort({ submittedAt: -1 })
-    .select(
-      "firstName lastName email phone businessName submittedAt customerId status tax.itemsToResell",
-    )
-    .lean();
+  const [rows, heldIds] = await Promise.all([
+    WholesaleApplication.find(PRACTITIONER_FILTER)
+      .sort({ submittedAt: -1 })
+      .select(
+        "firstName lastName email phone businessName submittedAt customerId status tax.itemsToResell",
+      )
+      .lean(),
+    getHeldPractitionerIds(),
+  ]);
+  const held = new Set(heldIds.map(String));
 
   return rows.map((r) => ({
     id: r._id.toString(),
@@ -82,6 +92,9 @@ export async function listPractitioners() {
     submittedAt: r.submittedAt || null,
     customerId: r.customerId || null,
     status: r.status || "approved",
+    // Practitioner-level payout hold (cdo_practitioner_holds). Distinct
+    // from per-commission pause; gates the automated payout CRON.
+    payoutsPaused: held.has(r._id.toString()),
   }));
 }
 
@@ -90,9 +103,15 @@ export async function countPractitioners() {
   return WholesaleApplication.countDocuments(PRACTITIONER_FILTER);
 }
 
+// cdo_orders now holds EVERY synced order; program-wide order views scope
+// to attributed (practitioner-linked) orders so "referral revenue" stays
+// meaningful. Backward-compatible with pre-`attributed` seed rows (they
+// carry a practitionerId).
+const ATTRIBUTED_ORDER_FILTER = { practitionerId: { $ne: null } };
+
 export async function listOrders({ limit = 0 } = {}) {
   await connectDB();
-  const q = CdoOrder.find({}).sort({ placedAt: -1, createdAt: -1 });
+  const q = CdoOrder.find(ATTRIBUTED_ORDER_FILTER).sort({ placedAt: -1, createdAt: -1 });
   if (limit) q.limit(limit);
   const rows = await q.lean();
   return rows.map((r) => ({
@@ -115,12 +134,16 @@ export async function listCommissions() {
     .lean();
   return rows.map((r) => ({
     id: r._id.toString(),
+    practitionerId: r.practitionerId || null,
     practitionerName: r.practitionerName || r.practitionerEmail || "—",
     orderName: r.orderName || "—",
     amount: r.amount || 0,
     rate: r.rate || 0,
     currency: r.currency || "USD",
     status: r.status || "pending",
+    paused: r.paused === true,
+    pausedBy: r.pausedBy || null,
+    pausedAt: r.pausedAt || null,
     earnedAt: r.earnedAt || r.createdAt || null,
   }));
 }
@@ -206,25 +229,51 @@ export async function getDashboardMetrics() {
     commissions,
     pendingPayouts,
     paidPayouts,
+    failedPayouts,
     referrals,
     convertedReferrals,
     activePractitioners,
+    upcoming,
   ] = await Promise.all([
-    CdoOrder.find({}).select("amount commissionAmount placedAt createdAt").lean(),
+    CdoOrder.find(ATTRIBUTED_ORDER_FILTER).select("amount commissionAmount placedAt createdAt").lean(),
     CdoCommission.find({}).select("amount status").lean(),
-    CdoPayout.find({ status: { $in: ["pending", "processing"] } })
+    // "Pending payouts" = open (not-yet-settled) payouts. NOTE: there is no
+    // "pending" payout status — the open set is awaiting_approval/approved/
+    // processing. (The old "pending" filter silently matched nothing.)
+    CdoPayout.find({ status: { $in: ["awaiting_approval", "approved", "processing"] } })
       .select("amount")
       .lean(),
     CdoPayout.find({ status: "paid" }).select("amount").lean(),
+    CdoPayout.find({ status: "failed" }).select("amount").lean(),
     CdoReferral.countDocuments({}),
     CdoReferral.countDocuments({ status: "converted" }),
     countPractitioners(),
+    getUpcomingPayouts(),
   ]);
 
   const totalRevenue = sum(orders, "amount");
-  const totalCommissions = sum(commissions, "amount");
+
+  // Commission ledger by status. "Earned" excludes reversed; "Paid" is the
+  // settled set; "Outstanding liability" = earned not yet paid.
+  const earnedCommissions = commissions.filter((c) => c.status !== "reversed");
+  const totalCommissionEarned = sum(earnedCommissions, "amount");
+  const totalCommissionPaid = sum(
+    commissions.filter((c) => c.status === "paid"),
+    "amount",
+  );
+  const pendingApprovalAmount = sum(
+    commissions.filter((c) => c.status === "pending"),
+    "amount",
+  );
+  const reversedTotal = sum(
+    commissions.filter((c) => c.status === "reversed"),
+    "amount",
+  );
+  const outstandingLiability = roundMoney(totalCommissionEarned - totalCommissionPaid);
+
   const pendingPayoutTotal = sum(pendingPayouts, "amount");
   const paidPayoutTotal = sum(paidPayouts, "amount");
+  const failedPayoutTotal = sum(failedPayouts, "amount");
 
   // Monthly performance — revenue + order count grouped by YYYY-MM.
   const monthMap = new Map();
@@ -249,22 +298,93 @@ export async function getDashboardMetrics() {
   ]);
 
   const conversionRate = referrals > 0 ? convertedReferrals / referrals : 0;
+  const avgOrderValue = orders.length ? roundMoney(totalRevenue / orders.length) : 0;
+  const avgCommissionPerOrder = orders.length
+    ? roundMoney(sum(orders, "commissionAmount") / orders.length)
+    : 0;
 
   return {
     kpis: {
       totalRevenue,
-      totalCommissions,
+      totalCommissionEarned,
+      totalCommissionPaid,
+      outstandingLiability,
+      pendingApprovalAmount,
+      reversedTotal,
       pendingPayoutTotal,
       paidPayoutTotal,
+      failedPayoutTotal,
+      failedPayoutCount: failedPayouts.length,
       totalReferrals: referrals,
       convertedReferrals,
       conversionRate,
       activePractitioners,
       totalOrders: orders.length,
+      avgOrderValue,
+      avgCommissionPerOrder,
+      // Back-compat alias for older callers that read `totalCommissions`.
+      totalCommissions: totalCommissionEarned,
     },
+    upcoming,
     monthlyPerformance,
     topPractitioners,
     recentOrders,
+  };
+}
+
+// Next calendar 25th (the production payout schedule). Pure date math; dev
+// runs on CDO_PAYOUT_INTERVAL but the business-meaningful "next payout date"
+// is still the 25th.
+function nextPayoutDate(from = new Date()) {
+  const d = new Date(from);
+  return d.getDate() < 25
+    ? new Date(d.getFullYear(), d.getMonth(), 25)
+    : new Date(d.getFullYear(), d.getMonth() + 1, 25);
+}
+
+// Forward-looking preview of what the NEXT payout run will disburse — a
+// dry-run of the batch grouping with NO writes. Eligible commissions
+// (approved, unpaid, not paused, not on practitioner hold — via
+// getEligibleCommissions) grouped by practitioner; only practitioners whose
+// total clears the minimum are included (mirrors buildPayoutBatch).
+export async function getUpcomingPayouts({ shop } = {}) {
+  await connectDB();
+  const settings = await getSettings();
+  const minAmount = Number(settings.minimumPayoutAmount) || 0;
+
+  const eligible = await getEligibleCommissions({ periodEnd: new Date() });
+  const rows = shop ? eligible.filter((c) => c.shop === shop) : eligible;
+
+  const groups = new Map();
+  for (const c of rows) {
+    const key = c.practitionerId;
+    if (!key) continue;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        practitionerId: key,
+        practitionerName: c.practitionerName || c.practitionerEmail || "—",
+        commissionCount: 0,
+        amount: 0,
+      });
+    }
+    const g = groups.get(key);
+    g.commissionCount += 1;
+    g.amount = roundMoney(g.amount + (Number(c.amount) || 0));
+  }
+
+  const breakdown = [...groups.values()]
+    .filter((g) => g.amount >= minAmount)
+    .sort((a, b) => b.amount - a.amount);
+  const belowMinimum = [...groups.values()].filter((g) => g.amount < minAmount);
+
+  return {
+    estimatedDate: nextPayoutDate(),
+    minimumPayoutAmount: minAmount,
+    totalAmount: roundMoney(breakdown.reduce((s, g) => s + g.amount, 0)),
+    practitionerCount: breakdown.length,
+    commissionCount: breakdown.reduce((s, g) => s + g.commissionCount, 0),
+    breakdown,
+    belowMinimumCount: belowMinimum.length,
   };
 }
 
@@ -273,6 +393,7 @@ export async function getDashboardMetrics() {
 export async function getTopPractitioners({ limit = 5 } = {}) {
   await connectDB();
   const rows = await CdoOrder.aggregate([
+    { $match: ATTRIBUTED_ORDER_FILTER },
     {
       $group: {
         _id: {
@@ -766,14 +887,22 @@ export async function getPractitionerKpis(practitionerId, { dateFrom, dateTo } =
     referralMatch.referredAt = range;
   }
 
+  const settings = await getSettings();
+  const minAmount = Number(settings.minimumPayoutAmount) || 0;
+
   const [
     orderAgg,
     commissionAgg,
+    commissionByStatus,
+    lifetimeOrderAgg,
     pendingPayouts,
     paidPayouts,
     totalReferrals,
     convertedReferrals,
     codeCount,
+    referredCustomers,
+    lastPaidPayout,
+    eligible,
   ] = await Promise.all([
     CdoOrder.aggregate([
       { $match: orderMatch },
@@ -788,15 +917,22 @@ export async function getPractitionerKpis(practitionerId, { dateFrom, dateTo } =
     ]),
     CdoCommission.aggregate([
       { $match: commissionMatch },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: "$amount" },
-        },
-      },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
     ]),
+    // All-time commission totals by status (not date-scoped) for the
+    // earned / paid / pending summary.
+    CdoCommission.aggregate([
+      { $match: match },
+      { $group: { _id: "$status", total: { $sum: "$amount" } } },
+    ]),
+    // Lifetime referral orders + revenue (all-time, ignores the date chip).
+    CdoOrder.aggregate([
+      { $match: match },
+      { $group: { _id: null, orders: { $sum: 1 }, revenue: { $sum: "$amount" } } },
+    ]),
+    // Open (not-yet-settled) payouts — awaiting_approval/approved/processing.
     CdoPayout.aggregate([
-      { $match: { ...match, status: { $in: ["pending", "processing"] } } },
+      { $match: { ...match, status: { $in: ["awaiting_approval", "approved", "processing"] } } },
       { $group: { _id: null, total: { $sum: "$amount" } } },
     ]),
     CdoPayout.aggregate([
@@ -806,11 +942,31 @@ export async function getPractitionerKpis(practitionerId, { dateFrom, dateTo } =
     CdoReferral.countDocuments(referralMatch),
     CdoReferral.countDocuments({ ...referralMatch, status: "converted" }),
     CdoPractitionerCode.countDocuments({ practitionerId: profile.id }),
+    CdoApplication.countDocuments({ "referral.practitionerId": profile.id }),
+    CdoPayout.findOne({ ...match, status: "paid" }).sort({ paidAt: -1 }).select("paidAt").lean(),
+    getEligibleCommissions({ practitionerId: profile.id, periodEnd: new Date() }),
   ]);
 
   const orderRow = orderAgg[0] || { revenue: 0, commissionFromOrders: 0, orders: 0 };
   const conversionRate =
     totalReferrals > 0 ? convertedReferrals / totalReferrals : 0;
+
+  // Commission status rollup (all-time).
+  const byStatus = { pending: 0, approved: 0, paid: 0, reversed: 0 };
+  for (const r of commissionByStatus) {
+    if (r._id in byStatus) byStatus[r._id] = roundMoney(r.total);
+  }
+  const totalCommissionEarned = roundMoney(byStatus.pending + byStatus.approved + byStatus.paid);
+  const totalCommissionPaid = byStatus.paid;
+  const pendingCommissions = roundMoney(byStatus.pending + byStatus.approved);
+
+  // This practitioner's next-cycle payout (eligible total, gated by minimum).
+  const eligibleTotal = roundMoney(
+    (eligible || []).reduce((s, c) => s + (Number(c.amount) || 0), 0),
+  );
+  const upcomingPayoutAmount = eligibleTotal >= minAmount ? eligibleTotal : 0;
+
+  const lifetime = lifetimeOrderAgg[0] || { orders: 0, revenue: 0 };
 
   return {
     totalOrders: orderRow.orders || 0,
@@ -822,6 +978,20 @@ export async function getPractitionerKpis(practitionerId, { dateFrom, dateTo } =
     convertedReferrals,
     conversionRate,
     activeCodes: codeCount,
+    // ── Commission summary (all-time) ──
+    totalCommissionEarned,
+    totalCommissionPaid,
+    pendingCommissions,
+    // ── Referral footprint ──
+    referredCustomers,
+    totalReferralOrders: lifetime.orders || 0,
+    lifetimeReferralRevenue: roundMoney(lifetime.revenue || 0),
+    // ── Payout cadence ──
+    lastPayoutDate: lastPaidPayout?.paidAt || null,
+    upcomingPayoutAmount,
+    nextExpectedPayoutAmount: upcomingPayoutAmount,
+    nextPayoutDate: nextPayoutDate(),
+    minimumPayoutAmount: minAmount,
   };
 }
 
@@ -1001,66 +1171,79 @@ function pushPayoutRemark(payout, { kind, message, actor, source }) {
 
 // ── Phase 2: commission accrual + eligibility ────────────────────────
 
+// Create the cdo_commission + ledger credit for a single attributed order.
+// Idempotent + the SINGLE writer of commissions for an order — used by
+// both the live order-ingestion pipeline (ingestShopifyOrder) and the
+// batch accrual (accrueCommissionsForOrders). Returns { created, commission }:
+//   • skips (created:false, commission:null) when commissionAmount <= 0
+//   • skips (created:false, commission:<existing>) when a commission for
+//     this orderId already exists
+// Rate prefers the order's snapshotted referral.commissionRate, falling
+// back to commissionAmount/amount, then the program default. Status follows
+// cdo_settings.autoApproveCommissions.
+async function createCommissionForOrder(order, settings) {
+  const amount = roundMoney(order.commissionAmount);
+  if (amount <= 0) return { created: false, commission: null };
+
+  const existing = await CdoCommission.findOne({ orderId: order._id }).lean();
+  if (existing) return { created: false, commission: existing };
+
+  const autoApprove = settings.autoApproveCommissions === true;
+  const snapshotRate = order.referral?.commissionRate;
+  const rate = Number.isFinite(snapshotRate)
+    ? snapshotRate
+    : Number(order.amount) > 0
+      ? Number((amount / Number(order.amount)).toFixed(4))
+      : settings.defaultCommissionRate;
+  const earnedAt = order.placedAt || order.createdAt || new Date();
+
+  const commission = await CdoCommission.create({
+    shop: order.shop,
+    practitionerId: order.practitionerId,
+    practitionerEmail: order.practitionerEmail,
+    practitionerName: order.practitionerName,
+    orderId: order._id,
+    orderName: order.orderName,
+    currency: order.currency || settings.currency,
+    amount,
+    rate,
+    status: autoApprove ? "approved" : "pending",
+    earnedAt,
+  });
+  await appendLedgerEntry({
+    shop: order.shop,
+    practitionerId: order.practitionerId,
+    practitionerEmail: order.practitionerEmail,
+    practitionerName: order.practitionerName,
+    currency: order.currency || settings.currency,
+    type: "commission",
+    amount,
+    relatedType: "CdoCommission",
+    relatedId: commission._id,
+    description: `Commission earned on ${order.orderName || order.shopifyOrderId || "order"}`,
+    occurredAt: earnedAt,
+  });
+  return { created: true, commission };
+}
+
 // Generate cdo_commissions for attributed orders that don't have one yet.
-// Idempotent: skips orders that already have a linked commission. Rate is
-// derived from the order (commissionAmount / amount) or the program
-// default; status follows cdo_settings.autoApproveCommissions. Each new
-// commission also posts a "commission" credit to the practitioner ledger.
+// Idempotent: delegates to createCommissionForOrder, which skips orders
+// that already have a linked commission and orders with no commission.
+// Status follows cdo_settings.autoApproveCommissions.
 export async function accrueCommissionsForOrders({ shop } = {}) {
   await connectDB();
   const settings = await getSettings();
-  const autoApprove = settings.autoApproveCommissions === true;
 
-  const orderFilter = { status: { $ne: "cancelled" } };
+  const orderFilter = { status: { $ne: "cancelled" }, commissionAmount: { $gt: 0 } };
   if (shop) orderFilter.shop = shop;
   const orders = await CdoOrder.find(orderFilter).lean();
 
-  const existing = await CdoCommission.find({
-    orderId: { $in: orders.map((o) => o._id) },
-  })
-    .select("orderId")
-    .lean();
-  const seen = new Set(existing.map((c) => String(c.orderId)));
-
   let createdCount = 0;
   for (const o of orders) {
-    if (seen.has(String(o._id))) continue;
-    const amount = roundMoney(o.commissionAmount);
-    if (amount <= 0) continue;
-    const rate =
-      Number(o.amount) > 0
-        ? Number((amount / Number(o.amount)).toFixed(4))
-        : settings.defaultCommissionRate;
-    const earnedAt = o.placedAt || o.createdAt || new Date();
-    const commission = await CdoCommission.create({
-      shop: o.shop,
-      practitionerId: o.practitionerId,
-      practitionerEmail: o.practitionerEmail,
-      practitionerName: o.practitionerName,
-      orderId: o._id,
-      orderName: o.orderName,
-      currency: o.currency || settings.currency,
-      amount,
-      rate,
-      status: autoApprove ? "approved" : "pending",
-      earnedAt,
-    });
-    await appendLedgerEntry({
-      shop: o.shop,
-      practitionerId: o.practitionerId,
-      practitionerEmail: o.practitionerEmail,
-      practitionerName: o.practitionerName,
-      currency: o.currency || settings.currency,
-      type: "commission",
-      amount,
-      relatedType: "CdoCommission",
-      relatedId: commission._id,
-      description: `Commission earned on ${o.orderName || o.shopifyOrderId || "order"}`,
-      occurredAt: earnedAt,
-    });
-    createdCount += 1;
+    const { created } = await createCommissionForOrder(o, settings);
+    if (created) createdCount += 1;
   }
-  return { createdCount, autoApprove };
+  return { createdCount, autoApprove: settings.autoApproveCommissions === true };
 }
 
 export async function approveCommission(commissionId) {
@@ -1083,6 +1266,7 @@ export async function reverseCommission(commissionId) {
     throw new Error("Cannot reverse a commission that is paid or attached to a payout");
   }
   c.status = "reversed";
+  c.payoutStatus = "cancelled";
   await c.save();
   return c.toObject();
 }
@@ -1091,8 +1275,16 @@ export async function reverseCommission(commissionId) {
 // the period end. The batch builder applies the per-practitioner minimum.
 export async function getEligibleCommissions({ practitionerId, periodEnd } = {}) {
   await connectDB();
-  const filter = { status: "approved", payoutId: null };
-  if (practitionerId) filter.practitionerId = practitionerId;
+  // Eligibility excludes individually-paused commissions and any
+  // commission owned by a practitioner whose payouts are on hold.
+  const filter = { status: "approved", payoutId: null, paused: { $ne: true } };
+  if (practitionerId) {
+    if (await isPractitionerPaused(practitionerId)) return [];
+    filter.practitionerId = practitionerId;
+  } else {
+    const held = await getHeldPractitionerIds();
+    if (held.length) filter.practitionerId = { $nin: held };
+  }
   if (periodEnd) filter.earnedAt = { $lte: new Date(periodEnd) };
   return CdoCommission.find(filter).sort({ earnedAt: 1 }).lean();
 }
@@ -1370,5 +1562,1264 @@ export async function getPayoutDetail(payoutId) {
       status: c.status,
     })),
     qboBillUrl: payout.qboBillId ? billWebUrl(payout.qboBillId) : null,
+  };
+}
+
+// ── Order ingestion (orders/create → cdo_orders) ─────────────────────
+//
+// The live pipeline behind the orders/create webhook. EVERY Shopify order
+// is synchronized into cdo_orders with a complete snapshot. When the buyer
+// used an eligible practitioner referral code, the order is ATTRIBUTED and
+// the full referral → commission → ledger chain is created + linked:
+//
+//   resolve code ─▶ upsert cdo_orders ─▶ (if attributed) ─▶
+//     upsert cdo_referrals (converted) ─▶ create cdo_commission + ledger ─▶
+//     first-touch cdo_applications mapping
+//
+// All cdo_* writes live here (per the payout.md layering rule); the webhook
+// route only handles auth/dedup + the Shopify-API customer tag.
+
+// Parse a possibly-stringy money value to a finite Number (Shopify sends
+// amounts as strings, e.g. "400.00").
+function money(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// Resolve a raw referral code carried on an order to its owning
+// practitioner + discount/commission terms. Case-insensitive (codes are
+// stored canonical-lowercase) and applies the SAME eligibility gate as
+// validateReferralCode — a code owned by a no-longer-eligible practitioner
+// stops attributing. Returns the referral snapshot, or null.
+export async function resolvePractitionerReferral(rawCode, { shop } = {}) {
+  const code = String(rawCode || "").trim();
+  if (!code) return null;
+  await connectDB();
+
+  const escaped = code.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const codeQuery = {
+    code: { $regex: `^${escaped}$`, $options: "i" },
+    status: "active",
+  };
+  if (shop !== undefined && shop !== null) codeQuery.shop = shop;
+  const codeDoc = await CdoPractitionerCode.findOne(codeQuery).lean();
+  if (!codeDoc) return null;
+
+  const source = codeDoc.practitionerSource || "wholesale";
+  const Model = source === "cdo" ? CdoApplication : WholesaleApplication;
+  const eligibility = source === "cdo" ? { status: "approved" } : PRACTITIONER_FILTER;
+  const practitioner = isValidObjectId(codeDoc.practitionerId)
+    ? await Model.findOne({ _id: codeDoc.practitionerId, ...eligibility })
+        .select("firstName lastName email status")
+        .lean()
+    : null;
+  if (!practitioner) return null;
+
+  const settings = await getSettings();
+  return {
+    code: codeDoc.code,
+    codeId: codeDoc._id.toString(),
+    practitionerId: codeDoc.practitionerId,
+    practitionerSource: source,
+    practitionerName:
+      codeDoc.practitionerName ||
+      `${practitioner.firstName || ""} ${practitioner.lastName || ""}`.trim() ||
+      practitioner.email ||
+      "—",
+    practitionerEmail: (practitioner.email || codeDoc.practitionerEmail || "").toLowerCase(),
+    discountPercent: codeDoc.discountPercent ?? 0,
+    commissionRate:
+      codeDoc.commissionRate != null
+        ? codeDoc.commissionRate
+        : settings.defaultCommissionRate,
+    linkedAt: new Date(),
+  };
+}
+
+// Extract the buyer email from an orders/create payload (lowercased).
+function orderEmail(payload) {
+  return String(
+    payload?.email || payload?.contact_email || payload?.customer?.email || "",
+  )
+    .toLowerCase()
+    .trim();
+}
+
+// Resolve the practitioner referral for an order, with cdo_applications as
+// the PRIMARY source of truth and cdo_practitioner_codes as the catalogue
+// fallback:
+//
+//   1. PRIMARY — the customer's established cdo_applications mapping. If the
+//      buyer already has a (non-rejected) application carrying a `referral`,
+//      that frozen snapshot IS the customer→practitioner relationship; use
+//      it directly. The code is "valid + active" because the relationship
+//      exists. (source: "cdo_application")
+//   2. FALLBACK — first-touch. No mapping yet but the order carried a code
+//      (note attribute / discount code / customer tag): validate it against
+//      cdo_practitioner_codes (active + eligible practitioner) and let the
+//      pipeline create the mapping. (source: the code-discovery source)
+//   3. Neither → unattributed (standard retail order).
+//
+// Returns { referral, attributionSource } — referral is null for retail.
+async function resolveOrderReferral({ shop, payload, rawCode, codeSource }) {
+  // 1. PRIMARY: the customer's existing mapping in cdo_applications.
+  const email = orderEmail(payload);
+  const customerGid = payload?.customer?.admin_graphql_api_id || null;
+  let app = null;
+  if (email) app = await CdoApplication.findOne({ email }).lean();
+  if (!app && customerGid) {
+    app = await CdoApplication.findOne({ customerId: customerGid }).lean();
+  }
+  if (app && app.referral && app.referral.practitionerId && app.status !== "rejected") {
+    const settings = await getSettings();
+    const referral = {
+      ...app.referral,
+      // Older snapshots may not carry a rate — fall back to the program
+      // default so commission still accrues.
+      commissionRate:
+        app.referral.commissionRate != null
+          ? app.referral.commissionRate
+          : settings.defaultCommissionRate,
+      linkedAt: app.referral.linkedAt || new Date(),
+    };
+    return { referral, attributionSource: "cdo_application" };
+  }
+
+  // 2. FALLBACK: validate a code carried on the order against the catalogue.
+  if (rawCode) {
+    const referral = await resolvePractitionerReferral(rawCode, { shop });
+    if (referral) return { referral, attributionSource: codeSource || null };
+  }
+
+  return { referral: null, attributionSource: null };
+}
+
+// Map a Shopify orders/create REST payload (snake_case) to a cdo_orders
+// document. Pure — no DB. `amount` is the order gross (total_price); the
+// commission base is the order subtotal (product revenue, excl. tax +
+// shipping), set by the caller.
+function mapShopifyOrderToDoc(payload, { referral, attribution, shop }) {
+  const o = payload || {};
+  const shopifyOrderId =
+    o.admin_graphql_api_id || (o.id ? `gid://shopify/Order/${o.id}` : null);
+
+  const cust = o.customer || {};
+  const customerName =
+    `${cust.first_name || o.billing_address?.first_name || ""} ${
+      cust.last_name || o.billing_address?.last_name || ""
+    }`.trim();
+  const customerEmail = String(
+    o.email || o.contact_email || cust.email || "",
+  )
+    .toLowerCase()
+    .trim();
+
+  const mapAddress = (a) =>
+    a
+      ? {
+          name: a.name || `${a.first_name || ""} ${a.last_name || ""}`.trim(),
+          line1: a.address1 || "",
+          line2: a.address2 || "",
+          city: a.city || "",
+          province: a.province || "",
+          zip: a.zip || "",
+          country: a.country || "",
+          phone: a.phone || "",
+        }
+      : null;
+
+  const subtotal = money(o.subtotal_price ?? o.current_subtotal_price);
+  const totalDiscounts = money(o.total_discounts ?? o.current_total_discounts);
+  const totalTax = money(o.total_tax ?? o.current_total_tax);
+  const total = money(o.total_price ?? o.current_total_price);
+  const totalShipping = money(
+    o.total_shipping_price_set?.shop_money?.amount ??
+      (o.shipping_lines || []).reduce((s, l) => s + money(l.price), 0),
+  );
+
+  // CDO program status (not Shopify's): cancelled / paid / pending.
+  let status = "pending";
+  if (o.cancelled_at) status = "cancelled";
+  else if (o.financial_status === "paid") status = "paid";
+
+  return {
+    shop,
+    attributed: Boolean(referral),
+    practitionerId: referral?.practitionerId ?? null,
+    practitionerEmail: referral?.practitionerEmail ?? null,
+    practitionerName: referral?.practitionerName ?? null,
+
+    shopifyOrderId,
+    orderName: o.name || null,
+    orderNumber: o.order_number != null ? String(o.order_number) : null,
+
+    customerEmail,
+    customerName,
+    customer: {
+      shopifyCustomerId: cust.admin_graphql_api_id || null,
+      firstName: cust.first_name || null,
+      lastName: cust.last_name || null,
+      email: (cust.email || customerEmail || "").toLowerCase(),
+      phone: cust.phone || o.phone || null,
+    },
+
+    lineItems: (o.line_items || []).map((li) => ({
+      productId: li.product_id != null ? String(li.product_id) : null,
+      variantId: li.variant_id != null ? String(li.variant_id) : null,
+      sku: li.sku || null,
+      title: li.title || null,
+      variantTitle: li.variant_title || null,
+      quantity: Number(li.quantity) || 0,
+      price: money(li.price),
+      totalDiscount: money(li.total_discount),
+    })),
+
+    currency: o.currency || "USD",
+    amount: total,
+    pricing: { subtotal, totalDiscounts, totalTax, totalShipping, total },
+    discountCodes: (o.discount_codes || []).map((d) => ({
+      code: d.code || null,
+      type: d.type || null,
+      amount: money(d.amount),
+    })),
+    taxLines: (o.tax_lines || []).map((t) => ({
+      title: t.title || null,
+      rate: money(t.rate),
+      price: money(t.price),
+    })),
+    shippingLines: (o.shipping_lines || []).map((s) => ({
+      title: s.title || null,
+      price: money(s.price),
+    })),
+
+    billingAddress: mapAddress(o.billing_address),
+    shippingAddress: mapAddress(o.shipping_address),
+
+    payment: {
+      gateways: Array.isArray(o.payment_gateway_names)
+        ? o.payment_gateway_names
+        : [],
+      financialStatus: o.financial_status || null,
+    },
+    financialStatus: o.financial_status || null,
+    fulfillmentStatus: o.fulfillment_status || null,
+
+    referral: referral || null,
+    referralCode: referral?.code || null,
+    attribution: attribution || { source: null, code: null, matchedAt: null },
+
+    status,
+    placedAt: o.created_at ? new Date(o.created_at) : new Date(),
+  };
+}
+
+// Upsert the cdo_referrals "conversion" row for an attributed order. One
+// row per (referralCode, referredEmail); flips to `converted` on the first
+// attributed order and records the converting orderId. Returns the doc.
+async function upsertReferralConversion({ shop, referral, order }) {
+  const referredEmail = order.customerEmail || "";
+  const when = order.placedAt || new Date();
+  const existing = await CdoReferral.findOne({
+    referralCode: referral.code,
+    referredEmail,
+  });
+  if (existing) {
+    if (existing.status !== "converted") {
+      existing.status = "converted";
+      existing.convertedAt = existing.convertedAt || when;
+    }
+    if (!existing.orderId) existing.orderId = order._id;
+    await existing.save();
+    return existing;
+  }
+  return CdoReferral.create({
+    shop,
+    practitionerId: referral.practitionerId,
+    practitionerEmail: referral.practitionerEmail,
+    practitionerName: referral.practitionerName,
+    referralCode: referral.code,
+    referredEmail,
+    referredName: order.customerName || null,
+    status: "converted",
+    orderId: order._id,
+    referredAt: when,
+    convertedAt: when,
+  });
+}
+
+// First-touch cdo_applications mapping for an attributed buyer. Mirrors the
+// prior webhook behavior: attach the referral snapshot to an existing
+// application only if it has none (first-touch wins), else create a patient
+// application. Customer tagging stays in the webhook route (Shopify API).
+async function upsertCustomerApplication({ shop, payload, referral }) {
+  const email = String(
+    payload?.email || payload?.contact_email || payload?.customer?.email || "",
+  )
+    .toLowerCase()
+    .trim();
+  if (!email) {
+    console.warn(
+      `[cdo.ingest] order ${payload?.id} has no email — skipping cdo_application mapping`,
+    );
+    return;
+  }
+  const customerGid = payload?.customer?.admin_graphql_api_id || null;
+  const existing = await CdoApplication.findOne({ email }).lean();
+
+  if (existing) {
+    const updates = {};
+    if (!existing.referral) updates.referral = referral;
+    if (!existing.customerId && customerGid) updates.customerId = customerGid;
+    if (Object.keys(updates).length) {
+      await CdoApplication.updateOne({ _id: existing._id }, { $set: updates });
+      console.log(
+        `[cdo.ingest] updated cdo_application ${existing._id} — set ${Object.keys(updates).join(", ")}`,
+      );
+    }
+    return;
+  }
+
+  await CdoApplication.create({
+    shop,
+    applicantType: "patient",
+    firstName: payload?.customer?.first_name || payload?.billing_address?.first_name || null,
+    lastName: payload?.customer?.last_name || payload?.billing_address?.last_name || null,
+    email,
+    billingAddress: null,
+    shippingAddress: null,
+    referral,
+    status: "approved",
+    submittedAt: new Date(),
+    reviewedAt: null,
+    customerId: customerGid,
+  });
+  console.log(`[cdo.ingest] created cdo_application for new patient ${email}`);
+}
+
+// Synchronize one Shopify order into cdo_orders and, when attributed,
+// create + link the referral / commission / ledger / customer-mapping
+// records. Idempotent: upserts the order by (shop, shopifyOrderId) and all
+// downstream writes are guarded, so Shopify's at-least-once delivery +
+// replays don't duplicate.
+//
+//   shop               – the order's shop domain
+//   payload            – the orders/create REST payload
+//   rawCode            – referral code extracted from the order (or null)
+//   attributionSource  – "note_attribute" | "discount_code" | null
+//
+// Returns { ok, attributed, referralCode, customerGid } so the caller can
+// tag the customer with the canonical code.
+export async function ingestShopifyOrder({ shop, payload, rawCode, attributionSource } = {}) {
+  await connectDB();
+  const orderId = payload?.id;
+  const shopifyOrderId =
+    payload?.admin_graphql_api_id || (orderId ? `gid://shopify/Order/${orderId}` : null);
+  if (!shopifyOrderId) {
+    console.warn("[cdo.ingest] payload has no order id — skipping");
+    return { ok: false, reason: "no_order_id" };
+  }
+
+  // cdo_applications is the primary source of truth (existing customer →
+  // practitioner mapping); the order's code is the first-touch fallback,
+  // validated against the cdo_practitioner_codes catalogue.
+  const { referral, attributionSource: resolvedSource } = await resolveOrderReferral({
+    shop,
+    payload,
+    rawCode,
+    codeSource: attributionSource,
+  });
+  const attributed = Boolean(referral);
+  if (rawCode && !attributed) {
+    console.warn(
+      `[cdo.ingest] order ${orderId} carried code "${rawCode}" but it didn't resolve to an eligible practitioner (no cdo_applications mapping + not in catalogue) — storing unattributed`,
+    );
+  }
+
+  const attribution = attributed
+    ? {
+        source: resolvedSource || null,
+        code: referral.code || rawCode || null,
+        matchedAt: new Date(),
+      }
+    : { source: null, code: rawCode || null, matchedAt: null };
+
+  const doc = mapShopifyOrderToDoc(payload, { referral, attribution, shop });
+
+  // Commission base = order subtotal (product revenue, excl. tax/shipping).
+  if (attributed) {
+    const rate = Number.isFinite(referral.commissionRate) ? referral.commissionRate : 0;
+    doc.commissionAmount = roundMoney((doc.pricing.subtotal || 0) * rate);
+  } else {
+    doc.commissionAmount = 0;
+  }
+
+  // Validation — never persist a negative / non-finite money figure.
+  if (!(doc.amount >= 0) || !(doc.commissionAmount >= 0)) {
+    console.error(
+      `[cdo.ingest] order ${orderId} has invalid amounts (amount=${doc.amount}, commission=${doc.commissionAmount}) — coercing to 0`,
+    );
+    if (!(doc.amount >= 0)) doc.amount = 0;
+    if (!(doc.commissionAmount >= 0)) doc.commissionAmount = 0;
+  }
+
+  const order = await CdoOrder.findOneAndUpdate(
+    { shop, shopifyOrderId },
+    { $set: doc },
+    { upsert: true, returnDocument: "after", setDefaultsOnInsert: true },
+  );
+  console.log(
+    `[cdo.ingest] synced order ${order.orderName || shopifyOrderId} (attributed=${attributed}, amount=${order.amount} ${order.currency})`,
+  );
+
+  if (!attributed) return { ok: true, attributed: false, referralCode: null, customerGid: null };
+
+  // Referral conversion row + link it back onto the order.
+  const referralDoc = await upsertReferralConversion({ shop, referral, order });
+  if (referralDoc && String(order.referralId || "") !== String(referralDoc._id)) {
+    order.referralId = referralDoc._id;
+    await CdoOrder.updateOne(
+      { _id: order._id },
+      { $set: { referralId: referralDoc._id } },
+    );
+  }
+
+  // Commission + ledger (idempotent by orderId).
+  const settings = await getSettings();
+  const { created } = await createCommissionForOrder(order, settings);
+  console.log(
+    `[cdo.ingest] order ${order.orderName || shopifyOrderId} commission ${
+      created ? "created" : "already existed"
+    } (${order.commissionAmount} ${order.currency}, practitioner=${referral.practitionerEmail})`,
+  );
+
+  // First-touch customer → practitioner mapping.
+  await upsertCustomerApplication({ shop, payload, referral });
+
+  const customerGid = payload?.customer?.admin_graphql_api_id || null;
+  return { ok: true, attributed: true, referralCode: referral.code, customerGid };
+}
+
+// Handle orders/cancelled: mark the cdo_order cancelled and reverse its
+// commission IF it isn't already paid or reserved into a payout. A paid /
+// batched commission is left intact (logged) — reversals never touch
+// posted money. Idempotent.
+export async function cancelShopifyOrder({ shop, shopifyOrderId } = {}) {
+  await connectDB();
+  if (!shopifyOrderId) return { ok: false, reason: "no_order_id" };
+
+  const order = await CdoOrder.findOne({ shop, shopifyOrderId });
+  if (!order) {
+    console.warn(
+      `[cdo.cancel] order ${shopifyOrderId} not found in cdo_orders — nothing to cancel`,
+    );
+    return { ok: false, reason: "order_not_found" };
+  }
+
+  if (order.status !== "cancelled") {
+    order.status = "cancelled";
+    await order.save();
+  }
+
+  const commission = await CdoCommission.findOne({ orderId: order._id });
+  if (!commission) {
+    return { ok: true, cancelled: true, reversed: false };
+  }
+  if (commission.status === "paid" || commission.payoutId) {
+    console.warn(
+      `[cdo.cancel] order ${shopifyOrderId} cancelled but its commission ${commission._id} is ${commission.status}${commission.payoutId ? " (batched)" : ""} — NOT reversing`,
+    );
+    return { ok: true, cancelled: true, reversed: false };
+  }
+  if (commission.status === "reversed") {
+    return { ok: true, cancelled: true, reversed: true };
+  }
+
+  commission.status = "reversed";
+  commission.payoutStatus = "cancelled";
+  await commission.save();
+  await appendLedgerEntry({
+    shop: order.shop,
+    practitionerId: order.practitionerId,
+    practitionerEmail: order.practitionerEmail,
+    practitionerName: order.practitionerName,
+    currency: order.currency,
+    type: "reversal",
+    amount: -roundMoney(commission.amount),
+    relatedType: "CdoCommission",
+    relatedId: commission._id,
+    description: `Commission reversed — order ${order.orderName || shopifyOrderId} cancelled`,
+    occurredAt: new Date(),
+  });
+  console.log(
+    `[cdo.cancel] order ${shopifyOrderId} cancelled, commission ${commission._id} reversed (${commission.amount} ${order.currency})`,
+  );
+  return { ok: true, cancelled: true, reversed: true };
+}
+
+// ── Pause / resume controls ──────────────────────────────────────────
+//
+// Two independent admin switches that hold money out of the automated
+// payout pipeline (mirrors the wholesale auto-charge pause pattern):
+//   • per-commission  → cdo_commissions.paused
+//   • per-practitioner → cdo_practitioner_holds.paused
+// Both are honoured by getEligibleCommissions (and therefore buildPayoutBatch)
+// and by autoApproveEligibleCommissions. Neither unwinds already-paid or
+// already-batched payouts — they only gate future runs. All are idempotent.
+
+export async function pauseCommission(commissionId, { actor, note } = {}) {
+  if (!isValidObjectId(commissionId)) throw new Error("Invalid commission id");
+  await connectDB();
+  const c = await CdoCommission.findById(commissionId);
+  if (!c) throw new Error("Commission not found");
+  if (c.status === "paid") throw new Error("Cannot pause a paid commission");
+  c.paused = true;
+  c.pausedAt = new Date();
+  c.pausedBy = actor || "admin";
+  if (note !== undefined) c.pauseNote = note ? String(note).slice(0, 500) : null;
+  // Reflect the hold on the payout dimension (unless already settled).
+  if (c.payoutStatus !== "paid") c.payoutStatus = "paused";
+  await c.save();
+  log.info("commission.paused", { commissionId: String(c._id), actor });
+  return c.toObject();
+}
+
+export async function resumeCommission(commissionId, { actor } = {}) {
+  if (!isValidObjectId(commissionId)) throw new Error("Invalid commission id");
+  await connectDB();
+  const c = await CdoCommission.findById(commissionId);
+  if (!c) throw new Error("Commission not found");
+  c.paused = false;
+  c.resumedAt = new Date();
+  c.resumedBy = actor || "admin";
+  // Return to the eligible pool unless it's already been paid.
+  if (c.payoutStatus === "paused") c.payoutStatus = "pending";
+  await c.save();
+  log.info("commission.resumed", { commissionId: String(c._id), actor });
+  return c.toObject();
+}
+
+// Set/clear a practitioner-wide payout hold. Upserts the single
+// cdo_practitioner_holds row for the practitioner.
+export async function pausePractitionerPayouts(practitionerId, { actor, note, shop } = {}) {
+  if (!isValidObjectId(practitionerId)) throw new Error("Invalid practitioner id");
+  await connectDB();
+  const hold = await CdoPractitionerHold.findOneAndUpdate(
+    { practitionerId },
+    {
+      $set: {
+        paused: true,
+        pausedAt: new Date(),
+        pausedBy: actor || "admin",
+        note: note ? String(note).slice(0, 500) : null,
+        ...(shop ? { shop } : {}),
+      },
+    },
+    { upsert: true, returnDocument: "after", setDefaultsOnInsert: true },
+  );
+  log.info("practitioner.payouts_paused", { practitionerId, actor });
+  return hold.toObject();
+}
+
+export async function resumePractitionerPayouts(practitionerId, { actor } = {}) {
+  if (!isValidObjectId(practitionerId)) throw new Error("Invalid practitioner id");
+  await connectDB();
+  const hold = await CdoPractitionerHold.findOneAndUpdate(
+    { practitionerId },
+    {
+      $set: {
+        paused: false,
+        resumedAt: new Date(),
+        resumedBy: actor || "admin",
+      },
+    },
+    { upsert: true, returnDocument: "after", setDefaultsOnInsert: true },
+  );
+  log.info("practitioner.payouts_resumed", { practitionerId, actor });
+  return hold.toObject();
+}
+
+// Read a practitioner's hold state (for the admin settings UI). Returns a
+// stable shape even when no hold row exists yet.
+export async function getPractitionerHold(practitionerId) {
+  if (!isValidObjectId(practitionerId)) return { paused: false };
+  await connectDB();
+  const hold = await CdoPractitionerHold.findOne({ practitionerId }).lean();
+  return {
+    paused: hold?.paused === true,
+    pausedAt: hold?.pausedAt || null,
+    pausedBy: hold?.pausedBy || null,
+    note: hold?.note || null,
+    resumedAt: hold?.resumedAt || null,
+    resumedBy: hold?.resumedBy || null,
+  };
+}
+
+export async function isPractitionerPaused(practitionerId) {
+  if (!practitionerId) return false;
+  await connectDB();
+  const hold = await CdoPractitionerHold.findOne({
+    practitionerId,
+    paused: true,
+  })
+    .select("_id")
+    .lean();
+  return Boolean(hold);
+}
+
+// All practitionerIds currently on payout hold — used to exclude them from
+// batch-wide eligibility queries in one round-trip.
+export async function getHeldPractitionerIds() {
+  await connectDB();
+  const rows = await CdoPractitionerHold.find({ paused: true })
+    .select("practitionerId")
+    .lean();
+  return rows.map((r) => r.practitionerId).filter(Boolean);
+}
+
+// ── Phase 5: fully-automated payout run (CRON) ───────────────────────
+//
+// The hands-off pipeline behind process-commission-payouts. Chains the
+// existing engine functions, honouring pause/hold filters, with NO manual
+// approval step. Idempotent + safely re-runnable: accrual is guarded by
+// orderId, approval only flips pending→approved, batching reserves
+// commissions + is partial-unique on (practitionerId, periodEnd), and
+// execution resumes-not-duplicates via per-step QBO id guards.
+
+// Auto-approve eligible pending commissions (the "no manual approval"
+// requirement). Skips paused commissions + held practitioners. Returns the
+// count flipped pending→approved.
+export async function autoApproveEligibleCommissions({ shop } = {}) {
+  await connectDB();
+  const held = await getHeldPractitionerIds();
+  const filter = { status: "pending", paused: { $ne: true } };
+  if (shop) filter.shop = shop;
+  if (held.length) filter.practitionerId = { $nin: held };
+  const res = await CdoCommission.updateMany(filter, {
+    $set: { status: "approved" },
+  });
+  const approved = res.modifiedCount || 0;
+  if (approved) log.info("commissions.auto_approved", { approved });
+  return approved;
+}
+
+// Loud, structured alert for a failed payout. Always logs; optionally
+// POSTs to CDO_PAYOUT_ALERT_WEBHOOK_URL when configured (off by default —
+// never sends externally otherwise, and never includes bank details).
+async function alertPayoutFailure(payout, err) {
+  const message = err?.message || payout?.lastError || "unknown error";
+  console.error(
+    `\n🚨 [cdo.payout.alert] payout ${payout?.reference || payout?._id} for ${payout?.practitionerEmail || payout?.practitionerId} FAILED: ${message}\n`,
+  );
+  log.error("cdo.payout.alert", {
+    payoutId: String(payout?._id),
+    practitionerId: payout?.practitionerId,
+    amount: payout?.amount,
+    reference: payout?.reference,
+    error: message,
+  });
+  const url = schedulerConfig.alertWebhookUrl;
+  if (!url) return;
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type: "cdo_payout_failed",
+        payoutId: String(payout?._id),
+        practitionerId: payout?.practitionerId,
+        practitionerEmail: payout?.practitionerEmail,
+        amount: payout?.amount,
+        currency: payout?.currency,
+        reference: payout?.reference,
+        error: message,
+        at: new Date().toISOString(),
+      }),
+    });
+  } catch (postErr) {
+    log.warn("cdo.payout.alert_webhook_failed", { err: postErr });
+  }
+}
+
+// ── Batch tracking (cdo_payout_batches) ──────────────────────────────
+//
+// Every automated run (and every manual reprocess) persists a durable
+// cdo_payout_batches record snapshotting which commissions it processed +
+// their per-commission outcome, so runs are traceable + reconcilable. The
+// money path is unchanged (executeApprovedPayout); the batch is the audit
+// layer on top. cdo_commissions carries a latest-state payout rollup.
+
+function makeBatchReference() {
+  // Runtime server code (not a workflow script), so Date/Math.random are
+  // available. CDOB-<yyyymmddThhmm>-<rand>.
+  const ts = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
+  const rand = Math.random().toString(36).slice(2, 6);
+  return `CDOB-${ts}-${rand}`;
+}
+
+// Mark a payout's commissions "processing", bump their attempt count, and
+// push a processing item onto the in-memory items[] (persisted by caller).
+async function markPayoutCommissionsProcessing(payout, batch, items, startedAt) {
+  const comms = await CdoCommission.find({ _id: { $in: payout.commissionIds } }).lean();
+  for (const c of comms) {
+    const attempt = (c.payoutAttemptCount || 0) + 1;
+    await CdoCommission.updateOne(
+      { _id: c._id },
+      {
+        $set: { payoutStatus: "processing", lastPayoutAttemptAt: startedAt, lastBatchId: batch._id },
+        $inc: { payoutAttemptCount: 1 },
+      },
+    );
+    items.push({
+      commissionId: c._id,
+      practitionerId: c.practitionerId,
+      practitionerEmail: c.practitionerEmail,
+      orderName: c.orderName,
+      amount: c.amount,
+      status: "processing",
+      attempt,
+      payoutId: payout._id,
+    });
+  }
+}
+
+// Approve (if still awaiting approval) + execute one payout, then write the
+// outcome onto its batch items + the commission rollups. Never throws —
+// failures land on the items + an alert. Shared by run + reprocess.
+async function settlePayoutForBatch(payoutId, payoutItems, { actor }) {
+  try {
+    const p = await CdoPayout.findById(payoutId).lean();
+    if (p && ["draft", "awaiting_approval"].includes(p.status)) {
+      await approvePayout(String(payoutId), actor);
+    }
+    const done = await executeApprovedPayout(String(payoutId), { actor });
+    const ok = done.status === "paid";
+    const txnRef = done.qboBillPaymentId || done.qboBillId || null;
+    const payoutDate = done.paidAt || null;
+    for (const it of payoutItems) {
+      it.status = ok ? "paid" : "failed";
+      it.txnRef = txnRef;
+      it.payoutDate = payoutDate;
+      it.failureReason = ok ? null : done.lastError || "execution did not complete";
+      await CdoCommission.updateOne(
+        { _id: it.commissionId },
+        {
+          $set: {
+            payoutStatus: ok ? "paid" : "failed",
+            payoutDate: ok ? payoutDate : null,
+            payoutTxnRef: txnRef,
+            payoutFailureReason: ok ? null : done.lastError || null,
+          },
+        },
+      );
+    }
+    if (!ok) await alertPayoutFailure(done, new Error(done.lastError || "payout not paid"));
+  } catch (err) {
+    const msg = err?.message || String(err);
+    for (const it of payoutItems) {
+      it.status = "failed";
+      it.failureReason = msg;
+      await CdoCommission.updateOne(
+        { _id: it.commissionId },
+        { $set: { payoutStatus: "failed", payoutFailureReason: msg } },
+      );
+    }
+    const fresh = await CdoPayout.findById(payoutId).lean().catch(() => null);
+    await alertPayoutFailure(fresh, err);
+  }
+}
+
+// Per-practitioner rollup for a batch — one entry per cdo_payouts the run
+// created/processed (one aggregated payout per practitioner). Reflects the
+// payout's final state (status + QBO reference + aggregated total).
+async function buildPractitionerPayoutRollup(payoutIds) {
+  if (!payoutIds || !payoutIds.length) return [];
+  const payouts = await CdoPayout.find({ _id: { $in: payoutIds } }).lean();
+  return payouts.map((p) => ({
+    practitionerId: p.practitionerId,
+    practitionerName: p.practitionerName,
+    practitionerEmail: p.practitionerEmail,
+    payoutId: p._id,
+    commissionCount: (p.commissionIds || []).length,
+    totalAmount: p.amount || 0,
+    status: p.status,
+    txnRef: p.qboBillPaymentId || p.qboBillId || null,
+  }));
+}
+
+function finalizeBatchCounts(batch, items) {
+  batch.items = items;
+  batch.totalCommissions = items.length;
+  batch.totalAmount = roundMoney(items.reduce((s, i) => s + (Number(i.amount) || 0), 0));
+  batch.successCount = items.filter((i) => i.status === "paid").length;
+  batch.failedCount = items.filter((i) => i.status === "failed").length;
+  batch.skippedCount = items.filter((i) => i.status === "skipped").length;
+  batch.completedAt = new Date();
+  batch.status = batch.failedCount > 0 ? "completed_with_errors" : "completed";
+}
+
+// The end-to-end automated run, wrapped in a durable batch record. Returns
+// a summary the CRON job logs. `mode`/`trigger` tag how the run was started.
+export async function runAutomatedPayouts({ shop, periodEnd, mode = "cron", trigger = "cron" } = {}) {
+  await connectDB();
+  const startedAt = new Date();
+  const periodEndDate = periodEnd ? new Date(periodEnd) : new Date();
+
+  const batch = await CdoPayoutBatch.create({
+    shop: shop || null,
+    reference: makeBatchReference(),
+    mode,
+    trigger,
+    executionTime: startedAt,
+    startedAt,
+    status: "running",
+  });
+
+  const summary = {
+    batchId: String(batch._id),
+    reference: batch.reference,
+    accrued: 0,
+    approved: 0,
+    batched: 0,
+    paid: 0,
+    failed: 0,
+    skipped: 0,
+  };
+
+  try {
+    // 1. Accrue (safety net) + 2. auto-approve (no manual approval).
+    const accrual = await accrueCommissionsForOrders({ shop });
+    summary.accrued = accrual.createdCount || 0;
+    summary.approved = await autoApproveEligibleCommissions({ shop });
+
+    // Candidate pool (approved + unpaid + not paused; held excluded) BEFORE
+    // reservation, so we can tell batched from skipped (below-minimum / open).
+    const eligibleBefore = await getEligibleCommissions({ periodEnd: periodEndDate });
+    const eligibleIds = new Set(eligibleBefore.map((c) => String(c._id)));
+
+    // 3. Build payouts (reserves batched commissions via payoutId).
+    const build = await buildPayoutBatch({ periodEnd: periodEndDate, actor: "system" });
+    summary.batched = build.created.length;
+
+    const items = [];
+    const batchedIds = new Set();
+
+    // 4. Mark batched commissions processing + record items.
+    for (const payout of build.created) {
+      batch.payoutIds.push(payout._id);
+      const before = items.length;
+      await markPayoutCommissionsProcessing(payout, batch, items, startedAt);
+      for (let i = before; i < items.length; i += 1) batchedIds.add(String(items[i].commissionId));
+    }
+
+    // Skipped = eligible candidates that were not reserved into a payout
+    // (below the minimum payout amount, or an open payout already exists).
+    const skippedIds = [...eligibleIds].filter((id) => !batchedIds.has(id));
+    if (skippedIds.length) {
+      const skipped = await CdoCommission.find({ _id: { $in: skippedIds } }).lean();
+      for (const c of skipped) {
+        await CdoCommission.updateOne(
+          { _id: c._id },
+          { $set: { payoutStatus: "skipped", lastBatchId: batch._id } },
+        );
+        items.push({
+          commissionId: c._id,
+          practitionerId: c.practitionerId,
+          practitionerEmail: c.practitionerEmail,
+          orderName: c.orderName,
+          amount: c.amount,
+          status: "skipped",
+          attempt: c.payoutAttemptCount || 0,
+          failureReason: "below_minimum_or_open_payout",
+        });
+      }
+    }
+
+    // Persist the processing snapshot before execution (crash visibility).
+    batch.items = items;
+    batch.totalCommissions = items.length;
+    batch.skippedCount = skippedIds.length;
+    await batch.save();
+
+    // 5. Approve + execute each payout; record outcomes per commission.
+    for (const payout of build.created) {
+      const payoutItems = items.filter((i) => String(i.payoutId) === String(payout._id));
+      await settlePayoutForBatch(payout._id, payoutItems, { actor: "system" });
+    }
+
+    // 6. Finalize — counts + per-practitioner rollup (one entry per payout).
+    batch.practitionerPayouts = await buildPractitionerPayoutRollup(batch.payoutIds);
+    finalizeBatchCounts(batch, items);
+    await batch.save();
+    summary.paid = batch.successCount;
+    summary.failed = batch.failedCount;
+    summary.skipped = batch.skippedCount;
+  } catch (wholeErr) {
+    batch.status = "failed";
+    batch.error = wholeErr?.message || String(wholeErr);
+    batch.completedAt = new Date();
+    await batch.save().catch(() => {});
+    log.error("automated_payouts.failed", { batchId: String(batch._id), err: wholeErr });
+    throw wholeErr;
+  }
+
+  log.info("automated_payouts.run", { ...summary });
+  return summary;
+}
+
+// List payout batches for the admin view (newest first).
+export async function listPayoutBatches({ limit = 0 } = {}) {
+  await connectDB();
+  const q = CdoPayoutBatch.find({}).sort({ createdAt: -1 });
+  if (limit) q.limit(limit);
+  const rows = await q.lean();
+  return rows.map((b) => ({
+    id: b._id.toString(),
+    reference: b.reference,
+    mode: b.mode,
+    status: b.status,
+    executionTime: b.executionTime || b.createdAt || null,
+    completedAt: b.completedAt || null,
+    totalCommissions: b.totalCommissions || 0,
+    totalAmount: b.totalAmount || 0,
+    successCount: b.successCount || 0,
+    failedCount: b.failedCount || 0,
+    skippedCount: b.skippedCount || 0,
+  }));
+}
+
+// Full batch detail (rollup + per-commission items) for the detail page.
+export async function getPayoutBatch(id) {
+  if (!isValidObjectId(id)) return null;
+  await connectDB();
+  const b = await CdoPayoutBatch.findById(id).lean();
+  if (!b) return null;
+
+  // Join the linked cdo_payouts to enrich the per-practitioner rollup with
+  // the vendor-bill deep link + method + paidAt + the payout audit trail
+  // (remarks[]), so the batch detail can show bills + history per practitioner.
+  const payoutIds = (b.practitionerPayouts || [])
+    .map((p) => p.payoutId)
+    .filter(Boolean);
+  const payoutDocs = payoutIds.length
+    ? await CdoPayout.find({ _id: { $in: payoutIds } })
+        .select("status method paidAt qboBillId qboBillPaymentId reference remarks")
+        .lean()
+    : [];
+  const payoutById = new Map(payoutDocs.map((p) => [String(p._id), p]));
+
+  return {
+    id: b._id.toString(),
+    reference: b.reference,
+    mode: b.mode,
+    trigger: b.trigger || null,
+    status: b.status,
+    executionTime: b.executionTime || b.createdAt || null,
+    startedAt: b.startedAt || null,
+    completedAt: b.completedAt || null,
+    totalCommissions: b.totalCommissions || 0,
+    totalAmount: b.totalAmount || 0,
+    successCount: b.successCount || 0,
+    failedCount: b.failedCount || 0,
+    skippedCount: b.skippedCount || 0,
+    error: b.error || null,
+    practitionerPayouts: (b.practitionerPayouts || []).map((p) => {
+      const doc = p.payoutId ? payoutById.get(String(p.payoutId)) : null;
+      const billId = doc?.qboBillId || null;
+      return {
+        id: p.payoutId ? String(p.payoutId) : String(p.practitionerId),
+        practitionerId: p.practitionerId || null,
+        practitionerName: p.practitionerName || p.practitionerEmail || "—",
+        practitionerEmail: p.practitionerEmail || null,
+        payoutId: p.payoutId ? String(p.payoutId) : null,
+        commissionCount: p.commissionCount || 0,
+        totalAmount: p.totalAmount || 0,
+        status: doc?.status || p.status || "—",
+        method: doc?.method || null,
+        reference: doc?.reference || null,
+        paidAt: doc?.paidAt || null,
+        txnRef: p.txnRef || doc?.qboBillPaymentId || billId || null,
+        qboBillId: billId,
+        qboBillUrl: billId ? billWebUrl(billId) : null,
+        remarks: (doc?.remarks || []).map((r) => ({
+          kind: r.kind,
+          message: r.message,
+          actor: r.actor || "system",
+          source: r.source || "system",
+          createdAt: r.createdAt || null,
+        })),
+      };
+    }),
+    items: (b.items || []).map((i) => ({
+      id: String(i.commissionId), // one item per commission per batch
+      commissionId: String(i.commissionId),
+      practitionerId: i.practitionerId || null,
+      practitionerEmail: i.practitionerEmail || null,
+      orderName: i.orderName || "—",
+      amount: i.amount || 0,
+      status: i.status,
+      attempt: i.attempt || 0,
+      failureReason: i.failureReason || null,
+      txnRef: i.txnRef || null,
+      payoutId: i.payoutId ? String(i.payoutId) : null,
+      payoutDate: i.payoutDate || null,
+    })),
+  };
+}
+
+// Cross-batch attempt trail for one commission (every batch that touched it).
+export async function getCommissionPayoutHistory(commissionId) {
+  if (!isValidObjectId(commissionId)) return [];
+  await connectDB();
+  const batches = await CdoPayoutBatch.find({ "items.commissionId": commissionId })
+    .sort({ createdAt: -1 })
+    .lean();
+  const history = [];
+  for (const b of batches) {
+    for (const i of b.items || []) {
+      if (String(i.commissionId) !== String(commissionId)) continue;
+      history.push({
+        batchId: b._id.toString(),
+        reference: b.reference,
+        mode: b.mode,
+        at: b.executionTime || b.createdAt || null,
+        status: i.status,
+        attempt: i.attempt || 0,
+        failureReason: i.failureReason || null,
+        txnRef: i.txnRef || null,
+        payoutDate: i.payoutDate || null,
+      });
+    }
+  }
+  return history;
+}
+
+// Reprocess a batch's FAILED payouts in a fresh manual_reprocess batch.
+// executeApprovedPayout resumes idempotently (per-step QBO id guards +
+// stable requestids), so retrying never double-pays. Increments each
+// commission's payoutAttemptCount.
+export async function reprocessBatch(batchId, { actor } = {}) {
+  if (!isValidObjectId(batchId)) throw new Error("Invalid batch id");
+  await connectDB();
+  const source = await CdoPayoutBatch.findById(batchId).lean();
+  if (!source) throw new Error("Batch not found");
+
+  const failedPayoutIds = [
+    ...new Set(
+      (source.items || [])
+        .filter((i) => i.status === "failed" && i.payoutId)
+        .map((i) => String(i.payoutId)),
+    ),
+  ];
+  if (!failedPayoutIds.length) {
+    return { ok: true, reprocessed: 0, message: "No failed payouts to reprocess" };
+  }
+
+  const startedAt = new Date();
+  const batch = await CdoPayoutBatch.create({
+    shop: source.shop || null,
+    reference: makeBatchReference(),
+    mode: "manual_reprocess",
+    trigger: `reprocess:${source.reference}`,
+    executionTime: startedAt,
+    startedAt,
+    status: "running",
+  });
+
+  const items = [];
+  try {
+    for (const pid of failedPayoutIds) {
+      const payout = await CdoPayout.findById(pid).lean();
+      if (!payout || payout.status === "paid") continue; // already settled — skip
+      batch.payoutIds.push(payout._id);
+      await markPayoutCommissionsProcessing(payout, batch, items, startedAt);
+    }
+    batch.items = items;
+    batch.totalCommissions = items.length;
+    await batch.save();
+
+    for (const pid of batch.payoutIds) {
+      const payoutItems = items.filter((i) => String(i.payoutId) === String(pid));
+      await settlePayoutForBatch(pid, payoutItems, { actor: actor || "admin" });
+    }
+
+    batch.practitionerPayouts = await buildPractitionerPayoutRollup(batch.payoutIds);
+    finalizeBatchCounts(batch, items);
+    await batch.save();
+  } catch (wholeErr) {
+    batch.status = "failed";
+    batch.error = wholeErr?.message || String(wholeErr);
+    batch.completedAt = new Date();
+    await batch.save().catch(() => {});
+    throw wholeErr;
+  }
+
+  return {
+    ok: true,
+    reprocessed: batch.totalCommissions,
+    batchId: String(batch._id),
+    reference: batch.reference,
+    paid: batch.successCount,
+    failed: batch.failedCount,
+  };
+}
+
+// ── Orders module (top-level admin view over the full cdo_orders set) ─
+//
+// Unlike listOrders() (attributed-only, for the CDO Program tab), these
+// power the standalone Orders module: EVERY synced order, with server-side
+// pagination / filtering / sorting + a full per-order detail. Read-only.
+
+function escapeRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const ORDER_SORT_FIELDS = ["placedAt", "amount", "commissionAmount", "createdAt"];
+
+export async function listCdoOrders({
+  page = 1,
+  pageSize = 25,
+  sort = "placedAt",
+  dir = "desc",
+  filters = {},
+} = {}) {
+  await connectDB();
+  const f = filters || {};
+  const and = [];
+
+  if (f.orderNumber) {
+    const rx = escapeRegex(f.orderNumber);
+    and.push({ $or: [{ orderName: { $regex: rx, $options: "i" } }, { orderNumber: { $regex: rx, $options: "i" } }] });
+  }
+  if (f.customer) {
+    const rx = escapeRegex(f.customer);
+    and.push({ $or: [{ customerName: { $regex: rx, $options: "i" } }, { customerEmail: { $regex: rx, $options: "i" } }] });
+  }
+  if (f.practitioner) {
+    const rx = escapeRegex(f.practitioner);
+    and.push({ $or: [{ practitionerName: { $regex: rx, $options: "i" } }, { practitionerEmail: { $regex: rx, $options: "i" } }, { practitionerId: f.practitioner }] });
+  }
+  if (f.referralCode) and.push({ referralCode: { $regex: `^${escapeRegex(f.referralCode)}$`, $options: "i" } });
+  if (f.status) and.push({ status: f.status });
+  if (f.financialStatus) and.push({ financialStatus: f.financialStatus });
+  if (f.commissionStatus === "attributed") and.push({ attributed: true });
+  else if (f.commissionStatus === "unattributed") and.push({ attributed: { $ne: true } });
+  if (f.dateFrom || f.dateTo) {
+    const range = {};
+    if (f.dateFrom) range.$gte = new Date(f.dateFrom);
+    if (f.dateTo) {
+      const d = new Date(f.dateTo);
+      d.setHours(23, 59, 59, 999);
+      range.$lte = d;
+    }
+    and.push({ placedAt: range });
+  }
+  const query = and.length ? { $and: and } : {};
+
+  const sortField = ORDER_SORT_FIELDS.includes(sort) ? sort : "placedAt";
+  const sortDir = dir === "asc" ? 1 : -1;
+  const size = Math.min(Math.max(Number(pageSize) || 25, 1), 100);
+  const pageNum = Math.max(Number(page) || 1, 1);
+
+  const [total, rows] = await Promise.all([
+    CdoOrder.countDocuments(query),
+    CdoOrder.find(query)
+      .sort({ [sortField]: sortDir, _id: -1 })
+      .skip((pageNum - 1) * size)
+      .limit(size)
+      .select(
+        "shopifyOrderId orderName orderNumber customerName customerEmail practitionerName practitionerEmail referralCode amount commissionAmount currency status financialStatus fulfillmentStatus attributed placedAt createdAt",
+      )
+      .lean(),
+  ]);
+
+  return {
+    rows: rows.map((r) => ({
+      id: r._id.toString(),
+      orderName: r.orderName || r.orderNumber || r.shopifyOrderId || "—",
+      orderNumber: r.orderNumber || null,
+      customerName: r.customerName || r.customerEmail || "—",
+      practitionerName: r.attributed ? r.practitionerName || r.practitionerEmail || "—" : "—",
+      referralCode: r.referralCode || "—",
+      amount: r.amount || 0,
+      commissionAmount: r.commissionAmount || 0,
+      currency: r.currency || "USD",
+      status: r.status || "pending",
+      financialStatus: r.financialStatus || "—",
+      fulfillmentStatus: r.fulfillmentStatus || "—",
+      attributed: r.attributed === true,
+      placedAt: r.placedAt || r.createdAt || null,
+    })),
+    total,
+    page: pageNum,
+    pageSize: size,
+    pageCount: Math.max(1, Math.ceil(total / size)),
+    sort: sortField,
+    dir: sortDir === 1 ? "asc" : "desc",
+  };
+}
+
+// Full per-order detail for the Orders detail page — the complete cdo_orders
+// snapshot + any linked commission(s).
+export async function getCdoOrderDetail(id) {
+  if (!isValidObjectId(id)) return null;
+  await connectDB();
+  const o = await CdoOrder.findById(id).lean();
+  if (!o) return null;
+  const commissions = await CdoCommission.find({ orderId: o._id }).lean();
+
+  return {
+    id: o._id.toString(),
+    shopifyOrderId: o.shopifyOrderId || null,
+    orderName: o.orderName || o.orderNumber || o.shopifyOrderId || "—",
+    orderNumber: o.orderNumber || null,
+    status: o.status || "pending",
+    financialStatus: o.financialStatus || null,
+    fulfillmentStatus: o.fulfillmentStatus || null,
+    currency: o.currency || "USD",
+    amount: o.amount || 0,
+    commissionAmount: o.commissionAmount || 0,
+    attributed: o.attributed === true,
+    placedAt: o.placedAt || null,
+    createdAt: o.createdAt || null,
+    updatedAt: o.updatedAt || null,
+    customer: {
+      name: o.customerName || o.customer?.firstName || "—",
+      email: o.customerEmail || o.customer?.email || null,
+      phone: o.customer?.phone || null,
+      shopifyCustomerId: o.customer?.shopifyCustomerId || null,
+    },
+    practitioner: o.attributed
+      ? { id: o.practitionerId || null, name: o.practitionerName || null, email: o.practitionerEmail || null }
+      : null,
+    referral: o.referral || null,
+    referralCode: o.referralCode || null,
+    attribution: o.attribution || null,
+    lineItems: o.lineItems || [],
+    pricing: o.pricing || {},
+    discountCodes: o.discountCodes || [],
+    taxLines: o.taxLines || [],
+    shippingLines: o.shippingLines || [],
+    billingAddress: o.billingAddress || null,
+    shippingAddress: o.shippingAddress || null,
+    payment: o.payment || {},
+    commissions: commissions.map((c) => ({
+      id: c._id.toString(),
+      amount: c.amount || 0,
+      rate: c.rate || 0,
+      status: c.status || "pending",
+      payoutStatus: c.payoutStatus || null,
+      payoutDate: c.payoutDate || null,
+      payoutTxnRef: c.payoutTxnRef || null,
+      payoutId: c.payoutId ? String(c.payoutId) : null,
+      earnedAt: c.earnedAt || null,
+    })),
+    timeline: [
+      o.placedAt ? { label: "Order placed", at: o.placedAt } : null,
+      o.attribution?.matchedAt
+        ? { label: `Referral matched (${o.attribution.source || "code"})`, at: o.attribution.matchedAt }
+        : null,
+      o.createdAt ? { label: "Synced to CDO", at: o.createdAt } : null,
+      o.updatedAt ? { label: "Last updated", at: o.updatedAt } : null,
+    ].filter(Boolean),
   };
 }
