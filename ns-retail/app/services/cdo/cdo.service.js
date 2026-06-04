@@ -1681,17 +1681,29 @@ async function resolveOrderReferral({ shop, payload, rawCode, codeSource }) {
     app = await CdoApplication.findOne({ customerId: customerGid }).lean();
   }
   if (app && app.referral && app.referral.practitionerId && app.status !== "rejected") {
-    const settings = await getSettings();
-    const referral = {
-      ...app.referral,
-      // Older snapshots may not carry a rate — fall back to the program
-      // default so commission still accrues.
-      commissionRate:
-        app.referral.commissionRate != null
-          ? app.referral.commissionRate
-          : settings.defaultCommissionRate,
-      linkedAt: app.referral.linkedAt || new Date(),
-    };
+    const referral = { ...app.referral, linkedAt: app.referral.linkedAt || new Date() };
+
+    // The customer→practitioner MAPPING is anchored to their application, but
+    // commission/discount TERMS must reflect the practitioner's CURRENT code —
+    // rate/discount edits apply to NEW orders (see cdoPractitionerCode). So
+    // re-resolve the live terms from the catalogue when the mapped code still
+    // resolves to the same practitioner; the snapshot is only a fallback.
+    if (app.referral.code) {
+      const live = await resolvePractitionerReferral(app.referral.code, { shop });
+      if (live && String(live.practitionerId) === String(app.referral.practitionerId)) {
+        referral.code = live.code;
+        referral.codeId = live.codeId;
+        referral.commissionRate = live.commissionRate;
+        referral.discountPercent = live.discountPercent;
+        referral.practitionerName = live.practitionerName || referral.practitionerName;
+        referral.practitionerEmail = live.practitionerEmail || referral.practitionerEmail;
+      }
+    }
+    // Still no rate (code archived / snapshot predates rates) → program default.
+    if (referral.commissionRate == null) {
+      const settings = await getSettings();
+      referral.commissionRate = settings.defaultCommissionRate;
+    }
     return { referral, attributionSource: "cdo_application" };
   }
 
