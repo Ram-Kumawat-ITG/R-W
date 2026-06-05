@@ -12,6 +12,8 @@ import ShopifyOrder from "../models/order.server";
 import Invoice from "../models/invoice.server";
 import PaymentAttempt from "../models/paymentAttempt.server";
 import CustomerMap from "../models/customerMap.server";
+import WholesaleApplication from "../models/wholesaleApplication.server";
+import QboItemMap from "../models/qboItemMap.server";
 import { getInvoice as getQboInvoice, getInvoiceWebUrl } from "../services/qbo/qbo.service";
 import {
   resolveCustomerVaultId,
@@ -280,6 +282,16 @@ export const loader = async ({ request, params }) => {
         .lean()
     : null;
 
+  // Business name lives on the customer's wholesale application (the
+  // registration form), not on CustomerMap — surface it in the Customer
+  // section. Queried by email (the app's customer key).
+  const application = order.customerEmail
+    ? await WholesaleApplication.findOne({ email: order.customerEmail })
+        .select("businessName")
+        .lean()
+    : null;
+  const businessName = application?.businessName || null;
+
   // Cache-or-source-of-truth lookups for BOTH the card vault and the
   // ACH billing id. customer_maps caches are populated at order intake;
   // if the customer captured a card or ACH AFTER that ran, only
@@ -329,6 +341,24 @@ export const loader = async ({ request, params }) => {
       const raw = await getQboInvoice(invoice.qboInvoiceId);
       qboInvoice = raw ? projectQboInvoice(raw) : null;
       if (!qboInvoice) qboInvoiceError = "QBO returned no invoice for this id";
+      // Attach each product line's SKU for the panel's SKU column. QBO
+      // invoice lines don't carry the item's Sku — resolve it from the
+      // qbo_item_maps cache by the line's QBO item id (reverse lookup).
+      if (qboInvoice?.productLines?.length) {
+        const itemIds = [
+          ...new Set(qboInvoice.productLines.map((l) => l.itemId).filter(Boolean)),
+        ];
+        if (itemIds.length) {
+          const maps = await QboItemMap.find({ qboItemId: { $in: itemIds } })
+            .select("qboItemId sku")
+            .lean();
+          const skuByItemId = new Map(maps.map((m) => [m.qboItemId, m.sku]));
+          qboInvoice.productLines = qboInvoice.productLines.map((l) => ({
+            ...l,
+            sku: skuByItemId.get(l.itemId) || null,
+          }));
+        }
+      }
     } catch (e) {
       console.error("[orders] QBO invoice fetch failed:", e?.message || e);
       qboInvoiceError = e?.message || "Failed to fetch QBO invoice";
@@ -340,6 +370,7 @@ export const loader = async ({ request, params }) => {
     invoice: invoice ? serialize(invoice) : null,
     attempts: attempts.map(serialize),
     customerMap: customerMap ? serialize(customerMap) : null,
+    businessName,
     breakdown,
     // Processing-fee rates by settlement method. Surfaced to the client
     // so confirmation modals (charge-card, mark-cheque-paid) can show the
@@ -540,7 +571,7 @@ function serialize(doc) {
 }
 
 export default function OrderDetail() {
-  const { order, invoice, attempts, customerMap, breakdown, qbo, processingFeeRates } =
+  const { order, invoice, attempts, customerMap, businessName, breakdown, qbo, processingFeeRates } =
     useLoaderData();
   const navigate = useNavigate();
   const shopify = useAppBridge();
@@ -1857,7 +1888,10 @@ export default function OrderDetail() {
             />
           </s-grid-item>
           <s-grid-item>
-            <KV label="Company" value={customerMap?.profile?.companyName} />
+            <KV
+              label="Business name"
+              value={businessName || customerMap?.profile?.companyName}
+            />
           </s-grid-item>
         </s-grid>
       </s-section>
@@ -2472,20 +2506,18 @@ export default function OrderDetail() {
                 ) : (
                   <s-table>
                     <s-table-header-row>
-                      <s-table-header>#</s-table-header>
-                      <s-table-header>Item</s-table-header>
-                      <s-table-header>Description</s-table-header>
                       <s-table-header>Qty</s-table-header>
-                      <s-table-header>Unit price</s-table-header>
+                      <s-table-header>Product(s)</s-table-header>
+                      <s-table-header>SKU</s-table-header>
+                      <s-table-header>Rate</s-table-header>
                       <s-table-header>Amount</s-table-header>
                     </s-table-header-row>
                     <s-table-body>
                       {qbo.invoice.productLines.map((l, i) => (
                         <s-table-row key={l.id || i}>
-                          <s-table-cell>{i + 1}</s-table-cell>
-                          <s-table-cell>{l.itemName || "—"}</s-table-cell>
-                          <s-table-cell>{l.description || "—"}</s-table-cell>
                           <s-table-cell>{l.qty ?? "—"}</s-table-cell>
+                          <s-table-cell>{l.description || l.itemName || "—"}</s-table-cell>
+                          <s-table-cell>{l.sku || "—"}</s-table-cell>
                           <s-table-cell>
                             {l.unitPrice != null
                               ? formatAmount(l.unitPrice, qbo.invoice.currency)
