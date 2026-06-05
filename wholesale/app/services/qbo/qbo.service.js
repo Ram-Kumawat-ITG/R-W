@@ -174,6 +174,65 @@ export async function appendInvoiceLines({ qboInvoiceId, newLines }) {
   return updated
 }
 
+// Replace the processing-fee line on an existing QBO invoice (and,
+// optionally, its DueDate) in a single sparse update. Used when an
+// invoice's payment method changes and the fee must be recalculated for
+// the new method — see services/invoice/paymentPreference.service.
+//
+// QBO has no line-level delete, so we GET the current invoice, drop every
+// existing processing-fee line (matched by the same /Processing Fee/i
+// description the rest of the app uses), append the caller's new fee line
+// (or none, when `feeLine` is null → fee removed, e.g. card → cheque), and
+// POST the full Line array back as a sparse update with the current
+// SyncToken. QBO recomputes TotalAmt and the SubTotal summary line. The
+// SyncToken acts as the concurrency guard: if a CRON charge updated the
+// invoice between our GET and POST, QBO rejects the stale token and the
+// caller's per-invoice try/catch isolates the failure.
+export async function setInvoiceProcessingFee({ qboInvoiceId, feeLine = null, dueDate }) {
+  if (!qboInvoiceId) throw new Error('setInvoiceProcessingFee: qboInvoiceId is required')
+  const current = await getInvoice(qboInvoiceId)
+  if (!current?.Id) {
+    throw new Error(`setInvoiceProcessingFee: QBO invoice ${qboInvoiceId} not found`)
+  }
+  const existingLines = Array.isArray(current.Line) ? current.Line : []
+  // Strip any existing processing-fee line(s). Same matcher as
+  // invoice.utils.findExistingProcessingFeeLine, inlined here to keep the
+  // QBO transport layer independent of the invoice domain.
+  const withoutFee = existingLines.filter(
+    (l) => !/Processing Fee/i.test(String(l?.Description || '')),
+  )
+  const nextLines = feeLine
+    ? [...withoutFee, toInvoiceLine(feeLine, qboConfig.defaultItemId)]
+    : withoutFee
+  const payload = {
+    Id: String(current.Id),
+    SyncToken: String(current.SyncToken),
+    sparse: true,
+    Line: nextLines,
+  }
+  if (dueDate) payload.DueDate = dueDate
+  console.log(
+    `[QBO invoice] setProcessingFee Id=${current.Id} ` +
+      `${feeLine ? `fee="${feeLine.description}" ($${feeLine.amount})` : 'fee=REMOVED'} ` +
+      `dueDate=${dueDate || '(unchanged)'} (was ${existingLines.length} lines, SyncToken=${current.SyncToken})`,
+  )
+  log.info('invoice.set_processing_fee.request', {
+    qboInvoiceId,
+    feeApplied: Boolean(feeLine),
+    feeAmount: feeLine?.amount ?? 0,
+    dueDate: dueDate || null,
+    syncToken: current.SyncToken,
+  })
+  const res = await qbo.post('/invoice', payload)
+  const updated = res?.Invoice
+  if (!updated?.Id) throw new Error('QBO invoice update returned no Id')
+  console.log(
+    `[QBO invoice] setProcessingFee DONE Id=${updated.Id} new TotalAmt=${updated.TotalAmt} ` +
+      `DueDate=${updated.DueDate} SyncToken=${updated.SyncToken}`,
+  )
+  return updated
+}
+
 // Deep link an admin can click to open the QBO invoice in the QuickBooks
 // web app. Routes to sandbox vs prod based on QBO_ENVIRONMENT; Intuit
 // handles realm selection from the operator's login session.

@@ -861,6 +861,74 @@ when a prior run already wrote the line (matches any method's
 "Processing Fee" description), adopts the SyncToken, and proceeds to
 `recordPayment` without double-adding.
 
+### 7.3.1 Payment-preference realignment (open-invoice sync)
+
+When a customer's payment preference changes (card / ACH / check), every
+**unpaid/open** invoice is realigned to the new method so its processing
+fee and payment terms match. Owned by
+`services/invoice/paymentPreference.service.applyPaymentPreferenceToOpenInvoices({ shop, email, newMethod, performedBy, source })`.
+
+**Eligibility.** `paymentStatus ∈ {pending, failed}` AND `amountPaid == 0`
+AND `qboCreationStatus:'created'` with a `qboInvoiceId`. Explicitly
+**excluded**: `partially_paid` / `paid` (money settled), `in_progress` /
+`awaiting_settlement` (a charge is mid-flight), `cancelled`. Re-validated
+per-invoice against the freshest state right before mutating.
+
+**Per-invoice steps** (try/catch isolated, mirrors
+`replayPendingOrdersForCustomer`):
+1. Skip if already on the new method, `amountPaid > 0`, status no longer
+   eligible, or `achSyncInProgress`.
+2. `base = amountDue − (processingFeeAmount || 0)` (the pre-fee total;
+   `amountPaid` is 0 so this is the full base).
+3. `newFee = computeProcessingFee({ baseAmount: base, method: newMethod })`
+   (null for check / 0%).
+4. Recompute due date from `dueDaysForMethod(newMethod)` against
+   `qboTxnDate || createdAt` → `qboDueDate` + local `dueAt`.
+5. **Rewrite the QBO invoice** via `qbo.service.setInvoiceProcessingFee({
+   qboInvoiceId, feeLine, dueDate })` — GET current, strip every
+   `/Processing Fee/i` line, append the new fee line (or none → fee
+   removed), sparse-POST the full `Line` array + `DueDate` with the
+   current `SyncToken`. QBO recomputes `TotalAmt`. The SyncToken is the
+   concurrency guard: a racing CRON charge invalidates it and the invoice
+   fails this run (isolated, retried on the next change).
+6. Persist locally: `paymentMethod`, fee fields (`processingFeeAmount/
+   Rate/Method`, `processingFeeAppliedAt` set when fee else null),
+   `amountDue = TotalAmt`, `qboSyncToken`, `qboDueDate`, `dueAt`. A
+   `failed` invoice resets to `pending` (`attemptCount=0`) so the new
+   method's auto-charge resumes.
+7. Append an `admin_action` remark recording `from → to` + fee delta + due
+   date + who.
+
+**After the loop**, `CustomerMap.paymentMethod` is mirrored to the new
+method (so the next order's invoice uses it immediately, not just after the
+order-intake re-sync), and one entry is appended to
+`WholesaleApplication.paymentMethodHistory[]` —
+`{ previousMethod, newMethod, invoiceCount, affectedInvoiceIds, changedAt,
+performedBy, source }` — the change-event audit log.
+
+**Triggers.**
+- **Customer self-service** — `/api/update-profile` detects a
+  `payment.method` change and calls the service **best-effort** (a QBO
+  failure never fails the profile save the customer just made); the summary
+  rides back in the response. `source:'customer'`, performedBy = email.
+- **Admin** — `POST /api/admin/customers/:id/payment-method` `{ method }`
+  saves the preference then realigns. `source:'admin'`, performedBy = admin
+  session email. Surfaced on the Customer detail page
+  (`app.customers.$id.jsx`) as a method selector + "Apply to open invoices"
+  button + a payment-method-history table.
+
+**Future orders** already pick up the latest preference — no scheduler
+change: `customer.service.ensureCustomerForOrder` re-reads
+`wholesale_applications.payment.method` at intake and PASS 1's
+`paymentMethod:{ $in:['card','ach'] }` filter adjusts automatically.
+
+**Limitations.** Switching an invoice to ACH sets the method but does not
+provision an NMI ACH billing profile; if `CustomerMap.nmiAchBillingId` is
+absent the scheduler's ACH charge skips with a reason (existing
+`resolveInvoiceVault` behavior). The immutable order-time snapshot
+`customerPaymentPreference` is intentionally **not** rewritten — only the
+operational `paymentMethod`.
+
 ### 7.4 Payment recording
 
 After a successful NMI charge:

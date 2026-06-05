@@ -54,6 +54,25 @@ const signatureSchema = new mongoose.Schema(
   { _id: false },
 );
 
+// Audit trail of payment-preference changes. One entry per change event
+// (customer self-service via /api/update-profile, or an admin via
+// /api/admin/customers/:id/payment-method). Each entry records the
+// previous + new method, how many open invoices were realigned, the ids
+// of those invoices, when, and who performed the change. Written by
+// services/invoice/paymentPreference.applyPaymentPreferenceToOpenInvoices.
+const paymentMethodHistorySchema = new mongoose.Schema(
+  {
+    previousMethod: String, // card | check | ach (normalized) | null
+    newMethod: String, // card | check | ach (normalized)
+    invoiceCount: { type: Number, default: 0 }, // open invoices realigned
+    affectedInvoiceIds: { type: [String], default: [] },
+    changedAt: { type: Date, default: Date.now },
+    performedBy: String, // customer email or admin email
+    source: { type: String, enum: ["customer", "admin"], required: true },
+  },
+  { _id: false },
+);
+
 const wholesaleApplicationSchema = new mongoose.Schema(
   {
     shop: { type: String, index: true },
@@ -78,6 +97,7 @@ const wholesaleApplicationSchema = new mongoose.Schema(
     tax: { type: taxSchema, default: null },
 
     payment: { type: paymentSchema, default: null },
+    paymentMethodHistory: { type: [paymentMethodHistorySchema], default: [] },
     signature: { type: signatureSchema, default: null },
 
     termsAccepted: { type: Boolean, default: false },

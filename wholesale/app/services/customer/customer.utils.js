@@ -3,6 +3,23 @@
 // Most of these exist to bridge Shopify's snake_case address shape into
 // our internal camelCase profile shape that QBO and NMI both consume.
 
+// Map a wholesale-application payment.method to the invoice/customerMap
+// enum. Tolerates either spelling of the cheque option ('check' or
+// 'cheque'), case insensitive, since both surface in real data — the
+// registration form uses id 'check' but some application records carry
+// 'cheque'. Canonical storage value is 'check'.
+//
+// Unknown / missing values default to 'card' so existing customers
+// without a captured preference keep the legacy CRON-auto-charge
+// behavior.
+export function normalizePaymentMethod(raw) {
+  const v = String(raw || '').trim().toLowerCase()
+  if (v === 'check' || v === 'cheque') return 'check'
+  if (v === 'ach' || v === 'bank' || v === 'bank-transfer') return 'ach'
+  if (v === 'card' || v === 'credit-card' || v === 'creditcard' || v === 'cc') return 'card'
+  return 'card'
+}
+
 // Normalize a Shopify address (snake_case shape) to our internal shape.
 // Returns null if the address has no usable street/zip data.
 export function normalizeAddress(addr) {

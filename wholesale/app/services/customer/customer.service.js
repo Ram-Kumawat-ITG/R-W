@@ -10,25 +10,9 @@ import {
   buildProfileFromShopifyOrder,
   missingBillingFields,
   formatAddress,
+  normalizePaymentMethod,
 } from './customer.utils'
 import { createLogger } from '../../utils/logger.utils'
-
-// Map a wholesale-application payment.method to the invoice/customerMap
-// enum. Tolerates either spelling of the cheque option ('check' or
-// 'cheque'), case insensitive, since both surface in real data — the
-// registration form uses id 'check' but some application records carry
-// 'cheque'. Canonical storage value is 'check'.
-//
-// Unknown / missing values default to 'card' so existing customers
-// without a captured preference keep the legacy CRON-auto-charge
-// behavior.
-function normalizePaymentMethod(raw) {
-  const v = String(raw || '').trim().toLowerCase()
-  if (v === 'check' || v === 'cheque') return 'check'
-  if (v === 'ach' || v === 'bank' || v === 'bank-transfer') return 'ach'
-  if (v === 'card' || v === 'credit-card' || v === 'creditcard' || v === 'cc') return 'card'
-  return 'card'
-}
 
 const log = createLogger('customer.service')
 

@@ -37,6 +37,18 @@ export default function CustomerDetail() {
   const [expandedCredId, setExpandedCredId] = useState(null);
   const modalRef = useRef(null);
 
+  // Payment-preference change control (realigns the customer's open invoices).
+  const prefFetcher = useFetcher();
+  const prefModalRef = useRef(null);
+  const currentMethod = normalizeMethod(a.payment?.method);
+  const [methodChoice, setMethodChoice] = useState(currentMethod);
+  const applyingPref =
+    prefFetcher.state === "submitting" || prefFetcher.state === "loading";
+  const handledPrefRef = useRef(null);
+  const methodHistory = Array.isArray(a.paymentMethodHistory)
+    ? [...a.paymentMethodHistory].reverse()
+    : [];
+
   const fullName =
     `${a.firstName || ""} ${a.lastName || ""}`.trim() || "(no name)";
   const declining =
@@ -89,6 +101,42 @@ export default function CustomerDetail() {
   };
   const openModal = () => modalRef.current?.showOverlay?.();
   const closeModal = () => modalRef.current?.hideOverlay?.();
+
+  // Surface the payment-preference result (toast on success, banner on error).
+  useEffect(() => {
+    if (!prefFetcher.data) return;
+    if (prefFetcher.state !== "idle") return;
+    if (handledPrefRef.current === prefFetcher.data) return;
+    handledPrefRef.current = prefFetcher.data;
+    const d = prefFetcher.data;
+    if (d.status === "success") {
+      const r = d.result || {};
+      shopify?.toast?.show(
+        `Payment method set to ${r.newMethod || methodChoice} — ` +
+          `${r.updated || 0} invoice(s) updated` +
+          (r.failed ? `, ${r.failed} failed` : ""),
+      );
+    } else {
+      setBannerError(
+        d.result?.detail || d.message || "Couldn't update the payment method.",
+      );
+    }
+  }, [prefFetcher.data, prefFetcher.state, shopify, methodChoice]);
+
+  const openPrefModal = () => prefModalRef.current?.showOverlay?.();
+  const closePrefModal = () => prefModalRef.current?.hideOverlay?.();
+  const onConfirmApplyMethod = () => {
+    setBannerError(null);
+    closePrefModal();
+    prefFetcher.submit(
+      { method: methodChoice },
+      {
+        method: "POST",
+        action: `/api/admin/customers/${a._id}/payment-method`,
+        encType: "application/json",
+      },
+    );
+  };
 
   const selectedCreds = CREDENTIAL_MAP.map((c) => {
     const v = a.credentials?.[c.id];
@@ -429,38 +477,108 @@ export default function CustomerDetail() {
 
       {/* ───── Payment details ───── */}
       <s-section heading="Payment details">
-        {!a.payment || !a.payment.method ? (
-          <s-paragraph tone="subdued">No payment details on file.</s-paragraph>
-        ) : (
-          <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
-            <s-grid-item>
-              <KV label="Payment method" value={a.payment.method} />
-            </s-grid-item>
-            {a.payment.cardholderName && (
+        <s-stack direction="block" gap="large-100">
+          {!a.payment || !a.payment.method ? (
+            <s-paragraph tone="subdued">No payment details on file.</s-paragraph>
+          ) : (
+            <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
               <s-grid-item>
-                <KV label="Cardholder name" value={a.payment.cardholderName} />
+                <KV label="Payment method" value={a.payment.method} />
               </s-grid-item>
-            )}
-            {a.payment.cardBrand && (
-              <s-grid-item>
-                <KV label="Card brand" value={a.payment.cardBrand} />
-              </s-grid-item>
-            )}
-            {a.payment.cardLast4 && (
-              <s-grid-item>
-                <KV label="Card number" value={`•••• •••• •••• ${a.payment.cardLast4}`} />
-              </s-grid-item>
-            )}
-            {(a.payment.cardExpMonth || a.payment.cardExpYear) && (
-              <s-grid-item>
-                <KV
-                  label="Expiry"
-                  value={`${String(a.payment.cardExpMonth || "").padStart(2, "0")} / ${a.payment.cardExpYear || ""}`}
-                />
-              </s-grid-item>
-            )}
-          </s-grid>
-        )}
+              {a.payment.cardholderName && (
+                <s-grid-item>
+                  <KV label="Cardholder name" value={a.payment.cardholderName} />
+                </s-grid-item>
+              )}
+              {a.payment.cardBrand && (
+                <s-grid-item>
+                  <KV label="Card brand" value={a.payment.cardBrand} />
+                </s-grid-item>
+              )}
+              {a.payment.cardLast4 && (
+                <s-grid-item>
+                  <KV label="Card number" value={`•••• •••• •••• ${a.payment.cardLast4}`} />
+                </s-grid-item>
+              )}
+              {(a.payment.cardExpMonth || a.payment.cardExpYear) && (
+                <s-grid-item>
+                  <KV
+                    label="Expiry"
+                    value={`${String(a.payment.cardExpMonth || "").padStart(2, "0")} / ${a.payment.cardExpYear || ""}`}
+                  />
+                </s-grid-item>
+              )}
+            </s-grid>
+          )}
+
+          {/* Change preference + realign all open invoices */}
+          <s-box padding="base" border="base" borderRadius="base" background="subdued">
+            <s-stack direction="block" gap="base">
+              <s-text><strong>Change payment preference</strong></s-text>
+              <s-paragraph tone="subdued">
+                Updates the customer&apos;s preference and re-aligns all of their
+                unpaid / open invoices to the selected method — recomputing the
+                processing fee (card 3% / ACH 1% / check 0%) and the due date,
+                and syncing QuickBooks. Paid, partially-paid, and in-flight
+                invoices are left unchanged. Future orders use the new method too.
+              </s-paragraph>
+              <s-stack direction="inline" gap="base" alignItems="end">
+                <s-select
+                  label="Payment method"
+                  value={methodChoice}
+                  onChange={(e) => setMethodChoice(e.target.value)}
+                >
+                  <s-option value="card">Credit card (3%)</s-option>
+                  <s-option value="ach">ACH / bank (1%)</s-option>
+                  <s-option value="check">Check / cheque (0%)</s-option>
+                </s-select>
+                <s-button
+                  variant="primary"
+                  onClick={openPrefModal}
+                  {...(methodChoice === currentMethod ? { disabled: true } : {})}
+                  {...(applyingPref ? { loading: true } : {})}
+                >
+                  Apply to open invoices
+                </s-button>
+              </s-stack>
+              <s-text tone="subdued">Current preference: {currentMethod}</s-text>
+            </s-stack>
+          </s-box>
+
+          {methodHistory.length > 0 && (
+            <s-stack direction="block" gap="tight">
+              <s-text><strong>Payment method history</strong></s-text>
+              <s-table>
+                <s-table-header-row>
+                  <s-table-header>When</s-table-header>
+                  <s-table-header>Change</s-table-header>
+                  <s-table-header>Invoices updated</s-table-header>
+                  <s-table-header>By</s-table-header>
+                  <s-table-header>Source</s-table-header>
+                </s-table-header-row>
+                <s-table-body>
+                  {methodHistory.map((h, i) => (
+                    <s-table-row key={i}>
+                      <s-table-cell>
+                        {h.changedAt ? new Date(h.changedAt).toLocaleString() : "—"}
+                      </s-table-cell>
+                      <s-table-cell>
+                        {(h.previousMethod || "—")} → {h.newMethod}
+                      </s-table-cell>
+                      <s-table-cell>{h.invoiceCount ?? 0}</s-table-cell>
+                      <s-table-cell>{h.performedBy || "—"}</s-table-cell>
+                      <s-table-cell>
+                        <s-badge tone={h.source === "admin" ? "info" : "default"}>
+                          {h.source === "admin" ? "Admin" : "Customer"}
+                        </s-badge>
+                      </s-table-cell>
+                    </s-table-row>
+                  ))}
+                </s-table-body>
+              </s-table>
+            </s-stack>
+          )}
+        </s-stack>
       </s-section>
 
       {/* ───── Synced data — parsed into a readable table ───── */}
@@ -519,6 +637,31 @@ export default function CustomerDetail() {
           Decline &amp; delete
         </s-button>
         <s-button slot="secondary-actions" onClick={closeModal}>
+          Cancel
+        </s-button>
+      </s-modal>
+
+      <s-modal
+        ref={prefModalRef}
+        id="apply-payment-method-modal"
+        heading="Apply payment method to open invoices?"
+        accessibilityLabel="Confirm payment method change"
+      >
+        <s-paragraph>
+          This sets the customer&apos;s payment preference to <strong>{methodChoice}</strong> and
+          re-aligns all of their unpaid / open invoices — recomputing the processing fee and
+          due date and updating QuickBooks. Paid, partially-paid, and in-flight invoices are
+          not touched. Future orders will use the new method too.
+        </s-paragraph>
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          onClick={onConfirmApplyMethod}
+          {...(applyingPref ? { loading: true } : {})}
+        >
+          Apply
+        </s-button>
+        <s-button slot="secondary-actions" onClick={closePrefModal}>
           Cancel
         </s-button>
       </s-modal>
@@ -589,6 +732,16 @@ function parseNote(note) {
 function truncate(s, n) {
   if (!s) return "";
   return s.length > n ? `${s.slice(0, n)}…` : s;
+}
+
+// Normalize a stored payment method to the card/ach/check enum used by the
+// selector. Mirrors customer.utils.normalizePaymentMethod (kept inline so
+// this render module imports no service-side code).
+function normalizeMethod(raw) {
+  const v = String(raw || "").trim().toLowerCase();
+  if (v === "check" || v === "cheque") return "check";
+  if (v === "ach" || v === "bank" || v === "bank-transfer") return "ach";
+  return "card";
 }
 
 // Strip the leading "[fieldName] " prefix(es) that ShopifyUserError adds to
