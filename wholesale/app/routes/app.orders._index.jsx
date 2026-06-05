@@ -435,9 +435,7 @@ export default function OrdersList() {
                     </s-table-cell>
                     <s-table-cell>{r.customerEmail || "—"}</s-table-cell>
                     <s-table-cell>
-                      {r.totalAmount != null
-                        ? formatAmount(r.totalAmount, r.currency)
-                        : "—"}
+                      <AmountCell order={r} />
                     </s-table-cell>
                     <s-table-cell>
                       <ProcessingBadge
@@ -529,6 +527,38 @@ export default function OrdersList() {
         )}
       </s-section>
     </s-page>
+  );
+}
+
+// Amount cell — shows the fee-inclusive grand total the customer will be
+// charged. Prefers Invoice.amountDue (which now bakes in the processing fee
+// for card / ACH invoices) over the Shopify order total. When the two differ
+// (a fee was added) we surface the pre-fee Shopify total as a subdued
+// subtitle so admins can see both at a glance. Falls back to the Shopify
+// total for orders with no invoice yet.
+function AmountCell({ order }) {
+  const shopifyTotal = order.totalAmount;
+  const invoiceTotal = order.invoice?.amountDue;
+  const currency = order.currency;
+  if (invoiceTotal == null) {
+    return (
+      <s-text>
+        {shopifyTotal != null ? formatAmount(shopifyTotal, currency) : "—"}
+      </s-text>
+    );
+  }
+  const feeAdded =
+    shopifyTotal != null &&
+    Number(invoiceTotal).toFixed(2) !== Number(shopifyTotal).toFixed(2);
+  return (
+    <s-stack direction="block" gap="none">
+      <s-text>{formatAmount(invoiceTotal, currency)}</s-text>
+      {feeAdded && (
+        <s-text tone="subdued">
+          incl. fee · {formatAmount(shopifyTotal, currency)} order
+        </s-text>
+      )}
+    </s-stack>
   );
 }
 

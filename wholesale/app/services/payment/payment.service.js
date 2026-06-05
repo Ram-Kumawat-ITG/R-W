@@ -172,13 +172,15 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
   await invoice.save()
 
   // Outstanding (base) — what's left to settle on the invoice before
-  // adding the per-method processing fee. The fee is decided by the
-  // ACTUAL settlement method on the invoice (not the customer's
-  // preference): a cheque-preferred customer who lands here via the
-  // admin charge-card fallback has invoice.paymentMethod === 'card'
-  // already, so the 3% card fee applies. The fee is added at most
-  // once per invoice — once processingFeeAppliedAt is set, retries
-  // use the already-applied amount and don't double-add.
+  // adding the per-method processing fee. For card / ACH invoices the fee
+  // was already added at creation (processingFeeAppliedAt is set, and it's
+  // baked into amountDue), so feePreview below is null and we charge the
+  // full fee-inclusive balance. The staging here is now the FALLBACK path:
+  // it fires for the cheque → card admin override (a cheque invoice has no
+  // fee yet, so charging the card applies the 3% card fee) and for legacy
+  // invoices created before fee-at-creation. The fee is added at most once
+  // per invoice — once processingFeeAppliedAt is set, retries use the
+  // already-applied amount and don't double-add.
   //
   // `requestedAmount` is the optional admin-driven partial-charge amount
   // (entered on the Retry / Charge-card modal). It clips against the

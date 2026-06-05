@@ -57,6 +57,7 @@ export async function createInvoice({
   docNumber,
   shipAddr,
   shipDate,
+  taxAmount,
 }) {
   if (!qboCustomerId) throw new Error('createInvoice: qboCustomerId is required')
   if (!Array.isArray(lines) || lines.length === 0) {
@@ -64,6 +65,16 @@ export async function createInvoice({
   }
 
   const shipAddrPayload = toQboAddress(shipAddr)
+  // Tax goes in QBO's native summary "Tax" row via TxnTaxDetail.TotalTax —
+  // NOT as a product line (see invoice.utils.shopifyLinesToQboLines). We send
+  // the already-computed Shopify tax as an override; QBO adds it to the line
+  // subtotal so TotalAmt still reconciles with Shopify's total_price. Only
+  // engaged when tax is non-zero — most wholesale orders are tax-exempt, and
+  // omitting TxnTaxDetail leaves QBO's own ($0) calculation untouched.
+  // Caveat: US automated-sales-tax companies may recompute and ignore this
+  // override; for tax-exempt customers that still resolves to $0.
+  const tax = Number(taxAmount || 0)
+  const txnTaxDetail = tax > 0 ? { TotalTax: Number(tax.toFixed(2)) } : undefined
   const payload = {
     CustomerRef: { value: String(qboCustomerId) },
     Line: lines.map((l) => toInvoiceLine(l, qboConfig.defaultItemId)),
@@ -73,6 +84,7 @@ export async function createInvoice({
     DocNumber: docNumber || undefined,
     ShipAddr: shipAddrPayload,
     ShipDate: shipDate || undefined,
+    TxnTaxDetail: txnTaxDetail,
   }
 
   console.log(`\n[QBO invoice] creating for customer=${qboCustomerId} lines=${lines.length}`)
@@ -81,7 +93,8 @@ export async function createInvoice({
     console.log(`              - ${line.description} qty=${line.quantity} unit=${line.unitPrice} total=${line.amount}`)
   }
   console.log(
-    `[QBO invoice] shipAddr=${shipAddrPayload ? 'set' : '(none)'} shipDate=${shipDate || '(none)'}`,
+    `[QBO invoice] shipAddr=${shipAddrPayload ? 'set' : '(none)'} shipDate=${shipDate || '(none)'} ` +
+      `tax=${txnTaxDetail ? `$${txnTaxDetail.TotalTax.toFixed(2)} (summary row)` : '(none)'}`,
   )
   log.info('invoice.create.request', {
     qboCustomerId,
@@ -89,6 +102,7 @@ export async function createInvoice({
     docNumber,
     hasShipAddr: Boolean(shipAddrPayload),
     shipDate: shipDate || null,
+    totalTax: txnTaxDetail ? txnTaxDetail.TotalTax : 0,
   })
 
   const res = await qbo.post('/invoice', payload)

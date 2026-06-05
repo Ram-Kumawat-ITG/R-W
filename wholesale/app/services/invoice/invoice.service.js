@@ -100,13 +100,41 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
 
   // Phase 2 — call QBO with the lock held.
   console.log(`[invoice] phase 2 — calling QBO createInvoice (we hold the claim)`)
-  // No processing-fee line at creation — the fee is appended at
-  // settlement time, with the rate selected by the actual settlement
-  // method (card / ach / check). This keeps the fee tied to the real
-  // method used to settle, including the cheque → card admin fallback
-  // and ACH receipts. See propagateSuccessfulPayment + recordManual-
-  // Payment for the append flow.
   const lines = shopifyLinesToQboLines(order)
+
+  // Processing-fee line at creation — for card / ACH (any method with a
+  // non-zero rate), append the fee line NOW so the invoice the customer
+  // first receives by email already shows the full amount that will be
+  // charged. We stamp `processingFeeAppliedAt` + the staging fields here;
+  // every settlement-time fee path (chargeInvoice, propagateSuccessful-
+  // Payment §0, checkAchSettlement, recordManualPayment) guards on these,
+  // so the fee is never double-added downstream.
+  //
+  // Cheque (0% rate) gets NO fee line and we deliberately leave
+  // `processingFeeAppliedAt` UNSET — the cheque → card admin fallback still
+  // applies the 3% card fee at settlement, exactly as before. The fee is
+  // sized on the post-discount grand total (order.total_price = adjusted
+  // subtotal + shipping + tax), which the QBO sales lines now sum to.
+  const feeBase = Number(order.total_price ?? 0)
+  const creationFee = computeProcessingFee({
+    baseAmount: feeBase,
+    method: invoice.paymentMethod,
+    rates: invoiceConfig.processingFeeRates,
+  })
+  if (creationFee) {
+    const feeLine = buildProcessingFeeLine(creationFee)
+    if (feeLine) {
+      lines.push(feeLine)
+      invoice.processingFeeAmount = creationFee.amount
+      invoice.processingFeeRate = creationFee.rate
+      invoice.processingFeeMethod = creationFee.method
+      invoice.processingFeeAppliedAt = new Date()
+      console.log(
+        `[invoice] processing fee at creation — ${creationFee.method} ` +
+          `$${creationFee.amount.toFixed(2)} (${(creationFee.rate * 100).toFixed(2)}% of $${feeBase.toFixed(2)})`,
+      )
+    }
+  }
   // Due date = order date + per-method terms. The term length is
   // selected by the invoice's locked paymentMethod (cheque →
   // CHEQUE_DUE_DATE, ACH → ACH_DUE_DATE, card → CARD_DUE_DATE; each
@@ -150,6 +178,9 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
       dueDate,
       shipAddr,
       shipDate,
+      // Tax renders in QBO's summary "Tax" row (TxnTaxDetail.TotalTax),
+      // not as a product line — see shopifyLinesToQboLines.
+      taxAmount: Number(order.total_tax || 0),
     })
   } catch (qboErr) {
     // QBO call failed — mark the claim as failed so a re-run can
@@ -268,6 +299,13 @@ export async function propagateSuccessfulPayment({ invoice, customerMap, transac
   }
 
   // ── 0) QBO: append processing-fee line (if owed) ──────────────
+  //
+  // For card / ACH invoices the fee line is normally added at CREATION
+  // (createInvoiceForOrder stamps processingFeeAppliedAt), so feePending is
+  // false here and this step is a no-op. It still fires as the FALLBACK
+  // path for invoices that staged the fee at settlement but haven't told
+  // QBO yet — the cheque → card admin override, and any legacy invoice
+  // created before fee-at-creation.
   //
   // Runs BEFORE recordPayment because the recorded payment amount has
   // to match the invoice's TotalAmt; without the fee line, QBO would

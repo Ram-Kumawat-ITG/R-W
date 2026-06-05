@@ -750,11 +750,41 @@ order date is the closest meaningful "ship on or after" marker.
 Unparseable → omitted (QBO leaves the field blank on the rendered
 invoice).
 
-**Processing-fee line — applied at settlement, per actual method.**
-A `<Method> Processing Fee – <X>%` line is appended to the QBO invoice
-the moment a payment is processed. The fee is decided by the **actual
-settlement method**, not the customer's preference, and per-method
-rates are configurable:
+**Discount line.** When a Shopify order carries an aggregate
+`total_discounts > 0` (coupon / referral), `shopifyLinesToQboLines`
+emits a single QBO `DiscountLineDetail` line (`{ kind: 'discount' }` →
+`qbo.utils.toInvoiceLine`) so the QBO invoice total reconciles with
+Shopify's post-discount `total_price`. Without it the invoice would
+over-state by the discount amount. Ordering on the invoice line array:
+product lines → discount → shipping → processing fee.
+
+**Tax — summary row, not a line.** Tax is **not** emitted as a product
+line. The order's `total_tax` is passed to `qbo.service.createInvoice`
+as `TxnTaxDetail.TotalTax`, which QBO renders in the invoice's summary
+"Tax" row (alongside Subtotal / Discount / Total) instead of in the
+Products section. It is only sent when `total_tax > 0` — most wholesale
+orders are tax-exempt, so the field is usually omitted and QBO's own
+($0) calculation stands. The override reconciles the total exactly for
+non-AST companies; **US automated-sales-tax companies may recompute and
+ignore the override** — for tax-exempt customers that still resolves to
+$0, so the practical impact is nil.
+
+> **Why only tax (and discount) reach the summary.** QBO renders the
+> customer invoice (emailed via `/invoice/{id}/send`, PDF via
+> `/invoice/{id}/pdf`); the app only feeds it a `Line[]` array plus a few
+> native fields. QBO's summary block has native slots **only** for
+> Subtotal, Discount (`DiscountLineDetail`), Tax (`TxnTaxDetail`), and
+> Total — there is **no API field for a shipping amount or a custom
+> processing-fee surcharge** (confirmed against the QBO Invoice entity:
+> `ShipMethodRef` / `ShipDate` / `ShipAddr` are metadata only, with no
+> freight/shipping-cost field). So **shipping and the processing fee
+> necessarily remain line items** in the Products section; only tax could
+> be moved into the summary without switching to an app-rendered invoice.
+
+**Processing-fee line — applied at creation for card / ACH; at
+settlement as the fallback.** A `<Method> Processing Fee – <X>%` line is
+added to the QBO invoice so the customer sees the full amount up front
+on the invoice they're emailed. Per-method rates are configurable:
 
 | Method  | Default rate | Env var |
 |---|---|---|
@@ -762,12 +792,28 @@ rates are configurable:
 | ACH | `1%` | `INVOICE_FEE_RATE_ACH` |
 | Cheque | `0%` | `INVOICE_FEE_RATE_CHECK` |
 
-| Settlement path | Fee applied? |
+**At creation** (`invoice.service.createInvoiceForOrder`): for a card or
+ACH invoice (any non-zero rate), the fee is computed on the order's
+post-discount grand total (`order.total_price`) and pushed onto the QBO
+`Line` array before the create call, so `TotalAmt` (→ `amountDue`) is
+fee-inclusive from the start. The staging fields
+(`processingFeeAmount` / `processingFeeRate` / `processingFeeMethod`)
+and `processingFeeAppliedAt` are stamped at the same time. A cheque
+invoice (0%) gets **no** fee line and leaves `processingFeeAppliedAt`
+unset.
+
+**At settlement** (fallback): the table below shows which paths add the
+fee for invoices that did **not** get it at creation — the cheque → card
+admin override (a cheque invoice with no fee, settled by card, picks up
+the 3% card rate) and any legacy invoice created before fee-at-creation.
+Because every settlement path guards on `!processingFeeAppliedAt`, a
+card / ACH invoice that already carries the fee is never double-charged.
+
+| Settlement path | Fee applied at settlement? |
 |---|---|
-| CRON auto-charge (card-preferred customer) | ✓ card rate |
-| Admin **Retry payment** (card-preferred) | ✓ card rate |
+| CRON auto-charge / **Retry payment** (card or ACH, fee already at creation) | ✗ already on invoice |
 | Admin **Charge card on file** (cheque → card fallback) | ✓ card rate |
-| Admin **Mark ACH paid** (`kind='ach'`) | ✓ ACH rate |
+| Admin **Mark ACH paid** (`kind='ach'`, legacy / no fee yet) | ✓ ACH rate |
 | Admin **Mark cheque paid** (`kind='cheque'`) | ✗ (0% by default) |
 | Declined / errored card attempt | ✗ (only successful payments write the line) |
 
@@ -2357,8 +2403,8 @@ required values throw immediately.
 | `ACH_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **ACH** invoices (§7.3) |
 | `CARD_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **card** invoices (§7.3) |
 | `INVOICE_TERMS_MINUTES` | `0` | Extra minutes added on top of `INVOICE_TERMS_DAYS` for the local full-datetime `Invoice.dueAt` field. **Testing knob** — set to `1` to flag invoices Overdue ~1 minute after creation without waiting whole days. The QBO date-only `DueDate` ignores this offset (it still rounds to `termsDays`); only the local Order List "Overdue" indicator + cheque-reminder UI uses `dueAt`. |
-| `INVOICE_FEE_RATE_CARD` | `0.03` | Per-method processing fee (decimal): card. Appended as a line at settlement when an NMI card charge approves or the cheque → card admin fallback runs. `0` disables. |
-| `INVOICE_FEE_RATE_ACH` | `0.01` | Per-method processing fee (decimal): ACH. Appended on `kind='ach'` manual receipts. `0` disables. |
+| `INVOICE_FEE_RATE_CARD` | `0.03` | Per-method processing fee (decimal): card. Added as a line at invoice creation for card invoices (and at settlement for the cheque → card admin fallback / legacy invoices). `0` disables. |
+| `INVOICE_FEE_RATE_ACH` | `0.01` | Per-method processing fee (decimal): ACH. Added as a line at invoice creation for ACH invoices (and on legacy `kind='ach'` manual receipts). `0` disables. |
 | `INVOICE_FEE_RATE_CHECK` | `0` | Per-method processing fee (decimal): cheque. Defaults to no fee. |
 | **Payments** | | |
 | `PAYMENT_CHARGE_IMMEDIATELY` | `false` | `true` = NMI charge in webhook process |

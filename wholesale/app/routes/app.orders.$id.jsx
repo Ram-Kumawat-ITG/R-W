@@ -18,7 +18,11 @@ import {
   resolveCustomerAchBillingId,
 } from "../services/customer/customer.service";
 import { invoiceConfig } from "../services/invoice/invoice.config";
-import { computeProcessingFee, processingFeeLabel } from "../services/invoice/invoice.utils";
+import {
+  computeProcessingFee,
+  processingFeeLabel,
+  computeInvoiceCalculation,
+} from "../services/invoice/invoice.utils";
 import {
   KV,
   TotalsRow,
@@ -348,6 +352,18 @@ function projectQboInvoice(inv) {
       };
     });
 
+  // Mirror QBO's invoice summary block. On the QBO-rendered invoice,
+  // SUBTOTAL is the sum of ALL line items (products + shipping + processing
+  // fee); the DiscountLineDetail amount is then subtracted to reach TOTAL.
+  // We surface the same figures so the in-app panel matches the rendered
+  // invoice exactly.
+  const lineSubtotal = Number(
+    itemLines.reduce((s, l) => s + (l.amount || 0), 0).toFixed(2),
+  );
+  const discount = lines
+    .filter((l) => l.DetailType === "DiscountLineDetail")
+    .reduce((s, l) => s + (l.Amount != null ? Number(l.Amount) : 0), 0);
+
   const linkedPayments = (inv.LinkedTxn || [])
     .filter((t) => t.TxnType === "Payment")
     .map((t) => ({ id: t.TxnId }));
@@ -372,6 +388,9 @@ function projectQboInvoice(inv) {
     createTime: inv.MetaData?.CreateTime || null,
     lastUpdatedTime: inv.MetaData?.LastUpdatedTime || null,
     lines: itemLines,
+    // Mirror QBO's summary block: SUBTOTAL (all lines) − DISCOUNT → TOTAL.
+    lineSubtotal,
+    discount: Number(discount.toFixed(2)),
     linkedPayments,
   };
 }
@@ -412,9 +431,20 @@ function extractBreakdown(rawPayload, fallbackCurrency) {
     rawPayload.total_shipping_price_set?.shop_money?.amount ?? 0,
   );
 
+  const discounts = Number(rawPayload.total_discounts ?? 0);
+  // Gross (pre-discount) line-items total — the "Order Subtotal" row.
+  // Shopify's `subtotal_price` is already net of discounts, so we prefer
+  // `total_line_items_price` for the gross figure and fall back to
+  // reconstructing it (subtotal + discounts) for older payloads.
+  const lineItemsTotal = Number(
+    rawPayload.total_line_items_price ??
+      Number(rawPayload.subtotal_price ?? 0) + discounts,
+  );
   const totals = {
+    lineItemsTotal,
+    // Adjusted (post-discount) subtotal — Shopify's subtotal_price.
     subtotal: Number(rawPayload.subtotal_price ?? rawPayload.total_line_items_price ?? 0),
-    discounts: Number(rawPayload.total_discounts ?? 0),
+    discounts,
     shipping,
     tax: Number(rawPayload.total_tax ?? 0),
     taxesIncluded: Boolean(rawPayload.taxes_included),
@@ -1168,6 +1198,49 @@ export default function OrderDetail() {
       ? Number(((outstanding ?? 0) + (cardFeePreview?.amount ?? 0)).toFixed(2))
       : null;
 
+  // Full invoice-calculation breakdown for the totals box: Order Subtotal →
+  // Discount → Adjusted Subtotal → Shipping → Tax → Payment Processing Fee →
+  // Grand Total. The fee + grand total come from the invoice when one exists
+  // (processingFeeAmount + amountDue are the source of truth — exactly what
+  // QBO holds / what will be charged). Before an invoice exists, fall back to
+  // a fee preview keyed on the order-time payment method so the customer
+  // still sees the expected fee. Returns null when there are no Shopify
+  // totals (legacy orders with no rawPayload).
+  const invoiceCalc = (() => {
+    if (!breakdown?.totals) return null;
+    const method = invoice?.paymentMethod || null;
+    let fee = null;
+    let grandTotalOverride;
+    if (invoice?.processingFeeAmount > 0) {
+      // Fee already stamped on the invoice (card / ACH at creation, or any
+      // settlement-applied fee). amountDue is the fee-inclusive total.
+      fee = {
+        amount: invoice.processingFeeAmount,
+        label: processingFeeLabel(invoice.processingFeeMethod || method),
+      };
+      grandTotalOverride = Number(invoice.amountDue);
+    } else if (method) {
+      // No fee on the invoice yet (e.g. cheque, 0% — or an invoice not yet
+      // created with a known method). Preview it from the order total so the
+      // line still renders for non-zero methods.
+      const preview = computeProcessingFee({
+        baseAmount: breakdown.totals.grandTotal,
+        method,
+        rates: processingFeeRates,
+      });
+      if (preview) {
+        fee = { amount: preview.amount, label: processingFeeLabel(method) };
+      }
+      // When an invoice exists its amountDue is authoritative even with no fee.
+      if (invoice) grandTotalOverride = Number(invoice.amountDue);
+    }
+    return computeInvoiceCalculation({
+      totals: breakdown.totals,
+      fee,
+      grandTotalOverride,
+    });
+  })();
+
   return (
     <s-page inlineSize="large" heading={`Order ${orderLabel}`}>
       <s-button
@@ -1422,7 +1495,7 @@ export default function OrderDetail() {
               </s-table-body>
             </s-table>
 
-            {breakdown.totals && (
+            {invoiceCalc && (
               <s-box
                 padding="base"
                 border="base"
@@ -1431,34 +1504,42 @@ export default function OrderDetail() {
               >
                 <s-stack direction="block" gap="tight">
                   <TotalsRow
-                    label="Subtotal"
-                    value={formatAmount(breakdown.totals.subtotal, breakdown.currency)}
+                    label="Order subtotal"
+                    value={formatAmount(invoiceCalc.orderSubtotal, breakdown.currency)}
                   />
-                  {breakdown.totals.discounts > 0 && (
-                    <TotalsRow
-                      label="Discounts"
-                      value={`− ${formatAmount(breakdown.totals.discounts, breakdown.currency)}`}
-                      tone="success"
-                    />
+                  {invoiceCalc.discount > 0 && (
+                    <>
+                      <TotalsRow
+                        label="Discount"
+                        value={`− ${formatAmount(invoiceCalc.discount, breakdown.currency)}`}
+                        tone="success"
+                      />
+                      <TotalsRow
+                        label="Adjusted subtotal"
+                        value={formatAmount(invoiceCalc.adjustedSubtotal, breakdown.currency)}
+                      />
+                    </>
                   )}
-                  {breakdown.totals.shipping > 0 && (
+                  {invoiceCalc.shipping > 0 && (
                     <TotalsRow
                       label="Shipping"
-                      value={formatAmount(breakdown.totals.shipping, breakdown.currency)}
+                      value={formatAmount(invoiceCalc.shipping, breakdown.currency)}
                     />
                   )}
                   <TotalsRow
-                    label={
-                      breakdown.totals.taxesIncluded
-                        ? "Tax (included)"
-                        : "Tax"
-                    }
-                    value={formatAmount(breakdown.totals.tax, breakdown.currency)}
+                    label={invoiceCalc.taxesIncluded ? "Tax (included)" : "Tax"}
+                    value={formatAmount(invoiceCalc.tax, breakdown.currency)}
                   />
+                  {invoiceCalc.fee && (
+                    <TotalsRow
+                      label={invoiceCalc.fee.label}
+                      value={formatAmount(invoiceCalc.fee.amount, breakdown.currency)}
+                    />
+                  )}
                   <s-divider />
                   <TotalsRow
                     label="Grand total"
-                    value={formatAmount(breakdown.totals.grandTotal, breakdown.currency)}
+                    value={formatAmount(invoiceCalc.grandTotal, breakdown.currency)}
                     strong
                   />
                 </s-stack>
@@ -2101,6 +2182,9 @@ export default function OrderDetail() {
                   </s-table>
                 )}
 
+                {/* Mirror the QBO-rendered invoice summary exactly:
+                    SUBTOTAL (sum of all lines) → DISCOUNT → TAX →
+                    TOTAL → TOTAL OF NEW CHARGES → BALANCE DUE. */}
                 <s-box
                   padding="base"
                   border="base"
@@ -2109,11 +2193,27 @@ export default function OrderDetail() {
                 >
                   <s-stack direction="block" gap="tight">
                     <TotalsRow
-                      label="Tax"
-                      value={formatAmount(qbo.invoice.totalTax, qbo.invoice.currency)}
+                      label="Subtotal"
+                      value={formatAmount(qbo.invoice.lineSubtotal, qbo.invoice.currency)}
                     />
+                    {qbo.invoice.discount > 0 && (
+                      <TotalsRow
+                        label="Discount"
+                        value={`-${formatAmount(qbo.invoice.discount, qbo.invoice.currency)}`}
+                      />
+                    )}
+                    {qbo.invoice.totalTax > 0 && (
+                      <TotalsRow
+                        label="Tax"
+                        value={formatAmount(qbo.invoice.totalTax, qbo.invoice.currency)}
+                      />
+                    )}
                     <TotalsRow
                       label="Total"
+                      value={formatAmount(qbo.invoice.totalAmt, qbo.invoice.currency)}
+                    />
+                    <TotalsRow
+                      label="Total of new charges"
                       value={formatAmount(qbo.invoice.totalAmt, qbo.invoice.currency)}
                     />
                     <s-divider />
