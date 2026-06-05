@@ -376,7 +376,7 @@ export async function action({ request }) {
     customerId = await createCustomer(admin, {
       application: payload,
       note,
-      tags: ["Approved"],
+      tags: ["Approved", "practitioner"],
       subscribeNews: Boolean(payload.subscribeNews),
     });
 

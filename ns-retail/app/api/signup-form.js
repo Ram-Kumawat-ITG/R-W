@@ -122,9 +122,17 @@ export async function action({ request }) {
   // Tags include the verified code (per user spec: "save it on customer
   // tag not in metafield"). Format: code:<the-code>. Future order webhooks
   // grep tags for `code:*` to attribute commissions.
+  //
+  // We ALSO tag the customer with the practitioner's bare email so the
+  // admin can filter "all patients referred by drjohn@example.com" in
+  // Shopify admin's customer list. Bare email (no prefix) per locked
+  // decision 2026-06-04.
   const tags = ["Signup-Self"];
   if (verifiedCode) {
     tags.push(`code:${verifiedCode}`);
+    if (verifiedCodeDoc?.practitionerEmail) {
+      tags.push(verifiedCodeDoc.practitionerEmail);
+    }
   }
 
   const customerInput = {

@@ -85,12 +85,13 @@ const wholesaleApplicationSchema = new mongoose.Schema(
 
     status: {
       type: String,
-      enum: ["pending", "approved", "rejected"],
+      enum: ["pending", "approved", "rejected", "blocked"],
       default: "pending",
       index: true,
     },
     submittedAt: { type: Date, default: Date.now },
     reviewedAt: { type: Date, default: null },
+    blockedAt: { type: Date, default: null },
 
     customerId: { type: String, index: true },
     nmiCustomerVaultId: { type: String, default: null },

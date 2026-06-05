@@ -24,6 +24,7 @@ export default [
   route("/api/admin/customers", "api/admin/customers.js"),
   route("/api/admin/customers/:id", "api/admin/customer.js"),
   route("/api/admin/customers/:id/decline", "api/admin/decline.js"),
+  route("/api/admin/customers/:id/block", "api/admin/block.js"),
   route("/api/admin/orders/:id/retry-payment", "api/admin/retry-payment.js"),
   route("/api/admin/orders/:id/mark-cheque-paid", "api/admin/mark-cheque-paid.js"),
   route("/api/admin/orders/:id/charge-card", "api/admin/charge-card.js"),

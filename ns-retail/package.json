@@ -5,7 +5,7 @@
     "build": "react-router build",
     "build:signup": "npm --prefix signup-form run build",
     "predeploy": "npm run build:signup",
-    "dev": "shopify app dev",
+    "dev": "shopify app dev --graphiql-port=13458",
     "config:link": "shopify app config link",
     "generate": "shopify app generate",
     "deploy": "shopify app deploy",

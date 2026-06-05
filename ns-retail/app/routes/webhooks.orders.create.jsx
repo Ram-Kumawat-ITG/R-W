@@ -58,7 +58,75 @@ export async function action({ request }) {
     );
   });
 
+  // Drop-ship forwarder — POST the full order payload to the wholesale
+  // app's /api/sync/retail-order so it can create the parallel wholesale
+  // Shopify order, wholesale invoice, and retail QBO bill.
+  //
+  // This is INDEPENDENT of the CDO tagging logic above — every retail
+  // order needs to flow to wholesale regardless of whether a practitioner
+  // code was used. Fire-and-forget; failures here do NOT block the
+  // webhook 200 response.
+  forwardToWholesaleDropship({ payload, retailShop: shop }).catch((err) => {
+    console.error(
+      `[webhooks.orders.create] forward-to-wholesale failed for order ${payload?.id}:`,
+      err?.message || err,
+    );
+  });
+
   return new Response(null, { status: 200 });
+}
+
+// ── Drop-ship forwarder ─────────────────────────────────────────────────
+//
+// Reads three env vars (set in ns-retail/.env):
+//   WHOLESALE_API_BASE   - e.g. "https://abc.trycloudflare.com" — the
+//                          wholesale app's current public URL
+//   WHOLESALE_SHOP       - e.g. "ns-wholesale.myshopify.com" — passed as
+//                          ?shop=... query param so wholesale knows which
+//                          tenant to operate on
+//   RETAIL_SYNC_SECRET   - shared secret matching wholesale/.env's same
+//                          var; sent as x-sync-secret header for auth
+//
+// If any env var is missing, logs once and skips — the webhook still
+// returns 200, and the CDO tagging logic continues to work. This lets
+// devs run ns-retail standalone without the wholesale app booted.
+async function forwardToWholesaleDropship({ payload, retailShop }) {
+  // eslint-disable-next-line no-undef
+  const apiBase = process.env.WHOLESALE_API_BASE;
+  // eslint-disable-next-line no-undef
+  const wholesaleShop = process.env.WHOLESALE_SHOP;
+  // eslint-disable-next-line no-undef
+  const syncSecret = process.env.RETAIL_SYNC_SECRET;
+
+  if (!apiBase || !wholesaleShop || !syncSecret) {
+    console.warn(
+      "[forward-to-wholesale] missing env (WHOLESALE_API_BASE/WHOLESALE_SHOP/RETAIL_SYNC_SECRET) — skipping forward",
+    );
+    return;
+  }
+
+  const url = new URL(`${apiBase.replace(/\/$/, "")}/api/sync/retail-order`);
+  url.searchParams.set("shop", wholesaleShop);
+  if (retailShop) url.searchParams.set("retail_shop", retailShop);
+
+  const res = await fetch(url.toString(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-sync-secret": syncSecret,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(
+      `wholesale /api/sync/retail-order returned ${res.status}: ${text.slice(0, 200)}`,
+    );
+  }
+  console.log(
+    `[forward-to-wholesale] order ${payload?.id} forwarded (status ${res.status})`,
+  );
 }
 
 async function processOrder({ shop, payload }) {
@@ -92,7 +160,12 @@ async function processOrder({ shop, payload }) {
   // cdo_application by email below.
   const customerGid = payload?.customer?.admin_graphql_api_id || null;
   if (customerGid) {
-    await tagCustomerWithCode(shop, customerGid, codeDoc.code).catch((err) => {
+    await tagCustomerWithCode(
+      shop,
+      customerGid,
+      codeDoc.code,
+      codeDoc.practitionerEmail || null,
+    ).catch((err) => {
       console.error(
         `[webhooks.orders.create] tag customer ${customerGid} failed:`,
         err?.message || err,
@@ -181,8 +254,15 @@ function extractPractitionerCode(order) {
   return null;
 }
 
-async function tagCustomerWithCode(shop, customerGid, code) {
-  const newTag = `code:${code}`;
+async function tagCustomerWithCode(shop, customerGid, code, practitionerEmail) {
+  const codeTag = `code:${code}`;
+  // Bare email as a tag (no prefix) per locked decision 2026-06-04 — lets
+  // the admin filter "all patients referred by drjohn@example.com" in
+  // Shopify admin's customer list.
+  const emailTag = practitionerEmail
+    ? String(practitionerEmail).toLowerCase().trim()
+    : null;
+
   const { admin } = await unauthenticated.admin(shop);
 
   // Fetch existing tags so we don't clobber other tags
@@ -195,8 +275,14 @@ async function tagCustomerWithCode(shop, customerGid, code) {
   const fetchData = await fetchRes.json();
   const existing = fetchData?.data?.customer?.tags || [];
 
-  if (existing.includes(newTag)) {
-    console.log(`[webhooks.orders.create] tag "${newTag}" already on ${customerGid}`);
+  // Determine which tags are missing — skip the whole update if both
+  // are already present.
+  const toAdd = [];
+  if (!existing.includes(codeTag)) toAdd.push(codeTag);
+  if (emailTag && !existing.includes(emailTag)) toAdd.push(emailTag);
+
+  if (!toAdd.length) {
+    console.log(`[webhooks.orders.create] tags already on ${customerGid}`);
     return;
   }
 
@@ -209,7 +295,7 @@ async function tagCustomerWithCode(shop, customerGid, code) {
     }`,
     {
       variables: {
-        input: { id: customerGid, tags: [...existing, newTag] },
+        input: { id: customerGid, tags: [...existing, ...toAdd] },
       },
     },
   );
@@ -220,7 +306,9 @@ async function tagCustomerWithCode(shop, customerGid, code) {
       `customerUpdate userErrors: ${errs.map((e) => e.message).join("; ")}`,
     );
   }
-  console.log(`[webhooks.orders.create] tagged ${customerGid} with "${newTag}"`);
+  console.log(
+    `[webhooks.orders.create] tagged ${customerGid} with ${toAdd.map((t) => `"${t}"`).join(", ")}`,
+  );
 }
 
 function buildReferralSnapshot(codeDoc) {

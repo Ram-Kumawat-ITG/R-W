@@ -156,7 +156,7 @@ export default function CustomersList() {
     handledDeclineRef.current = declineFetcher.data;
 
     if (declineFetcher.data.status === "success") {
-      shopify?.toast?.show("Customer declined and removed.");
+      shopify?.toast?.show("Customer blocked.");
       setDecliningId(null);
     } else if (declineFetcher.data.status === "error") {
       shopify?.toast?.show(
@@ -255,7 +255,7 @@ export default function CustomersList() {
     setDecliningId(id);
     declineFetcher.submit(null, {
       method: "POST",
-      action: `/api/admin/customers/${id}/decline`,
+      action: `/api/admin/customers/${id}/block`,
     });
     setPendingDeclineRow(null);
   };
@@ -421,6 +421,8 @@ export default function CustomersList() {
                     <s-table-cell>
                       {r.shopifyCreateFailed ? (
                         <s-badge tone="critical">Sync failed</s-badge>
+                      ) : r.status === "blocked" ? (
+                        <s-badge tone="critical">Blocked</s-badge>
                       ) : (
                         <s-badge tone="success">Approved</s-badge>
                       )}
@@ -435,14 +437,16 @@ export default function CustomersList() {
                         <s-button
                           variant="secondary"
                           tone="critical"
-                          icon="delete"
-                          accessibilityLabel={`Decline ${fullName}`}
+                          disabled={r.status === "blocked"}
+                          accessibilityLabel={`Block ${fullName}`}
                           onClick={(e) => {
                             e.stopPropagation();
                             openDeclineModal(r);
                           }}
                           {...(decliningId === r.id ? { loading: true } : {})}
-                        ></s-button>
+                        >
+                          Block
+                        </s-button>
                       </s-stack>
                     </s-table-cell>
                   </s-table-row>
@@ -490,13 +494,14 @@ export default function CustomersList() {
 
       <s-modal
         ref={declineModalRef}
-        id="decline-customer-modal"
-        heading="Decline and delete this customer?"
-        accessibilityLabel="Decline customer confirmation"
+        id="block-customer-modal"
+        heading="Block this customer?"
+        accessibilityLabel="Block customer confirmation"
       >
         <s-paragraph>
-          This will remove the customer from Shopify, delete their record from
-          the database, and send them a rejection email. This cannot be undone.
+          This customer will be tagged as Blocked in Shopify. They keep their
+          record and order history, but won't be able to place new wholesale
+          orders. You can reverse this later.
         </s-paragraph>
         <s-button
           slot="primary-action"
@@ -505,7 +510,7 @@ export default function CustomersList() {
           onClick={onConfirmDecline}
           {...(declineFetcher.state !== "idle" ? { loading: true } : {})}
         >
-          Decline &amp; delete
+          Block customer
         </s-button>
         <s-button slot="secondary-actions" onClick={closeDeclineModal}>
           Cancel

@@ -1,16 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import mongoose from "mongoose";
-import {
-  useLoaderData,
-  useNavigate,
-  useFetcher,
-} from "react-router";
+import { useLoaderData, useNavigate, useFetcher } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import connectDB from "../services/APIService/mongo.service";
 import WholesaleApplication from "../models/wholesaleApplication.server";
 import { buildShopifyNote } from "../services/shopify/shopify.utils";
-import { CREDENTIAL_MAP, REFERRAL_MAP } from "../services/shopify/shopify.constants";
+import {
+  CREDENTIAL_MAP,
+  REFERRAL_MAP,
+} from "../services/shopify/shopify.constants";
 import { KV } from "../components/admin-ui";
 
 export const loader = async ({ request, params }) => {
@@ -67,23 +66,23 @@ export default function CustomerDetail() {
     handledDeclineRef.current = fetcher.data;
 
     if (fetcher.data.status === "success") {
-      shopify?.toast?.show("Customer declined and removed.");
+      shopify?.toast?.show("Customer blocked.");
       navigate("/app/customers");
     } else if (fetcher.data.status === "error") {
       setBannerError(
         fetcher.data.result?.detail ||
           fetcher.data.message ||
-          "Decline failed. Please retry.",
+          "Block failed. Please retry.",
       );
     }
   }, [fetcher.data, fetcher.state, navigate, shopify]);
 
-  const onConfirmDecline = () => {
+  const onConfirmBlock = () => {
     setBannerError(null);
     closeModal();
     fetcher.submit(null, {
       method: "POST",
-      action: `/api/admin/customers/${a._id}/decline`,
+      action: `/api/admin/customers/${a._id}/block`,
     });
     navigate("/app/customers");
   };
@@ -114,6 +113,7 @@ export default function CustomerDetail() {
   const submittedLabel = a.submittedAt
     ? new Date(a.submittedAt).toLocaleString()
     : null;
+  const status = a.status;
   const expandedCred = selectedCreds.find((c) => c.id === expandedCredId);
   const parsedNote = parseNote(shopifyNote);
 
@@ -127,16 +127,17 @@ export default function CustomerDetail() {
       >
         Back
       </s-button>
-      <s-button
-        slot="primary-action"
-        variant="primary"
-        tone="critical"
-        icon="delete"
-        onClick={openModal}
-        {...(declining ? { loading: true } : {})}
-      >
-        Decline
-      </s-button>
+      {status !== "blocked" && (
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          tone="critical"
+          onClick={openModal}
+          {...(declining ? { loading: true } : {})}
+        >
+          Block customer
+        </s-button>
+      )}
 
       <s-box paddingBlockStart="large-200" />
 
@@ -161,8 +162,8 @@ export default function CustomerDetail() {
       {a.phoneDuplicate && (
         <s-banner tone="info" heading="Duplicate phone number detected">
           <s-paragraph>
-            Another wholesale application uses the same phone number ({a.phone || "—"}).
-            Review carefully before approving.
+            Another wholesale application uses the same phone number (
+            {a.phone || "—"}). Review carefully before approving.
           </s-paragraph>
         </s-banner>
       )}
@@ -174,7 +175,13 @@ export default function CustomerDetail() {
             {a.shopifyCreateFailed ? (
               <s-badge tone="critical">Sync failed</s-badge>
             ) : (
-              <s-badge tone="success">Approved</s-badge>
+              <s-badge
+                tone={
+                  status.toLowerCase() === "blocked" ? "critical" : "success"
+                }
+              >
+                {status}
+              </s-badge>
             )}
             {submittedLabel && (
               <s-text tone="subdued">Submitted {submittedLabel}</s-text>
@@ -421,7 +428,9 @@ export default function CustomerDetail() {
                 </s-text>
               </s-box>
             ) : (
-              <s-paragraph tone="subdued">Signature value not available.</s-paragraph>
+              <s-paragraph tone="subdued">
+                Signature value not available.
+              </s-paragraph>
             )}
           </s-stack>
         )}
@@ -448,7 +457,10 @@ export default function CustomerDetail() {
             )}
             {a.payment.cardLast4 && (
               <s-grid-item>
-                <KV label="Card number" value={`•••• •••• •••• ${a.payment.cardLast4}`} />
+                <KV
+                  label="Card number"
+                  value={`•••• •••• •••• ${a.payment.cardLast4}`}
+                />
               </s-grid-item>
             )}
             {(a.payment.cardExpMonth || a.payment.cardExpYear) && (
@@ -501,22 +513,23 @@ export default function CustomerDetail() {
 
       <s-modal
         ref={modalRef}
-        id="decline-customer-modal"
-        heading="Decline and delete this customer?"
-        accessibilityLabel="Decline customer confirmation"
+        id="block-customer-modal"
+        heading="Block this customer?"
+        accessibilityLabel="Block customer confirmation"
       >
         <s-paragraph>
-          This will remove the customer from Shopify, delete their record from
-          the database, and send them a rejection email. This cannot be undone.
+          This customer will be tagged as Blocked in Shopify. They keep their
+          record and order history, but won't be able to place new wholesale
+          orders. You can reverse this later.
         </s-paragraph>
         <s-button
           slot="primary-action"
           variant="primary"
           tone="critical"
-          onClick={onConfirmDecline}
+          onClick={onConfirmBlock}
           {...(declining ? { loading: true } : {})}
         >
-          Decline &amp; delete
+          Block customer
         </s-button>
         <s-button slot="secondary-actions" onClick={closeModal}>
           Cancel
@@ -525,7 +538,6 @@ export default function CustomerDetail() {
     </s-page>
   );
 }
-
 
 function AddressBlock({ addr }) {
   if (!addr || (!addr.line1 && !addr.city && !addr.zip)) {
