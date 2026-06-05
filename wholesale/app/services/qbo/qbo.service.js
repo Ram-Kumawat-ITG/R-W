@@ -6,6 +6,7 @@ import { qbo, qboGetBinary } from './qbo.apis'
 import { qboConfig } from './qbo.config'
 import { QBO_APP_URLS } from './qbo.constants'
 import { escapeQboQuery, toCustomerPayload, toInvoiceLine, toQboAddress } from './qbo.utils'
+import QboItemMap from '../../models/qboItemMap.server'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('qbo.service')
@@ -46,6 +47,128 @@ export async function findOrCreateCustomer(profile) {
   return { customer: created, created: true }
 }
 
+// ── Items (SKU column support) ───────────────────────────────────────
+//
+// QBO sources an invoice's SKU column from the referenced Item's `Sku`
+// field (there's no per-line SKU). To show SKUs we reference a per-product
+// QBO Item carrying that SKU. `findOrCreateItemBySku` mirrors the customer
+// find-or-create + caches the resolved id in `qbo_item_maps`. Everything
+// here is best-effort: createInvoice falls back to the default item when an
+// item can't be resolved, so invoicing never breaks.
+
+// Income account for newly-created Items. Resolved once from the default
+// item's IncomeAccountRef (so new items book to the same account as the
+// existing generic item), falling back to QBO_INCOME_ACCOUNT_ID. Cached
+// in-module; `undefined` = not yet resolved, `null` = resolved-but-none.
+let cachedIncomeAccountRef
+async function resolveIncomeAccountRef() {
+  if (cachedIncomeAccountRef !== undefined) return cachedIncomeAccountRef
+  try {
+    const res = await qbo.get(`/item/${encodeURIComponent(qboConfig.defaultItemId)}`)
+    const ref = res?.Item?.IncomeAccountRef
+    if (ref?.value) {
+      cachedIncomeAccountRef = { value: String(ref.value) }
+      return cachedIncomeAccountRef
+    }
+  } catch (err) {
+    log.warn('item.income_account.lookup_failed', { err: err?.message || String(err) })
+  }
+  cachedIncomeAccountRef = qboConfig.incomeAccountId
+    ? { value: String(qboConfig.incomeAccountId) }
+    : null
+  return cachedIncomeAccountRef
+}
+
+async function findItemBySku(sku) {
+  if (!sku) return null
+  const stmt = `SELECT * FROM Item WHERE Sku = '${escapeQboQuery(sku)}' MAXRESULTS 1`
+  const res = await qbo.query(stmt)
+  return res?.QueryResponse?.Item?.[0] || null
+}
+
+async function findItemByName(name) {
+  if (!name) return null
+  const stmt = `SELECT * FROM Item WHERE Name = '${escapeQboQuery(name)}' MAXRESULTS 1`
+  const res = await qbo.query(stmt)
+  return res?.QueryResponse?.Item?.[0] || null
+}
+
+// QBO Item Name must be UNIQUE and cannot contain ':'. Multiple products /
+// variants frequently share a display name but have different SKUs, so we
+// make the Name unique by appending the SKU — otherwise QBO rejects the
+// second create as a duplicate name and we'd be forced to reuse the wrong
+// item (the bug that showed every line with the first line's SKU). Clamp to
+// QBO's 100-char Name limit.
+function sanitizeItemName(name, sku) {
+  const base = String(name || '').replace(/:/g, '-').trim()
+  const skuPart = sku ? ` (${String(sku).replace(/:/g, '-').trim()})` : ''
+  let full = `${base}${skuPart}`.trim()
+  if (!full) full = sku ? `SKU ${sku}` : 'Item'
+  return full.length > 100 ? full.slice(0, 100).trim() : full
+}
+
+async function createItem({ name, sku }) {
+  const incomeRef = await resolveIncomeAccountRef()
+  if (!incomeRef) throw new Error('cannot create QBO Item — no IncomeAccountRef available')
+  const Name = sanitizeItemName(name, sku)
+  const payload = { Name, Sku: sku, Type: 'Service', IncomeAccountRef: incomeRef }
+  try {
+    const res = await qbo.post('/item', payload)
+    const created = res?.Item
+    if (!created?.Id) throw new Error('QBO item create returned no Id')
+    return created
+  } catch (err) {
+    // Name collision (pre-existing item, or a concurrent create won the
+    // race). Adopt the existing item ONLY when its SKU matches what we're
+    // resolving — never return an item with a different SKU (that's what
+    // previously caused every line to show the first line's SKU).
+    if (/duplicate name|6240/i.test(err?.message || '')) {
+      const existing = await findItemByName(Name)
+      if (existing?.Id && String(existing.Sku || '') === String(sku || '')) {
+        return existing
+      }
+    }
+    throw err
+  }
+}
+
+// Resolve a SKU to a QBO Item id: cache → QBO query-by-SKU → create. Caches
+// the result. Returns the id, or null on any failure (caller falls back to
+// the default item). `name` seeds a new item's Name.
+export async function findOrCreateItemBySku({ sku, name }) {
+  const clean = sku ? String(sku).trim() : ''
+  if (!clean) return null
+  try {
+    // Trust a cache hit ONLY when the stored row records the SAME SKU on the
+    // mapped item. Rows missing `qboSku` (or with a mismatch) are stale /
+    // poisoned by the earlier name-collision bug — re-resolve + overwrite.
+    const cached = await QboItemMap.findOne({ sku: clean }).select('qboItemId qboSku').lean()
+    if (cached?.qboItemId && cached.qboSku === clean) return cached.qboItemId
+
+    let item = await findItemBySku(clean)
+    if (!item) item = await createItem({ name, sku: clean })
+    const qboItemId = item?.Id ? String(item.Id) : null
+    if (qboItemId) {
+      await QboItemMap.updateOne(
+        { sku: clean },
+        {
+          $set: {
+            qboItemId,
+            qboSku: item?.Sku ? String(item.Sku) : clean,
+            name: name || item?.Name || undefined,
+          },
+        },
+        { upsert: true },
+      )
+      console.log(`[items] resolved SKU "${clean}" → QBO item ${qboItemId}`)
+    }
+    return qboItemId
+  } catch (err) {
+    log.warn('item.resolve_failed', { sku: clean, err: err?.message || String(err) })
+    return null
+  }
+}
+
 // ── Invoice ──────────────────────────────────────────────────────────
 
 export async function createInvoice({
@@ -62,6 +185,17 @@ export async function createInvoice({
   if (!qboCustomerId) throw new Error('createInvoice: qboCustomerId is required')
   if (!Array.isArray(lines) || lines.length === 0) {
     throw new Error('createInvoice: at least one line is required')
+  }
+
+  // Resolve per-product QBO Items so the invoice's SKU column populates.
+  // Best-effort per line: a null result leaves `qboItemId` unset and
+  // toInvoiceLine falls back to the default item (current behavior). Only
+  // product lines carry a `sku`; shipping / discount / processing-fee lines
+  // are skipped and stay on the default item.
+  for (const l of lines) {
+    if (l.kind === 'discount' || !l.sku) continue
+    const itemId = await findOrCreateItemBySku({ sku: l.sku, name: l.name })
+    if (itemId) l.qboItemId = itemId
   }
 
   const shipAddrPayload = toQboAddress(shipAddr)

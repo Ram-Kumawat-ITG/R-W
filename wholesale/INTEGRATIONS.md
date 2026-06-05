@@ -861,6 +861,37 @@ order date is the closest meaningful "ship on or after" marker.
 Unparseable → omitted (QBO leaves the field blank on the rendered
 invoice).
 
+**Per-product Items (SKU column).** QBO sources an invoice's SKU column
+from the referenced **`Item.Sku`** — there is no per-line SKU field. So
+`createInvoice` resolves each **product** line's SKU to a per-product QBO
+**Item** carrying that SKU and sets `line.qboItemId` (which
+`qbo.utils.toInvoiceLine` already honors, falling back to
+`QBO_DEFAULT_ITEM_ID`). `qbo.service.findOrCreateItemBySku({ sku, name })`
+mirrors `findOrCreateCustomer`: cache (`qbo_item_maps`, `sku` unique) →
+`findItemBySku` (QL `WHERE Sku=…`) → `createItem` (`POST /item`,
+`Type:'Service'`, `Sku`, `IncomeAccountRef` derived once from the default
+item via `resolveIncomeAccountRef`, optional `QBO_INCOME_ACCOUNT_ID`
+fallback). **Best-effort + graceful** — a null/failed resolution or a line
+with no SKU leaves the line on the default item, so invoicing never breaks.
+`shopifyLinesToQboLines` carries `sku`+`name` on product lines; shipping /
+discount / processing-fee lines have no SKU and stay on the default item.
+The SKU is **not** put in the line Description (`formatLineDescription`
+returns name + vendor only) — it shows solely in QBO's dedicated SKU column
+via the item's `Sku`.
+
+> **Unique Item names (correctness).** QBO Item `Name` must be unique, and
+> products that share a display name but differ by SKU would otherwise
+> collide — making the second create fail and (wrongly) reuse the first
+> item, showing every line the first SKU. So `sanitizeItemName` appends the
+> SKU (`"Product (SKU)"`, ≤100 chars) → a distinct item per SKU; the
+> duplicate-Name fallback adopts an existing item **only when its `Sku`
+> matches**; and the cache stores `qboSku` so a hit is trusted only when
+> `qboSku === sku` — rows missing/mismatching it are re-resolved and
+> overwritten (self-heals any rows poisoned before this guard).
+
+Forward-only (existing invoices aren't backfilled); the SKU must exist on
+the Shopify variant.
+
 **Discount line.** When a Shopify order carries an aggregate
 `total_discounts > 0` (coupon / referral), `shopifyLinesToQboLines`
 emits a single QBO `DiscountLineDetail` line (`{ kind: 'discount' }` →

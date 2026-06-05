@@ -92,6 +92,11 @@ export function shopifyLinesToQboLines(order) {
       quantity: qty,
       unitPrice,
       amount,
+      // Carried for per-product QBO Item resolution (SKU column). The QBO
+      // service resolves `sku` → a QBO Item (carrying that SKU) and sets the
+      // line's qboItemId; lines without a sku stay on the default item.
+      sku: item.sku ? String(item.sku).trim() : undefined,
+      name: item.name || item.title || undefined,
     })
   }
   // Order-level / coupon / referral discount. Shopify reports the aggregate
@@ -310,21 +315,16 @@ export function applyDerivedPaymentStatus(invoice) {
 }
 
 // Compose the QBO invoice line description from a Shopify line_item.
-// Format: "<product name> by <vendor>, SKU: <sku>" — vendor and SKU are
-// each conditional so missing fields don't leave dangling separators.
-// We use `name` (which Shopify pre-joins as "Title - Variant Title")
-// over `title` so any variant detail survives the trip into QBO.
+// Format: "<product name> by <vendor>" — vendor is conditional. We use
+// `name` (which Shopify pre-joins as "Title - Variant Title") over `title`
+// so any variant detail survives the trip into QBO.
 //
-// SKU is normalized: some merchants enter the value in Shopify as
-// "SKU: 1234" (with the prefix baked in). Without stripping, the output
-// becomes "SKU: SKU: 1234". Strip any leading "SKU:" (case-insensitive)
-// before re-prefixing so the result is always exactly one "SKU: ".
+// SKU is deliberately NOT included here — it's carried separately on the
+// line (see shopifyLinesToQboLines) and surfaces in QBO's dedicated SKU
+// column via the referenced Item's Sku. Keeping it out of the description
+// avoids the SKU appearing twice (Products column + SKU column).
 export function formatLineDescription(item) {
   if (!item) return ''
   const productName = item.name || item.title || `Item ${item.id ?? ''}`.trim()
-  const head = item.vendor ? `${productName} by ${item.vendor}` : productName
-  const parts = [head]
-  const sku = String(item.sku || '').replace(/^\s*sku\s*:\s*/i, '').trim()
-  if (sku) parts.push(`SKU: ${sku}`)
-  return parts.join(', ')
+  return item.vendor ? `${productName} by ${item.vendor}` : productName
 }
