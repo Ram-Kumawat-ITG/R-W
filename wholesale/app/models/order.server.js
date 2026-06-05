@@ -135,6 +135,14 @@ const orderSchema = new mongoose.Schema(
     },
     trackingUpdatedAt: Date,
 
+    // Official Ship Date — sourced from Shopify, NOT the order creation date.
+    // Denormalized as the EARLIEST fulfillment date across `fulfillments[]`
+    // (i.e. when the order first shipped). Recomputed on every fulfillment
+    // sync. Per-shipment dates live on `fulfillments[].fulfilledAt` (shown
+    // for partially-fulfilled orders). Fed to the QBO invoice's ShipDate and
+    // shown on Order Details + the invoice panel + the tracking section.
+    shippedAt: Date,
+
     rawPayload: mongoose.Schema.Types.Mixed,
     receivedAt: { type: Date, default: Date.now },
     completedAt: Date,

@@ -12,11 +12,12 @@ import {
   createInvoiceForOrder,
   appendInvoiceRemark,
 } from '../invoice/invoice.service'
+import { toYmd } from '../invoice/invoice.utils'
 import { chargeInvoice } from '../payment/payment.service'
 import { validateShopifyOrder } from './order.validator'
 import { paymentConfig } from '../payment/payment.config'
 import { customerHasApprovedTag, getOrderFulfillments } from '../shopify/shopify.service'
-import { voidInvoice as voidQboInvoice, setInvoiceShippingMemo } from '../qbo/qbo.service'
+import { voidInvoice as voidQboInvoice, setInvoiceShipping } from '../qbo/qbo.service'
 import {
   normalizeCarrier,
   carrierDisplayName,
@@ -589,19 +590,47 @@ async function pushShippingToInvoice(localOrder) {
       const statusLabel = shipmentStatusLabel(f.shipmentStatus || f.status)
       return `${carrier} — ${num}${statusLabel ? ` (${statusLabel})` : ''}`
     })
-  if (!lines.length) return
+  // Official Ship Date for the QBO invoice = the Shopify fulfillment date
+  // (earliest shipment), overwriting the order-creation date set at invoice
+  // creation. Date-only (YYYY-MM-DD) to match QBO's ShipDate field.
+  const shipDate = localOrder.shippedAt ? toYmd(localOrder.shippedAt) : undefined
+  if (!lines.length && !shipDate) return
   try {
-    const updated = await setInvoiceShippingMemo({ qboInvoiceId: invoice.qboInvoiceId, lines })
+    const updated = await setInvoiceShipping({
+      qboInvoiceId: invoice.qboInvoiceId,
+      lines,
+      shipDate,
+    })
     if (updated?.SyncToken && updated.SyncToken !== invoice.qboSyncToken) {
       await Invoice.updateOne({ _id: invoice._id }, { $set: { qboSyncToken: updated.SyncToken } })
     }
-    console.log(`[orders] shipping synced to QBO invoice ${invoice.qboInvoiceId} (${lines.length} line(s))`)
+    console.log(
+      `[orders] shipping synced to QBO invoice ${invoice.qboInvoiceId} ` +
+        `(${lines.length} line(s), shipDate=${shipDate || '(unchanged)'})`,
+    )
   } catch (err) {
     log.warn('fulfillment.invoice_memo_failed', {
       invoiceId: String(localOrder.invoiceRef),
       err,
     })
   }
+}
+
+// Recompute the order's official Ship Date = the EARLIEST fulfillment date
+// across all shipments (when it first shipped). Mutates localOrder; returns
+// true when the value changed (so callers know to persist).
+function recomputeShipDate(localOrder) {
+  const times = (localOrder.fulfillments || [])
+    .map((f) => (f.fulfilledAt ? new Date(f.fulfilledAt).getTime() : NaN))
+    .filter((t) => Number.isFinite(t))
+  const earliest = times.length ? new Date(Math.min(...times)) : null
+  const prev = localOrder.shippedAt ? new Date(localOrder.shippedAt).getTime() : null
+  const next = earliest ? earliest.getTime() : null
+  if (prev !== next) {
+    localOrder.shippedAt = earliest
+    return true
+  }
+  return false
 }
 
 // Apply ONE normalized fulfillment to a (mutable) ShopifyOrder doc — the
@@ -738,6 +767,7 @@ export async function handleFulfillmentUpdate({ shop, fulfillment, webhookId, ev
     localOrder,
     normalized,
   )
+  recomputeShipDate(localOrder)
   if (!changed) console.log(`[orders] fulfillment ${fulfillmentId} unchanged — no history row`)
 
   if (webhookId) {
@@ -823,6 +853,7 @@ export async function syncFulfillmentsFromShopify({ shop, shopifyOrderId, admin 
       anyChanged = true
     }
   }
+  if (recomputeShipDate(localOrder)) anyChanged = true
 
   if (anyChanged) {
     await localOrder.save()

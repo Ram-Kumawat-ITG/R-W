@@ -239,18 +239,22 @@ export async function setInvoiceProcessingFee({ qboInvoiceId, feeLine = null, du
 // preserved.
 const SHIPPING_MEMO_MARKER = '\n\nShipping:\n'
 
-// Set the shipping section of a QBO invoice's CustomerMemo (the message
-// shown on the customer's invoice). `lines` is an array of human strings
-// like "UPS — 1Z999AA1… (In transit)". GET the current invoice, preserve
-// the non-shipping part of the memo, replace the shipping block, sparse-POST
-// with the current SyncToken (concurrency guard, same as the other sparse
-// updates). Passing an empty `lines` removes the shipping block. Returns the
-// updated invoice. QBO caps CustomerMemo at 1000 chars — we clamp.
-export async function setInvoiceShippingMemo({ qboInvoiceId, lines = [] }) {
-  if (!qboInvoiceId) throw new Error('setInvoiceShippingMemo: qboInvoiceId is required')
+// Set a QBO invoice's shipping details — the carrier/tracking block in the
+// CustomerMemo (the message shown on the customer's invoice) AND the native
+// `ShipDate` field (the official Ship Date, sourced from the Shopify
+// fulfillment date rather than the order-creation date set at invoice
+// creation). `lines` is an array of human strings like
+// "UPS — 1Z999AA1… (In transit)"; `shipDate` is "YYYY-MM-DD". GET the
+// current invoice, preserve the non-shipping part of the memo, replace the
+// shipping block, set ShipDate, sparse-POST with the current SyncToken
+// (concurrency guard, same as the other sparse updates). Empty `lines`
+// removes the shipping block; omitted `shipDate` leaves ShipDate untouched.
+// QBO caps CustomerMemo at 1000 chars — we clamp.
+export async function setInvoiceShipping({ qboInvoiceId, lines = [], shipDate }) {
+  if (!qboInvoiceId) throw new Error('setInvoiceShipping: qboInvoiceId is required')
   const current = await getInvoice(qboInvoiceId)
   if (!current?.Id) {
-    throw new Error(`setInvoiceShippingMemo: QBO invoice ${qboInvoiceId} not found`)
+    throw new Error(`setInvoiceShipping: QBO invoice ${qboInvoiceId} not found`)
   }
   const existingMemo = current.CustomerMemo?.value || ''
   const base = existingMemo.split(SHIPPING_MEMO_MARKER)[0].trimEnd()
@@ -265,12 +269,15 @@ export async function setInvoiceShippingMemo({ qboInvoiceId, lines = [] }) {
     sparse: true,
     CustomerMemo: memo ? { value: memo } : undefined,
   }
+  if (shipDate) payload.ShipDate = shipDate
   console.log(
-    `[QBO invoice] setShippingMemo Id=${current.Id} lines=${lines.length} SyncToken=${current.SyncToken}`,
+    `[QBO invoice] setShipping Id=${current.Id} lines=${lines.length} ` +
+      `shipDate=${shipDate || '(unchanged)'} SyncToken=${current.SyncToken}`,
   )
-  log.info('invoice.set_shipping_memo.request', {
+  log.info('invoice.set_shipping.request', {
     qboInvoiceId,
     lineCount: lines.length,
+    shipDate: shipDate || null,
     syncToken: current.SyncToken,
   })
   const res = await qbo.post('/invoice', payload)

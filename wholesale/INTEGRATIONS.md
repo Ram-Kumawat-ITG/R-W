@@ -438,15 +438,27 @@ delivery + updated-at, and a newest-first history table. The in-app
 tracking-number deep-link, one row per shipment).
 
 **On the customer-facing invoice.** Carrier + tracking is also written to
-the QBO invoice's `CustomerMemo` via `qbo.service.setInvoiceShippingMemo`
-(a managed "Shipping:" block — sparse update, SyncToken guard, replaces
-rather than duplicates, preserves the base memo, 1000-char clamp).
-`order.service.pushShippingToInvoice` composes the lines from the order's
-fulfillments and is called best-effort from both fulfillment paths on any
-tracking change (never breaks tracking capture). The customer sees it on
-the next invoice view / PDF; the invoice email is **not** auto-resent on
-tracking changes (avoids spam across the label→in-transit→delivered status
-sequence — admins use the "Send invoice" button to push an updated copy).
+the QBO invoice via `qbo.service.setInvoiceShipping({ qboInvoiceId, lines,
+shipDate })` — one sparse update that sets BOTH a managed "Shipping:" block
+in the `CustomerMemo` (SyncToken guard, replaces rather than duplicates,
+preserves the base memo, 1000-char clamp) AND the native `ShipDate` field.
+`order.service.pushShippingToInvoice` composes the lines + ship date from
+the order's fulfillments and is called best-effort from both fulfillment
+paths on any tracking change (never breaks tracking capture). The customer
+sees it on the next invoice view / PDF; the invoice email is **not**
+auto-resent on tracking changes (avoids spam across the
+label→in-transit→delivered status sequence — admins use the "Send invoice"
+button to push an updated copy).
+
+**Ship Date (Shopify-sourced).** The official Ship Date is the Shopify
+fulfillment date, not the order-creation date. `ShopifyOrder.shippedAt` is
+denormalized as the **earliest** `fulfillments[].fulfilledAt`
+(`order.service.recomputeShipDate`, run in both fulfillment paths) and fed
+to the QBO invoice `ShipDate` (above), overwriting the order-date `ShipDate`
+set at invoice creation (§7.3 / §18.3). Shown as "Ship date" on Order
+Details (Overview), the invoice Shipping block, and per-shipment in the
+tracking section (so partially-fulfilled orders show each shipment's own
+date).
 
 **Live-pull fallback (reliability).** Webhooks alone are not enough —
 fulfillment topics are approval-gated and may not be subscribed, and they

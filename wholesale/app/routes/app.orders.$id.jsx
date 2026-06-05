@@ -256,6 +256,7 @@ export const loader = async ({ request, params }) => {
         order.trackingHistory = synced.trackingHistory || order.trackingHistory;
         order.trackingUpdatedAt = synced.trackingUpdatedAt || order.trackingUpdatedAt;
         order.fulfillmentStatus = synced.fulfillmentStatus ?? order.fulfillmentStatus;
+        order.shippedAt = synced.shippedAt ?? order.shippedAt;
       }
     } catch (e) {
       console.error("[order-detail] fulfillment live-sync failed:", e?.message || e);
@@ -1509,6 +1510,16 @@ export default function OrderDetail() {
               <KV label="Fulfillment status" value={order.fulfillmentStatus} />
             </s-grid-item>
             <s-grid-item>
+              <KV
+                label="Ship date"
+                value={
+                  order.shippedAt
+                    ? new Date(order.shippedAt).toLocaleDateString()
+                    : null
+                }
+              />
+            </s-grid-item>
+            <s-grid-item>
               <KV label="Currency" value={order.currency} />
             </s-grid-item>
           </s-grid>
@@ -1592,7 +1603,7 @@ export default function OrderDetail() {
                       </s-grid-item>
                       <s-grid-item>
                         <KV
-                          label="Fulfillment date"
+                          label="Ship date"
                           value={
                             f.fulfilledAt
                               ? new Date(f.fulfilledAt).toLocaleDateString()
@@ -2408,6 +2419,14 @@ export default function OrderDetail() {
                       <s-text>
                         <strong>Shipping</strong>
                       </s-text>
+                      {order.shippedAt && (
+                        <s-stack direction="inline" gap="base" alignItems="center">
+                          <s-text tone="subdued">Ship date:</s-text>
+                          <s-text>
+                            {new Date(order.shippedAt).toLocaleDateString()}
+                          </s-text>
+                        </s-stack>
+                      )}
                       {order.fulfillments.map((f, i) => (
                         <s-stack
                           key={f.fulfillmentId || i}
