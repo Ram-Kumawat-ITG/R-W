@@ -381,6 +381,92 @@ It marks the invoice cancelled and leaves the audit trail; an admin
 who needs to give a partial-paid customer their money back uses the
 gateway's refund tooling directly (NMI portal / cheque void).
 
+### 4.6 `fulfillments/create` + `fulfillments/update` webhooks — shipment tracking
+
+`app/routes/webhooks.fulfillments.create.jsx` + `.update.jsx`. Same
+handler shape as the other webhooks (verify HMAC, log, fire-and-forget,
+ACK 200), both calling `order.service.handleFulfillmentUpdate({ shop,
+fulfillment, webhookId, event })` with `event: 'created' | 'updated'`.
+Subscriptions registered both declaratively (both `shopify.app*.toml`)
+and programmatically (`REQUIRED_SUBSCRIPTIONS` — `FULFILLMENTS_CREATE` /
+`FULFILLMENTS_UPDATE`; fulfillment data is protected-customer-data, same
+approval gate as `orders/create`). The `read_orders` scope covers it.
+
+Purpose: capture Shopify's shipment tracking onto the local order so the
+admin Order Details page can show carrier + number + status with a
+click-through to the carrier's official tracking page.
+
+`handleFulfillmentUpdate` flow:
+
+```
+1. Webhook-id dedup     → ShopifyOrder.seenWebhookIds.includes(webhookId)? exit
+2. Find local order by (shop, shopifyOrderId=fulfillment.order_id)
+                          → absent? log + ack (not our order)
+3. Extract tracking     → tracking_number || tracking_numbers[0],
+                          tracking_company, tracking_url || tracking_urls[0],
+                          shipment_status, status
+4. carrierKey = normalizeCarrier(tracking_company)          (ups|fedex|usps|dhl|other)
+   trackingUrl = resolveCarrierTrackingUrl({carrierKey, trackingNumber,
+                   shopifyUrl, extraTemplates})             (deep-link or Shopify URL)
+5. Upsert fulfillments[] by fulfillmentId (in place)
+6. If a tracked field changed (number/company/shipment_status/status):
+     push trackingHistory[] row (event created|updated), bump trackingUpdatedAt,
+     best-effort appendInvoiceRemark { kind:'system_note', "Tracking …" }
+7. seenWebhookIds += webhookId; save
+```
+
+**Carrier-link resolution** is split to respect the render-import rule:
+the pure, env-free `app/utils/shipping.constants.js` owns
+`CARRIER_TRACKING_URL_TEMPLATES` (UPS/FedEx/USPS/DHL, `{trackingNumber}`
+placeholder), `normalizeCarrier`, `resolveCarrierTrackingUrl`,
+`carrierDisplayName`, `shipmentStatusLabel`. The **service** resolves and
+STORES the final `trackingUrl`, so the Order Details render imports only
+this pure module + the stored value — never a `*.config.js`. Ops can add
+"other configured carriers" via `CARRIER_TRACKING_URLS` (JSON) read in
+the server-only `services/order/tracking.config.js` and merged on top of
+the base templates. Unknown carrier → falls back to Shopify's own
+`tracking_url`.
+
+**Storage** (`ShopifyOrder`): `fulfillments[]` (current state, one per
+Shopify fulfillment id), `trackingHistory[]` (append-only change log),
+`trackingUpdatedAt`. **Display**: a "Shipment tracking" section on
+`app.orders.$id.jsx` — Fulfillment status, carrier name + "Track shipment"
+as external `<s-link target="_blank">` deep-links, `ShipmentStatusBadge`
+(`components/admin-ui.jsx`), per-fulfillment Fulfillment date + est.
+delivery + updated-at, and a newest-first history table. The in-app
+**QuickBooks invoice** panel also shows a Shipping block (carrier +
+tracking-number deep-link, one row per shipment).
+
+**On the customer-facing invoice.** Carrier + tracking is also written to
+the QBO invoice's `CustomerMemo` via `qbo.service.setInvoiceShippingMemo`
+(a managed "Shipping:" block — sparse update, SyncToken guard, replaces
+rather than duplicates, preserves the base memo, 1000-char clamp).
+`order.service.pushShippingToInvoice` composes the lines from the order's
+fulfillments and is called best-effort from both fulfillment paths on any
+tracking change (never breaks tracking capture). The customer sees it on
+the next invoice view / PDF; the invoice email is **not** auto-resent on
+tracking changes (avoids spam across the label→in-transit→delivered status
+sequence — admins use the "Send invoice" button to push an updated copy).
+
+**Live-pull fallback (reliability).** Webhooks alone are not enough —
+fulfillment topics are approval-gated and may not be subscribed, and they
+do **not** backfill orders fulfilled before the subscription existed. So
+the Order Details loader also **pulls** the order's fulfillments live via
+Admin GraphQL (`QUERY_ORDER_FULFILLMENTS` →
+`shopify.service.getOrderFulfillments`) and persists them through
+`order.service.syncFulfillmentsFromShopify`, which reuses the same
+`applyFulfillmentToOrder` upsert as the webhook path (push + pull stay in
+lockstep). Best-effort: a Shopify outage never 500s the page (mirrors the
+live-QBO-invoice fetch). This is why tracking shows on the order page even
+with no webhook delivery; the webhooks remain for real-time push + the
+invoice audit remark. `fulfilledAt` (the "Fulfillment Date") +
+`estimatedDeliveryAt` come from the GraphQL pull; order-level
+`fulfillmentStatus` mirrors `displayFulfillmentStatus`.
+
+Out of scope: a customer-facing storefront order portal (none exists —
+the embedded-admin Order Details page is the order view). Customers
+still receive Shopify's native shipping-confirmation email with tracking.
+
 ---
 
 ## 5. Order processing orchestrator

@@ -20,6 +20,18 @@ export const REQUIRED_SUBSCRIPTIONS = [
     topic: 'ORDERS_CANCELLED',
     callbackPath: '/webhooks/orders/cancelled',
   },
+  // Shipment tracking — fulfillment create/update carry the carrier +
+  // tracking number + shipment_status we surface on Order Details.
+  // Registered here too (not just declaratively) since fulfillment data is
+  // protected-customer-data and may be approval-gated like orders/create.
+  {
+    topic: 'FULFILLMENTS_CREATE',
+    callbackPath: '/webhooks/fulfillments/create',
+  },
+  {
+    topic: 'FULFILLMENTS_UPDATE',
+    callbackPath: '/webhooks/fulfillments/update',
+  },
 ]
 
 // ── Registration-form note keys ──────────────────────────────────────

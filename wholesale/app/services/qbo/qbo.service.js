@@ -233,6 +233,52 @@ export async function setInvoiceProcessingFee({ qboInvoiceId, feeLine = null, du
   return updated
 }
 
+// Marker that delimits the auto-managed shipping block inside an invoice's
+// CustomerMemo, so repeated writes replace (not duplicate) it. Anything the
+// invoice already had above this marker (e.g. "Shopify order #1140") is
+// preserved.
+const SHIPPING_MEMO_MARKER = '\n\nShipping:\n'
+
+// Set the shipping section of a QBO invoice's CustomerMemo (the message
+// shown on the customer's invoice). `lines` is an array of human strings
+// like "UPS — 1Z999AA1… (In transit)". GET the current invoice, preserve
+// the non-shipping part of the memo, replace the shipping block, sparse-POST
+// with the current SyncToken (concurrency guard, same as the other sparse
+// updates). Passing an empty `lines` removes the shipping block. Returns the
+// updated invoice. QBO caps CustomerMemo at 1000 chars — we clamp.
+export async function setInvoiceShippingMemo({ qboInvoiceId, lines = [] }) {
+  if (!qboInvoiceId) throw new Error('setInvoiceShippingMemo: qboInvoiceId is required')
+  const current = await getInvoice(qboInvoiceId)
+  if (!current?.Id) {
+    throw new Error(`setInvoiceShippingMemo: QBO invoice ${qboInvoiceId} not found`)
+  }
+  const existingMemo = current.CustomerMemo?.value || ''
+  const base = existingMemo.split(SHIPPING_MEMO_MARKER)[0].trimEnd()
+  let memo = base
+  if (Array.isArray(lines) && lines.length) {
+    memo = `${base}${base ? SHIPPING_MEMO_MARKER : 'Shipping:\n'}${lines.join('\n')}`
+  }
+  if (memo.length > 1000) memo = memo.slice(0, 1000)
+  const payload = {
+    Id: String(current.Id),
+    SyncToken: String(current.SyncToken),
+    sparse: true,
+    CustomerMemo: memo ? { value: memo } : undefined,
+  }
+  console.log(
+    `[QBO invoice] setShippingMemo Id=${current.Id} lines=${lines.length} SyncToken=${current.SyncToken}`,
+  )
+  log.info('invoice.set_shipping_memo.request', {
+    qboInvoiceId,
+    lineCount: lines.length,
+    syncToken: current.SyncToken,
+  })
+  const res = await qbo.post('/invoice', payload)
+  const updated = res?.Invoice
+  if (!updated?.Id) throw new Error('QBO invoice update returned no Id')
+  return updated
+}
+
 // Deep link an admin can click to open the QBO invoice in the QuickBooks
 // web app. Routes to sandbox vs prod based on QBO_ENVIRONMENT; Intuit
 // handles realm selection from the operator's login session.

@@ -77,3 +77,31 @@ export const QUERY_FILE_BY_ID = `#graphql
   }
 `
 
+// Live pull of an order's fulfillments + tracking — the fallback the Order
+// Details loader uses so shipment tracking shows even when the
+// fulfillments/* webhooks were missed or never subscribed (protected-topic
+// approval gate). `displayStatus` is the carrier-driven shipment status
+// (IN_TRANSIT / OUT_FOR_DELIVERY / DELIVERED …); `status` is the
+// fulfillment-level state; order `displayFulfillmentStatus` is FULFILLED /
+// PARTIALLY_FULFILLED / UNFULFILLED.
+export const QUERY_ORDER_FULFILLMENTS = `#graphql
+  query OrderFulfillments($id: ID!) {
+    order(id: $id) {
+      id
+      displayFulfillmentStatus
+      fulfillments(first: 50) {
+        id
+        status
+        displayStatus
+        createdAt
+        estimatedDeliveryAt
+        trackingInfo(first: 10) {
+          company
+          number
+          url
+        }
+      }
+    }
+  }
+`
+

@@ -17,6 +17,7 @@ import {
   resolveCustomerVaultId,
   resolveCustomerAchBillingId,
 } from "../services/customer/customer.service";
+import { syncFulfillmentsFromShopify } from "../services/order/order.service";
 import { invoiceConfig } from "../services/invoice/invoice.config";
 import {
   computeProcessingFee,
@@ -30,7 +31,9 @@ import {
   PaymentStatusBadge,
   PaymentMethodBadge,
   OutcomeBadge,
+  ShipmentStatusBadge,
 } from "../components/admin-ui";
+import { carrierDisplayName } from "../utils/shipping.constants";
 import { formatAmount, fmtDateTime } from "../utils/format.utils";
 import { PAYMENT_METHOD_LABEL } from "../utils/payment.constants";
 
@@ -225,7 +228,7 @@ function computePipelineSteps({ order, invoice }) {
 }
 
 export const loader = async ({ request, params }) => {
-  const { session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const { id } = params;
   if (!id || !mongoose.isValidObjectId(id)) {
     throw new Response("Invalid id", { status: 400 });
@@ -234,6 +237,30 @@ export const loader = async ({ request, params }) => {
   await connectDB();
   const order = await ShopifyOrder.findOne({ _id: id, shop: session.shop }).lean();
   if (!order) throw new Response("Not found", { status: 404 });
+
+  // Live-pull the order's fulfillments from Shopify and persist them, so
+  // shipment tracking shows even when the fulfillments/* webhooks were
+  // missed / never subscribed (protected-topic approval gate) or the order
+  // was fulfilled before the subscription existed. Best-effort: a Shopify
+  // outage must NOT 500 the page — we just fall back to whatever's already
+  // stored. Mirrors the graceful live-QBO-invoice fetch below.
+  if (order.shopifyOrderId) {
+    try {
+      const synced = await syncFulfillmentsFromShopify({
+        shop: session.shop,
+        shopifyOrderId: order.shopifyOrderId,
+        admin,
+      });
+      if (synced) {
+        order.fulfillments = synced.fulfillments || order.fulfillments;
+        order.trackingHistory = synced.trackingHistory || order.trackingHistory;
+        order.trackingUpdatedAt = synced.trackingUpdatedAt || order.trackingUpdatedAt;
+        order.fulfillmentStatus = synced.fulfillmentStatus ?? order.fulfillmentStatus;
+      }
+    } catch (e) {
+      console.error("[order-detail] fulfillment live-sync failed:", e?.message || e);
+    }
+  }
 
   const invoice = order.invoiceRef
     ? await Invoice.findById(order.invoiceRef).lean()
@@ -1494,6 +1521,158 @@ export default function OrderDetail() {
         </s-stack>
       </s-section>
 
+      {/* ───── Shipment tracking ───── */}
+      <s-section
+        heading={`Shipment tracking${
+          order.trackingUpdatedAt
+            ? ` · updated ${new Date(order.trackingUpdatedAt).toLocaleString()}`
+            : ""
+        }`}
+      >
+        {!order.fulfillments?.length ? (
+          <s-paragraph tone="subdued">
+            No tracking yet. Carrier and tracking number appear here once the
+            order is fulfilled in Shopify.
+          </s-paragraph>
+        ) : (
+          <s-stack direction="block" gap="base">
+            <s-stack direction="inline" gap="tight" alignItems="center">
+              <s-text tone="subdued">Fulfillment status:</s-text>
+              {(() => {
+                const fs = order.fulfillmentStatus || "unfulfilled";
+                const label = fs
+                  .replace(/_/g, " ")
+                  .replace(/\b\w/g, (c) => c.toUpperCase());
+                const tone =
+                  fs === "fulfilled"
+                    ? "success"
+                    : fs === "partially_fulfilled" || fs === "partial"
+                      ? "warning"
+                      : "default";
+                return <s-badge tone={tone}>{label}</s-badge>;
+              })()}
+            </s-stack>
+            {order.fulfillments.map((f, i) => {
+              const carrier = carrierDisplayName(f.carrierKey, f.trackingCompany);
+              const status = f.shipmentStatus || f.status;
+              return (
+                <s-box
+                  key={f.fulfillmentId || i}
+                  padding="base"
+                  border="base"
+                  borderRadius="base"
+                  background="subdued"
+                >
+                  <s-stack direction="block" gap="base">
+                    <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
+                      <s-grid-item>
+                        <s-stack direction="block" gap="none">
+                          <s-text tone="subdued">Carrier</s-text>
+                          {f.trackingUrl ? (
+                            <s-link href={f.trackingUrl} target="_blank">
+                              {carrier} ↗
+                            </s-link>
+                          ) : (
+                            <s-text>{carrier}</s-text>
+                          )}
+                        </s-stack>
+                      </s-grid-item>
+                      <s-grid-item>
+                        <KV label="Tracking number" value={f.trackingNumber} />
+                      </s-grid-item>
+                      <s-grid-item>
+                        <s-stack direction="block" gap="none">
+                          <s-text tone="subdued">Status</s-text>
+                          {status ? (
+                            <ShipmentStatusBadge status={status} />
+                          ) : (
+                            <s-text tone="subdued">—</s-text>
+                          )}
+                        </s-stack>
+                      </s-grid-item>
+                      <s-grid-item>
+                        <KV
+                          label="Fulfillment date"
+                          value={
+                            f.fulfilledAt
+                              ? new Date(f.fulfilledAt).toLocaleDateString()
+                              : null
+                          }
+                        />
+                      </s-grid-item>
+                      {f.estimatedDeliveryAt && (
+                        <s-grid-item>
+                          <KV
+                            label="Est. delivery"
+                            value={new Date(f.estimatedDeliveryAt).toLocaleDateString()}
+                          />
+                        </s-grid-item>
+                      )}
+                    </s-grid>
+                    <s-stack direction="inline" gap="base" alignItems="center">
+                      {f.trackingUrl && (
+                        <s-link href={f.trackingUrl} target="_blank">
+                          Track shipment ↗
+                        </s-link>
+                      )}
+                      {f.updatedAt && (
+                        <s-text tone="subdued">
+                          Updated {new Date(f.updatedAt).toLocaleString()}
+                        </s-text>
+                      )}
+                    </s-stack>
+                  </s-stack>
+                </s-box>
+              );
+            })}
+
+            {order.trackingHistory?.length > 0 && (
+              <s-stack direction="block" gap="tight">
+                <s-text>
+                  <strong>Tracking history</strong>
+                </s-text>
+                <s-table>
+                  <s-table-header-row>
+                    <s-table-header>When</s-table-header>
+                    <s-table-header>Carrier</s-table-header>
+                    <s-table-header>Number</s-table-header>
+                    <s-table-header>Status</s-table-header>
+                    <s-table-header>Event</s-table-header>
+                  </s-table-header-row>
+                  <s-table-body>
+                    {[...order.trackingHistory]
+                      .sort((a, b) => String(b.at).localeCompare(String(a.at)))
+                      .map((h, i) => (
+                        <s-table-row key={i}>
+                          <s-table-cell>
+                            {h.at ? new Date(h.at).toLocaleString() : "—"}
+                          </s-table-cell>
+                          <s-table-cell>
+                            {carrierDisplayName(h.carrierKey, h.trackingCompany)}
+                          </s-table-cell>
+                          <s-table-cell>{h.trackingNumber || "—"}</s-table-cell>
+                          <s-table-cell>
+                            {h.shipmentStatus ? (
+                              <ShipmentStatusBadge status={h.shipmentStatus} />
+                            ) : (
+                              "—"
+                            )}
+                          </s-table-cell>
+                          <s-table-cell>
+                            <s-badge tone={h.event === "created" ? "info" : "default"}>
+                              {h.event === "created" ? "Added" : "Updated"}
+                            </s-badge>
+                          </s-table-cell>
+                        </s-table-row>
+                      ))}
+                  </s-table-body>
+                </s-table>
+              </s-stack>
+            )}
+          </s-stack>
+        )}
+      </s-section>
+
       {/* ───── Line items + totals ───── */}
       <s-section
         heading={`Line items (${breakdown?.lineItems?.length ?? 0})`}
@@ -2214,6 +2393,45 @@ export default function OrderDetail() {
                     />
                   </s-grid-item>
                 </s-grid>
+
+                {/* Shipping carrier + tracking on the invoice (sourced from
+                    the order's fulfillments). Lists every shipment when an
+                    order has more than one. */}
+                {order.fulfillments?.length > 0 && (
+                  <s-box
+                    padding="base"
+                    border="base"
+                    borderRadius="base"
+                    background="subdued"
+                  >
+                    <s-stack direction="block" gap="tight">
+                      <s-text>
+                        <strong>Shipping</strong>
+                      </s-text>
+                      {order.fulfillments.map((f, i) => (
+                        <s-stack
+                          key={f.fulfillmentId || i}
+                          direction="inline"
+                          gap="base"
+                          alignItems="center"
+                        >
+                          <s-text tone="subdued">Carrier:</s-text>
+                          <s-text>
+                            {carrierDisplayName(f.carrierKey, f.trackingCompany)}
+                          </s-text>
+                          <s-text tone="subdued">Tracking number:</s-text>
+                          {f.trackingUrl ? (
+                            <s-link href={f.trackingUrl} target="_blank">
+                              {f.trackingNumber || "—"} ↗
+                            </s-link>
+                          ) : (
+                            <s-text>{f.trackingNumber || "—"}</s-text>
+                          )}
+                        </s-stack>
+                      ))}
+                    </s-stack>
+                  </s-box>
+                )}
 
                 {qbo.invoice.productLines.length === 0 ? (
                   <s-paragraph tone="subdued">

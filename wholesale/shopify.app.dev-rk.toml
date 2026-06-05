@@ -37,6 +37,13 @@ api_version = "2025-07"
   uri = "/webhooks/orders/cancelled"
   topics = [ "orders/cancelled" ]
 
+  # NOTE: fulfillments/create + fulfillments/update are protected
+  # customer-data topics and are NOT declared here — declaring them fails
+  # `shopify app deploy` until the app is approved for fulfillment data in
+  # the Partners dashboard. They are registered programmatically after
+  # install via REQUIRED_SUBSCRIPTIONS → ensureProtectedWebhooks
+  # (app/services/shopify/shopify.constants.js + shopify.service.js).
+
   [[webhooks.subscriptions]]
   uri = "/webhooks/app/scopes_update"
   topics = [ "app/scopes_update" ]
