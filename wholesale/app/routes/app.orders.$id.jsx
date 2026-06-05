@@ -1589,7 +1589,20 @@ export default function OrderDetail() {
                         </s-stack>
                       </s-grid-item>
                       <s-grid-item>
-                        <KV label="Tracking number" value={f.trackingNumber} />
+                        <s-stack direction="block" gap="none">
+                          <s-text tone="subdued">Tracking number</s-text>
+                          {f.trackingNumber ? (
+                            f.trackingUrl ? (
+                              <s-link href={f.trackingUrl} target="_blank">
+                                {f.trackingNumber} ↗
+                              </s-link>
+                            ) : (
+                              <s-text>{f.trackingNumber}</s-text>
+                            )
+                          ) : (
+                            <s-text tone="subdued">—</s-text>
+                          )}
+                        </s-stack>
                       </s-grid-item>
                       <s-grid-item>
                         <s-stack direction="block" gap="none">

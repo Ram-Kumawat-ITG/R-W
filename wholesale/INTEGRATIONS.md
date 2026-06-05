@@ -430,18 +430,31 @@ the base templates. Unknown carrier → falls back to Shopify's own
 **Storage** (`ShopifyOrder`): `fulfillments[]` (current state, one per
 Shopify fulfillment id), `trackingHistory[]` (append-only change log),
 `trackingUpdatedAt`. **Display**: a "Shipment tracking" section on
-`app.orders.$id.jsx` — Fulfillment status, carrier name + "Track shipment"
-as external `<s-link target="_blank">` deep-links, `ShipmentStatusBadge`
-(`components/admin-ui.jsx`), per-fulfillment Fulfillment date + est.
-delivery + updated-at, and a newest-first history table. The in-app
-**QuickBooks invoice** panel also shows a Shipping block (carrier +
-tracking-number deep-link, one row per shipment).
+`app.orders.$id.jsx` — Fulfillment status, carrier, the **tracking number
+itself as a clickable `<s-link target="_blank">`** to the carrier's tracking
+page (plus a "Track shipment" link), `ShipmentStatusBadge`
+(`components/admin-ui.jsx`), per-fulfillment Ship date + est. delivery +
+updated-at, and a newest-first history table. The in-app **QuickBooks
+invoice** panel also shows a Shipping block (Ship date + carrier +
+tracking-number deep-link, one row per shipment). On the **QBO-rendered**
+invoice PDF/email the tracking link can't be a true hyperlink (CustomerMemo
+is plain text), so the memo includes the bare tracking URL (`Track: <url>`)
+which most PDF/email clients auto-linkify.
 
 **On the customer-facing invoice.** Carrier + tracking is also written to
 the QBO invoice via `qbo.service.setInvoiceShipping({ qboInvoiceId, lines,
-shipDate })` — one sparse update that sets BOTH a managed "Shipping:" block
-in the `CustomerMemo` (SyncToken guard, replaces rather than duplicates,
-preserves the base memo, 1000-char clamp) AND the native `ShipDate` field.
+shipDate, trackingNum })` — one sparse update that sets the managed
+"Shipping:" block in the `CustomerMemo` (SyncToken guard, replaces rather
+than duplicates, preserves the base memo, 1000-char clamp), the native
+`ShipDate` field, AND the native **`TrackingNum`** field (carrier + number
+per shipment, joined for multi-shipment). `TrackingNum` renders in the
+invoice **header next to Ship Date / Ship Via** (when shipping is enabled on
+the company's sales form) — that's how tracking shows "below the Ship Date"
+on the rendered invoice, separate from the top-of-invoice memo. A **no-op
+guard** skips the POST when memo/ShipDate/TrackingNum already match, so
+`pushShippingToInvoice` can be called on every order-view live-pull (not just
+on change) to **backfill** these onto invoices synced before the fields
+existed, then converge.
 `order.service.pushShippingToInvoice` composes the lines + ship date from
 the order's fulfillments and is called best-effort from both fulfillment
 paths on any tracking change (never breaks tracking capture). The customer

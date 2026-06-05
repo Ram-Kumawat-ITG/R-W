@@ -250,7 +250,7 @@ const SHIPPING_MEMO_MARKER = '\n\nShipping:\n'
 // (concurrency guard, same as the other sparse updates). Empty `lines`
 // removes the shipping block; omitted `shipDate` leaves ShipDate untouched.
 // QBO caps CustomerMemo at 1000 chars — we clamp.
-export async function setInvoiceShipping({ qboInvoiceId, lines = [], shipDate }) {
+export async function setInvoiceShipping({ qboInvoiceId, lines = [], shipDate, trackingNum }) {
   if (!qboInvoiceId) throw new Error('setInvoiceShipping: qboInvoiceId is required')
   const current = await getInvoice(qboInvoiceId)
   if (!current?.Id) {
@@ -263,6 +263,19 @@ export async function setInvoiceShipping({ qboInvoiceId, lines = [], shipDate })
     memo = `${base}${base ? SHIPPING_MEMO_MARKER : 'Shipping:\n'}${lines.join('\n')}`
   }
   if (memo.length > 1000) memo = memo.slice(0, 1000)
+  const trackingNumValue = trackingNum ? String(trackingNum).slice(0, 250) : undefined
+  // No-op guard: skip the POST (and a needless SyncToken bump) when none of
+  // the shipping fields would change. This lets callers invoke setInvoice
+  // Shipping on every order view to backfill TrackingNum / ShipDate onto
+  // invoices synced before those fields existed, without redundant writes.
+  const memoChanged = memo !== existingMemo
+  const shipChanged = Boolean(shipDate) && current.ShipDate !== shipDate
+  const trackChanged =
+    Boolean(trackingNumValue) && String(current.TrackingNum || '') !== trackingNumValue
+  if (!memoChanged && !shipChanged && !trackChanged) {
+    console.log(`[QBO invoice] setShipping Id=${current.Id} — no change, skipping POST`)
+    return current
+  }
   const payload = {
     Id: String(current.Id),
     SyncToken: String(current.SyncToken),
@@ -270,14 +283,22 @@ export async function setInvoiceShipping({ qboInvoiceId, lines = [], shipDate })
     CustomerMemo: memo ? { value: memo } : undefined,
   }
   if (shipDate) payload.ShipDate = shipDate
+  // Native QBO shipping field — renders in the invoice header next to
+  // Ship Date / Ship Via (when shipping is enabled on the company's sales
+  // form). This is how "tracking details" sit BELOW the Ship Date on the
+  // rendered invoice, distinct from the CustomerMemo message block. Single
+  // free-text field, so multi-shipment numbers are joined by the caller.
+  if (trackingNumValue) payload.TrackingNum = trackingNumValue
   console.log(
     `[QBO invoice] setShipping Id=${current.Id} lines=${lines.length} ` +
-      `shipDate=${shipDate || '(unchanged)'} SyncToken=${current.SyncToken}`,
+      `shipDate=${shipDate || '(unchanged)'} trackingNum=${trackingNum ? 'set' : '(unchanged)'} ` +
+      `SyncToken=${current.SyncToken}`,
   )
   log.info('invoice.set_shipping.request', {
     qboInvoiceId,
     lineCount: lines.length,
     shipDate: shipDate || null,
+    hasTrackingNum: Boolean(trackingNum),
     syncToken: current.SyncToken,
   })
   const res = await qbo.post('/invoice', payload)

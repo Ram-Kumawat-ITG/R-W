@@ -588,18 +588,30 @@ async function pushShippingToInvoice(localOrder) {
       const carrier = carrierDisplayName(f.carrierKey, f.trackingCompany)
       const num = f.trackingNumber || 'no number'
       const statusLabel = shipmentStatusLabel(f.shipmentStatus || f.status)
-      return `${carrier} — ${num}${statusLabel ? ` (${statusLabel})` : ''}`
+      const head = `${carrier} — ${num}${statusLabel ? ` (${statusLabel})` : ''}`
+      // QBO's CustomerMemo is plain text (no rich hyperlinks), so include the
+      // full tracking URL — most invoice-PDF / email clients auto-linkify a
+      // bare URL, giving the customer a clickable tracking link on the doc.
+      return f.trackingUrl ? `${head}\n  Track: ${f.trackingUrl}` : head
     })
   // Official Ship Date for the QBO invoice = the Shopify fulfillment date
   // (earliest shipment), overwriting the order-creation date set at invoice
   // creation. Date-only (YYYY-MM-DD) to match QBO's ShipDate field.
   const shipDate = localOrder.shippedAt ? toYmd(localOrder.shippedAt) : undefined
-  if (!lines.length && !shipDate) return
+  // Native QBO TrackingNum (renders in the header below Ship Date): carrier +
+  // number per shipment, joined for multi-shipment orders.
+  const trackingNum =
+    (localOrder.fulfillments || [])
+      .filter((f) => f.trackingNumber)
+      .map((f) => `${carrierDisplayName(f.carrierKey, f.trackingCompany)} ${f.trackingNumber}`)
+      .join(' | ') || undefined
+  if (!lines.length && !shipDate && !trackingNum) return
   try {
     const updated = await setInvoiceShipping({
       qboInvoiceId: invoice.qboInvoiceId,
       lines,
       shipDate,
+      trackingNum,
     })
     if (updated?.SyncToken && updated.SyncToken !== invoice.qboSyncToken) {
       await Invoice.updateOne({ _id: invoice._id }, { $set: { qboSyncToken: updated.SyncToken } })
@@ -865,7 +877,13 @@ export async function syncFulfillmentsFromShopify({ shop, shopifyOrderId, admin 
       shopifyOrderId,
       count: data.fulfillments?.length || 0,
     })
-    // Mirror carrier + tracking onto the customer-facing QBO invoice memo.
+  }
+  // Mirror carrier + tracking + ship date onto the customer-facing QBO
+  // invoice — even when fulfillment data didn't change this run, so the
+  // native TrackingNum / ShipDate backfill onto invoices synced before those
+  // fields were added. Idempotent: setInvoiceShipping no-ops when nothing
+  // differs, so this doesn't write on every view once converged.
+  if ((localOrder.fulfillments || []).length) {
     await pushShippingToInvoice(localOrder)
   }
   return localOrder.toObject()
