@@ -758,16 +758,23 @@ Shopify's post-discount `total_price`. Without it the invoice would
 over-state by the discount amount. Ordering on the invoice line array:
 product lines → discount → shipping → processing fee.
 
-**Tax — summary row, not a line.** Tax is **not** emitted as a product
-line. The order's `total_tax` is passed to `qbo.service.createInvoice`
-as `TxnTaxDetail.TotalTax`, which QBO renders in the invoice's summary
+**Tax — summary row, not a line; sourced from Shopify.** Tax is **not**
+emitted as a product line. The order's `total_tax` (configured in
+**Shopify**, not QBO) is passed to `qbo.service.createInvoice` as
+`TxnTaxDetail.TotalTax`, which QBO renders in the invoice's summary
 "Tax" row (alongside Subtotal / Discount / Total) instead of in the
-Products section. It is only sent when `total_tax > 0` — most wholesale
-orders are tax-exempt, so the field is usually omitted and QBO's own
-($0) calculation stands. The override reconciles the total exactly for
-non-AST companies; **US automated-sales-tax companies may recompute and
-ignore the override** — for tax-exempt customers that still resolves to
-$0, so the practical impact is nil.
+Products section. It is **always sent** (even at `$0`) so the customer
+sees a tax figure on every invoice. By design **no QBO tax code
+(`TxnTaxCodeRef`) is applied** — tax authority lives in Shopify.
+
+> **Rendering caveat.** Whether QBO actually shows the row in its
+> template can depend on a tax code being present on the transaction,
+> not on `TotalTax` alone: a **non-zero** Shopify tax renders fine, but a
+> **$0.00** row may be omitted by QBO. Forcing a $0 row would require a
+> company-specific tax code (AST `"NON"`, or a 0%/exempt `TaxCode` id),
+> which we deliberately do not wire in. US automated-sales-tax companies
+> may also recompute and ignore the override. The app's own Order Details
+> totals panels always show the tax line regardless of QBO's rendering.
 
 > **Why only tax (and discount) reach the summary.** QBO renders the
 > customer invoice (emailed via `/invoice/{id}/send`, PDF via

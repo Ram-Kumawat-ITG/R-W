@@ -160,17 +160,24 @@ export function computeProcessingFee({ baseAmount, method, rates }) {
 }
 
 // Build a processing-fee invoice line. Used to append the line to a QBO
-// invoice at settlement. The description encodes the method label + the
-// rate as a percentage so it's self-documenting in QBO ("Credit Card
-// Processing Fee – 3%").
-export function buildProcessingFeeLine({ amount, rate, method }) {
+// invoice at settlement. The description encodes the method label, the rate
+// as a percentage, AND the calculation basis when known, so the line is
+// self-documenting on the customer's invoice ("Credit Card Processing Fee –
+// 3% of $596.58"). `baseAmount` is the amount the fee was computed on
+// (post-discount grand total); when omitted the basis clause is dropped and
+// the description falls back to "… – 3%".
+export function buildProcessingFeeLine({ amount, rate, method, baseAmount }) {
   if (!Number.isFinite(amount) || amount <= 0) return null
   if (!Number.isFinite(rate) || rate <= 0) return null
   const rounded = Number(amount.toFixed(2))
   if (rounded <= 0) return null
   const pct = +(rate * 100).toFixed(4)
+  const basis =
+    Number.isFinite(baseAmount) && baseAmount > 0
+      ? ` of $${Number(baseAmount).toFixed(2)}`
+      : ''
   return {
-    description: `${processingFeeLabel(method)} – ${pct}%`,
+    description: `${processingFeeLabel(method)} – ${pct}%${basis}`,
     quantity: 1,
     unitPrice: rounded,
     amount: rounded,

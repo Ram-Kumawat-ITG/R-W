@@ -65,16 +65,20 @@ export async function createInvoice({
   }
 
   const shipAddrPayload = toQboAddress(shipAddr)
-  // Tax goes in QBO's native summary "Tax" row via TxnTaxDetail.TotalTax —
-  // NOT as a product line (see invoice.utils.shopifyLinesToQboLines). We send
-  // the already-computed Shopify tax as an override; QBO adds it to the line
-  // subtotal so TotalAmt still reconciles with Shopify's total_price. Only
-  // engaged when tax is non-zero — most wholesale orders are tax-exempt, and
-  // omitting TxnTaxDetail leaves QBO's own ($0) calculation untouched.
-  // Caveat: US automated-sales-tax companies may recompute and ignore this
-  // override; for tax-exempt customers that still resolves to $0.
+  // Tax is SOURCED FROM SHOPIFY (order.total_tax) and passed straight through
+  // to QBO's native summary "Tax" row via TxnTaxDetail.TotalTax — NOT as a
+  // product line (see invoice.utils.shopifyLinesToQboLines). QBO adds it to
+  // the line subtotal so TotalAmt still reconciles with Shopify's total_price.
+  // Always sent (even at $0) so the customer sees a tax figure on every
+  // invoice. By design we do NOT apply a QBO tax code (TxnTaxCodeRef) — tax is
+  // configured in Shopify, not QBO. Note: whether QBO RENDERS a "$0.00 Tax"
+  // row in its summary can still depend on a tax code being present; with a
+  // non-zero Shopify tax the row shows, but a $0 row may be omitted by QBO's
+  // template. The app's own Order Details panels always show the tax line
+  // regardless. (US automated-sales-tax companies may also recompute/ignore
+  // this override.)
   const tax = Number(taxAmount || 0)
-  const txnTaxDetail = tax > 0 ? { TotalTax: Number(tax.toFixed(2)) } : undefined
+  const txnTaxDetail = { TotalTax: Number(tax.toFixed(2)) }
   const payload = {
     CustomerRef: { value: String(qboCustomerId) },
     Line: lines.map((l) => toInvoiceLine(l, qboConfig.defaultItemId)),

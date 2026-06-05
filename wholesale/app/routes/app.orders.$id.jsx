@@ -352,17 +352,53 @@ function projectQboInvoice(inv) {
       };
     });
 
-  // Mirror QBO's invoice summary block. On the QBO-rendered invoice,
-  // SUBTOTAL is the sum of ALL line items (products + shipping + processing
-  // fee); the DiscountLineDetail amount is then subtracted to reach TOTAL.
-  // We surface the same figures so the in-app panel matches the rendered
-  // invoice exactly.
-  const lineSubtotal = Number(
-    itemLines.reduce((s, l) => s + (l.amount || 0), 0).toFixed(2),
+  // Classify the QBO SalesItemLineDetail rows so the panel can show a full,
+  // always-on itemized breakdown (Subtotal of products → Discount → Shipping
+  // → Tax → Processing Fee → Grand total). The descriptions are the ones we
+  // author at creation: "Shipping" (exact) and "<Method> Processing Fee – X%
+  // of $Y". Anything else is a product line.
+  const FEE_RE = /processing fee/i;
+  const SHIP_RE = /^\s*shipping\s*$/i;
+  const productLines = [];
+  let shipping = 0;
+  let processingFee = 0;
+  let processingFeeLabel = null;
+  for (const l of itemLines) {
+    const desc = l.description || "";
+    if (FEE_RE.test(desc)) {
+      processingFee += l.amount || 0;
+      processingFeeLabel = desc; // self-documenting: "… – 3% of $596.58"
+    } else if (SHIP_RE.test(desc)) {
+      shipping += l.amount || 0;
+    } else {
+      productLines.push(l);
+    }
+  }
+  const productSubtotal = Number(
+    productLines.reduce((s, l) => s + (l.amount || 0), 0).toFixed(2),
   );
-  const discount = lines
-    .filter((l) => l.DetailType === "DiscountLineDetail")
-    .reduce((s, l) => s + (l.Amount != null ? Number(l.Amount) : 0), 0);
+  shipping = Number(shipping.toFixed(2));
+  processingFee = Number(processingFee.toFixed(2));
+  const discount = Number(
+    lines
+      .filter((l) => l.DetailType === "DiscountLineDetail")
+      .reduce((s, l) => s + (l.Amount != null ? Number(l.Amount) : 0), 0)
+      .toFixed(2),
+  );
+  const totalTax = inv.TxnTaxDetail?.TotalTax != null ? Number(inv.TxnTaxDetail.TotalTax) : 0;
+  const totalAmt = inv.TotalAmt != null ? Number(inv.TotalAmt) : null;
+  // Reconciling catch-all: any portion of the QBO total not explained by the
+  // classified rows surfaces as "Other charges" so the breakdown always sums
+  // to TotalAmt (and we never silently hide a charge).
+  const otherCharges =
+    totalAmt != null
+      ? Number(
+          (
+            totalAmt -
+            (productSubtotal - discount + shipping + totalTax + processingFee)
+          ).toFixed(2),
+        )
+      : 0;
 
   const linkedPayments = (inv.LinkedTxn || [])
     .filter((t) => t.TxnType === "Payment")
@@ -380,17 +416,21 @@ function projectQboInvoice(inv) {
     currency: inv.CurrencyRef?.value || null,
     emailStatus: inv.EmailStatus || null,
     printStatus: inv.PrintStatus || null,
-    totalAmt: inv.TotalAmt != null ? Number(inv.TotalAmt) : null,
+    totalAmt,
     balance: inv.Balance != null ? Number(inv.Balance) : null,
-    totalTax: inv.TxnTaxDetail?.TotalTax != null
-      ? Number(inv.TxnTaxDetail.TotalTax)
-      : 0,
+    totalTax,
     createTime: inv.MetaData?.CreateTime || null,
     lastUpdatedTime: inv.MetaData?.LastUpdatedTime || null,
     lines: itemLines,
-    // Mirror QBO's summary block: SUBTOTAL (all lines) − DISCOUNT → TOTAL.
-    lineSubtotal,
-    discount: Number(discount.toFixed(2)),
+    // Full itemized breakdown (always-on rows): products subtotal → discount
+    // → shipping → tax → processing fee → other → grand total.
+    productLines,
+    productSubtotal,
+    discount,
+    shipping,
+    processingFee,
+    processingFeeLabel,
+    otherCharges,
     linkedPayments,
   };
 }
@@ -1209,6 +1249,14 @@ export default function OrderDetail() {
   const invoiceCalc = (() => {
     if (!breakdown?.totals) return null;
     const method = invoice?.paymentMethod || null;
+    // Fee basis = the order's post-discount grand total (order.total_price),
+    // which is exactly what computeProcessingFee is keyed on at creation.
+    const feeBasis = Number(breakdown.totals.grandTotal || 0);
+    const fmtPct = (r) => +(Number(r) * 100).toFixed(4);
+    const feeLabelWithBasis = (m, r) =>
+      Number(r) > 0
+        ? `${processingFeeLabel(m)} – ${fmtPct(r)}% of $${feeBasis.toFixed(2)}`
+        : processingFeeLabel(m);
     let fee = null;
     let grandTotalOverride;
     if (invoice?.processingFeeAmount > 0) {
@@ -1216,7 +1264,10 @@ export default function OrderDetail() {
       // settlement-applied fee). amountDue is the fee-inclusive total.
       fee = {
         amount: invoice.processingFeeAmount,
-        label: processingFeeLabel(invoice.processingFeeMethod || method),
+        label: feeLabelWithBasis(
+          invoice.processingFeeMethod || method,
+          invoice.processingFeeRate,
+        ),
       };
       grandTotalOverride = Number(invoice.amountDue);
     } else if (method) {
@@ -1229,7 +1280,7 @@ export default function OrderDetail() {
         rates: processingFeeRates,
       });
       if (preview) {
-        fee = { amount: preview.amount, label: processingFeeLabel(method) };
+        fee = { amount: preview.amount, label: feeLabelWithBasis(method, preview.rate) };
       }
       // When an invoice exists its amountDue is authoritative even with no fee.
       if (invoice) grandTotalOverride = Number(invoice.amountDue);
@@ -1507,27 +1558,25 @@ export default function OrderDetail() {
                     label="Order subtotal"
                     value={formatAmount(invoiceCalc.orderSubtotal, breakdown.currency)}
                   />
-                  {invoiceCalc.discount > 0 && (
-                    <>
-                      <TotalsRow
-                        label="Discount"
-                        value={`− ${formatAmount(invoiceCalc.discount, breakdown.currency)}`}
-                        tone="success"
-                      />
-                      <TotalsRow
-                        label="Adjusted subtotal"
-                        value={formatAmount(invoiceCalc.adjustedSubtotal, breakdown.currency)}
-                      />
-                    </>
-                  )}
-                  {invoiceCalc.shipping > 0 && (
-                    <TotalsRow
-                      label="Shipping"
-                      value={formatAmount(invoiceCalc.shipping, breakdown.currency)}
-                    />
-                  )}
                   <TotalsRow
-                    label={invoiceCalc.taxesIncluded ? "Tax (included)" : "Tax"}
+                    label="Discount"
+                    value={
+                      invoiceCalc.discount > 0
+                        ? `− ${formatAmount(invoiceCalc.discount, breakdown.currency)}`
+                        : formatAmount(0, breakdown.currency)
+                    }
+                    tone={invoiceCalc.discount > 0 ? "success" : undefined}
+                  />
+                  <TotalsRow
+                    label="Adjusted subtotal"
+                    value={formatAmount(invoiceCalc.adjustedSubtotal, breakdown.currency)}
+                  />
+                  <TotalsRow
+                    label="Shipping charges"
+                    value={formatAmount(invoiceCalc.shipping, breakdown.currency)}
+                  />
+                  <TotalsRow
+                    label={invoiceCalc.taxesIncluded ? "Sales tax (included)" : "Sales tax"}
                     value={formatAmount(invoiceCalc.tax, breakdown.currency)}
                   />
                   {invoiceCalc.fee && (
@@ -1536,6 +1585,27 @@ export default function OrderDetail() {
                       value={formatAmount(invoiceCalc.fee.amount, breakdown.currency)}
                     />
                   )}
+                  {(() => {
+                    // Reconciling catch-all so the breakdown always sums to
+                    // the grand total — surfaces any charge the named rows
+                    // don't account for instead of silently hiding it.
+                    const feeAmt = invoiceCalc.fee?.amount || 0;
+                    const other = Number(
+                      (
+                        invoiceCalc.grandTotal -
+                        (invoiceCalc.adjustedSubtotal +
+                          invoiceCalc.shipping +
+                          invoiceCalc.tax +
+                          feeAmt)
+                      ).toFixed(2),
+                    );
+                    return Math.abs(other) > 0.005 ? (
+                      <TotalsRow
+                        label="Other charges"
+                        value={formatAmount(other, breakdown.currency)}
+                      />
+                    ) : null;
+                  })()}
                   <s-divider />
                   <TotalsRow
                     label="Grand total"
@@ -2145,9 +2215,9 @@ export default function OrderDetail() {
                   </s-grid-item>
                 </s-grid>
 
-                {qbo.invoice.lines.length === 0 ? (
+                {qbo.invoice.productLines.length === 0 ? (
                   <s-paragraph tone="subdued">
-                    QBO invoice has no item lines.
+                    QBO invoice has no product lines.
                   </s-paragraph>
                 ) : (
                   <s-table>
@@ -2160,9 +2230,9 @@ export default function OrderDetail() {
                       <s-table-header>Amount</s-table-header>
                     </s-table-header-row>
                     <s-table-body>
-                      {qbo.invoice.lines.map((l, i) => (
+                      {qbo.invoice.productLines.map((l, i) => (
                         <s-table-row key={l.id || i}>
-                          <s-table-cell>{l.lineNum ?? i + 1}</s-table-cell>
+                          <s-table-cell>{i + 1}</s-table-cell>
                           <s-table-cell>{l.itemName || "—"}</s-table-cell>
                           <s-table-cell>{l.description || "—"}</s-table-cell>
                           <s-table-cell>{l.qty ?? "—"}</s-table-cell>
@@ -2182,9 +2252,12 @@ export default function OrderDetail() {
                   </s-table>
                 )}
 
-                {/* Mirror the QBO-rendered invoice summary exactly:
-                    SUBTOTAL (sum of all lines) → DISCOUNT → TAX →
-                    TOTAL → TOTAL OF NEW CHARGES → BALANCE DUE. */}
+                {/* Full itemized breakdown. Products stay in the table above;
+                    Discount / Shipping / Tax always render (even at $0), the
+                    Processing Fee shows as its own clearly-described row, and
+                    "Other charges" appears only when the QBO total carries an
+                    amount the classified rows don't explain. Reconciles to the
+                    QBO Grand total. */}
                 <s-box
                   padding="base"
                   border="base"
@@ -2194,29 +2267,43 @@ export default function OrderDetail() {
                   <s-stack direction="block" gap="tight">
                     <TotalsRow
                       label="Subtotal"
-                      value={formatAmount(qbo.invoice.lineSubtotal, qbo.invoice.currency)}
-                    />
-                    {qbo.invoice.discount > 0 && (
-                      <TotalsRow
-                        label="Discount"
-                        value={`-${formatAmount(qbo.invoice.discount, qbo.invoice.currency)}`}
-                      />
-                    )}
-                    {qbo.invoice.totalTax > 0 && (
-                      <TotalsRow
-                        label="Tax"
-                        value={formatAmount(qbo.invoice.totalTax, qbo.invoice.currency)}
-                      />
-                    )}
-                    <TotalsRow
-                      label="Total"
-                      value={formatAmount(qbo.invoice.totalAmt, qbo.invoice.currency)}
+                      value={formatAmount(qbo.invoice.productSubtotal, qbo.invoice.currency)}
                     />
                     <TotalsRow
-                      label="Total of new charges"
-                      value={formatAmount(qbo.invoice.totalAmt, qbo.invoice.currency)}
+                      label="Discount"
+                      value={
+                        qbo.invoice.discount > 0
+                          ? `− ${formatAmount(qbo.invoice.discount, qbo.invoice.currency)}`
+                          : formatAmount(0, qbo.invoice.currency)
+                      }
+                      tone={qbo.invoice.discount > 0 ? "success" : undefined}
                     />
+                    <TotalsRow
+                      label="Shipping charges"
+                      value={formatAmount(qbo.invoice.shipping, qbo.invoice.currency)}
+                    />
+                    <TotalsRow
+                      label="Sales tax"
+                      value={formatAmount(qbo.invoice.totalTax, qbo.invoice.currency)}
+                    />
+                    {qbo.invoice.processingFee > 0 && (
+                      <TotalsRow
+                        label={qbo.invoice.processingFeeLabel || "Processing fee"}
+                        value={formatAmount(qbo.invoice.processingFee, qbo.invoice.currency)}
+                      />
+                    )}
+                    {Math.abs(qbo.invoice.otherCharges) > 0.005 && (
+                      <TotalsRow
+                        label="Other charges"
+                        value={formatAmount(qbo.invoice.otherCharges, qbo.invoice.currency)}
+                      />
+                    )}
                     <s-divider />
+                    <TotalsRow
+                      label="Grand total"
+                      value={formatAmount(qbo.invoice.totalAmt, qbo.invoice.currency)}
+                      strong
+                    />
                     <TotalsRow
                       label="Balance due"
                       value={formatAmount(qbo.invoice.balance, qbo.invoice.currency)}

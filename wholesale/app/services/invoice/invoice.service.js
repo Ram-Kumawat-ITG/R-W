@@ -122,7 +122,7 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
     rates: invoiceConfig.processingFeeRates,
   })
   if (creationFee) {
-    const feeLine = buildProcessingFeeLine(creationFee)
+    const feeLine = buildProcessingFeeLine({ ...creationFee, baseAmount: feeBase })
     if (feeLine) {
       lines.push(feeLine)
       invoice.processingFeeAmount = creationFee.amount
