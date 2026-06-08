@@ -60,16 +60,26 @@ export async function syncWithRetry(label, fn) {
 
 // Convert Shopify line_items to QBO invoice lines.
 //
-// Shape: { description, quantity, unitPrice, amount, qboItemId? }
-// Lines with non-positive amount are dropped. Shipping + tax become their
-// own synthetic lines so the invoice total matches Shopify's. If nothing
-// makes it through, we fall back to a single line at total_price so we
-// still produce a balanced invoice.
+// Shape: { description, quantity, unitPrice, amount, qboItemId? }, plus the
+// special discount marker { kind: 'discount', description, amount }.
+// Lines with non-positive amount are dropped. Discount and shipping become
+// their own synthetic lines. If nothing makes it through, we fall back to a
+// single line at total_price so we still produce a balanced invoice.
 //
-// NOTE: the processing-fee line is NOT added here — it's appended to
-// the QBO invoice at settlement time, with the rate selected by the
-// actual settlement method (card / ach / check). See
-// services/invoice/invoice.service.propagateSuccessfulPayment.
+// Ordering: product lines → discount → shipping. The discount line is a QBO
+// DiscountLineDetail (see toInvoiceLine) that subtracts from the running
+// subtotal of the product lines.
+//
+// TAX is deliberately NOT emitted as a line here. It is passed separately
+// to qbo.service.createInvoice as TxnTaxDetail.TotalTax so QBO renders it in
+// the invoice summary's "Tax" row rather than in the Products section. (QBO
+// has no API field for shipping or processing fees, so those stay as line
+// items — only tax has a native summary slot besides discount.)
+//
+// NOTE: the processing-fee line is NOT added here — it's appended by
+// services/invoice/invoice.service.createInvoiceForOrder (for card / ACH,
+// at creation) or at settlement time as a fallback. The rate is selected by
+// the invoice's payment method (card 3% / ach 1% / check 0%).
 export function shopifyLinesToQboLines(order) {
   const lines = []
   for (const item of order.line_items || []) {
@@ -82,6 +92,23 @@ export function shopifyLinesToQboLines(order) {
       quantity: qty,
       unitPrice,
       amount,
+      // Carried for per-product QBO Item resolution (SKU column). The QBO
+      // service resolves `sku` → a QBO Item (carrying that SKU) and sets the
+      // line's qboItemId; lines without a sku stay on the default item.
+      sku: item.sku ? String(item.sku).trim() : undefined,
+      name: item.name || item.title || undefined,
+    })
+  }
+  // Order-level / coupon / referral discount. Shopify reports the aggregate
+  // on `total_discounts`; we emit a single QBO discount line so the invoice
+  // total reconciles with Shopify's discounted total_price. Per-line
+  // discounts are already rolled into this aggregate.
+  const discountTotal = Number(order.total_discounts || 0)
+  if (discountTotal > 0) {
+    lines.push({
+      kind: 'discount',
+      description: 'Discount',
+      amount: discountTotal,
     })
   }
   const shippingTotal = Number(order.total_shipping_price_set?.shop_money?.amount || 0)
@@ -93,15 +120,9 @@ export function shopifyLinesToQboLines(order) {
       amount: shippingTotal,
     })
   }
-  const taxTotal = Number(order.total_tax || 0)
-  if (taxTotal > 0) {
-    lines.push({
-      description: 'Tax',
-      quantity: 1,
-      unitPrice: taxTotal,
-      amount: taxTotal,
-    })
-  }
+  // Tax is intentionally omitted from the line array — see the header
+  // comment. It travels to QBO via TxnTaxDetail.TotalTax (qbo.service.
+  // createInvoice) so it lands in the invoice's summary "Tax" row.
   if (lines.length === 0) {
     lines.push({
       description: `Order ${order.name || order.id}`,
@@ -144,20 +165,70 @@ export function computeProcessingFee({ baseAmount, method, rates }) {
 }
 
 // Build a processing-fee invoice line. Used to append the line to a QBO
-// invoice at settlement. The description encodes the method label + the
-// rate as a percentage so it's self-documenting in QBO ("Credit Card
-// Processing Fee – 3%").
-export function buildProcessingFeeLine({ amount, rate, method }) {
+// invoice at settlement. The description encodes the method label, the rate
+// as a percentage, AND the calculation basis when known, so the line is
+// self-documenting on the customer's invoice ("Credit Card Processing Fee –
+// 3% of $596.58"). `baseAmount` is the amount the fee was computed on
+// (post-discount grand total); when omitted the basis clause is dropped and
+// the description falls back to "… – 3%".
+export function buildProcessingFeeLine({ amount, rate, method, baseAmount }) {
   if (!Number.isFinite(amount) || amount <= 0) return null
   if (!Number.isFinite(rate) || rate <= 0) return null
   const rounded = Number(amount.toFixed(2))
   if (rounded <= 0) return null
   const pct = +(rate * 100).toFixed(4)
+  const basis =
+    Number.isFinite(baseAmount) && baseAmount > 0
+      ? ` of $${Number(baseAmount).toFixed(2)}`
+      : ''
   return {
-    description: `${processingFeeLabel(method)} – ${pct}%`,
+    description: `${processingFeeLabel(method)} – ${pct}%${basis}`,
     quantity: 1,
     unitPrice: rounded,
     amount: rounded,
+  }
+}
+
+// Build the ordered invoice-calculation rows for display. Pure — used by
+// the admin Order Details totals box so the on-screen breakdown matches the
+// QBO invoice's structure exactly:
+//
+//   Order Subtotal  (gross, pre-discount line-items total)
+//   − Discount
+//   = Adjusted Subtotal
+//   + Shipping
+//   + Tax
+//   + Payment Processing Fee
+//   = Grand Total
+//
+// `totals` is the Shopify-derived breakdown
+// ({ lineItemsTotal, discounts, subtotal, shipping, tax, grandTotal,
+// taxesIncluded }). `fee` is { amount, label } | null. `grandTotalOverride`
+// (the invoice's fee-inclusive amountDue) wins when provided so the displayed
+// total is exactly what will be charged; otherwise we sum the components.
+export function computeInvoiceCalculation({ totals, fee, grandTotalOverride }) {
+  if (!totals) return null
+  const orderSubtotal = Number(totals.lineItemsTotal ?? totals.subtotal ?? 0)
+  const discount = Number(totals.discounts ?? 0)
+  const adjustedSubtotal = Number((orderSubtotal - discount).toFixed(2))
+  const shipping = Number(totals.shipping ?? 0)
+  const tax = Number(totals.tax ?? 0)
+  const feeAmount = fee ? Number(fee.amount ?? 0) : 0
+  const computedGrand = Number(
+    (adjustedSubtotal + shipping + tax + feeAmount).toFixed(2),
+  )
+  const grandTotal = Number.isFinite(grandTotalOverride)
+    ? Number(grandTotalOverride.toFixed(2))
+    : computedGrand
+  return {
+    orderSubtotal,
+    discount,
+    adjustedSubtotal,
+    shipping,
+    tax,
+    taxesIncluded: Boolean(totals.taxesIncluded),
+    fee: feeAmount > 0 ? { amount: feeAmount, label: fee?.label || 'Processing Fee' } : null,
+    grandTotal,
   }
 }
 
@@ -244,21 +315,16 @@ export function applyDerivedPaymentStatus(invoice) {
 }
 
 // Compose the QBO invoice line description from a Shopify line_item.
-// Format: "<product name> by <vendor>, SKU: <sku>" — vendor and SKU are
-// each conditional so missing fields don't leave dangling separators.
-// We use `name` (which Shopify pre-joins as "Title - Variant Title")
-// over `title` so any variant detail survives the trip into QBO.
+// Format: "<product name> by <vendor>" — vendor is conditional. We use
+// `name` (which Shopify pre-joins as "Title - Variant Title") over `title`
+// so any variant detail survives the trip into QBO.
 //
-// SKU is normalized: some merchants enter the value in Shopify as
-// "SKU: 1234" (with the prefix baked in). Without stripping, the output
-// becomes "SKU: SKU: 1234". Strip any leading "SKU:" (case-insensitive)
-// before re-prefixing so the result is always exactly one "SKU: ".
+// SKU is deliberately NOT included here — it's carried separately on the
+// line (see shopifyLinesToQboLines) and surfaces in QBO's dedicated SKU
+// column via the referenced Item's Sku. Keeping it out of the description
+// avoids the SKU appearing twice (Products column + SKU column).
 export function formatLineDescription(item) {
   if (!item) return ''
   const productName = item.name || item.title || `Item ${item.id ?? ''}`.trim()
-  const head = item.vendor ? `${productName} by ${item.vendor}` : productName
-  const parts = [head]
-  const sku = String(item.sku || '').replace(/^\s*sku\s*:\s*/i, '').trim()
-  if (sku) parts.push(`SKU: ${sku}`)
-  return parts.join(', ')
+  return item.vendor ? `${productName} by ${item.vendor}` : productName
 }

@@ -12,7 +12,6 @@
 // services/scheduler/jobs/processPendingPayments.job.js — that's what
 // calls into this service per-invoice.
 
-import Invoice from '../../models/invoice.server'
 import PaymentAttempt from '../../models/paymentAttempt.server'
 import {
   chargeCustomerVault,
@@ -173,13 +172,15 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
   await invoice.save()
 
   // Outstanding (base) — what's left to settle on the invoice before
-  // adding the per-method processing fee. The fee is decided by the
-  // ACTUAL settlement method on the invoice (not the customer's
-  // preference): a cheque-preferred customer who lands here via the
-  // admin charge-card fallback has invoice.paymentMethod === 'card'
-  // already, so the 3% card fee applies. The fee is added at most
-  // once per invoice — once processingFeeAppliedAt is set, retries
-  // use the already-applied amount and don't double-add.
+  // adding the per-method processing fee. For card / ACH invoices the fee
+  // was already added at creation (processingFeeAppliedAt is set, and it's
+  // baked into amountDue), so feePreview below is null and we charge the
+  // full fee-inclusive balance. The staging here is now the FALLBACK path:
+  // it fires for the cheque → card admin override (a cheque invoice has no
+  // fee yet, so charging the card applies the 3% card fee) and for legacy
+  // invoices created before fee-at-creation. The fee is added at most once
+  // per invoice — once processingFeeAppliedAt is set, retries use the
+  // already-applied amount and don't double-add.
   //
   // `requestedAmount` is the optional admin-driven partial-charge amount
   // (entered on the Retry / Charge-card modal). It clips against the
@@ -457,7 +458,13 @@ export async function checkAchSettlement({ invoice, customerMap }) {
       amount: settledAmount,
       newStatus: invoice.paymentStatus,
     })
-    return { action: 'settled', condition, amount: settledAmount, transactionId }
+    return {
+      action: 'settled',
+      condition,
+      amount: settledAmount,
+      transactionId,
+      newStatus: invoice.paymentStatus,
+    }
   }
 
   if (condition === 'failed' || condition === 'canceled') {
@@ -466,6 +473,15 @@ export async function checkAchSettlement({ invoice, customerMap }) {
     const action = status.latestAction
     const reason =
       action?.response_text || action?.responsetext || `NMI condition=${condition}`
+    const returnCode = action?.response_code || action?.responsecode || undefined
+
+    // Persist the NACHA return detail on the invoice so the ACH
+    // status-sync layer + admin UI can surface it (code + reason +
+    // when). These are distinct from the PaymentAttempt row below: this
+    // is the "latest return" snapshot on the invoice itself.
+    invoice.achReturnCode = returnCode
+    invoice.achReturnReason = reason
+    invoice.achReturnedAt = new Date()
 
     // Persist the failure on the payment audit ledger so the
     // PaymentAttempt count + lastAttemptError reflect the return.
@@ -510,7 +526,15 @@ export async function checkAchSettlement({ invoice, customerMap }) {
       reason,
       newStatus: invoice.paymentStatus,
     })
-    return { action: 'returned', condition, reason, transactionId, amount: failedAmount }
+    return {
+      action: 'returned',
+      condition,
+      reason,
+      returnCode,
+      transactionId,
+      amount: failedAmount,
+      newStatus: invoice.paymentStatus,
+    }
   }
 
   // pendingsettlement / pending / in_progress / unknown — leave alone.

@@ -2,6 +2,7 @@ import { Outlet, useLoaderData, useNavigate } from "react-router";
 import { authenticate } from "../shopify.server";
 import {
   getPractitionerProfile,
+  getPractitionerHold,
   createPractitionerCode,
   updatePractitionerCode,
   deletePractitionerCode,
@@ -41,7 +42,8 @@ export const loader = async ({ request, params }) => {
   if (!profile) {
     throw new Response("Practitioner not found", { status: 404 });
   }
-  return { profile };
+  const hold = await getPractitionerHold(params.id);
+  return { profile, hold };
 };
 
 export const action = async ({ request, params }) => {
@@ -146,7 +148,7 @@ function parseFractionField(raw) {
 }
 
 export default function CdoCustomerDetailLayout() {
-  const { profile } = useLoaderData();
+  const { profile, hold } = useLoaderData();
   const navigate = useNavigate();
 
   const initials =
@@ -180,6 +182,9 @@ export default function CdoCustomerDetailLayout() {
                 )}
                 <s-stack direction="inline" gap="small-200" alignItems="center">
                   <StatusBadge status={profile.status} />
+                  <s-badge tone={hold?.paused ? "warning" : "success"}>
+                    {hold?.paused ? "Payouts paused" : "Payouts active"}
+                  </s-badge>
                   {profile.businessName && (
                     <s-text tone="subdued">· {profile.businessName}</s-text>
                   )}
@@ -187,6 +192,15 @@ export default function CdoCustomerDetailLayout() {
                     <s-text tone="subdued">· ID {profile.customerId}</s-text>
                   )}
                 </s-stack>
+                {hold?.paused && (
+                  <s-text tone="subdued">
+                    Commission payouts paused
+                    {hold.pausedBy ? ` by ${hold.pausedBy}` : ""}
+                    {hold.pausedAt ? ` on ${formatDateTime(hold.pausedAt)}` : ""}
+                    {hold.note ? ` — ${hold.note}` : ""}. Commissions still accrue; manage on the
+                    Settings tab.
+                  </s-text>
+                )}
                 {profile.submittedAt && (
                   <s-text tone="subdued">
                     Registered {formatDateTime(profile.submittedAt)}

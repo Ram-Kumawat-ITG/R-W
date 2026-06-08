@@ -1,34 +1,33 @@
 import { authenticate, unauthenticated } from "../shopify.server";
-import connectDB from "../db/mongo.server";
-import CdoApplication from "../models/cdoApplication.server";
-import CdoPractitionerCode from "../models/cdoPractitionerCode.server";
+import { ingestShopifyOrder } from "../services/cdo/cdo.service";
+import { extractPractitionerCode, extractCodeFromTags } from "../utils/orderCode";
 
 // In-memory dedup of webhook ids — Shopify delivers at-least-once and
 // can fire the same payload multiple times in a short window. 5 min TTL
-// is enough to absorb retries without leaking memory.
+// is enough to absorb retries without leaking memory. (The DB layer is
+// also idempotent — orders upsert by (shop, shopifyOrderId) — this is just
+// a fast-path so retries don't re-run the whole pipeline.)
 const _seenWebhookIds = new Set();
 const SEEN_TTL_MS = 5 * 60 * 1000;
 
-const CODE_PATTERN = /^[a-z]+_[a-f0-9]{8}$/i;
-
 // Handler for retail Shopify orders/create.
 //
-// What it does on every paid order:
+// On every order:
 //   1. Verify HMAC
 //   2. Dedup against the webhook id
-//   3. Return 200 IMMEDIATELY (fire-and-forget the rest — never block
-//      the webhook response on downstream Mongo / GraphQL calls)
-//   4. Extract the practitioner code from cart attributes (preferred)
-//      or from the order's discount_codes (fallback)
-//   5. Look the code up in cdo_practitioner_codes (active only)
-//   6. Tag the customer with `code:<the-code>`
-//   7. Upsert cdo_applications by email — first-touch wins, only
-//      populate referral if it's currently null
+//   3. Return 200 IMMEDIATELY (fire-and-forget the rest — never block the
+//      webhook response on downstream Mongo / GraphQL calls)
+//   4. Resolve the practitioner code: cart/order attribute first, then a
+//      discount code on the order, then a `CODE:`/`REFERRAL:` tag on the
+//      Shopify customer (the code isn't always present on the order itself)
+//   5. Hand the order to cdo.service.ingestShopifyOrder, which syncs the
+//      full order into cdo_orders and — when attributed — creates the
+//      referral / commission / ledger / customer-mapping records
+//   6. Tag the customer with `code:<the-code>` when attributed
 export async function action({ request }) {
-  let topic, shop, payload, webhookId;
+  let shop, payload, webhookId;
   try {
     const res = await authenticate.webhook(request);
-    topic = res.topic;
     shop = res.shop;
     payload = res.payload;
     webhookId = request.headers.get("x-shopify-webhook-id");
@@ -130,128 +129,65 @@ async function forwardToWholesaleDropship({ payload, retailShop }) {
 }
 
 async function processOrder({ shop, payload }) {
-  const orderId = payload?.id;
-  const code = extractPractitionerCode(payload);
-  if (!code) {
-    console.log(`[webhooks.orders.create] order ${orderId} — no practitioner code`);
-    return;
-  }
+  let { code, source } = extractPractitionerCode(payload);
 
-  await connectDB();
-  const escaped = code.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const codeDoc = await CdoPractitionerCode.findOne({
-    code: { $regex: `^${escaped}$`, $options: "i" },
-    status: "active",
-  }).lean();
-
-  if (!codeDoc) {
-    console.warn(
-      `[webhooks.orders.create] order ${orderId} carried code "${code}" but it's not in cdo_practitioner_codes`,
-    );
-    return;
-  }
-
-  console.log(
-    `[webhooks.orders.create] order ${orderId} matched code ${codeDoc.code} (practitioner=${codeDoc.practitionerEmail})`,
-  );
-
-  // 6. Tag the customer if we have one. Guest checkouts may not have a
-  // linked customer; in that case skip tagging but still upsert the
-  // cdo_application by email below.
+  // The referral code isn't always on the order. Fall back to the
+  // customer's Shopify tags (e.g. "CODE:DURGESH10" / "REFERRAL:DURGESH10").
   const customerGid = payload?.customer?.admin_graphql_api_id || null;
-  if (customerGid) {
-    await tagCustomerWithCode(
-      shop,
-      customerGid,
-      codeDoc.code,
-      codeDoc.practitionerEmail || null,
-    ).catch((err) => {
+  if (!code && customerGid) {
+    try {
+      const tags = await fetchCustomerTags(shop, customerGid);
+      const fromTag = extractCodeFromTags(tags);
+      if (fromTag) {
+        code = fromTag;
+        source = "customer_tag";
+        console.log(
+          `[webhooks.orders.create] resolved code "${fromTag}" from customer ${customerGid} tags`,
+        );
+      }
+    } catch (err) {
       console.error(
-        `[webhooks.orders.create] tag customer ${customerGid} failed:`,
+        `[webhooks.orders.create] fetching customer ${customerGid} tags failed:`,
+        err?.message || err,
+      );
+    }
+  }
+
+  const result = await ingestShopifyOrder({
+    shop,
+    payload,
+    rawCode: code,
+    attributionSource: source,
+  });
+
+  // Tag the customer with the canonical code when the order attributed and
+  // we have a linked customer. Guest checkouts may have no customer — the
+  // cdo_application mapping (by email) still happened inside the service.
+  if (result?.attributed && result.customerGid && result.referralCode) {
+    await tagCustomerWithCode(shop, result.customerGid, result.referralCode).catch((err) => {
+      console.error(
+        `[webhooks.orders.create] tag customer ${result.customerGid} failed:`,
         err?.message || err,
       );
     });
   }
-
-  // 7. Upsert cdo_applications (first-touch wins for referral).
-  const email = String(
-    payload?.email || payload?.contact_email || payload?.customer?.email || "",
-  )
-    .toLowerCase()
-    .trim();
-  if (!email) {
-    console.warn(`[webhooks.orders.create] order ${orderId} has no email — skipping cdo_application upsert`);
-    return;
-  }
-
-  const referralSnapshot = buildReferralSnapshot(codeDoc);
-  const existing = await CdoApplication.findOne({ email }).lean();
-
-  if (existing) {
-    // First-touch wins: don't overwrite existing referral. Just attach
-    // the customerId if it was missing.
-    const updates = {};
-    if (!existing.referral) {
-      updates.referral = referralSnapshot;
-    }
-    if (!existing.customerId && customerGid) {
-      updates.customerId = customerGid;
-    }
-    if (Object.keys(updates).length) {
-      await CdoApplication.updateOne({ _id: existing._id }, { $set: updates });
-      console.log(
-        `[webhooks.orders.create] updated cdo_application ${existing._id} — set ${Object.keys(updates).join(", ")}`,
-      );
-    } else {
-      console.log(
-        `[webhooks.orders.create] cdo_application ${existing._id} already complete — no update needed (first-touch wins)`,
-      );
-    }
-    return;
-  }
-
-  // No row yet — create one. This happens when the order came from a
-  // brand-new patient who didn't go through our signup form.
-  await CdoApplication.create({
-    shop,
-    applicantType: "patient",
-    firstName: payload?.customer?.first_name || payload?.billing_address?.first_name || null,
-    lastName: payload?.customer?.last_name || payload?.billing_address?.last_name || null,
-    email,
-    billingAddress: null,
-    shippingAddress: null,
-    referral: referralSnapshot,
-    status: "approved",
-    submittedAt: new Date(),
-    reviewedAt: null,
-    customerId: customerGid,
-  });
-  console.log(
-    `[webhooks.orders.create] created cdo_application for new patient ${email}`,
-  );
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
+// extractPractitionerCode + extractCodeFromTags live in ../utils/orderCode
+// (shared with the orders/paid + orders/updated handlers). Customer-tag
+// fetching + tagging stay here (Shopify Admin API).
 
-function extractPractitionerCode(order) {
-  // 1. Preferred: the cart attribute our checkout UI extension stamps
-  //    on the order before discount apply. Reliable signal even if the
-  //    discount itself was later removed by another code.
-  const noteAttrs = order?.note_attributes || [];
-  for (const attr of noteAttrs) {
-    if (attr?.name === "cdo_practitioner_code" && attr?.value) {
-      const v = String(attr.value).trim();
-      if (v) return v;
-    }
-  }
-  // 2. Fallback: scan discount_codes for one that matches the
-  //    practitioner-code shape.
-  const dcs = order?.discount_codes || [];
-  for (const dc of dcs) {
-    const c = String(dc?.code || "").trim();
-    if (c && CODE_PATTERN.test(c)) return c;
-  }
-  return null;
+async function fetchCustomerTags(shop, customerGid) {
+  const { admin } = await unauthenticated.admin(shop);
+  const res = await admin.graphql(
+    `query GetCustomerTags($id: ID!) {
+      customer(id: $id) { id tags }
+    }`,
+    { variables: { id: customerGid } },
+  );
+  const data = await res.json();
+  return data?.data?.customer?.tags || [];
 }
 
 async function tagCustomerWithCode(shop, customerGid, code, practitionerEmail) {
@@ -266,14 +202,7 @@ async function tagCustomerWithCode(shop, customerGid, code, practitionerEmail) {
   const { admin } = await unauthenticated.admin(shop);
 
   // Fetch existing tags so we don't clobber other tags
-  const fetchRes = await admin.graphql(
-    `query GetCustomerTags($id: ID!) {
-      customer(id: $id) { id tags }
-    }`,
-    { variables: { id: customerGid } },
-  );
-  const fetchData = await fetchRes.json();
-  const existing = fetchData?.data?.customer?.tags || [];
+  const existing = await fetchCustomerTags(shop, customerGid);
 
   // Determine which tags are missing — skip the whole update if both
   // are already present.
@@ -309,22 +238,6 @@ async function tagCustomerWithCode(shop, customerGid, code, practitionerEmail) {
   console.log(
     `[webhooks.orders.create] tagged ${customerGid} with ${toAdd.map((t) => `"${t}"`).join(", ")}`,
   );
-}
-
-function buildReferralSnapshot(codeDoc) {
-  return {
-    code: codeDoc.code,
-    codeId: String(codeDoc._id),
-    practitionerId: codeDoc.practitionerId ? String(codeDoc.practitionerId) : null,
-    practitionerSource: "wholesale",
-    practitionerName: codeDoc.practitionerName || null,
-    practitionerEmail: codeDoc.practitionerEmail || null,
-    discountPercent:
-      typeof codeDoc.discountPercent === "number" ? codeDoc.discountPercent : 0,
-    commissionRate:
-      typeof codeDoc.commissionRate === "number" ? codeDoc.commissionRate : null,
-    linkedAt: new Date(),
-  };
 }
 
 export async function loader() {

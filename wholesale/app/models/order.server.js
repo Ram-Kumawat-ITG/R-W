@@ -83,6 +83,66 @@ const orderSchema = new mongoose.Schema(
     nmiTransactionId: String,
     shopifyPaidSyncedAt: Date,
 
+    // ── Shipment tracking ─────────────────────────────────────────────
+    //
+    // Populated by the fulfillments/create + fulfillments/update webhooks
+    // (services/order/order.service.handleFulfillmentUpdate). `fulfillments[]`
+    // is the CURRENT state — one entry per Shopify fulfillment id, upserted
+    // in place on update. `trackingHistory[]` is the append-only audit trail
+    // — one row per detected change (number / carrier / status), so the
+    // Order Details page can show "what changed when". `trackingUrl` is the
+    // resolved carrier deep-link (official tracking page, number pre-filled),
+    // falling back to Shopify's own `shopifyTrackingUrl`. `carrierKey` is the
+    // normalized carrier (ups/fedex/usps/dhl/other).
+    fulfillments: {
+      type: [
+        new mongoose.Schema(
+          {
+            fulfillmentId: { type: String, required: true },
+            trackingNumber: String,
+            trackingCompany: String, // raw Shopify tracking_company
+            carrierKey: String, // normalized: ups|fedex|usps|dhl|other
+            trackingUrl: String, // resolved carrier deep-link (or Shopify's)
+            shopifyTrackingUrl: String, // Shopify's own tracking_url
+            shipmentStatus: String, // carrier-driven shipment_status
+            status: String, // fulfillment.status (pending/open/success/cancelled)
+            fulfilledAt: Date, // Shopify fulfillment created_at (the "Fulfillment Date")
+            estimatedDeliveryAt: Date, // carrier estimate, when provided
+            createdAt: { type: Date, default: Date.now }, // when WE first saw it
+            updatedAt: { type: Date, default: Date.now }, // when WE last updated it
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+    trackingHistory: {
+      type: [
+        new mongoose.Schema(
+          {
+            at: { type: Date, default: Date.now },
+            fulfillmentId: String,
+            trackingNumber: String,
+            trackingCompany: String,
+            carrierKey: String,
+            shipmentStatus: String,
+            event: { type: String, enum: ['created', 'updated'] },
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+    trackingUpdatedAt: Date,
+
+    // Official Ship Date — sourced from Shopify, NOT the order creation date.
+    // Denormalized as the EARLIEST fulfillment date across `fulfillments[]`
+    // (i.e. when the order first shipped). Recomputed on every fulfillment
+    // sync. Per-shipment dates live on `fulfillments[].fulfilledAt` (shown
+    // for partially-fulfilled orders). Fed to the QBO invoice's ShipDate and
+    // shown on Order Details + the invoice panel + the tracking section.
+    shippedAt: Date,
+
     rawPayload: mongoose.Schema.Types.Mixed,
     receivedAt: { type: Date, default: Date.now },
     completedAt: Date,

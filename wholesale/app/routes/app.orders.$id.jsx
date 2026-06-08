@@ -12,13 +12,20 @@ import ShopifyOrder from "../models/order.server";
 import Invoice from "../models/invoice.server";
 import PaymentAttempt from "../models/paymentAttempt.server";
 import CustomerMap from "../models/customerMap.server";
+import WholesaleApplication from "../models/wholesaleApplication.server";
+import QboItemMap from "../models/qboItemMap.server";
 import { getInvoice as getQboInvoice, getInvoiceWebUrl } from "../services/qbo/qbo.service";
 import {
   resolveCustomerVaultId,
   resolveCustomerAchBillingId,
 } from "../services/customer/customer.service";
+import { syncFulfillmentsFromShopify } from "../services/order/order.service";
 import { invoiceConfig } from "../services/invoice/invoice.config";
-import { computeProcessingFee, processingFeeLabel } from "../services/invoice/invoice.utils";
+import {
+  computeProcessingFee,
+  processingFeeLabel,
+  computeInvoiceCalculation,
+} from "../services/invoice/invoice.utils";
 import {
   KV,
   TotalsRow,
@@ -26,7 +33,9 @@ import {
   PaymentStatusBadge,
   PaymentMethodBadge,
   OutcomeBadge,
+  ShipmentStatusBadge,
 } from "../components/admin-ui";
+import { carrierDisplayName } from "../utils/shipping.constants";
 import { formatAmount, fmtDateTime } from "../utils/format.utils";
 import { PAYMENT_METHOD_LABEL } from "../utils/payment.constants";
 
@@ -44,6 +53,19 @@ const RETRYABLE_PAYMENT_STATUSES = new Set([
   "partially_paid",
   "failed",
 ]);
+
+// Label + Polaris badge tone for the normalized status returned by the
+// last ACH status sync (manual button or CRON). Mirrors the values
+// achStatusSync.service writes to Invoice.achSyncLastStatus.
+const ACH_SYNC_STATUS_META = {
+  settled: { label: "Settled", tone: "success" },
+  returned: { label: "Returned", tone: "critical" },
+  voided: { label: "Voided", tone: "critical" },
+  failed: { label: "Failed", tone: "critical" },
+  pending_settlement: { label: "Awaiting settlement", tone: "info" },
+  unknown: { label: "Status unknown", tone: "warning" },
+  error: { label: "Sync error", tone: "warning" },
+};
 
 // Human-readable label + Polaris badge tone for each Invoice.remarks[]
 // kind. Keep in lockstep with the enum in models/invoice.server.js so
@@ -208,7 +230,7 @@ function computePipelineSteps({ order, invoice }) {
 }
 
 export const loader = async ({ request, params }) => {
-  const { session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const { id } = params;
   if (!id || !mongoose.isValidObjectId(id)) {
     throw new Response("Invalid id", { status: 400 });
@@ -217,6 +239,31 @@ export const loader = async ({ request, params }) => {
   await connectDB();
   const order = await ShopifyOrder.findOne({ _id: id, shop: session.shop }).lean();
   if (!order) throw new Response("Not found", { status: 404 });
+
+  // Live-pull the order's fulfillments from Shopify and persist them, so
+  // shipment tracking shows even when the fulfillments/* webhooks were
+  // missed / never subscribed (protected-topic approval gate) or the order
+  // was fulfilled before the subscription existed. Best-effort: a Shopify
+  // outage must NOT 500 the page — we just fall back to whatever's already
+  // stored. Mirrors the graceful live-QBO-invoice fetch below.
+  if (order.shopifyOrderId) {
+    try {
+      const synced = await syncFulfillmentsFromShopify({
+        shop: session.shop,
+        shopifyOrderId: order.shopifyOrderId,
+        admin,
+      });
+      if (synced) {
+        order.fulfillments = synced.fulfillments || order.fulfillments;
+        order.trackingHistory = synced.trackingHistory || order.trackingHistory;
+        order.trackingUpdatedAt = synced.trackingUpdatedAt || order.trackingUpdatedAt;
+        order.fulfillmentStatus = synced.fulfillmentStatus ?? order.fulfillmentStatus;
+        order.shippedAt = synced.shippedAt ?? order.shippedAt;
+      }
+    } catch (e) {
+      console.error("[order-detail] fulfillment live-sync failed:", e?.message || e);
+    }
+  }
 
   const invoice = order.invoiceRef
     ? await Invoice.findById(order.invoiceRef).lean()
@@ -234,6 +281,16 @@ export const loader = async ({ request, params }) => {
         .select("qboCustomerId nmiCustomerVaultId nmiAchBillingId profile")
         .lean()
     : null;
+
+  // Business name lives on the customer's wholesale application (the
+  // registration form), not on CustomerMap — surface it in the Customer
+  // section. Queried by email (the app's customer key).
+  const application = order.customerEmail
+    ? await WholesaleApplication.findOne({ email: order.customerEmail })
+        .select("businessName")
+        .lean()
+    : null;
+  const businessName = application?.businessName || null;
 
   // Cache-or-source-of-truth lookups for BOTH the card vault and the
   // ACH billing id. customer_maps caches are populated at order intake;
@@ -284,6 +341,24 @@ export const loader = async ({ request, params }) => {
       const raw = await getQboInvoice(invoice.qboInvoiceId);
       qboInvoice = raw ? projectQboInvoice(raw) : null;
       if (!qboInvoice) qboInvoiceError = "QBO returned no invoice for this id";
+      // Attach each product line's SKU for the panel's SKU column. QBO
+      // invoice lines don't carry the item's Sku — resolve it from the
+      // qbo_item_maps cache by the line's QBO item id (reverse lookup).
+      if (qboInvoice?.productLines?.length) {
+        const itemIds = [
+          ...new Set(qboInvoice.productLines.map((l) => l.itemId).filter(Boolean)),
+        ];
+        if (itemIds.length) {
+          const maps = await QboItemMap.find({ qboItemId: { $in: itemIds } })
+            .select("qboItemId sku")
+            .lean();
+          const skuByItemId = new Map(maps.map((m) => [m.qboItemId, m.sku]));
+          qboInvoice.productLines = qboInvoice.productLines.map((l) => ({
+            ...l,
+            sku: skuByItemId.get(l.itemId) || null,
+          }));
+        }
+      }
     } catch (e) {
       console.error("[orders] QBO invoice fetch failed:", e?.message || e);
       qboInvoiceError = e?.message || "Failed to fetch QBO invoice";
@@ -295,6 +370,7 @@ export const loader = async ({ request, params }) => {
     invoice: invoice ? serialize(invoice) : null,
     attempts: attempts.map(serialize),
     customerMap: customerMap ? serialize(customerMap) : null,
+    businessName,
     breakdown,
     // Processing-fee rates by settlement method. Surfaced to the client
     // so confirmation modals (charge-card, mark-cheque-paid) can show the
@@ -335,6 +411,54 @@ function projectQboInvoice(inv) {
       };
     });
 
+  // Classify the QBO SalesItemLineDetail rows so the panel can show a full,
+  // always-on itemized breakdown (Subtotal of products → Discount → Shipping
+  // → Tax → Processing Fee → Grand total). The descriptions are the ones we
+  // author at creation: "Shipping" (exact) and "<Method> Processing Fee – X%
+  // of $Y". Anything else is a product line.
+  const FEE_RE = /processing fee/i;
+  const SHIP_RE = /^\s*shipping\s*$/i;
+  const productLines = [];
+  let shipping = 0;
+  let processingFee = 0;
+  let processingFeeLabel = null;
+  for (const l of itemLines) {
+    const desc = l.description || "";
+    if (FEE_RE.test(desc)) {
+      processingFee += l.amount || 0;
+      processingFeeLabel = desc; // self-documenting: "… – 3% of $596.58"
+    } else if (SHIP_RE.test(desc)) {
+      shipping += l.amount || 0;
+    } else {
+      productLines.push(l);
+    }
+  }
+  const productSubtotal = Number(
+    productLines.reduce((s, l) => s + (l.amount || 0), 0).toFixed(2),
+  );
+  shipping = Number(shipping.toFixed(2));
+  processingFee = Number(processingFee.toFixed(2));
+  const discount = Number(
+    lines
+      .filter((l) => l.DetailType === "DiscountLineDetail")
+      .reduce((s, l) => s + (l.Amount != null ? Number(l.Amount) : 0), 0)
+      .toFixed(2),
+  );
+  const totalTax = inv.TxnTaxDetail?.TotalTax != null ? Number(inv.TxnTaxDetail.TotalTax) : 0;
+  const totalAmt = inv.TotalAmt != null ? Number(inv.TotalAmt) : null;
+  // Reconciling catch-all: any portion of the QBO total not explained by the
+  // classified rows surfaces as "Other charges" so the breakdown always sums
+  // to TotalAmt (and we never silently hide a charge).
+  const otherCharges =
+    totalAmt != null
+      ? Number(
+          (
+            totalAmt -
+            (productSubtotal - discount + shipping + totalTax + processingFee)
+          ).toFixed(2),
+        )
+      : 0;
+
   const linkedPayments = (inv.LinkedTxn || [])
     .filter((t) => t.TxnType === "Payment")
     .map((t) => ({ id: t.TxnId }));
@@ -351,14 +475,21 @@ function projectQboInvoice(inv) {
     currency: inv.CurrencyRef?.value || null,
     emailStatus: inv.EmailStatus || null,
     printStatus: inv.PrintStatus || null,
-    totalAmt: inv.TotalAmt != null ? Number(inv.TotalAmt) : null,
+    totalAmt,
     balance: inv.Balance != null ? Number(inv.Balance) : null,
-    totalTax: inv.TxnTaxDetail?.TotalTax != null
-      ? Number(inv.TxnTaxDetail.TotalTax)
-      : 0,
+    totalTax,
     createTime: inv.MetaData?.CreateTime || null,
     lastUpdatedTime: inv.MetaData?.LastUpdatedTime || null,
     lines: itemLines,
+    // Full itemized breakdown (always-on rows): products subtotal → discount
+    // → shipping → tax → processing fee → other → grand total.
+    productLines,
+    productSubtotal,
+    discount,
+    shipping,
+    processingFee,
+    processingFeeLabel,
+    otherCharges,
     linkedPayments,
   };
 }
@@ -399,9 +530,20 @@ function extractBreakdown(rawPayload, fallbackCurrency) {
     rawPayload.total_shipping_price_set?.shop_money?.amount ?? 0,
   );
 
+  const discounts = Number(rawPayload.total_discounts ?? 0);
+  // Gross (pre-discount) line-items total — the "Order Subtotal" row.
+  // Shopify's `subtotal_price` is already net of discounts, so we prefer
+  // `total_line_items_price` for the gross figure and fall back to
+  // reconstructing it (subtotal + discounts) for older payloads.
+  const lineItemsTotal = Number(
+    rawPayload.total_line_items_price ??
+      Number(rawPayload.subtotal_price ?? 0) + discounts,
+  );
   const totals = {
+    lineItemsTotal,
+    // Adjusted (post-discount) subtotal — Shopify's subtotal_price.
     subtotal: Number(rawPayload.subtotal_price ?? rawPayload.total_line_items_price ?? 0),
-    discounts: Number(rawPayload.total_discounts ?? 0),
+    discounts,
     shipping,
     tax: Number(rawPayload.total_tax ?? 0),
     taxesIncluded: Boolean(rawPayload.taxes_included),
@@ -429,7 +571,7 @@ function serialize(doc) {
 }
 
 export default function OrderDetail() {
-  const { order, invoice, attempts, customerMap, breakdown, qbo, processingFeeRates } =
+  const { order, invoice, attempts, customerMap, businessName, breakdown, qbo, processingFeeRates } =
     useLoaderData();
   const navigate = useNavigate();
   const shopify = useAppBridge();
@@ -440,18 +582,29 @@ export default function OrderDetail() {
   const sendInvoiceFetcher = useFetcher();
   const pauseAutoChargeFetcher = useFetcher();
   const resumeAutoChargeFetcher = useFetcher();
+  const pauseRemindersFetcher = useFetcher();
+  const resumeRemindersFetcher = useFetcher();
+  const syncAchFetcher = useFetcher();
   const modalRef = useRef(null);
   const chequeModalRef = useRef(null);
   const chargeCardModalRef = useRef(null);
   const pauseAutoChargeModalRef = useRef(null);
   const resumeAutoChargeModalRef = useRef(null);
+  const pauseRemindersModalRef = useRef(null);
+  const resumeRemindersModalRef = useRef(null);
   const [bannerError, setBannerError] = useState(null);
   const [bannerSuccess, setBannerSuccess] = useState(null);
+  // Dedicated feedback for the ACH status sync action (its own banner so
+  // the wording is accurate — it reflects NMI state, it's not a "retry").
+  // Shape: { tone: 'success'|'critical'|'info', heading, text }.
+  const [achSyncBanner, setAchSyncBanner] = useState(null);
   const [chequeReference, setChequeReference] = useState("");
   const [chequeAmount, setChequeAmount] = useState("");
   const [chequeReceivedAt, setChequeReceivedAt] = useState("");
   const [pauseNote, setPauseNote] = useState("");
   const [resumeNote, setResumeNote] = useState("");
+  const [reminderPauseNote, setReminderPauseNote] = useState("");
+  const [reminderResumeNote, setReminderResumeNote] = useState("");
   const handledRetryRef = useRef(null);
   const handledChequeRef = useRef(null);
   const handledChargeCardRef = useRef(null);
@@ -459,6 +612,9 @@ export default function OrderDetail() {
   const handledSendInvoiceRef = useRef(null);
   const handledPauseAutoChargeRef = useRef(null);
   const handledResumeAutoChargeRef = useRef(null);
+  const handledPauseRemindersRef = useRef(null);
+  const handledResumeRemindersRef = useRef(null);
+  const handledSyncAchRef = useRef(null);
   // Holds the window opened synchronously on PDF click; we redirect it
   // to a blob URL once the fetcher returns. Opening *after* the async
   // step would trip popup blockers.
@@ -642,6 +798,44 @@ export default function OrderDetail() {
     resumeAutoChargeFetcher.state === "submitting" ||
     resumeAutoChargeFetcher.state === "loading";
 
+  // Email-reminder pause/resume. Gated to cheque invoices — the reminder
+  // CRON only emails Check-method invoices, so a pause flag on a card/ACH
+  // invoice would be a silent no-op. Paid/cancelled invoices already drop
+  // out of the reminder sweep, so neither button is offered there.
+  const reminderPaused = invoice?.reminderPaused === true;
+  const reminderPauseActionable =
+    !!invoice &&
+    isChequeInvoice &&
+    invoice.paymentStatus !== "paid" &&
+    invoice.paymentStatus !== "cancelled";
+  const canPauseReminders = reminderPauseActionable && !reminderPaused;
+  const canResumeReminders = reminderPauseActionable && reminderPaused;
+  const pauseRemindersSubmitting =
+    pauseRemindersFetcher.state === "submitting" ||
+    pauseRemindersFetcher.state === "loading";
+  const resumeRemindersSubmitting =
+    resumeRemindersFetcher.state === "submitting" ||
+    resumeRemindersFetcher.state === "loading";
+
+  // "Sync ACH status" — on-demand reconciliation against NMI for an ACH
+  // invoice that's awaiting settlement. Only meaningful while there's an
+  // in-flight transaction to poll (paymentStatus 'awaiting_settlement'
+  // with a pendingSettlementTxnId) — the exact set the CRON sweeps.
+  const syncingAch =
+    syncAchFetcher.state === "submitting" || syncAchFetcher.state === "loading";
+  const isAchAwaitingSettlement =
+    isAchInvoice &&
+    invoice?.paymentStatus === "awaiting_settlement" &&
+    !!invoice?.pendingSettlementTxnId;
+  // Disable while a sync is in flight from THIS tab (fetcher submitting) or
+  // already running server-side (achSyncInProgress, e.g. another tab / a
+  // concurrent CRON tick) — the server also enforces this with an atomic
+  // lock, this just reflects it in the UI.
+  const canSyncAch =
+    isAchAwaitingSettlement &&
+    !syncingAch &&
+    invoice?.achSyncInProgress !== true;
+
   // Surface retry result via banner + toast. Don't auto-revalidate manually —
   // React Router 7 does that after the fetcher action settles.
   useEffect(() => {
@@ -715,6 +909,48 @@ export default function OrderDetail() {
       action: `/api/admin/orders/${order._id}/charge-card`,
     });
   };
+
+  // Fire an on-demand ACH status sync. No confirmation modal — it only
+  // reflects what NMI already decided (it never initiates a new charge),
+  // and duplicate clicks are blocked by the disabled state + the server
+  // lock. React Router auto-revalidates the loader after the action, so
+  // the on-page status / badges / last-sync timestamp refresh themselves.
+  const onSyncAch = () => {
+    setAchSyncBanner(null);
+    syncAchFetcher.submit(null, {
+      method: "POST",
+      action: `/api/admin/orders/${order._id}/sync-ach-status`,
+    });
+  };
+
+  useEffect(() => {
+    if (!syncAchFetcher.data) return;
+    if (syncAchFetcher.state !== "idle") return;
+    if (handledSyncAchRef.current === syncAchFetcher.data) return;
+    handledSyncAchRef.current = syncAchFetcher.data;
+
+    const data = syncAchFetcher.data;
+    if (data.status === "success") {
+      const act = data.result?.action;
+      if (act === "settled") {
+        setAchSyncBanner({ tone: "success", heading: "ACH settled", text: data.message });
+        shopify?.toast?.show("ACH settlement confirmed");
+      } else if (act === "returned") {
+        setAchSyncBanner({ tone: "critical", heading: "ACH returned", text: data.message });
+        shopify?.toast?.show("ACH returned", { isError: true });
+      } else {
+        setAchSyncBanner({ tone: "info", heading: "ACH status synced", text: data.message });
+        shopify?.toast?.show("ACH status synced");
+      }
+    } else if (data.status === "error") {
+      setAchSyncBanner({
+        tone: "critical",
+        heading: "Sync did not complete",
+        text: data.message || "ACH status sync failed",
+      });
+      shopify?.toast?.show(data.message || "Sync failed", { isError: true });
+    }
+  }, [syncAchFetcher.data, syncAchFetcher.state, shopify]);
 
   useEffect(() => {
     if (!chequeFetcher.data) return;
@@ -860,6 +1096,79 @@ export default function OrderDetail() {
     }
   }, [resumeAutoChargeFetcher.data, resumeAutoChargeFetcher.state, shopify]);
 
+  // Email-reminder pause/resume submission handlers. Both endpoints
+  // accept an optional `note` body for the remarks ledger; loader
+  // auto-revalidates after the action settles.
+  const onConfirmPauseReminders = () => {
+    setBannerError(null);
+    setBannerSuccess(null);
+    pauseRemindersModalRef.current?.hideOverlay?.();
+    const body = {};
+    const trimmed = reminderPauseNote.trim();
+    if (trimmed) body.note = trimmed;
+    pauseRemindersFetcher.submit(body, {
+      method: "POST",
+      action: `/api/admin/orders/${order._id}/pause-reminders`,
+      encType: "application/json",
+    });
+  };
+
+  const onConfirmResumeReminders = () => {
+    setBannerError(null);
+    setBannerSuccess(null);
+    resumeRemindersModalRef.current?.hideOverlay?.();
+    const body = {};
+    const trimmed = reminderResumeNote.trim();
+    if (trimmed) body.note = trimmed;
+    resumeRemindersFetcher.submit(body, {
+      method: "POST",
+      action: `/api/admin/orders/${order._id}/resume-reminders`,
+      encType: "application/json",
+    });
+  };
+
+  useEffect(() => {
+    if (!pauseRemindersFetcher.data) return;
+    if (pauseRemindersFetcher.state !== "idle") return;
+    if (handledPauseRemindersRef.current === pauseRemindersFetcher.data) return;
+    handledPauseRemindersRef.current = pauseRemindersFetcher.data;
+
+    const data = pauseRemindersFetcher.data;
+    if (data.status === "success") {
+      setBannerSuccess(
+        data.result?.reapplied
+          ? "Email reminders pause refreshed"
+          : "Email reminders paused — CRON will skip this invoice",
+      );
+      setReminderPauseNote("");
+      shopify?.toast?.show("Email reminders paused");
+    } else {
+      setBannerError(data.message || "Could not pause email reminders");
+      shopify?.toast?.show(data.message || "Pause failed", { isError: true });
+    }
+  }, [pauseRemindersFetcher.data, pauseRemindersFetcher.state, shopify]);
+
+  useEffect(() => {
+    if (!resumeRemindersFetcher.data) return;
+    if (resumeRemindersFetcher.state !== "idle") return;
+    if (handledResumeRemindersRef.current === resumeRemindersFetcher.data) return;
+    handledResumeRemindersRef.current = resumeRemindersFetcher.data;
+
+    const data = resumeRemindersFetcher.data;
+    if (data.status === "success") {
+      setBannerSuccess(
+        data.result?.wasAlreadyRunning
+          ? "Email reminders were already running — confirmation recorded"
+          : "Email reminders resumed — CRON will evaluate the ladder on the next run",
+      );
+      setReminderResumeNote("");
+      shopify?.toast?.show("Email reminders resumed");
+    } else {
+      setBannerError(data.message || "Could not resume email reminders");
+      shopify?.toast?.show(data.message || "Resume failed", { isError: true });
+    }
+  }, [resumeRemindersFetcher.data, resumeRemindersFetcher.state, shopify]);
+
   // Click handler must open the new window *synchronously* — that's the
   // only way it counts as a user-gesture and survives popup blockers.
   // We open with "about:blank", then redirect to a blob URL once the
@@ -988,6 +1297,60 @@ export default function OrderDetail() {
       ? Number(((outstanding ?? 0) + (cardFeePreview?.amount ?? 0)).toFixed(2))
       : null;
 
+  // Full invoice-calculation breakdown for the totals box: Order Subtotal →
+  // Discount → Adjusted Subtotal → Shipping → Tax → Payment Processing Fee →
+  // Grand Total. The fee + grand total come from the invoice when one exists
+  // (processingFeeAmount + amountDue are the source of truth — exactly what
+  // QBO holds / what will be charged). Before an invoice exists, fall back to
+  // a fee preview keyed on the order-time payment method so the customer
+  // still sees the expected fee. Returns null when there are no Shopify
+  // totals (legacy orders with no rawPayload).
+  const invoiceCalc = (() => {
+    if (!breakdown?.totals) return null;
+    const method = invoice?.paymentMethod || null;
+    // Fee basis = the order's post-discount grand total (order.total_price),
+    // which is exactly what computeProcessingFee is keyed on at creation.
+    const feeBasis = Number(breakdown.totals.grandTotal || 0);
+    const fmtPct = (r) => +(Number(r) * 100).toFixed(4);
+    const feeLabelWithBasis = (m, r) =>
+      Number(r) > 0
+        ? `${processingFeeLabel(m)} – ${fmtPct(r)}% of $${feeBasis.toFixed(2)}`
+        : processingFeeLabel(m);
+    let fee = null;
+    let grandTotalOverride;
+    if (invoice?.processingFeeAmount > 0) {
+      // Fee already stamped on the invoice (card / ACH at creation, or any
+      // settlement-applied fee). amountDue is the fee-inclusive total.
+      fee = {
+        amount: invoice.processingFeeAmount,
+        label: feeLabelWithBasis(
+          invoice.processingFeeMethod || method,
+          invoice.processingFeeRate,
+        ),
+      };
+      grandTotalOverride = Number(invoice.amountDue);
+    } else if (method) {
+      // No fee on the invoice yet (e.g. cheque, 0% — or an invoice not yet
+      // created with a known method). Preview it from the order total so the
+      // line still renders for non-zero methods.
+      const preview = computeProcessingFee({
+        baseAmount: breakdown.totals.grandTotal,
+        method,
+        rates: processingFeeRates,
+      });
+      if (preview) {
+        fee = { amount: preview.amount, label: feeLabelWithBasis(method, preview.rate) };
+      }
+      // When an invoice exists its amountDue is authoritative even with no fee.
+      if (invoice) grandTotalOverride = Number(invoice.amountDue);
+    }
+    return computeInvoiceCalculation({
+      totals: breakdown.totals,
+      fee,
+      grandTotalOverride,
+    });
+  })();
+
   return (
     <s-page inlineSize="large" heading={`Order ${orderLabel}`}>
       <s-button
@@ -1040,6 +1403,20 @@ export default function OrderDetail() {
           Charge card on file
         </s-button>
       )}
+      {/* Sync ACH status — on-demand reconciliation with NMI. Shown only
+          for ACH invoices that have an in-flight transaction awaiting
+          settlement (the same set the CRON sweeps). Disabled while a sync
+          is already running (this tab, another tab, or a CRON tick). */}
+      {invoice && isAchAwaitingSettlement && (
+        <s-button
+          slot="secondary-actions"
+          disabled={!canSyncAch}
+          onClick={onSyncAch}
+          {...(syncingAch ? { loading: true } : {})}
+        >
+          Sync ACH status
+        </s-button>
+      )}
       {/* Pause / Resume auto-charge — card-preferred invoices only.
           One button at a time: the live `autoChargePaused` flag picks
           which one to render so admins always see the action that
@@ -1062,6 +1439,28 @@ export default function OrderDetail() {
           {...(resumeAutoChargeSubmitting ? { loading: true } : {})}
         >
           Resume auto-charge
+        </s-button>
+      )}
+      {/* Pause / Resume email reminders — cheque invoices only. One
+          button at a time, picked by the live `reminderPaused` flag. */}
+      {invoice && isChequeInvoice && !reminderPaused && (
+        <s-button
+          slot="secondary-actions"
+          disabled={!canPauseReminders}
+          onClick={() => pauseRemindersModalRef.current?.showOverlay?.()}
+          {...(pauseRemindersSubmitting ? { loading: true } : {})}
+        >
+          Pause auto email notifications
+        </s-button>
+      )}
+      {invoice && isChequeInvoice && reminderPaused && (
+        <s-button
+          slot="secondary-actions"
+          disabled={!canResumeReminders}
+          onClick={() => resumeRemindersModalRef.current?.showOverlay?.()}
+          {...(resumeRemindersSubmitting ? { loading: true } : {})}
+        >
+          Resume auto email notifications
         </s-button>
       )}
 
@@ -1142,6 +1541,16 @@ export default function OrderDetail() {
               <KV label="Fulfillment status" value={order.fulfillmentStatus} />
             </s-grid-item>
             <s-grid-item>
+              <KV
+                label="Ship date"
+                value={
+                  order.shippedAt
+                    ? new Date(order.shippedAt).toLocaleDateString()
+                    : null
+                }
+              />
+            </s-grid-item>
+            <s-grid-item>
               <KV label="Currency" value={order.currency} />
             </s-grid-item>
           </s-grid>
@@ -1152,6 +1561,171 @@ export default function OrderDetail() {
             </s-banner>
           )}
         </s-stack>
+      </s-section>
+
+      {/* ───── Shipment tracking ───── */}
+      <s-section
+        heading={`Shipment tracking${
+          order.trackingUpdatedAt
+            ? ` · updated ${new Date(order.trackingUpdatedAt).toLocaleString()}`
+            : ""
+        }`}
+      >
+        {!order.fulfillments?.length ? (
+          <s-paragraph tone="subdued">
+            No tracking yet. Carrier and tracking number appear here once the
+            order is fulfilled in Shopify.
+          </s-paragraph>
+        ) : (
+          <s-stack direction="block" gap="base">
+            <s-stack direction="inline" gap="tight" alignItems="center">
+              <s-text tone="subdued">Fulfillment status:</s-text>
+              {(() => {
+                const fs = order.fulfillmentStatus || "unfulfilled";
+                const label = fs
+                  .replace(/_/g, " ")
+                  .replace(/\b\w/g, (c) => c.toUpperCase());
+                const tone =
+                  fs === "fulfilled"
+                    ? "success"
+                    : fs === "partially_fulfilled" || fs === "partial"
+                      ? "warning"
+                      : "default";
+                return <s-badge tone={tone}>{label}</s-badge>;
+              })()}
+            </s-stack>
+            {order.fulfillments.map((f, i) => {
+              const carrier = carrierDisplayName(f.carrierKey, f.trackingCompany);
+              const status = f.shipmentStatus || f.status;
+              return (
+                <s-box
+                  key={f.fulfillmentId || i}
+                  padding="base"
+                  border="base"
+                  borderRadius="base"
+                  background="subdued"
+                >
+                  <s-stack direction="block" gap="base">
+                    <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
+                      <s-grid-item>
+                        <s-stack direction="block" gap="none">
+                          <s-text tone="subdued">Carrier</s-text>
+                          {f.trackingUrl ? (
+                            <s-link href={f.trackingUrl} target="_blank">
+                              {carrier} ↗
+                            </s-link>
+                          ) : (
+                            <s-text>{carrier}</s-text>
+                          )}
+                        </s-stack>
+                      </s-grid-item>
+                      <s-grid-item>
+                        <s-stack direction="block" gap="none">
+                          <s-text tone="subdued">Tracking number</s-text>
+                          {f.trackingNumber ? (
+                            f.trackingUrl ? (
+                              <s-link href={f.trackingUrl} target="_blank">
+                                {f.trackingNumber} ↗
+                              </s-link>
+                            ) : (
+                              <s-text>{f.trackingNumber}</s-text>
+                            )
+                          ) : (
+                            <s-text tone="subdued">—</s-text>
+                          )}
+                        </s-stack>
+                      </s-grid-item>
+                      <s-grid-item>
+                        <s-stack direction="block" gap="none">
+                          <s-text tone="subdued">Status</s-text>
+                          {status ? (
+                            <ShipmentStatusBadge status={status} />
+                          ) : (
+                            <s-text tone="subdued">—</s-text>
+                          )}
+                        </s-stack>
+                      </s-grid-item>
+                      <s-grid-item>
+                        <KV
+                          label="Ship date"
+                          value={
+                            f.fulfilledAt
+                              ? new Date(f.fulfilledAt).toLocaleDateString()
+                              : null
+                          }
+                        />
+                      </s-grid-item>
+                      {f.estimatedDeliveryAt && (
+                        <s-grid-item>
+                          <KV
+                            label="Est. delivery"
+                            value={new Date(f.estimatedDeliveryAt).toLocaleDateString()}
+                          />
+                        </s-grid-item>
+                      )}
+                    </s-grid>
+                    <s-stack direction="inline" gap="base" alignItems="center">
+                      {f.trackingUrl && (
+                        <s-link href={f.trackingUrl} target="_blank">
+                          Track shipment ↗
+                        </s-link>
+                      )}
+                      {f.updatedAt && (
+                        <s-text tone="subdued">
+                          Updated {new Date(f.updatedAt).toLocaleString()}
+                        </s-text>
+                      )}
+                    </s-stack>
+                  </s-stack>
+                </s-box>
+              );
+            })}
+
+            {order.trackingHistory?.length > 0 && (
+              <s-stack direction="block" gap="tight">
+                <s-text>
+                  <strong>Tracking history</strong>
+                </s-text>
+                <s-table>
+                  <s-table-header-row>
+                    <s-table-header>When</s-table-header>
+                    <s-table-header>Carrier</s-table-header>
+                    <s-table-header>Number</s-table-header>
+                    <s-table-header>Status</s-table-header>
+                    <s-table-header>Event</s-table-header>
+                  </s-table-header-row>
+                  <s-table-body>
+                    {[...order.trackingHistory]
+                      .sort((a, b) => String(b.at).localeCompare(String(a.at)))
+                      .map((h, i) => (
+                        <s-table-row key={i}>
+                          <s-table-cell>
+                            {h.at ? new Date(h.at).toLocaleString() : "—"}
+                          </s-table-cell>
+                          <s-table-cell>
+                            {carrierDisplayName(h.carrierKey, h.trackingCompany)}
+                          </s-table-cell>
+                          <s-table-cell>{h.trackingNumber || "—"}</s-table-cell>
+                          <s-table-cell>
+                            {h.shipmentStatus ? (
+                              <ShipmentStatusBadge status={h.shipmentStatus} />
+                            ) : (
+                              "—"
+                            )}
+                          </s-table-cell>
+                          <s-table-cell>
+                            <s-badge tone={h.event === "created" ? "info" : "default"}>
+                              {h.event === "created" ? "Added" : "Updated"}
+                            </s-badge>
+                          </s-table-cell>
+                        </s-table-row>
+                      ))}
+                  </s-table-body>
+                </s-table>
+              </s-stack>
+            )}
+          </s-stack>
+        )}
       </s-section>
 
       {/* ───── Line items + totals ───── */}
@@ -1206,7 +1780,7 @@ export default function OrderDetail() {
               </s-table-body>
             </s-table>
 
-            {breakdown.totals && (
+            {invoiceCalc && (
               <s-box
                 padding="base"
                 border="base"
@@ -1215,34 +1789,61 @@ export default function OrderDetail() {
               >
                 <s-stack direction="block" gap="tight">
                   <TotalsRow
-                    label="Subtotal"
-                    value={formatAmount(breakdown.totals.subtotal, breakdown.currency)}
+                    label="Order subtotal"
+                    value={formatAmount(invoiceCalc.orderSubtotal, breakdown.currency)}
                   />
-                  {breakdown.totals.discounts > 0 && (
-                    <TotalsRow
-                      label="Discounts"
-                      value={`− ${formatAmount(breakdown.totals.discounts, breakdown.currency)}`}
-                      tone="success"
-                    />
-                  )}
-                  {breakdown.totals.shipping > 0 && (
-                    <TotalsRow
-                      label="Shipping"
-                      value={formatAmount(breakdown.totals.shipping, breakdown.currency)}
-                    />
-                  )}
                   <TotalsRow
-                    label={
-                      breakdown.totals.taxesIncluded
-                        ? "Tax (included)"
-                        : "Tax"
+                    label="Discount"
+                    value={
+                      invoiceCalc.discount > 0
+                        ? `− ${formatAmount(invoiceCalc.discount, breakdown.currency)}`
+                        : formatAmount(0, breakdown.currency)
                     }
-                    value={formatAmount(breakdown.totals.tax, breakdown.currency)}
+                    tone={invoiceCalc.discount > 0 ? "success" : undefined}
                   />
+                  <TotalsRow
+                    label="Adjusted subtotal"
+                    value={formatAmount(invoiceCalc.adjustedSubtotal, breakdown.currency)}
+                  />
+                  <TotalsRow
+                    label="Shipping charges"
+                    value={formatAmount(invoiceCalc.shipping, breakdown.currency)}
+                  />
+                  <TotalsRow
+                    label={invoiceCalc.taxesIncluded ? "Sales tax (included)" : "Sales tax"}
+                    value={formatAmount(invoiceCalc.tax, breakdown.currency)}
+                  />
+                  {invoiceCalc.fee && (
+                    <TotalsRow
+                      label={invoiceCalc.fee.label}
+                      value={formatAmount(invoiceCalc.fee.amount, breakdown.currency)}
+                    />
+                  )}
+                  {(() => {
+                    // Reconciling catch-all so the breakdown always sums to
+                    // the grand total — surfaces any charge the named rows
+                    // don't account for instead of silently hiding it.
+                    const feeAmt = invoiceCalc.fee?.amount || 0;
+                    const other = Number(
+                      (
+                        invoiceCalc.grandTotal -
+                        (invoiceCalc.adjustedSubtotal +
+                          invoiceCalc.shipping +
+                          invoiceCalc.tax +
+                          feeAmt)
+                      ).toFixed(2),
+                    );
+                    return Math.abs(other) > 0.005 ? (
+                      <TotalsRow
+                        label="Other charges"
+                        value={formatAmount(other, breakdown.currency)}
+                      />
+                    ) : null;
+                  })()}
                   <s-divider />
                   <TotalsRow
                     label="Grand total"
-                    value={formatAmount(breakdown.totals.grandTotal, breakdown.currency)}
+                    value={formatAmount(invoiceCalc.grandTotal, breakdown.currency)}
                     strong
                   />
                 </s-stack>
@@ -1287,7 +1888,10 @@ export default function OrderDetail() {
             />
           </s-grid-item>
           <s-grid-item>
-            <KV label="Company" value={customerMap?.profile?.companyName} />
+            <KV
+              label="Business name"
+              value={businessName || customerMap?.profile?.companyName}
+            />
           </s-grid-item>
         </s-grid>
       </s-section>
@@ -1317,6 +1921,15 @@ export default function OrderDetail() {
                     : "Auto-charge active"}
                 </s-badge>
               )}
+              {/* Email-reminder badge — only meaningful for cheque
+                  invoices (the only ones the reminder CRON emails). */}
+              {isChequeInvoice && (
+                <s-badge tone={reminderPaused ? "warning" : "success"}>
+                  {reminderPaused
+                    ? "Email reminders paused"
+                    : "Email reminders active"}
+                </s-badge>
+              )}
             </s-stack>
 
             {/* Paused-state context banner — surfaces who paused it,
@@ -1341,6 +1954,33 @@ export default function OrderDetail() {
                     : ""}
                   {invoice.autoChargePauseNote
                     ? ` — "${invoice.autoChargePauseNote}"`
+                    : ""}
+                  .
+                </s-paragraph>
+              </s-banner>
+            )}
+
+            {/* Email-reminder paused banner — surfaces who muted the
+                reminder CRON, when, and why, so admins know automated
+                emails are intentionally stopped for this invoice. */}
+            {isChequeInvoice && reminderPaused && (
+              <s-banner tone="warning" heading="Auto email reminders are paused">
+                <s-paragraph>
+                  The reminder scheduler will not send any further payment
+                  reminder emails (Day 9 / 11 / 13) for this invoice until
+                  an admin resumes. Payment collection is unaffected — this
+                  pauses notifications only.
+                </s-paragraph>
+                <s-paragraph tone="subdued">
+                  Paused{" "}
+                  {invoice.reminderPausedAt
+                    ? `on ${new Date(invoice.reminderPausedAt).toLocaleString()}`
+                    : ""}
+                  {invoice.reminderPausedBy
+                    ? ` by ${invoice.reminderPausedBy}`
+                    : ""}
+                  {invoice.reminderPauseNote
+                    ? ` — "${invoice.reminderPauseNote}"`
                     : ""}
                   .
                 </s-paragraph>
@@ -1550,6 +2190,40 @@ export default function OrderDetail() {
                   Pending if the bank rejects the debit.
                 </s-paragraph>
               </s-banner>
+            )}
+            {/* Result of the most recent on-demand "Sync ACH status" click. */}
+            {achSyncBanner && (
+              <s-banner tone={achSyncBanner.tone} heading={achSyncBanner.heading}>
+                <s-paragraph>{achSyncBanner.text}</s-paragraph>
+              </s-banner>
+            )}
+            {/* Last synchronization timestamp + latest status NMI returned —
+                covers BOTH the manual button and the scheduled CRON sweep. */}
+            {invoice && isAchInvoice && invoice.achSyncLastAt && (
+              <s-stack direction="inline" gap="base" alignItems="center" wrap>
+                <s-text tone="subdued">
+                  Last ACH sync:{" "}
+                  {new Date(invoice.achSyncLastAt).toLocaleString()}
+                </s-text>
+                {(() => {
+                  const meta =
+                    ACH_SYNC_STATUS_META[invoice.achSyncLastStatus] || {
+                      label: invoice.achSyncLastStatus,
+                      tone: "default",
+                    };
+                  return <s-badge tone={meta.tone}>{meta.label}</s-badge>;
+                })()}
+                <s-text tone="subdued">
+                  via{" "}
+                  {invoice.achSyncLastSource === "admin_manual_sync"
+                    ? "manual sync"
+                    : "scheduled sync"}
+                  {invoice.achSyncLastSource === "admin_manual_sync" &&
+                  invoice.achSyncLastBy
+                    ? ` (${invoice.achSyncLastBy})`
+                    : ""}
+                </s-text>
+              </s-stack>
             )}
             {invoice && isManualInvoice && (
               <s-paragraph tone="subdued">
@@ -1778,27 +2452,72 @@ export default function OrderDetail() {
                   </s-grid-item>
                 </s-grid>
 
-                {qbo.invoice.lines.length === 0 ? (
+                {/* Shipping carrier + tracking on the invoice (sourced from
+                    the order's fulfillments). Lists every shipment when an
+                    order has more than one. */}
+                {order.fulfillments?.length > 0 && (
+                  <s-box
+                    padding="base"
+                    border="base"
+                    borderRadius="base"
+                    background="subdued"
+                  >
+                    <s-stack direction="block" gap="tight">
+                      <s-text>
+                        <strong>Shipping</strong>
+                      </s-text>
+                      {order.shippedAt && (
+                        <s-stack direction="inline" gap="base" alignItems="center">
+                          <s-text tone="subdued">Ship date:</s-text>
+                          <s-text>
+                            {new Date(order.shippedAt).toLocaleDateString()}
+                          </s-text>
+                        </s-stack>
+                      )}
+                      {order.fulfillments.map((f, i) => (
+                        <s-stack
+                          key={f.fulfillmentId || i}
+                          direction="inline"
+                          gap="base"
+                          alignItems="center"
+                        >
+                          <s-text tone="subdued">Carrier:</s-text>
+                          <s-text>
+                            {carrierDisplayName(f.carrierKey, f.trackingCompany)}
+                          </s-text>
+                          <s-text tone="subdued">Tracking number:</s-text>
+                          {f.trackingUrl ? (
+                            <s-link href={f.trackingUrl} target="_blank">
+                              {f.trackingNumber || "—"} ↗
+                            </s-link>
+                          ) : (
+                            <s-text>{f.trackingNumber || "—"}</s-text>
+                          )}
+                        </s-stack>
+                      ))}
+                    </s-stack>
+                  </s-box>
+                )}
+
+                {qbo.invoice.productLines.length === 0 ? (
                   <s-paragraph tone="subdued">
-                    QBO invoice has no item lines.
+                    QBO invoice has no product lines.
                   </s-paragraph>
                 ) : (
                   <s-table>
                     <s-table-header-row>
-                      <s-table-header>#</s-table-header>
-                      <s-table-header>Item</s-table-header>
-                      <s-table-header>Description</s-table-header>
                       <s-table-header>Qty</s-table-header>
-                      <s-table-header>Unit price</s-table-header>
+                      <s-table-header>Product(s)</s-table-header>
+                      <s-table-header>SKU</s-table-header>
+                      <s-table-header>Rate</s-table-header>
                       <s-table-header>Amount</s-table-header>
                     </s-table-header-row>
                     <s-table-body>
-                      {qbo.invoice.lines.map((l, i) => (
+                      {qbo.invoice.productLines.map((l, i) => (
                         <s-table-row key={l.id || i}>
-                          <s-table-cell>{l.lineNum ?? i + 1}</s-table-cell>
-                          <s-table-cell>{l.itemName || "—"}</s-table-cell>
-                          <s-table-cell>{l.description || "—"}</s-table-cell>
                           <s-table-cell>{l.qty ?? "—"}</s-table-cell>
+                          <s-table-cell>{l.description || l.itemName || "—"}</s-table-cell>
+                          <s-table-cell>{l.sku || "—"}</s-table-cell>
                           <s-table-cell>
                             {l.unitPrice != null
                               ? formatAmount(l.unitPrice, qbo.invoice.currency)
@@ -1815,6 +2534,12 @@ export default function OrderDetail() {
                   </s-table>
                 )}
 
+                {/* Full itemized breakdown. Products stay in the table above;
+                    Discount / Shipping / Tax always render (even at $0), the
+                    Processing Fee shows as its own clearly-described row, and
+                    "Other charges" appears only when the QBO total carries an
+                    amount the classified rows don't explain. Reconciles to the
+                    QBO Grand total. */}
                 <s-box
                   padding="base"
                   border="base"
@@ -1823,14 +2548,44 @@ export default function OrderDetail() {
                 >
                   <s-stack direction="block" gap="tight">
                     <TotalsRow
-                      label="Tax"
-                      value={formatAmount(qbo.invoice.totalTax, qbo.invoice.currency)}
+                      label="Subtotal"
+                      value={formatAmount(qbo.invoice.productSubtotal, qbo.invoice.currency)}
                     />
                     <TotalsRow
-                      label="Total"
-                      value={formatAmount(qbo.invoice.totalAmt, qbo.invoice.currency)}
+                      label="Discount"
+                      value={
+                        qbo.invoice.discount > 0
+                          ? `− ${formatAmount(qbo.invoice.discount, qbo.invoice.currency)}`
+                          : formatAmount(0, qbo.invoice.currency)
+                      }
+                      tone={qbo.invoice.discount > 0 ? "success" : undefined}
                     />
+                    <TotalsRow
+                      label="Shipping charges"
+                      value={formatAmount(qbo.invoice.shipping, qbo.invoice.currency)}
+                    />
+                    <TotalsRow
+                      label="Sales tax"
+                      value={formatAmount(qbo.invoice.totalTax, qbo.invoice.currency)}
+                    />
+                    {qbo.invoice.processingFee > 0 && (
+                      <TotalsRow
+                        label={qbo.invoice.processingFeeLabel || "Processing fee"}
+                        value={formatAmount(qbo.invoice.processingFee, qbo.invoice.currency)}
+                      />
+                    )}
+                    {Math.abs(qbo.invoice.otherCharges) > 0.005 && (
+                      <TotalsRow
+                        label="Other charges"
+                        value={formatAmount(qbo.invoice.otherCharges, qbo.invoice.currency)}
+                      />
+                    )}
                     <s-divider />
+                    <TotalsRow
+                      label="Grand total"
+                      value={formatAmount(qbo.invoice.totalAmt, qbo.invoice.currency)}
+                      strong
+                    />
                     <TotalsRow
                       label="Balance due"
                       value={formatAmount(qbo.invoice.balance, qbo.invoice.currency)}
@@ -2319,6 +3074,86 @@ export default function OrderDetail() {
         <s-button
           slot="secondary-actions"
           onClick={() => resumeAutoChargeModalRef.current?.hideOverlay?.()}
+        >
+          Cancel
+        </s-button>
+      </s-modal>
+
+      <s-modal
+        ref={pauseRemindersModalRef}
+        id="pause-reminders-modal"
+        heading="Pause auto email notifications?"
+        accessibilityLabel="Pause email reminders confirmation"
+      >
+        <s-stack direction="block" gap="base">
+          <s-paragraph>
+            The reminder scheduler will stop sending automated payment
+            reminder emails (Day 9 / 11 / 13) for this invoice until you
+            resume. This affects notifications only — it does not change
+            the invoice, the balance, or any payment action.
+          </s-paragraph>
+          <s-paragraph tone="subdued">
+            Reminders resume automatically once you re-enable them; they
+            also stop on their own once the invoice is paid.
+          </s-paragraph>
+          <s-text-area
+            label="Note (optional)"
+            placeholder="Reason for pausing — visible in the remarks ledger"
+            value={reminderPauseNote}
+            rows={3}
+            onChange={(e) => setReminderPauseNote(e.currentTarget.value)}
+            maxLength={500}
+          />
+        </s-stack>
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          onClick={onConfirmPauseReminders}
+          {...(pauseRemindersSubmitting ? { loading: true } : {})}
+        >
+          Pause notifications
+        </s-button>
+        <s-button
+          slot="secondary-actions"
+          onClick={() => pauseRemindersModalRef.current?.hideOverlay?.()}
+        >
+          Cancel
+        </s-button>
+      </s-modal>
+
+      <s-modal
+        ref={resumeRemindersModalRef}
+        id="resume-reminders-modal"
+        heading="Resume auto email notifications?"
+        accessibilityLabel="Resume email reminders confirmation"
+      >
+        <s-stack direction="block" gap="base">
+          <s-paragraph>
+            This invoice will be included in the reminder scheduler again.
+            The next CRON run evaluates the Day 9 / 11 / 13 ladder and
+            sends any reminder that is now due and not yet sent — no email
+            is sent right now.
+          </s-paragraph>
+          <s-text-area
+            label="Note (optional)"
+            placeholder="Reason for resuming — visible in the remarks ledger"
+            value={reminderResumeNote}
+            rows={3}
+            onChange={(e) => setReminderResumeNote(e.currentTarget.value)}
+            maxLength={500}
+          />
+        </s-stack>
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          onClick={onConfirmResumeReminders}
+          {...(resumeRemindersSubmitting ? { loading: true } : {})}
+        >
+          Resume notifications
+        </s-button>
+        <s-button
+          slot="secondary-actions"
+          onClick={() => resumeRemindersModalRef.current?.hideOverlay?.()}
         >
           Cancel
         </s-button>

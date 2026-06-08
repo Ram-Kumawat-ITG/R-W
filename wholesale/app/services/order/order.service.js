@@ -12,11 +12,19 @@ import {
   createInvoiceForOrder,
   appendInvoiceRemark,
 } from '../invoice/invoice.service'
+import { toYmd } from '../invoice/invoice.utils'
 import { chargeInvoice } from '../payment/payment.service'
 import { validateShopifyOrder } from './order.validator'
 import { paymentConfig } from '../payment/payment.config'
-import { customerHasApprovedTag } from '../shopify/shopify.service'
-import { voidInvoice as voidQboInvoice } from '../qbo/qbo.service'
+import { customerHasApprovedTag, getOrderFulfillments } from '../shopify/shopify.service'
+import { voidInvoice as voidQboInvoice, setInvoiceShipping } from '../qbo/qbo.service'
+import {
+  normalizeCarrier,
+  carrierDisplayName,
+  shipmentStatusLabel,
+  resolveCarrierTrackingUrl,
+} from '../../utils/shipping.constants'
+import { trackingConfig } from './tracking.config'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('order.service')
@@ -557,5 +565,327 @@ export async function handleOrderCancelled({ shop, order, webhookId }) {
 
   console.log(`[orders] cancellation handling complete for order=${shopifyOrderId}\n`)
   return localOrder
+}
+
+// Write the order's shipping (carrier + tracking, one line per shipment) to
+// the linked QBO invoice's CustomerMemo so it appears on the customer's
+// invoice. Best-effort — a QBO failure must never break tracking capture.
+// Called from both fulfillment paths whenever tracking changed. Idempotent:
+// setInvoiceShippingMemo replaces the managed shipping block, so re-writing
+// the same lines is a no-op for the customer-visible result.
+async function pushShippingToInvoice(localOrder) {
+  if (!localOrder?.invoiceRef) return
+  let invoice
+  try {
+    invoice = await Invoice.findById(localOrder.invoiceRef).select('qboInvoiceId qboSyncToken')
+  } catch {
+    return
+  }
+  if (!invoice?.qboInvoiceId) return
+  const lines = (localOrder.fulfillments || [])
+    .filter((f) => f.trackingNumber || f.trackingCompany)
+    .map((f) => {
+      const carrier = carrierDisplayName(f.carrierKey, f.trackingCompany)
+      const num = f.trackingNumber || 'no number'
+      const statusLabel = shipmentStatusLabel(f.shipmentStatus || f.status)
+      const head = `${carrier} — ${num}${statusLabel ? ` (${statusLabel})` : ''}`
+      // QBO's CustomerMemo is plain text (no rich hyperlinks), so include the
+      // full tracking URL — most invoice-PDF / email clients auto-linkify a
+      // bare URL, giving the customer a clickable tracking link on the doc.
+      return f.trackingUrl ? `${head}\n  Track: ${f.trackingUrl}` : head
+    })
+  // Official Ship Date for the QBO invoice = the Shopify fulfillment date
+  // (earliest shipment), overwriting the order-creation date set at invoice
+  // creation. Date-only (YYYY-MM-DD) to match QBO's ShipDate field.
+  const shipDate = localOrder.shippedAt ? toYmd(localOrder.shippedAt) : undefined
+  // Native QBO TrackingNum (renders in the header below Ship Date): carrier +
+  // number per shipment, joined for multi-shipment orders.
+  const trackingNum =
+    (localOrder.fulfillments || [])
+      .filter((f) => f.trackingNumber)
+      .map((f) => `${carrierDisplayName(f.carrierKey, f.trackingCompany)} ${f.trackingNumber}`)
+      .join(' | ') || undefined
+  if (!lines.length && !shipDate && !trackingNum) return
+  try {
+    const updated = await setInvoiceShipping({
+      qboInvoiceId: invoice.qboInvoiceId,
+      lines,
+      shipDate,
+      trackingNum,
+    })
+    if (updated?.SyncToken && updated.SyncToken !== invoice.qboSyncToken) {
+      await Invoice.updateOne({ _id: invoice._id }, { $set: { qboSyncToken: updated.SyncToken } })
+    }
+    console.log(
+      `[orders] shipping synced to QBO invoice ${invoice.qboInvoiceId} ` +
+        `(${lines.length} line(s), shipDate=${shipDate || '(unchanged)'})`,
+    )
+  } catch (err) {
+    log.warn('fulfillment.invoice_memo_failed', {
+      invoiceId: String(localOrder.invoiceRef),
+      err,
+    })
+  }
+}
+
+// Recompute the order's official Ship Date = the EARLIEST fulfillment date
+// across all shipments (when it first shipped). Mutates localOrder; returns
+// true when the value changed (so callers know to persist).
+function recomputeShipDate(localOrder) {
+  const times = (localOrder.fulfillments || [])
+    .map((f) => (f.fulfilledAt ? new Date(f.fulfilledAt).getTime() : NaN))
+    .filter((t) => Number.isFinite(t))
+  const earliest = times.length ? new Date(Math.min(...times)) : null
+  const prev = localOrder.shippedAt ? new Date(localOrder.shippedAt).getTime() : null
+  const next = earliest ? earliest.getTime() : null
+  if (prev !== next) {
+    localOrder.shippedAt = earliest
+    return true
+  }
+  return false
+}
+
+// Apply ONE normalized fulfillment to a (mutable) ShopifyOrder doc — the
+// shared upsert used by BOTH the webhook path (handleFulfillmentUpdate) and
+// the live-pull path (syncFulfillmentsFromShopify). Resolves the carrier +
+// deep-link, upserts fulfillments[] by id, and appends a trackingHistory[]
+// row only when a tracked field actually changed. Mutates `localOrder` in
+// place; does NOT save. Returns { changed, isNew, carrierKey, trackingUrl }.
+//
+// `n` is the normalized shape (same from REST webhook or GraphQL pull):
+//   { fulfillmentId, trackingNumber, trackingCompany, shopifyTrackingUrl,
+//     shipmentStatus, status, fulfilledAt?, estimatedDeliveryAt? }
+function applyFulfillmentToOrder(localOrder, n) {
+  const carrierKey = normalizeCarrier(n.trackingCompany)
+  const trackingUrl = resolveCarrierTrackingUrl({
+    carrierKey,
+    trackingNumber: n.trackingNumber,
+    shopifyUrl: n.shopifyTrackingUrl,
+    extraTemplates: trackingConfig.extraCarrierTemplates,
+  })
+  if (!Array.isArray(localOrder.fulfillments)) localOrder.fulfillments = []
+  const now = new Date()
+  const existing = localOrder.fulfillments.find((f) => f.fulfillmentId === n.fulfillmentId)
+  const changed =
+    !existing ||
+    existing.trackingNumber !== n.trackingNumber ||
+    existing.trackingCompany !== n.trackingCompany ||
+    existing.shipmentStatus !== n.shipmentStatus ||
+    existing.status !== n.status
+
+  const fulfilledAt = n.fulfilledAt ? new Date(n.fulfilledAt) : undefined
+  const estimatedDeliveryAt = n.estimatedDeliveryAt ? new Date(n.estimatedDeliveryAt) : undefined
+
+  if (existing) {
+    existing.trackingNumber = n.trackingNumber
+    existing.trackingCompany = n.trackingCompany
+    existing.carrierKey = carrierKey
+    existing.trackingUrl = trackingUrl
+    existing.shopifyTrackingUrl = n.shopifyTrackingUrl
+    existing.shipmentStatus = n.shipmentStatus
+    existing.status = n.status
+    if (fulfilledAt) existing.fulfilledAt = fulfilledAt
+    if (estimatedDeliveryAt) existing.estimatedDeliveryAt = estimatedDeliveryAt
+    if (changed) existing.updatedAt = now
+  } else {
+    localOrder.fulfillments.push({
+      fulfillmentId: n.fulfillmentId,
+      trackingNumber: n.trackingNumber,
+      trackingCompany: n.trackingCompany,
+      carrierKey,
+      trackingUrl,
+      shopifyTrackingUrl: n.shopifyTrackingUrl,
+      shipmentStatus: n.shipmentStatus,
+      status: n.status,
+      fulfilledAt,
+      estimatedDeliveryAt,
+      createdAt: now,
+      updatedAt: now,
+    })
+  }
+
+  if (changed) {
+    if (!Array.isArray(localOrder.trackingHistory)) localOrder.trackingHistory = []
+    localOrder.trackingHistory.push({
+      at: now,
+      fulfillmentId: n.fulfillmentId,
+      trackingNumber: n.trackingNumber,
+      trackingCompany: n.trackingCompany,
+      carrierKey,
+      shipmentStatus: n.shipmentStatus,
+      event: existing ? 'updated' : 'created',
+    })
+    localOrder.trackingUpdatedAt = now
+  }
+
+  return { changed, isNew: !existing, carrierKey, trackingUrl }
+}
+
+// Handle a Shopify fulfillments/create or fulfillments/update webhook —
+// capture the shipment tracking (carrier, number, status, deep-link) onto
+// the local order. Mirrors handleOrderCancelled's shape: idempotent (dedup
+// on seenWebhookIds[]), find-the-local-order, mutate, audit-remark.
+//
+// `fulfillment` is Shopify's Fulfillment payload — carries `order_id`,
+// `tracking_number`/`tracking_numbers[]`, `tracking_company`,
+// `tracking_url`/`tracking_urls[]`, `shipment_status`, `status`. No extra
+// Shopify fetch needed. `event` is 'created' | 'updated' (for the history row
+// label). Returns the local order, or null when we have no such order.
+export async function handleFulfillmentUpdate({ shop, fulfillment, webhookId, event = 'updated' }) {
+  if (!fulfillment?.id) throw new Error('handleFulfillmentUpdate: fulfillment.id is required')
+  if (!fulfillment?.order_id) throw new Error('handleFulfillmentUpdate: fulfillment.order_id is required')
+  const shopifyOrderId = String(fulfillment.order_id)
+  const fulfillmentId = String(fulfillment.id)
+
+  console.log(
+    `\n[orders] handleFulfillmentUpdate shop=${shop} order=${shopifyOrderId} ` +
+      `fulfillment=${fulfillmentId} event=${event} webhookId=${webhookId || '(none)'}`,
+  )
+
+  // ── 1. Dedup against the same webhook delivery ────────────────
+  if (webhookId) {
+    const dup = await ShopifyOrder.findOne({ shop, shopifyOrderId, seenWebhookIds: webhookId })
+      .select('_id')
+      .lean()
+    if (dup) {
+      console.log(`[orders] DUPLICATE fulfillment webhookId=${webhookId} — already handled`)
+      log.info('fulfillment.skip.duplicate_webhook', { shopifyOrderId, fulfillmentId, webhookId })
+      return await ShopifyOrder.findById(dup._id)
+    }
+  }
+
+  // ── 2. Find the local order (must already be ingested) ────────
+  const localOrder = await ShopifyOrder.findOne({ shop, shopifyOrderId })
+  if (!localOrder) {
+    // Tracking for an order we never ingested (e.g. created before this app,
+    // or a non-wholesale order). Nothing to attach it to — log and ack.
+    console.log(`[orders] no local order for ${shopifyOrderId} — skipping fulfillment tracking`)
+    log.warn('fulfillment.no_local_order', { shop, shopifyOrderId, fulfillmentId })
+    return null
+  }
+
+  // ── 3. Normalize the REST fulfillment payload + apply ─────────
+  const normalized = {
+    fulfillmentId,
+    trackingNumber: fulfillment.tracking_number || fulfillment.tracking_numbers?.[0] || null,
+    trackingCompany: fulfillment.tracking_company || null,
+    shopifyTrackingUrl: fulfillment.tracking_url || fulfillment.tracking_urls?.[0] || null,
+    shipmentStatus: fulfillment.shipment_status || null,
+    status: fulfillment.status || null,
+    fulfilledAt: fulfillment.created_at || null,
+    estimatedDeliveryAt: fulfillment.estimated_delivery_at || null,
+  }
+  const { changed, isNew, carrierKey, trackingUrl } = applyFulfillmentToOrder(
+    localOrder,
+    normalized,
+  )
+  recomputeShipDate(localOrder)
+  if (!changed) console.log(`[orders] fulfillment ${fulfillmentId} unchanged — no history row`)
+
+  if (webhookId) {
+    if (!localOrder.seenWebhookIds.includes(webhookId)) {
+      localOrder.seenWebhookIds.push(webhookId)
+    }
+    localOrder.lastWebhookId = webhookId
+  }
+  await localOrder.save()
+
+  console.log(
+    `[orders] tracking ${isNew ? 'added' : 'updated'} — order=${shopifyOrderId} ` +
+      `carrier=${carrierDisplayName(carrierKey, normalized.trackingCompany)} ` +
+      `number=${normalized.trackingNumber || '(none)'} ` +
+      `status=${normalized.shipmentStatus || normalized.status || '(none)'} ` +
+      `url=${trackingUrl ? 'resolved' : '(none)'}`,
+  )
+  log.info('fulfillment.tracked', {
+    shop,
+    shopifyOrderId,
+    fulfillmentId,
+    carrierKey,
+    trackingNumber: normalized.trackingNumber,
+    shipmentStatus: normalized.shipmentStatus,
+    changed,
+  })
+
+  // ── 4. Best-effort audit remark on the linked invoice ─────────
+  if (changed && localOrder.invoiceRef) {
+    try {
+      const statusLabel = shipmentStatusLabel(normalized.shipmentStatus || normalized.status)
+      await appendInvoiceRemark(localOrder.invoiceRef, {
+        kind: 'system_note',
+        source: 'system',
+        message:
+          `Tracking ${isNew ? 'added' : 'updated'}: ` +
+          `${carrierDisplayName(carrierKey, normalized.trackingCompany)} ` +
+          `${normalized.trackingNumber || '(no number)'}` +
+          (statusLabel ? ` (${statusLabel})` : ''),
+      })
+    } catch (remarkErr) {
+      // Audit remark is best-effort — never let it fail the tracking write.
+      log.warn('fulfillment.remark_failed', { shopifyOrderId, err: remarkErr })
+    }
+  }
+
+  // Mirror carrier + tracking onto the customer-facing QBO invoice memo.
+  if (changed) await pushShippingToInvoice(localOrder)
+
+  return localOrder
+}
+
+// Live-pull an order's fulfillments from Shopify Admin GraphQL and persist
+// them onto the local order — the reliability fallback for when the
+// fulfillments/* webhooks were missed or never subscribed, and for orders
+// fulfilled before the subscription existed (webhooks don't backfill). The
+// Order Details loader calls this (best-effort) so tracking renders on view
+// regardless of webhook delivery. Reuses applyFulfillmentToOrder so the
+// webhook and pull paths stay in lockstep. Returns the updated order as a
+// plain object, or null if the order isn't found locally.
+export async function syncFulfillmentsFromShopify({ shop, shopifyOrderId, admin }) {
+  if (!shop || !shopifyOrderId) {
+    throw new Error('syncFulfillmentsFromShopify: shop and shopifyOrderId are required')
+  }
+  const localOrder = await ShopifyOrder.findOne({ shop, shopifyOrderId })
+  if (!localOrder) return null
+
+  const data = await getOrderFulfillments({ admin, shop, shopifyOrderId })
+  if (!data) return localOrder.toObject()
+
+  let anyChanged = false
+  for (const n of data.fulfillments || []) {
+    if (!n.fulfillmentId) continue
+    const { changed } = applyFulfillmentToOrder(localOrder, n)
+    if (changed) anyChanged = true
+  }
+  // Mirror the order-level fulfillment status (FULFILLED / PARTIALLY_FULFILLED
+  // / UNFULFILLED → lower-case) so the page can show "Fulfillment status".
+  if (data.displayFulfillmentStatus) {
+    const fs = String(data.displayFulfillmentStatus).toLowerCase()
+    if (localOrder.fulfillmentStatus !== fs) {
+      localOrder.fulfillmentStatus = fs
+      anyChanged = true
+    }
+  }
+  if (recomputeShipDate(localOrder)) anyChanged = true
+
+  if (anyChanged) {
+    await localOrder.save()
+    console.log(
+      `[orders] live-pull synced ${data.fulfillments?.length || 0} fulfillment(s) for order=${shopifyOrderId}`,
+    )
+    log.info('fulfillment.live_sync', {
+      shop,
+      shopifyOrderId,
+      count: data.fulfillments?.length || 0,
+    })
+  }
+  // Mirror carrier + tracking + ship date onto the customer-facing QBO
+  // invoice — even when fulfillment data didn't change this run, so the
+  // native TrackingNum / ShipDate backfill onto invoices synced before those
+  // fields were added. Idempotent: setInvoiceShipping no-ops when nothing
+  // differs, so this doesn't write on every view once converged.
+  if ((localOrder.fulfillments || []).length) {
+    await pushShippingToInvoice(localOrder)
+  }
+  return localOrder.toObject()
 }
 

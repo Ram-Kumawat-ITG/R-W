@@ -4,6 +4,8 @@ import WholesaleApplication from '../models/wholesaleApplication.server'
 import { sendResponse } from '../services/APIService/api.service'
 import { buildShopifyNote } from '../services/shopify/shopify.utils'
 import { customerUpdateNote, customerUpdateDefaultAddress } from '../utils/shopifyCustomer'
+import { normalizePaymentMethod } from '../services/customer/customer.utils'
+import { applyPaymentPreferenceToOpenInvoices } from '../services/invoice/paymentPreference.service'
 
 // POST /api/update-profile  (Shopify App Proxy)
 // Content-Type: application/json
@@ -160,6 +162,37 @@ export async function action({ request }) {
     }
   }
 
+  // ── Realign open invoices to the new payment preference ──────────────────
+  //
+  // `doc` is the PRE-update snapshot, so doc.payment.method is the old
+  // method. If the customer actually changed their method, realign all of
+  // their unpaid/open invoices (recompute fee + due date, sync QBO, audit).
+  // Best-effort: a QBO hiccup must never fail the profile save the customer
+  // just made — we already persisted above. The summary rides along in the
+  // response so the storefront can surface "N invoices updated".
+  let paymentMethodRealign = null
+  if (hasPaymentUpdate && payment.method != null && payment.method !== '') {
+    const oldMethod = normalizePaymentMethod(doc.payment?.method)
+    const requestedMethod = normalizePaymentMethod(payment.method)
+    if (oldMethod !== requestedMethod) {
+      if (!doc.shop) {
+        console.warn('[proxy/update-profile] cannot realign invoices — application has no shop')
+      } else {
+        try {
+          paymentMethodRealign = await applyPaymentPreferenceToOpenInvoices({
+            shop: doc.shop,
+            email,
+            newMethod: requestedMethod,
+            performedBy: email,
+            source: 'customer',
+          })
+        } catch (e) {
+          console.error('[proxy/update-profile] invoice realign failed:', e?.message || e)
+        }
+      }
+    }
+  }
+
   // ── Build response ────────────────────────────────────────────────────────
   const updatedDoc = doc.toObject()
   for (const [key, val] of Object.entries($set)) {
@@ -183,6 +216,7 @@ export async function action({ request }) {
     address: updatedDoc.billingAddress ?? null,
     payment: updatedDoc.payment ?? null,
     tax: updatedDoc.tax ?? null,
+    paymentMethodRealign,
   })
 }
 

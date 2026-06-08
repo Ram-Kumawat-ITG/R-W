@@ -22,10 +22,10 @@ const PAGE_SIZE = 15;
 
 // Filter chips. Two kinds:
 //   - processingStatus filters drive a ShopifyOrder.processingStatus query
-//   - invoice-side filters (overdue / pending_cheque / failed_payments)
-//     run against the Invoice collection first; matching invoice _ids
-//     then narrow the ShopifyOrder query via _id $in. The `scope` field
-//     tells the loader which path to take.
+//   - invoice-side filters (overdue / pending_cheque / failed_payments /
+//     pref_*) run against the Invoice collection first; matching invoice
+//     _ids then narrow the ShopifyOrder query via _id $in. The `scope`
+//     field tells the loader which path to take.
 const STATUS_FILTERS = [
   { id: "all", label: "All", scope: "order" },
   { id: "scheduled", label: "Scheduled", scope: "order" },
@@ -37,7 +37,21 @@ const STATUS_FILTERS = [
   { id: "overdue", label: "Overdue", scope: "invoice" },
   { id: "pending_cheque", label: "Pending cheque", scope: "invoice" },
   { id: "failed_payments", label: "Failed payments", scope: "invoice" },
+  // Preferred-payment-method chips. Filter on the immutable order-time
+  // `customerPaymentPreference` snapshot (NOT the mutable `paymentMethod`,
+  // which flips when an admin uses the cheque→card fallback) so the chip
+  // reflects what the customer actually chose at order time.
+  { id: "pref_card", label: "Card", scope: "invoice" },
+  { id: "pref_ach", label: "ACH", scope: "invoice" },
+  { id: "pref_cheque", label: "Cheque", scope: "invoice" },
 ];
+
+// Map a preferred-method chip id → the stored preference value.
+const PREF_FILTER_METHOD = {
+  pref_card: "card",
+  pref_ach: "ach",
+  pref_cheque: "check",
+};
 const INVOICE_FILTER_IDS = new Set(
   STATUS_FILTERS.filter((f) => f.scope === "invoice").map((f) => f.id),
 );
@@ -69,6 +83,21 @@ function buildInvoiceFilter(filterId, shop, now) {
   }
   if (filterId === "failed_payments") {
     return { shop, paymentStatus: "failed" };
+  }
+  // Preferred-method chips (pref_card / pref_ach / pref_cheque). Prefer the
+  // order-time `customerPaymentPreference` snapshot; fall back to
+  // `paymentMethod` for legacy invoices created before the snapshot field
+  // existed (mirrors the dueAt → qboDueDate fallback above).
+  if (PREF_FILTER_METHOD[filterId]) {
+    const pref = PREF_FILTER_METHOD[filterId];
+    return {
+      shop,
+      $or: [
+        { customerPaymentPreference: pref },
+        { customerPaymentPreference: { $exists: false }, paymentMethod: pref },
+        { customerPaymentPreference: null, paymentMethod: pref },
+      ],
+    };
   }
   return null;
 }
@@ -406,9 +435,7 @@ export default function OrdersList() {
                     </s-table-cell>
                     <s-table-cell>{r.customerEmail || "—"}</s-table-cell>
                     <s-table-cell>
-                      {r.totalAmount != null
-                        ? formatAmount(r.totalAmount, r.currency)
-                        : "—"}
+                      <AmountCell order={r} />
                     </s-table-cell>
                     <s-table-cell>
                       <ProcessingBadge
@@ -500,6 +527,38 @@ export default function OrdersList() {
         )}
       </s-section>
     </s-page>
+  );
+}
+
+// Amount cell — shows the fee-inclusive grand total the customer will be
+// charged. Prefers Invoice.amountDue (which now bakes in the processing fee
+// for card / ACH invoices) over the Shopify order total. When the two differ
+// (a fee was added) we surface the pre-fee Shopify total as a subdued
+// subtitle so admins can see both at a glance. Falls back to the Shopify
+// total for orders with no invoice yet.
+function AmountCell({ order }) {
+  const shopifyTotal = order.totalAmount;
+  const invoiceTotal = order.invoice?.amountDue;
+  const currency = order.currency;
+  if (invoiceTotal == null) {
+    return (
+      <s-text>
+        {shopifyTotal != null ? formatAmount(shopifyTotal, currency) : "—"}
+      </s-text>
+    );
+  }
+  const feeAdded =
+    shopifyTotal != null &&
+    Number(invoiceTotal).toFixed(2) !== Number(shopifyTotal).toFixed(2);
+  return (
+    <s-stack direction="block" gap="none">
+      <s-text>{formatAmount(invoiceTotal, currency)}</s-text>
+      {feeAdded && (
+        <s-text tone="subdued">
+          incl. fee · {formatAmount(shopifyTotal, currency)} order
+        </s-text>
+      )}
+    </s-stack>
   );
 }
 

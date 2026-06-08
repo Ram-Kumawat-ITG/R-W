@@ -9,6 +9,7 @@ import {
   PAYMENT_METHOD_LABEL,
   PAYMENT_METHOD_SHORT,
 } from "../utils/payment.constants";
+import { shipmentStatusLabel } from "../utils/shipping.constants";
 
 // Label/value pair used throughout the admin detail pages. Renders the
 // label as subdued small text above the value; empty / nullish values
@@ -136,6 +137,37 @@ export function OutcomeBadge({ outcome }) {
   const m =
     OUTCOME_TONE_MAP[outcome] || { tone: "default", label: outcome || "—" };
   return <s-badge tone={m.tone}>{m.label}</s-badge>;
+}
+
+// Tone per Shopify shipment_status / fulfillment.status value. Unknown
+// values fall through to a default-tone badge with the friendly label.
+const SHIPMENT_STATUS_TONE_MAP = {
+  // carrier shipment_status
+  label_printed: "default",
+  label_purchased: "default",
+  confirmed: "info",
+  in_transit: "info",
+  out_for_delivery: "info",
+  ready_for_pickup: "info",
+  picked_up: "info",
+  attempted_delivery: "warning",
+  delivered: "success",
+  failure: "critical",
+  // fulfillment.status
+  pending: "warning",
+  open: "info",
+  success: "success",
+  cancelled: "default",
+  error: "critical",
+};
+
+// Renders a fulfillment's `shipment_status` (or `status`) — see the
+// ShopifyOrder `fulfillments[]` sub-schema. Returns null when there's no
+// status so callers can choose to render nothing.
+export function ShipmentStatusBadge({ status }) {
+  if (!status) return null;
+  const tone = SHIPMENT_STATUS_TONE_MAP[status] || "default";
+  return <s-badge tone={tone}>{shipmentStatusLabel(status)}</s-badge>;
 }
 
 // ── Plain-text payment-method cells ─────────────────────────────────

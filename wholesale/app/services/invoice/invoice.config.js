@@ -1,8 +1,12 @@
-// Invoice service configuration. Currently just terms — kept in its own
-// file so future additions (per-method terms, late-fee schedules, etc.)
-// have a natural home.
+// Invoice service configuration — terms, per-method due dates, and
+// processing-fee rates. Kept in its own file so future additions
+// (late-fee schedules, etc.) have a natural home.
 
 import { readInt, readNumber } from '../../utils/env.utils'
+
+// Generic default terms (days) — the fallback used by any payment method
+// that has no method-specific override configured below.
+const DEFAULT_TERMS_DAYS = readInt('INVOICE_TERMS_DAYS', 15)
 
 export const invoiceConfig = {
   // Days from order date to invoice due date. Sent to QBO as `DueDate`
@@ -10,8 +14,23 @@ export const invoiceConfig = {
   // overrides any customer-level `SalesTerm` configured in QBO.
   //
   // 15 is the wholesale default per project decision. Override via
-  // INVOICE_TERMS_DAYS env var.
-  termsDays: readInt('INVOICE_TERMS_DAYS', 15),
+  // INVOICE_TERMS_DAYS env var. NOTE: this is the GENERIC fallback —
+  // the active terms are selected PER PAYMENT METHOD via
+  // `dueDaysByMethod` (see below) and resolved with `dueDaysForMethod`.
+  termsDays: DEFAULT_TERMS_DAYS,
+
+  // Per-payment-method due-date terms (days from the order/invoice date).
+  // The due date is computed at invoice creation from the invoice's
+  // locked `paymentMethod`:
+  //   cheque → CHEQUE_DUE_DATE, ACH → ACH_DUE_DATE, card → CARD_DUE_DATE.
+  // Each falls back to INVOICE_TERMS_DAYS when its env var is unset, so
+  // existing single-terms setups keep working. Example: order June 1 +
+  // CHEQUE_DUE_DATE=15 → due June 16. Resolve via `dueDaysForMethod`.
+  dueDaysByMethod: {
+    check: readInt('CHEQUE_DUE_DATE', DEFAULT_TERMS_DAYS),
+    ach: readInt('ACH_DUE_DATE', DEFAULT_TERMS_DAYS),
+    card: readInt('CARD_DUE_DATE', DEFAULT_TERMS_DAYS),
+  },
 
   // Additional minutes added to the due date — primarily a TESTING aid
   // so admins can watch the Overdue indicator + cheque reminders fire
@@ -38,4 +57,14 @@ export const invoiceConfig = {
     ach: readNumber('INVOICE_FEE_RATE_ACH', 0.01),
     check: readNumber('INVOICE_FEE_RATE_CHECK', 0),
   },
+}
+
+// Resolve the due-date terms (days) for a given payment method, falling
+// back to the generic INVOICE_TERMS_DAYS when the method is unknown or
+// has no configured override. `paymentMethod` values are 'check' / 'ach'
+// / 'card' (the locked Invoice.paymentMethod).
+export function dueDaysForMethod(paymentMethod) {
+  const byMethod = invoiceConfig.dueDaysByMethod
+  const days = byMethod?.[paymentMethod]
+  return Number.isFinite(days) ? days : invoiceConfig.termsDays
 }

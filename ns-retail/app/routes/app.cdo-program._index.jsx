@@ -24,11 +24,51 @@ const MONTH_LABEL = (key) => {
 
 export default function CdoDashboard() {
   const { metrics } = useLoaderData();
-  const { kpis, monthlyPerformance, topPractitioners, recentOrders } = metrics;
+  const { kpis, upcoming, monthlyPerformance, topPractitioners, recentOrders } = metrics;
 
   return (
     <s-stack direction="block" gap="base">
-      <s-section heading="Overview">
+      <s-section heading="Commission overview">
+        <s-grid
+          gap="base"
+          gridTemplateColumns="repeat(auto-fill, minmax(220px, 1fr))"
+        >
+          <MetricCard
+            label="Total Commission Earned"
+            value={formatCurrency(kpis.totalCommissionEarned)}
+            sublabel="Excludes reversed"
+          />
+          <MetricCard
+            label="Total Commission Paid"
+            value={formatCurrency(kpis.totalCommissionPaid)}
+            tone="success"
+          />
+          <MetricCard
+            label="Outstanding Liability"
+            value={formatCurrency(kpis.outstandingLiability)}
+            tone="critical"
+            sublabel="Earned, not yet paid"
+          />
+          <MetricCard
+            label="Pending Payouts"
+            value={formatCurrency(kpis.pendingPayoutTotal)}
+            sublabel="Awaiting approval / in flight"
+          />
+          <MetricCard
+            label="Paid Out"
+            value={formatCurrency(kpis.paidPayoutTotal)}
+            tone="success"
+          />
+          <MetricCard
+            label="Failed Payouts"
+            value={formatCurrency(kpis.failedPayoutTotal)}
+            tone={kpis.failedPayoutCount ? "critical" : "neutral"}
+            sublabel={`${formatNumber(kpis.failedPayoutCount)} payout(s)`}
+          />
+        </s-grid>
+      </s-section>
+
+      <s-section heading="Program overview">
         <s-grid
           gap="base"
           gridTemplateColumns="repeat(auto-fill, minmax(220px, 1fr))"
@@ -39,18 +79,8 @@ export default function CdoDashboard() {
             sublabel={`${formatNumber(kpis.totalOrders)} attributed orders`}
           />
           <MetricCard
-            label="Total Commissions"
-            value={formatCurrency(kpis.totalCommissions)}
-          />
-          <MetricCard
-            label="Pending Payouts"
-            value={formatCurrency(kpis.pendingPayoutTotal)}
-            tone="critical"
-          />
-          <MetricCard
-            label="Paid Out"
-            value={formatCurrency(kpis.paidPayoutTotal)}
-            tone="success"
+            label="Avg Order Value"
+            value={formatCurrency(kpis.avgOrderValue)}
           />
           <MetricCard
             label="Total Referrals"
@@ -67,6 +97,55 @@ export default function CdoDashboard() {
             sublabel="Referrals → orders"
           />
         </s-grid>
+      </s-section>
+
+      <s-section heading="Upcoming payout (next cycle)">
+        <s-stack direction="block" gap="base">
+          <s-grid gap="base" gridTemplateColumns="repeat(auto-fill, minmax(220px, 1fr))">
+            <MetricCard
+              label="Scheduled total"
+              value={formatCurrency(upcoming.totalAmount)}
+              tone="success"
+            />
+            <MetricCard
+              label="Estimated payout date"
+              value={formatDate(upcoming.estimatedDate)}
+            />
+            <MetricCard
+              label="Practitioners"
+              value={formatNumber(upcoming.practitionerCount)}
+              sublabel={`${formatNumber(upcoming.commissionCount)} commissions`}
+            />
+            <MetricCard
+              label="Min payout threshold"
+              value={formatCurrency(upcoming.minimumPayoutAmount)}
+              sublabel={`${formatNumber(upcoming.belowMinimumCount)} below minimum (rolls over)`}
+            />
+          </s-grid>
+          {upcoming.breakdown.length === 0 ? (
+            <s-paragraph tone="subdued">
+              No practitioner clears the minimum payout this cycle yet. Commissions accrue until
+              the threshold is met.
+            </s-paragraph>
+          ) : (
+            <s-table>
+              <s-table-header-row>
+                <s-table-header>Practitioner</s-table-header>
+                <s-table-header>Commissions</s-table-header>
+                <s-table-header>Amount</s-table-header>
+              </s-table-header-row>
+              <s-table-body>
+                {upcoming.breakdown.map((p) => (
+                  <s-table-row key={p.practitionerId}>
+                    <s-table-cell>{p.practitionerName}</s-table-cell>
+                    <s-table-cell>{formatNumber(p.commissionCount)}</s-table-cell>
+                    <s-table-cell>{formatCurrency(p.amount)}</s-table-cell>
+                  </s-table-row>
+                ))}
+              </s-table-body>
+            </s-table>
+          )}
+        </s-stack>
       </s-section>
 
       <s-section heading="Top Practitioners">

@@ -55,12 +55,29 @@ export function toCustomerPayload(profile) {
   }
 }
 
-// Project an invoice line (our shape) into QBO's SalesItemLineDetail shape.
-// `defaultItemId` is required because every QBO line must reference an Item.
+// Project an invoice line (our shape) into a QBO line.
+// `defaultItemId` is required because every QBO SalesItemLine must reference
+// an Item.
+//
+// Two line shapes are produced:
+//   - kind === 'discount' → a QBO DiscountLineDetail line (no ItemRef). The
+//     `amount` is POSITIVE; QBO subtracts it from the running subtotal. This
+//     is how Shopify order-level / coupon / referral discounts are reflected
+//     on the invoice so the QBO total matches Shopify's post-discount total.
+//   - everything else      → a SalesItemLineDetail (products, shipping, tax,
+//     processing fee).
 export function toInvoiceLine(item, defaultItemId) {
   const amount = Number(item.amount)
   if (!Number.isFinite(amount)) {
     throw new Error(`Invoice line amount is not numeric: ${item.amount}`)
+  }
+  if (item.kind === 'discount') {
+    return {
+      DetailType: 'DiscountLineDetail',
+      Amount: amount,
+      Description: item.description || 'Discount',
+      DiscountLineDetail: { PercentBased: false },
+    }
   }
   return {
     DetailType: 'SalesItemLineDetail',

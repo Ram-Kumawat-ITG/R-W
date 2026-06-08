@@ -24,6 +24,11 @@ export const qboConfig = {
   oauthTokenUrl: readEnv('QBO_OAUTH_TOKEN_URL', { fallback: QBO_OAUTH_TOKEN_URL }),
   minorVersion: readEnv('QBO_MINOR_VERSION', { fallback: '73' }),
   defaultItemId: readEnv('QBO_DEFAULT_ITEM_ID', { fallback: '1' }),
+  // Income account for auto-created per-product Items (SKU column support).
+  // Optional — normally we derive the income account from the default item
+  // (QBO_DEFAULT_ITEM_ID); this is only the fallback when that item exposes
+  // no IncomeAccountRef. See qbo.service.findOrCreateItemBySku.
+  incomeAccountId: readEnv('QBO_INCOME_ACCOUNT_ID', { fallback: null }),
 }
 
 export function assertQboConfigured() {

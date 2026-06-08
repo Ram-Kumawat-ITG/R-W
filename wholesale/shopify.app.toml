@@ -37,6 +37,13 @@ api_version = "2026-07"
   # Until then it is registered programmatically after install — see
   # app/services/shopify/registerWebhooks.server.js.
 
+  # NOTE: fulfillments/create + fulfillments/update carry protected customer
+  # data — same approval gate as `orders/create`. They are NOT declared here
+  # (declaring an unapproved protected topic fails `shopify app deploy`);
+  # instead they're registered programmatically after install via
+  # REQUIRED_SUBSCRIPTIONS → ensureProtectedWebhooks. Testable meanwhile via
+  # `shopify app webhook trigger` / fulfilling a test order.
+
   [[webhooks.subscriptions]]
   topics = [ "products/create" ]
   uri = "/webhooks/products/create"

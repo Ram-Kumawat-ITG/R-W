@@ -15,11 +15,14 @@ import {
   getPractitionerProfile,
   listPractitionerCodes,
   getPractitionerKpis,
+  listPractitionerPayouts,
   getSettings,
 } from "../services/cdo/cdo.service";
 import MetricCard from "../components/cdo/MetricCard";
+import StatusBadge from "../components/cdo/StatusBadge";
 import {
   formatCurrency,
+  formatDate,
   formatDateTime,
   formatNumber,
   formatPercent,
@@ -81,17 +84,18 @@ export const loader = async ({ request, params }) => {
     throw new Response("Practitioner not found", { status: 404 });
   }
 
-  const [codes, kpis, settings] = await Promise.all([
+  const [codes, kpis, payouts, settings] = await Promise.all([
     listPractitionerCodes(params.id),
     getPractitionerKpis(params.id, resolveDateRange(range)),
+    listPractitionerPayouts(params.id),
     getSettings(),
   ]);
 
-  return { profile, codes, kpis, settings, range };
+  return { profile, codes, kpis, payouts, settings, range };
 };
 
 export default function CdoCustomerDetails() {
-  const { profile, codes, kpis, settings, range } = useLoaderData();
+  const { profile, codes, kpis, payouts, settings, range } = useLoaderData();
   const shopify = useAppBridge();
   const revalidator = useRevalidator();
   const codeFetcher = useFetcher();
@@ -268,6 +272,97 @@ export default function CdoCustomerDetails() {
             />
           </s-grid>
         </s-stack>
+      </s-section>
+
+      <s-section heading="Commission & payout summary">
+        <s-grid gap="base" gridTemplateColumns="repeat(4, minmax(0, 1fr))">
+          <MetricCard
+            label="Commission earned"
+            value={formatCurrency(kpis.totalCommissionEarned, settings.currency)}
+            sublabel="Lifetime, excl. reversed"
+          />
+          <MetricCard
+            label="Commission paid"
+            value={formatCurrency(kpis.totalCommissionPaid, settings.currency)}
+            tone="success"
+          />
+          <MetricCard
+            label="Pending commissions"
+            value={formatCurrency(kpis.pendingCommissions, settings.currency)}
+            tone="critical"
+            sublabel="Earned, not yet paid"
+          />
+          <MetricCard
+            label="Upcoming payout"
+            value={formatCurrency(kpis.upcomingPayoutAmount, settings.currency)}
+            sublabel={
+              kpis.upcomingPayoutAmount > 0
+                ? `Est. ${formatDate(kpis.nextPayoutDate)}`
+                : `Below ${formatCurrency(kpis.minimumPayoutAmount, settings.currency)} minimum`
+            }
+          />
+          <MetricCard
+            label="Referred customers"
+            value={formatNumber(kpis.referredCustomers)}
+          />
+          <MetricCard
+            label="Referral orders"
+            value={formatNumber(kpis.totalReferralOrders)}
+          />
+          <MetricCard
+            label="Lifetime referral revenue"
+            value={formatCurrency(kpis.lifetimeReferralRevenue, settings.currency)}
+          />
+          <MetricCard
+            label="Last payout"
+            value={kpis.lastPayoutDate ? formatDate(kpis.lastPayoutDate) : "—"}
+            sublabel={kpis.lastPayoutDate ? "Most recent paid payout" : "No payouts yet"}
+          />
+        </s-grid>
+      </s-section>
+
+      <s-section heading={`Payout history (${payouts.length})`}>
+        {payouts.length === 0 ? (
+          <s-paragraph tone="subdued">
+            No payouts yet. Payouts appear here once this practitioner&apos;s commissions clear
+            the minimum and a payout cycle runs.
+          </s-paragraph>
+        ) : (
+          <s-table>
+            <s-table-header-row>
+              <s-table-header>Reference</s-table-header>
+              <s-table-header>Amount</s-table-header>
+              <s-table-header>Commissions</s-table-header>
+              <s-table-header>Status</s-table-header>
+              <s-table-header>Period end</s-table-header>
+              <s-table-header>Paid</s-table-header>
+              <s-table-header>QBO bill</s-table-header>
+            </s-table-header-row>
+            <s-table-body>
+              {payouts.map((p) => (
+                <s-table-row key={p.id}>
+                  <s-table-cell>{p.reference || "—"}</s-table-cell>
+                  <s-table-cell>{formatCurrency(p.amount, p.currency)}</s-table-cell>
+                  <s-table-cell>{formatNumber(p.commissionCount)}</s-table-cell>
+                  <s-table-cell>
+                    <StatusBadge status={p.status} />
+                  </s-table-cell>
+                  <s-table-cell>{p.periodEnd ? formatDate(p.periodEnd) : "—"}</s-table-cell>
+                  <s-table-cell>{p.paidAt ? formatDate(p.paidAt) : "—"}</s-table-cell>
+                  <s-table-cell>
+                    {p.qboBillUrl ? (
+                      <s-link href={p.qboBillUrl} target="_blank">
+                        Bill {p.qboBillId}
+                      </s-link>
+                    ) : (
+                      "—"
+                    )}
+                  </s-table-cell>
+                </s-table-row>
+              ))}
+            </s-table-body>
+          </s-table>
+        )}
       </s-section>
 
       <s-section heading="Profile">

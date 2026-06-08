@@ -34,6 +34,16 @@ export default function CdoCustomers() {
     },
     { key: "customerId", header: "Customer ID" },
     {
+      key: "payoutsPaused",
+      header: "Payouts",
+      render: (r) =>
+        r.payoutsPaused ? (
+          <s-badge tone="warning">Paused</s-badge>
+        ) : (
+          <s-badge tone="success">Active</s-badge>
+        ),
+    },
+    {
       key: "actions",
       header: "Actions",
       render: (r) => (

@@ -1,7 +1,7 @@
 // Storefront-side fetch helpers. All routes hit our app via Shopify's app
 // proxy at /apps/<subpath>/api/*. The proxy is configured in
 // ns-retail/shopify.app.toml ([app_proxy] subpath = "retail-signup").
-const PROXY_BASE = 'retail-signup'
+const PROXY_BASE = 'wholesale-application'
 
 const API = {
   checkEmail: `/apps/${PROXY_BASE}/api/auth/check-email`,
