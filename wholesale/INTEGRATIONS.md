@@ -3080,3 +3080,147 @@ the embedded admin once to trigger registration. Outcome is logged.
 - **Backfill job** — replay the Shopify orders/list for a date range
   into the local pipeline. Useful when subscribing to `orders/create`
   for the first time after operating without webhooks.
+
+## 25. Practitioner Portal (CDO referral dashboard)
+
+A storefront self-service dashboard for **CDO practitioners** (approved
+wholesale customers who hold a referral code). It is a **read-only view**
+over data that the sibling **`ns-retail`** app writes — the wholesale app
+never generates commissions or payouts; it only surfaces them. Delivered
+as Phase 1 (foundation) on 2026-06-08.
+
+### 25.1 The CDO data model (shared MongoDB collections)
+
+`ns-retail` owns and writes these collections in the same database
+(`MONGODB_URI`). The wholesale app reads them through `strict:false`
+mirror models that are explicitly flagged read-only (same convention as
+the pre-existing `cdo_practitioner_codes` mirror — see `cdoPractitionerCode.server.js`).
+
+| Collection | Mirror model | Holds | Key fields used here |
+|---|---|---|---|
+| `cdo_practitioner_codes` | `cdoPractitionerCode.server.js` (pre-existing) | Referral codes | `practitionerId`, `code`, `discountPercent`, `commissionRate`, `status`, `isPrimary` |
+| `cdo_orders` | `cdoOrder.server.js` | Attributed retail orders | `practitionerId`, `referralCode`, `customerEmail`, `pricing.total` / `amount`, `commissionAmount`, `placedAt`, `lineItems[]` |
+| `cdo_commissions` | `cdoCommission.server.js` | Per-order commission | `practitionerId`, `orderName`, `amount`, `rate`, `status` (`pending`/`paid`), `payoutStatus` (`paid`/`failed`/`paused`), `earnedAt` |
+| `cdo_payouts` | `cdoPayout.server.js` | Payout records | `practitionerId`, `amount`, `method`, `status`, `reference`, `qboBillId`, `paidAt` |
+| `cdo_referrals` | `cdoReferral.server.js` | Referred patients | `practitionerId`, `referredEmail`, `referredName`, `referralCode`, `status`, `referredAt`, `convertedAt` |
+| `cdo_applications` | `cdoApplication.server.js` | Patient applications | `applicantType`, `referral{}`, `customerId`, `email`, `submittedAt` |
+
+> **Maintenance rule:** these collections are owned by `ns-retail`. If its
+> schema changes, the mirrors here only need updating when the portal
+> starts depending on a new field — `strict:false` keeps reads working
+> regardless. Never write to these collections from the wholesale app.
+
+### 25.2 The tenant key (how identity resolves)
+
+The single linkage that makes the whole portal work and stay isolated:
+
+```
+wholesale_applications._id   ===   practitionerId (across every cdo_* collection)
+wholesale_applications.customerId   ===   gid://shopify/Customer/<id>
+```
+
+So a logged-in customer is mapped to their CDO data as:
+
+```
+Customer-account UI extension calls shopify.sessionToken.get() → signed JWT
+  → fetch(`${api_base_url}/api/portal/*`, { Authorization: Bearer <jwt> })
+  → authenticate.public.customerAccount(request)  // verifies JWT sig/aud/exp → { sessionToken, cors }
+  → sessionToken.sub  ===  gid://shopify/Customer/<id>   (present iff logged in + protected-data access)
+  → WholesaleApplication.findOne({ customerId: sessionToken.sub, status: 'approved' })
+  → practitionerId = String(application._id)
+  → every cdo_* query is scoped { practitionerId }
+```
+
+The mapping lives in
+`services/cdo/cdo.portal.service.js#resolvePractitionerByCustomerGid` (the
+guard performs the JWT verification, then passes `sessionToken.sub`).
+
+### 25.3 Security model (core requirement)
+
+- **Identity is never trusted from the client.** `practitionerId` is
+  re-derived server-side on *every* request from the Shopify-signed
+  session-token `sub` claim (verified by `authenticate.public.customerAccount`,
+  built into `@shopify/shopify-app-react-router`). No `practitionerId`/`email`
+  from the query or body is ever used for scoping.
+- Auth outcomes the extension branches on:
+  - **401** (no/invalid/expired token, or `sub` claim absent because the
+    buyer isn't logged in / protected-data access not granted) → extension
+    shows a "sign in required" notice.
+  - **403** (logged in, but not an approved `WholesaleApplication`) →
+    extension shows an "access restricted" notice.
+- All endpoints are GET/read-only and share the `app/api/portal/_guard.js`
+  `portalLoader` wrapper (DB connect → `authenticate.public.customerAccount`
+  → resolve `sub` → error-map → handler → `cors(res)`).
+- **CORS:** the extension runs in a null-origin Web Worker and sends an
+  `Authorization` header, so its `fetch` is "non-simple" → the browser issues
+  an `OPTIONS` preflight (carrying no auth). Each portal route's `action`
+  (`portalAction`) answers the preflight with a 204 + CORS headers; success
+  responses are wrapped by the library `cors` helper, error responses carry
+  `sendResponse`'s wildcard `Access-Control-Allow-Origin: *`.
+- **Prerequisites:** Shopify *new customer accounts* + *protected customer
+  data access* (the `sub` claim is only present when the app may read
+  customer data).
+
+### 25.4 Endpoints (called by the extension at `${api_base_url}/api/portal/*`)
+
+Thin handlers in `app/api/portal/*`, registered in `app/routes.js`. All
+business logic is in `services/cdo/cdo.portal.service.js`.
+
+| Endpoint | Service fn | Returns |
+|---|---|---|
+| `GET /me` | `getProfile` | practitioner name/email/primary code (bootstrap) |
+| `GET /summary` | `getSummary` | summary cards (patients, revenue, commission buckets, active codes) |
+| `GET /revenue?from&to` | `getRevenue` | revenue: this month / last month / current year / lifetime + optional range |
+| `GET /customers?search&page&pageSize` | `getReferredCustomers` | referred patients + per-customer total orders & LTV (joins `cdo_orders` by email) |
+| `GET /commissions?status&from&to&page&pendingOnly` | `getCommissions` | commission list + totals; `pendingOnly=1` → earned-but-unpaid view |
+| `GET /payouts?status&from&to&page` | `getPayouts` | payout history |
+| `GET /referrals` | `getReferralCodes` | codes + per-code usage (referrals/orders/revenue/commission) |
+| `GET /discounts` | `getDiscounts` | discounts derived from codes (type/value/status/usage) |
+
+Commission buckets: **paid** = `payoutStatus==='paid'`; **pending** =
+`status==='pending'`; **awaiting payout** = `status==='paid' &&
+payoutStatus!=='paid'`; **failed** = `payoutStatus==='failed'`. Per-code
+commission is summed from `cdo_orders.commissionAmount` (commissions link
+to orders, not codes). Money values are rounded to 2 dp server-side
+(`round2`) to strip float noise.
+
+### 25.5 Frontend (Customer Account UI extension, full-page)
+
+`extensions/practitioner-portal-account/` is a Customer Account UI
+extension (`type = "ui_extension"`, api_version `2025-10`), built and
+deployed by the Shopify CLI (`shopify app dev` / `deploy`) — there is no
+separate Vite step.
+
+- **`shopify.extension.toml`**: single `[[extensions.targeting]]` →
+  `target = "customer-account.page.render"`, `module =
+  "./src/PractitionerPortal.jsx"`; `[extensions.capabilities] network_access
+  = true`; one `[extensions.settings]` field `api_base_url` (the app backend
+  base URL, set per environment in the customer-account editor; read at
+  runtime via `shopify.settings.value.api_base_url`).
+- **Runtime/UI**: Preact (`@shopify/ui-extensions/preact`, `render(<App/>,
+  document.body)`) + **Polaris web components** (`s-page`, `s-section`,
+  `s-grid`, `s-stack`, `s-text`, `s-heading`, `s-badge`, `s-button`,
+  `s-banner`, `s-spinner`, `s-text-field`, `s-select`, `s-divider`). The
+  sandbox forbids arbitrary HTML/CSS, so **tables are built from `s-grid`**
+  (`src/ui.jsx#Table`) and the UI inherits the merchant's branding.
+- **Files**: `src/PractitionerPortal.jsx` (entry + auth bootstrap via
+  `/api/portal/me` + local-state tab nav: overview / patients / commissions /
+  pending / payouts / referrals / discounts), `src/api.js` (fetch wrapper —
+  reads `api_base_url`, attaches a fresh `shopify.sessionToken.get()` Bearer
+  per call, parses the `{status,message,result}` envelope), `src/sections.jsx`
+  (the seven sections), `src/ui.jsx` (`useResource` hook, `Table`, `StatCards`,
+  `StatusBadge`, `Pagination`), `src/format.js` (Intl formatters).
+- **Merchant step**: add the page to the customer-account navigation menu and
+  set `api_base_url` (full-page targets allow direct linking by default).
+
+### 25.6 Out of scope / limitations (later phases)
+
+- **CSV export is not available on this surface.** The extension runs in a
+  sandboxed Web Worker with no DOM/Blob, so a client-side download is
+  impossible (and a plain `<link>` can't carry the Bearer token). A later
+  phase can add a server endpoint emitting CSV behind a short-lived signed
+  URL. (The removed storefront theme-block portal had client-side CSV.)
+- Commission / payout **generation** — owned by `ns-retail`.
+- Live **Shopify Discount API** objects — Phase 1 derives the Discounts
+  section from practitioner codes (`discountPercent`, status, usage).
+- Charts / graphs — Phase 1 is cards + tables only.

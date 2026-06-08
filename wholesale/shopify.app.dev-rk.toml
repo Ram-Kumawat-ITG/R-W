@@ -1,29 +1,17 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "e4de0235635b192d07f7b96bc1a5e0df"
-application_url = "https://unconsoled-internationally-stephani.ngrok-free.dev"
-embedded = true
 name = "dev-rk"
 handle = "dev-rk-2"
-
-[access_scopes]
-# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "customer_read_customers,customer_read_orders,customer_write_orders,read_assigned_fulfillment_orders,read_cart_transforms,read_customers,read_discounts,read_files,read_gift_cards,read_inventory,read_locations,read_markets,read_product_listings,read_products,read_publications,read_shipping,read_third_party_fulfillment_orders,unauthenticated_read_checkouts,unauthenticated_read_customers,unauthenticated_read_product_inventory,unauthenticated_read_product_listings,write_cart_transforms,write_checkouts,write_customers,write_draft_orders,write_files,write_gift_cards,write_merchant_managed_fulfillment_orders,write_order_edits,write_orders,write_products,write_publications,write_shipping,write_third_party_fulfillment_orders"
-
-[auth]
-redirect_urls = [
-  "https://unconsoled-internationally-stephani.ngrok-free.dev/auth/callback",
-  "https://unconsoled-internationally-stephani.ngrok-free.dev/auth/shopify/callback",
-  "https://unconsoled-internationally-stephani.ngrok-free.dev/api/auth/callback"
-]
-
-[app_proxy]
-url = "https://unconsoled-internationally-stephani.ngrok-free.dev"
-subpath = "wholesale-application"
-prefix = "apps"
+application_url = "https://slide-basin-fence-existing.trycloudflare.com"
+embedded = true
 
 [webhooks]
 api_version = "2025-07"
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/orders/cancelled"
+  topics = [ "orders/cancelled" ]
 
   [[webhooks.subscriptions]]
   uri = "/webhooks/app/uninstalled"
@@ -34,22 +22,27 @@ api_version = "2025-07"
   topics = [ "orders/create" ]
 
   [[webhooks.subscriptions]]
-  uri = "/webhooks/orders/cancelled"
-  topics = [ "orders/cancelled" ]
-
-  # NOTE: fulfillments/create + fulfillments/update are protected
-  # customer-data topics and are NOT declared here — declaring them fails
-  # `shopify app deploy` until the app is approved for fulfillment data in
-  # the Partners dashboard. They are registered programmatically after
-  # install via REQUIRED_SUBSCRIPTIONS → ensureProtectedWebhooks
-  # (app/services/shopify/shopify.constants.js + shopify.service.js).
-
-  [[webhooks.subscriptions]]
   uri = "/webhooks/app/scopes_update"
   topics = [ "app/scopes_update" ]
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+scopes = "customer_read_customers,customer_read_orders,customer_write_orders,read_assigned_fulfillment_orders,read_cart_transforms,read_customers,read_discounts,read_files,read_gift_cards,read_inventory,read_locations,read_markets,read_product_listings,read_products,read_publications,read_shipping,read_third_party_fulfillment_orders,unauthenticated_read_checkouts,unauthenticated_read_customers,unauthenticated_read_product_inventory,unauthenticated_read_product_listings,write_cart_transforms,write_checkouts,write_customers,write_draft_orders,write_files,write_gift_cards,write_merchant_managed_fulfillment_orders,write_order_edits,write_orders,write_products,write_publications,write_shipping,write_third_party_fulfillment_orders"
+
+[auth]
+redirect_urls = [
+  "https://slide-basin-fence-existing.trycloudflare.com/auth/callback",
+  "https://slide-basin-fence-existing.trycloudflare.com/auth/shopify/callback",
+  "https://slide-basin-fence-existing.trycloudflare.com/api/auth/callback"
+]
+
+[app_proxy]
+url = "https://unconsoled-internationally-stephani.ngrok-free.dev"
+subpath = "wholesale-application"
+prefix = "apps"
 
 [pos]
 embedded = false
 
 [build]
-automatically_update_urls_on_dev = false
+automatically_update_urls_on_dev = true
