@@ -30,6 +30,9 @@ export const invoiceConfig = {
     check: readInt('CHEQUE_DUE_DATE', DEFAULT_TERMS_DAYS),
     ach: readInt('ACH_DUE_DATE', DEFAULT_TERMS_DAYS),
     card: readInt('CARD_DUE_DATE', DEFAULT_TERMS_DAYS),
+    // Immediate Payment — customer self-pays each invoice on demand via
+    // a hosted pay-link/QR, so the due window is typically short.
+    immediate: readInt('IMMEDIATE_DUE_DATE', DEFAULT_TERMS_DAYS),
   },
 
   // Additional minutes added to the due date — primarily a TESTING aid
@@ -52,10 +55,15 @@ export const invoiceConfig = {
   //
   // Override via INVOICE_FEE_RATE_CARD / INVOICE_FEE_RATE_ACH /
   // INVOICE_FEE_RATE_CHECK env vars.
+  // Immediate Payment is a card-based hosted charge, so it carries the
+  // card-style rate by default (override via INVOICE_FEE_RATE_IMMEDIATE).
+  // The fee is baked into the invoice at creation (like card) so the
+  // hosted pay-link collects the full fee-inclusive outstanding amount.
   processingFeeRates: {
     card: readNumber('INVOICE_FEE_RATE_CARD', 0.03),
     ach: readNumber('INVOICE_FEE_RATE_ACH', 0.01),
     check: readNumber('INVOICE_FEE_RATE_CHECK', 0),
+    immediate: readNumber('INVOICE_FEE_RATE_IMMEDIATE', 0.03),
   },
 }
 

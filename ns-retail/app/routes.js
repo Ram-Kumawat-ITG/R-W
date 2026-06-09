@@ -29,4 +29,15 @@ export default [
   route("/api/cdo/validate-code", "api/cdo/validate-code.js"),
   route("/api/cdo/checkout-validate-code", "api/cdo/checkout-validate-code.js"),
   route("/api/signup-form", "api/signup-form.js"),
+  // Practitioner Portal — Customer Account UI extension backend (/api/portal/*).
+  // Read-only over the cdo_* collections ns-retail owns; auth via the customer
+  // session-token JWT (see app/api/portal/_guard.js).
+  route("/api/portal/me", "api/portal/me.js"),
+  route("/api/portal/summary", "api/portal/summary.js"),
+  route("/api/portal/revenue", "api/portal/revenue.js"),
+  route("/api/portal/customers", "api/portal/customers.js"),
+  route("/api/portal/commissions", "api/portal/commissions.js"),
+  route("/api/portal/payouts", "api/portal/payouts.js"),
+  route("/api/portal/referrals", "api/portal/referrals.js"),
+  route("/api/portal/discounts", "api/portal/discounts.js"),
 ];

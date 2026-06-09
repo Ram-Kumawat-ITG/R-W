@@ -16,6 +16,9 @@ export function normalizePaymentMethod(raw) {
   const v = String(raw || '').trim().toLowerCase()
   if (v === 'check' || v === 'cheque') return 'check'
   if (v === 'ach' || v === 'bank' || v === 'bank-transfer') return 'ach'
+  // Immediate Payment — customer self-pays each invoice via a hosted
+  // NMI pay-link + QR. No stored vault; never auto-charged by the CRON.
+  if (v === 'immediate' || v === 'immediate-payment' || v === 'pay-by-link' || v === 'paylink') return 'immediate'
   if (v === 'card' || v === 'credit-card' || v === 'creditcard' || v === 'cc') return 'card'
   return 'card'
 }

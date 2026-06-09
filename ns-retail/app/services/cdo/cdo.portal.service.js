@@ -320,6 +320,63 @@ export async function getCommissions(
 
 // ── Payouts ──────────────────────────────────────────────────────────────────
 
+// Per-payout commission breakdown — the order-level commissions that make up
+// each payout, so a practitioner can reconcile what a payout paid for. Joined
+// from cdo_commissions (linked via `payoutId`) to cdo_orders for the order
+// date / patient name / revenue. Scoped by practitionerId so a practitioner
+// can only ever read the breakdown of their own payouts. Returns a Map keyed
+// by payout id → array of breakdown line rows.
+async function getPayoutBreakdowns(practitionerId, payoutIds) {
+  const map = new Map();
+  if (!payoutIds || payoutIds.length === 0) return map;
+
+  const rows = await CdoCommission.aggregate([
+    { $match: { practitionerId, payoutId: { $in: payoutIds } } },
+    {
+      $lookup: {
+        from: "cdo_orders",
+        localField: "orderId",
+        foreignField: "_id",
+        as: "order",
+      },
+    },
+    { $addFields: { order: { $arrayElemAt: ["$order", 0] } } },
+    { $sort: { earnedAt: -1, createdAt: -1 } },
+    {
+      $project: {
+        payoutId: 1,
+        orderName: 1,
+        amount: 1,
+        rate: 1,
+        status: 1,
+        orderDate: { $ifNull: ["$order.placedAt", "$earnedAt"] },
+        customerName: {
+          $ifNull: ["$order.customerName", "$order.customer.name"],
+        },
+        revenue: {
+          $ifNull: ["$order.pricing.total", { $ifNull: ["$order.amount", 0] }],
+        },
+      },
+    },
+  ]);
+
+  for (const r of rows) {
+    const key = String(r.payoutId);
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push({
+      id: String(r._id),
+      orderName: r.orderName || null,
+      orderDate: r.orderDate || null,
+      customerName: r.customerName || null,
+      revenue: round2(r.revenue),
+      rate: r.rate,
+      amount: round2(r.amount),
+      status: r.status || null,
+    });
+  }
+  return map;
+}
+
 export async function getPayouts(
   practitionerId,
   { status, from, to, page, pageSize } = {},
@@ -337,20 +394,25 @@ export async function getPayouts(
   const p = clampPage(page);
   const size = clampPageSize(pageSize);
 
-  const [rows, total] = await Promise.all([
+  const [docs, total] = await Promise.all([
     CdoPayout.find(match)
       .sort({ paidAt: -1, createdAt: -1 })
       .skip((p - 1) * size)
       .limit(size)
       .select(
-        "amount currency method status reference qboBillId paidAt createdAt periodStart periodEnd rejectionReason",
+        "amount currency method status reference qboBillId paidAt createdAt periodStart periodEnd rejectionReason commissionIds",
       )
       .lean(),
     CdoPayout.countDocuments(match),
   ]);
 
+  const breakdowns = await getPayoutBreakdowns(
+    practitionerId,
+    docs.map((d) => d._id),
+  );
+
   return {
-    rows: rows.map((r) => ({
+    rows: docs.map((r) => ({
       id: String(r._id),
       date: r.paidAt || r.createdAt || null,
       amount: round2(r.amount),
@@ -362,6 +424,7 @@ export async function getPayouts(
       periodStart: r.periodStart || null,
       periodEnd: r.periodEnd || null,
       rejectionReason: r.rejectionReason || null,
+      breakdown: breakdowns.get(String(r._id)) || [],
     })),
     page: p,
     pageSize: size,

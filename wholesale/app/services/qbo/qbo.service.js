@@ -2,7 +2,7 @@
 // QuickBooks. Combines customer find-or-create, invoice creation, and
 // payment recording. All HTTP plumbing is in qbo.apis.js.
 
-import { qbo, qboGetBinary } from './qbo.apis'
+import { qbo, qboGetBinary, qboUpload } from './qbo.apis'
 import { qboConfig } from './qbo.config'
 import { QBO_APP_URLS } from './qbo.constants'
 import { escapeQboQuery, toCustomerPayload, toInvoiceLine, toQboAddress } from './qbo.utils'
@@ -441,6 +441,41 @@ export async function setInvoiceShipping({ qboInvoiceId, lines = [], shipDate, t
   return updated
 }
 
+// Marker delimiting the auto-managed "Pay online" block in a CustomerMemo.
+const PAY_LINK_MEMO_MARKER = '\nPay online: '
+
+// Add (or refresh) the Immediate-Payment pay link in an existing invoice's
+// CustomerMemo. Used when an open invoice is realigned to the `immediate`
+// method after creation (createInvoiceForOrder bakes the link in at create
+// time, so this is the retro path). GET → preserve the non-pay-link part of
+// the memo → append the link → sparse-POST with the current SyncToken.
+// Returns the updated invoice. Idempotent: re-running with the same URL is a
+// no-op.
+export async function setInvoicePayLinkMemo({ qboInvoiceId, payLinkUrl }) {
+  if (!qboInvoiceId) throw new Error('setInvoicePayLinkMemo: qboInvoiceId is required')
+  if (!payLinkUrl) throw new Error('setInvoicePayLinkMemo: payLinkUrl is required')
+  const current = await getInvoice(qboInvoiceId)
+  if (!current?.Id) throw new Error(`setInvoicePayLinkMemo: QBO invoice ${qboInvoiceId} not found`)
+
+  const existingMemo = current.CustomerMemo?.value || ''
+  const base = existingMemo.split(PAY_LINK_MEMO_MARKER)[0].trimEnd()
+  let memo = `${base}${PAY_LINK_MEMO_MARKER}${payLinkUrl}`
+  if (memo.length > 1000) memo = memo.slice(0, 1000)
+  if (memo === existingMemo) {
+    return current
+  }
+  const res = await qbo.post('/invoice', {
+    Id: String(current.Id),
+    SyncToken: String(current.SyncToken),
+    sparse: true,
+    CustomerMemo: { value: memo },
+  })
+  const updated = res?.Invoice
+  if (!updated?.Id) throw new Error('QBO invoice memo update returned no Id')
+  log.info('invoice.pay_link_memo.set', { qboInvoiceId })
+  return updated
+}
+
 // Deep link an admin can click to open the QBO invoice in the QuickBooks
 // web app. Routes to sandbox vs prod based on QBO_ENVIRONMENT; Intuit
 // handles realm selection from the operator's login session.
@@ -448,6 +483,42 @@ export function getInvoiceWebUrl(invoiceId) {
   if (!invoiceId) return null
   const host = QBO_APP_URLS[qboConfig.environment] || QBO_APP_URLS.production
   return `${host}/app/invoice?txnId=${encodeURIComponent(invoiceId)}`
+}
+
+// Attach a file (the Immediate-Payment QR PNG) to a QBO invoice via the
+// /upload endpoint. `IncludeOnSend: true` makes QBO include the file with
+// the invoice when it's emailed (/invoice/{id}/send), so the QR travels
+// with the customer's invoice email. QBO cannot embed an image inline in
+// the invoice body — an attachment is the closest supported mechanism;
+// the clickable pay-link in the CustomerMemo is the primary CTA.
+//
+// Returns the created Attachable (with its Id) or null. Caller treats
+// this as best-effort — a failed attach must never break invoicing.
+export async function attachQrToInvoice({ qboInvoiceId, pngBuffer, fileName = 'payment-qr.png', note }) {
+  if (!qboInvoiceId) throw new Error('attachQrToInvoice: qboInvoiceId is required')
+  if (!pngBuffer?.length) throw new Error('attachQrToInvoice: pngBuffer is required')
+
+  const metadata = {
+    FileName: fileName,
+    Note: note || 'Scan to pay this invoice online.',
+    IncludeOnSend: true,
+    AttachableRef: [
+      {
+        IncludeOnSend: true,
+        EntityRef: { type: 'Invoice', value: String(qboInvoiceId) },
+      },
+    ],
+  }
+
+  console.log(`[QBO attach] uploading QR (${pngBuffer.length} bytes) → invoice ${qboInvoiceId}`)
+  const attachable = await qboUpload({
+    metadata,
+    fileBuffer: pngBuffer,
+    fileName,
+    contentType: 'image/png',
+  })
+  log.info('invoice.qr_attached', { qboInvoiceId, attachableId: attachable?.Id || null })
+  return attachable
 }
 
 // Fetch the rendered invoice PDF straight from QBO. Used by the admin

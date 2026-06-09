@@ -19,6 +19,13 @@ export const nmiConfig = {
   // Explicit URL overrides win if set. Otherwise auto-select by environment.
   apiUrl: readEnv('NMI_API_URL', { fallback: NMI_BASE_URLS[nmiEnvironment].api }),
   queryUrl: readEnv('NMI_QUERY_URL', { fallback: NMI_BASE_URLS[nmiEnvironment].query }),
+  // Collect.js script URL — NMI-hosted card tokenization used by the
+  // Immediate Payment self-pay page (/pay/:token). The browser loads this
+  // with the publishable tokenization key (= publicKey above). Override via
+  // NMI_COLLECT_JS_URL; defaults to the per-environment host.
+  collectJsUrl: readEnv('NMI_COLLECT_JS_URL', {
+    fallback: NMI_BASE_URLS[nmiEnvironment].collectJs,
+  }),
   // Sandbox-only static test card. Resolved at boot. Production env scrubs
   // these values via assertSafeTestCardConfig() if accidentally set.
   testCard: {

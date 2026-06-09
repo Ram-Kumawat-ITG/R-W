@@ -20,6 +20,7 @@ import {
   resolveCustomerAchBillingId,
 } from "../services/customer/customer.service";
 import { syncFulfillmentsFromShopify } from "../services/order/order.service";
+import { buildPayLinkUrl, renderPayQrDataUrl } from "../services/payment/payLink.utils";
 import { invoiceConfig } from "../services/invoice/invoice.config";
 import {
   computeProcessingFee,
@@ -287,7 +288,7 @@ export const loader = async ({ request, params }) => {
   // section. Queried by email (the app's customer key).
   const application = order.customerEmail
     ? await WholesaleApplication.findOne({ email: order.customerEmail })
-        .select("businessName")
+        .select("businessName payment")
         .lean()
     : null;
   const businessName = application?.businessName || null;
@@ -365,6 +366,36 @@ export const loader = async ({ request, params }) => {
     }
   }
 
+  // Immediate Payment — surface the customer's self-pay link + an inline
+  // QR (so an admin can copy/share it or scan it) for invoices that carry a
+  // pay token. The QR data URL is generated on the fly; the durable QR also
+  // lives on the QBO invoice as an attachment.
+  let payLink = null;
+  if (invoice?.payToken) {
+    const url = buildPayLinkUrl(invoice.payToken);
+    let qrDataUrl = null;
+    try {
+      qrDataUrl = await renderPayQrDataUrl(url);
+    } catch (e) {
+      console.error("[orders] pay-link QR render failed:", e?.message || e);
+    }
+    payLink = {
+      url,
+      qrDataUrl,
+      qrAttachedToInvoice: Boolean(invoice.qrAttachedAt),
+    };
+  }
+
+  // Card on file — the card captured at registration and vaulted in NMI.
+  // `hasVault` (resolved cache-or-source-of-truth) gates the "Charge card
+  // on file" recovery action; brand/last4 come from the stored registration
+  // card metadata (we never store the PAN). Used by the Card-on-file section.
+  const cardOnFile = {
+    hasVault: Boolean(resolvedVaultId),
+    brand: application?.payment?.card?.cardBrand || null,
+    last4: application?.payment?.card?.cardLast4 || null,
+  };
+
   return {
     order: orderForClient,
     invoice: invoice ? serialize(invoice) : null,
@@ -372,6 +403,8 @@ export const loader = async ({ request, params }) => {
     customerMap: customerMap ? serialize(customerMap) : null,
     businessName,
     breakdown,
+    payLink,
+    cardOnFile,
     // Processing-fee rates by settlement method. Surfaced to the client
     // so confirmation modals (charge-card, mark-cheque-paid) can show the
     // fee breakdown + new total before the admin commits. Matches the
@@ -571,7 +604,7 @@ function serialize(doc) {
 }
 
 export default function OrderDetail() {
-  const { order, invoice, attempts, customerMap, businessName, breakdown, qbo, processingFeeRates } =
+  const { order, invoice, attempts, customerMap, businessName, breakdown, qbo, processingFeeRates, payLink, cardOnFile } =
     useLoaderData();
   const navigate = useNavigate();
   const shopify = useAppBridge();
@@ -646,6 +679,10 @@ export default function OrderDetail() {
   // receipt path. The "Charge card on file" fallback remains visible
   // for both cheque AND ACH (it's the cross-method override).
   const isChequeInvoice = paymentMethod === "check";
+  // Immediate Payment invoices have no auto-charge and no stored vault of
+  // their own — "Charge card on file" is the admin's payment-recovery path
+  // when the customer never paid via the link.
+  const isImmediateInvoice = paymentMethod === "immediate";
   // Immutable preference snapshot taken when this invoice was created.
   // Reads ONLY from customerPaymentPreference — never falls back to
   // paymentMethod (which is mutable via cheque → card override). Legacy
@@ -760,12 +797,15 @@ export default function OrderDetail() {
     ((isCardInvoice) ||
       (isAchInvoice && !!customerMap?.nmiAchBillingId));
   const canMarkChequePaid = isChequeInvoice && statusAllowsAction;
-  // "Charge card on file" is the cross-method fallback: cheque or ACH
-  // invoice that needs to be settled by the card on file (e.g. after
-  // an ACH decline). Requires a card vault id regardless of the
-  // invoice's current paymentMethod.
+  // "Charge card on file" is the cross-method payment-recovery action:
+  // a cheque / ACH / Immediate-Payment invoice that the customer didn't
+  // settle via their preferred method, collected instead against the card
+  // captured at registration. Requires a card vault id regardless of the
+  // invoice's current paymentMethod. (Card invoices use "Retry payment",
+  // which already charges the same vault.)
+  const showChargeCard = isManualInvoice || isImmediateInvoice;
   const canChargeCard =
-    isManualInvoice &&
+    showChargeCard &&
     statusAllowsAction &&
     !!customerMap?.nmiCustomerVaultId;
 
@@ -1393,7 +1433,7 @@ export default function OrderDetail() {
           Mark cheque paid
         </s-button>
       )}
-      {invoice && isManualInvoice && (
+      {invoice && showChargeCard && (
         <s-button
           slot="secondary-actions"
           disabled={!canChargeCard}
@@ -2225,6 +2265,19 @@ export default function OrderDetail() {
                 </s-text>
               </s-stack>
             )}
+            {invoice && (
+              <s-stack direction="inline" gap="tight">
+                <s-text tone="subdued">Card on file:</s-text>
+                {cardOnFile?.hasVault ? (
+                  <s-text>
+                    {cardOnFile.brand ? `${cardOnFile.brand} ` : ""}
+                    {cardOnFile.last4 ? `•••• ${cardOnFile.last4}` : "Stored"}
+                  </s-text>
+                ) : (
+                  <s-text tone="subdued">None</s-text>
+                )}
+              </s-stack>
+            )}
             {invoice && isManualInvoice && (
               <s-paragraph tone="subdued">
                 {invoice.paymentStatus === "paid"
@@ -2239,16 +2292,15 @@ export default function OrderDetail() {
               </s-paragraph>
             )}
             {invoice &&
-              isManualInvoice &&
+              showChargeCard &&
               statusAllowsAction &&
               !customerMap?.nmiCustomerVaultId && (
                 <s-banner tone="warning" heading="No card on file">
                   <s-paragraph>
-                    This customer didn&apos;t save a card at registration, so
-                    the &quot;Charge card on file&quot; fallback is unavailable.
-                    Use &quot;Mark cheque paid&quot; when payment arrives, or
-                    capture a card on file via NMI directly and then refresh
-                    this page.
+                    This customer doesn&apos;t have a card vaulted in NMI, so
+                    the &quot;Charge card on file&quot; recovery action is
+                    unavailable.{isChequeInvoice ? " Use “Mark cheque paid” when payment arrives, or" : ""} capture a card on file via NMI and
+                    then refresh this page.
                   </s-paragraph>
                 </s-banner>
               )}
@@ -2350,6 +2402,54 @@ export default function OrderDetail() {
           </s-stack>
         )}
       </s-section>
+
+      {/* ───── Immediate Payment — self-pay link + QR ───── */}
+      {invoice?.paymentMethod === "immediate" && payLink && (
+        <s-section heading="Payment link (Immediate Payment)">
+          <s-stack direction="block" gap="base">
+            <s-paragraph>
+              This customer pays each invoice on demand via a secure link and QR
+              code included on the QuickBooks invoice. The link always charges the
+              current outstanding balance.
+            </s-paragraph>
+            <s-stack direction="inline" gap="base">
+              <PaymentStatusBadge status={invoice.paymentStatus} />
+            </s-stack>
+            <s-stack direction="inline" gap="base">
+              <s-link href={payLink.url} target="_blank">
+                {payLink.url}
+              </s-link>
+              <s-button
+                variant="secondary"
+                onClick={() => {
+                  if (typeof navigator !== "undefined" && navigator.clipboard) {
+                    navigator.clipboard.writeText(payLink.url);
+                    shopify.toast.show("Payment link copied");
+                  }
+                }}
+              >
+                Copy link
+              </s-button>
+            </s-stack>
+            {payLink.qrDataUrl && (
+              <img
+                src={payLink.qrDataUrl}
+                alt="QR code to pay this invoice"
+                width="160"
+                height="160"
+              />
+            )}
+            <KV
+              label="QR on QBO invoice"
+              value={
+                payLink.qrAttachedToInvoice
+                  ? "Attached — included with the invoice email"
+                  : "Not attached (link in invoice memo still works)"
+              }
+            />
+          </s-stack>
+        </s-section>
+      )}
 
       {/* ───── QuickBooks invoice (live fetch) ───── */}
       {invoice?.qboInvoiceId && (
@@ -2925,10 +3025,12 @@ export default function OrderDetail() {
           <strong>
             {PAYMENT_METHOD_LABEL[paymentMethod] || paymentMethod}
           </strong>{" "}
-          for this invoice, but no cheque was received. Charging the card on
-          file now will switch this invoice&apos;s payment method to credit
-          card and attempt an NMI sale. The customer&apos;s default preference
-          will not change for future orders.
+          for this invoice but hasn&apos;t paid by that method. Charging the
+          card on file now will switch this invoice&apos;s payment method to
+          credit card and attempt an NMI sale against the card captured at
+          registration{cardOnFile?.last4 ? ` (•••• ${cardOnFile.last4})` : ""}.
+          The customer&apos;s default preference will not change for future
+          orders.
         </s-paragraph>
         <s-paragraph>
           <strong>Payment breakdown</strong>

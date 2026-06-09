@@ -1,5 +1,5 @@
-// GET /api/portal/me  (App Proxy: /apps/wholesale-application/api/portal/me)
-// Bootstrap endpoint — the SPA calls this first to confirm the visitor is a
+// GET /api/portal/me — bootstrap endpoint. The Customer Account UI extension
+// calls this first (with a session-token JWT) to confirm the visitor is a
 // logged-in, approved practitioner before rendering the dashboard.
 import { portalLoader, portalAction } from "./_guard";
 import { ok } from "../../services/APIService/api.service";

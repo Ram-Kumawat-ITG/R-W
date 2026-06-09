@@ -596,6 +596,56 @@ timeline + attribution audit) for the detail page.
 **Service API additions:** `getUpcomingPayouts` · `listCdoOrders` · `getCdoOrderDetail`
 (reporting/reads, in `cdo.service.js`).
 
+## 18. Practitioner Portal (Customer Account UI extension)
+
+Self-service dashboard for CDO practitioners, rendered **inside the Shopify
+customer account** as a full-page UI extension. Read-only over the `cdo_*`
+collections this app owns. Moved here from the wholesale workspace on
+**2026-06-08** (single-owner architecture — the data and the portal now live in
+the same app).
+
+**Pieces:**
+
+| Piece | Path |
+|---|---|
+| Extension (Preact + Polaris web components, full page) | `extensions/practitioner-portal-account/` (`customer-account.page.render` target, `network_access = true`, api_version `2025-10`) |
+| Backend service (all read-only aggregations) | `app/services/cdo/cdo.portal.service.js` |
+| API handlers (thin) + shared guard | `app/api/portal/{_guard,me,summary,revenue,customers,commissions,payouts,referrals,discounts}.js`, registered in `app/routes.js` |
+| Response helpers | `app/services/APIService/api.service.js` |
+| Models reused (the real ones) | `cdoOrder` · `cdoCommission` · `cdoPayout` · `cdoReferral` · `cdoPractitionerCode` · `wholesaleApplication` |
+
+**Auth / tenant resolution (identity is never trusted from the client):** the
+extension obtains a session-token JWT via `shopify.sessionToken.get()` and sends
+`Authorization: Bearer`. `portalLoader` (in `_guard.js`) verifies it with
+`authenticate.public.customerAccount`, then `resolvePractitionerByCustomerGid`
+maps the token's `sub` (customer GID) → an **approved** `WholesaleApplication`
+whose `_id` is the `practitionerId`. Every aggregation in `cdo.portal.service.js`
+is scoped by `{ practitionerId }`. Auth failures map to `401` (not signed in /
+no `sub`) and `403` (signed in, not an approved practitioner). A null-origin Web
+Worker + the Authorization header make the fetch non-simple, so `portalAction`
+answers the CORS `OPTIONS` preflight and the library `cors` helper stamps
+success responses.
+
+**Endpoints** (all GET, served at `${api_base_url}/api/portal/*`): `me`,
+`summary`, `revenue` (month/last/year/lifetime + range), `customers` (referred
+patients), `commissions` (+ `pendingOnly`), `payouts` (with per-payout
+commission breakdown), `referrals` (codes + usage), `discounts` (derived from
+codes). Pagination + search + date-range filters where applicable.
+
+**Prerequisites (Partner dashboard, ns-retail app):** customer accounts
+enabled + protected customer data access (for the `sub` claim). **Merchant step
+after deploy:** add the page to the customer-account navigation menu and set the
+extension's `api_base_url` setting to the ns-retail app URL.
+
+**Dev workflow:** paste the current `shopify app dev` tunnel URL into
+`extensions/practitioner-portal-account/src/config.js` `DEV_API_BASE_URL` (it
+wins over the merchant-set setting when non-empty); leave it `''` for production
+builds.
+
+**Out of scope (here):** commission/payout *generation* (owned by the CDO
+engine, §4/§7), live Shopify Discount API objects, charts, and CSV export (the
+sandboxed Web Worker has no DOM/Blob).
+
 ---
 
 ### Appendix — Environment variables

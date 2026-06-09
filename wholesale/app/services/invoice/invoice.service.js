@@ -23,7 +23,9 @@ import {
   appendInvoiceLines as appendQboInvoiceLines,
   getInvoice as getQboInvoice,
   sendInvoiceEmail as sendQboInvoiceEmail,
+  attachQrToInvoice as attachQrToQboInvoice,
 } from '../qbo/qbo.service'
+import { mintPayToken, buildPayLinkUrl, renderPayQrPng } from '../payment/payLink.utils'
 import {
   markShopifyOrderPaid,
   recordOrderTransaction as recordShopifyOrderTransaction,
@@ -167,13 +169,33 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
   console.log(
     `[invoice] shipDate = ${shipDate || '(none)'} shipAddr = ${shipAddr ? 'present' : '(none)'}`,
   )
+
+  // Immediate Payment — mint the durable pay-link token NOW so the public
+  // /pay/<token> URL can be baked into the QBO invoice's CustomerMemo (and
+  // a matching QR attached after the invoice id is known, below). Stamped
+  // on the in-memory doc; persisted in the single save() in Phase 4. The
+  // token is opaque (no amount) — outstanding is recomputed server-side at
+  // click time. For non-immediate invoices payLinkUrl stays null and the
+  // memo is unchanged.
+  const isImmediate = invoice.paymentMethod === 'immediate'
+  let payLinkUrl = null
+  if (isImmediate) {
+    invoice.payToken = mintPayToken()
+    invoice.payTokenCreatedAt = new Date()
+    payLinkUrl = buildPayLinkUrl(invoice.payToken)
+    console.log(`[invoice] immediate payment — pay link ${payLinkUrl}`)
+  }
+  const memo = isImmediate && payLinkUrl
+    ? `Shopify order ${order.name || order.id}\nPay online: ${payLinkUrl}`
+    : `Shopify order ${order.name || order.id}`
+
   let qboInvoice
   try {
     qboInvoice = await createQboInvoice({
       qboCustomerId: customerMap.qboCustomerId,
       currency: order.currency || 'USD',
       lines,
-      memo: `Shopify order ${order.name || order.id}`,
+      memo,
       docNumber: order.name?.replace(/^#/, '') || shopifyOrderId,
       dueDate,
       shipAddr,
@@ -205,6 +227,29 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
   invoice.currency = qboInvoice.CurrencyRef?.value || invoice.currency
   invoice.qboCreationStatus = 'created'
   invoice.qboCreationError = undefined
+
+  // Phase 3.5 — Immediate Payment: attach the pay-link QR to the QBO
+  // invoice with IncludeOnSend so it rides with the email QBO sends in
+  // Phase 4. BEST-EFFORT — a QR/upload failure must never break invoicing
+  // (the clickable link in the CustomerMemo is the primary CTA), so we
+  // swallow errors and just record the failure for a later retry.
+  if (isImmediate && payLinkUrl) {
+    try {
+      const pngBuffer = await renderPayQrPng(payLinkUrl)
+      const attachable = await attachQrToQboInvoice({
+        qboInvoiceId: invoice.qboInvoiceId,
+        pngBuffer,
+        fileName: `pay-invoice-${invoice.qboDocNumber || shopifyOrderId}.png`,
+        note: 'Scan to pay this invoice online.',
+      })
+      invoice.qrAttachableId = attachable?.Id || undefined
+      invoice.qrAttachedAt = new Date()
+      console.log(`[invoice] QR attached to QBO invoice ${invoice.qboInvoiceId} (attachable=${invoice.qrAttachableId || '?'})`)
+    } catch (qrErr) {
+      console.error(`[invoice] QR attach FAILED (non-fatal) for invoice ${invoice._id}: ${qrErr.message}`)
+      log.warn('create.qr_attach_failed', { invoiceId: invoice._id.toString(), err: qrErr?.message || String(qrErr) })
+    }
+  }
 
   // Phase 4 — fire the initial customer-facing invoice email via QBO.
   // Mutates email-tracking fields on the in-memory doc; never throws.

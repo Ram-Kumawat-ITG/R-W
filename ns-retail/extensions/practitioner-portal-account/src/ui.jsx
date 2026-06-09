@@ -1,6 +1,7 @@
 /* global shopify */
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks'
 import { apiGet, ApiError } from './api.js'
+import { titleCase } from './format.js'
 
 // ── Data hook ────────────────────────────────────────────────────────────────
 // Fetch a portal endpoint; re-fetch when params change. On 401/403 it calls
@@ -104,24 +105,23 @@ export function ErrorBanner({ message, onRetry }) {
   )
 }
 
-const BADGE_TONES = {
-  active: 'success',
-  paid: 'success',
-  converted: 'success',
-  approved: 'success',
-  pending: 'warning',
-  paused: 'warning',
-  awaiting: 'warning',
-  failed: 'critical',
-  rejected: 'critical',
-  inactive: 'neutral',
-  archived: 'neutral',
-}
+// The customer-account `s-badge` only supports tone 'auto' | 'neutral' |
+// 'critical' (no success/warning/info on this surface) — anything else
+// silently renders as default grey. So we flag failures as critical and leave
+// everything else neutral, relying on the (Title-Cased) label to convey state.
+const CRITICAL_STATES = new Set([
+  'failed',
+  'rejected',
+  'declined',
+  'error',
+  'cancelled',
+  'canceled',
+])
 
 export function StatusBadge({ value }) {
   if (!value) return <s-text color="subdued">—</s-text>
-  const tone = BADGE_TONES[String(value).toLowerCase()] || 'neutral'
-  return <s-badge tone={tone}>{value}</s-badge>
+  const tone = CRITICAL_STATES.has(String(value).toLowerCase()) ? 'critical' : 'neutral'
+  return <s-badge tone={tone}>{titleCase(value)}</s-badge>
 }
 
 export function StatCard({ label, value, sub }) {

@@ -21,15 +21,14 @@ export default [
   route("/api/registration-form", "api/registration-form.js"),
   route("/api/auth/check-email", "api/auth/check-email.js"),
   route("/api/update-profile",   "api/update-profile.js"),
-  // Practitioner Portal (storefront theme app extension, App Proxy)
-  route("/api/portal/me", "api/portal/me.js"),
-  route("/api/portal/summary", "api/portal/summary.js"),
-  route("/api/portal/revenue", "api/portal/revenue.js"),
-  route("/api/portal/customers", "api/portal/customers.js"),
-  route("/api/portal/commissions", "api/portal/commissions.js"),
-  route("/api/portal/payouts", "api/portal/payouts.js"),
-  route("/api/portal/referrals", "api/portal/referrals.js"),
-  route("/api/portal/discounts", "api/portal/discounts.js"),
+  // Immediate Payment — public, non-embedded self-pay page. The durable
+  // /pay/:token link + QR are baked into the QBO invoice; the page renders
+  // an NMI Collect.js card form and charges the exact outstanding balance.
+  // No Shopify auth — secured by the opaque token + server-side amount
+  // derivation; card data is tokenized by NMI and never hits our server.
+  route("/pay/:token", "api/pay/pay.jsx"),
+  // Practitioner Portal moved to the ns-retail app (extension + /api/portal/*
+  // backend now live there — it owns the cdo_* collections). See ns-retail.
   route("/api/admin/customers", "api/admin/customers.js"),
   route("/api/admin/customers/:id", "api/admin/customer.js"),
   route("/api/admin/customers/:id/decline", "api/admin/decline.js"),

@@ -32,7 +32,7 @@ const customerMapSchema = new mongoose.Schema(
     // fallback) live on the Invoice doc, not here.
     paymentMethod: {
       type: String,
-      enum: ['card', 'check', 'ach'],
+      enum: ['card', 'check', 'ach', 'immediate'],
       index: true,
     },
 

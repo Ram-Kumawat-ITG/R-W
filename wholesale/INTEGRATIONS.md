@@ -1928,6 +1928,89 @@ banner, plus an optional outbound webhook when `ACH_ALERT_WEBHOOK_URL`
 is configured). A transaction still awaiting settlement past
 `ACH_SYNC_STUCK_DAYS` (default 5) raises a throttled "stuck" alert.
 
+### 9.6 Immediate Payment — hosted self-pay link + QR
+
+A 4th payment method, **`immediate`**, for customers who pay each invoice
+themselves, on demand, for the exact amount — no stored vault, never
+auto-charged. The QBO invoice they receive carries a **payment link** and a
+**QR code**, both leading to an NMI-hosted payment page pre-set to the
+current outstanding balance.
+
+**Durable in-app link.** The link baked into the invoice is **our** URL —
+`/pay/:token` — so it stays valid for days. The QR encodes the same URL.
+
+**Token.** `Invoice.payToken` is an opaque 256-bit random string
+(`payLink.utils.mintPayToken`). It carries **no amount** — the outstanding
+balance is always recomputed server-side (`amountDue − amountPaid`), which
+defeats amount tampering; the random space defeats enumeration. Minted in
+`createInvoiceForOrder` for `immediate` invoices (and retro-provisioned by
+`paymentPreference.service` when an open invoice is realigned to
+`immediate`).
+
+**On the QBO invoice** (QBO has no inline-image API, so):
+- the pay URL is appended to the `CustomerMemo` as a bare `Pay online:
+  <url>` line (auto-linkifies in the emailed invoice / PDF), and
+- the QR PNG is attached to the invoice via the Attachable `/upload`
+  multipart endpoint (`qbo.apis.qboUpload` → `qbo.service.attachQrToInvoice`,
+  `IncludeOnSend:true`) so it is delivered with the invoice email.
+
+Both happen in `createInvoiceForOrder` **before** the Phase-4 `/send`, and
+both are best-effort — a QR/upload failure is logged and skipped, never
+breaking invoicing (the memo link is the primary CTA).
+
+**Payment flow (NMI Collect.js — single page):**
+
+```
+QBO invoice (link + QR)  →  GET /pay/:token  (api/pay/pay.jsx)
+   guard paid/cancelled/outstanding≤0 → friendly page (no form)
+   else: render NMI Collect.js card form (iframe fields) + "Pay $X"
+customer enters card → CollectJS tokenizes (card never hits our server)
+   → POST /pay/:token { paymentToken }  (same route's action)
+       amount = outstanding (recomputed SERVER-SIDE, client amount ignored)
+       chargeWithPaymentToken({ paymentToken, amount })  → NMI type=sale
+       approved → settleHostedPayment(...)  → 'paid'
+                → propagateSuccessfulPayment (QBO Payment + Shopify mark-paid)
+       declined/error → inline error, customer can re-enter card
+```
+
+Collect.js (NMI-hosted iframe fields) keeps card data off our servers
+(PCI SAQ A-EP) — the same mechanism the registration form uses to vault
+cards. The page loads `NMI_COLLECT_JS_URL` with `NMI_PUBLIC_KEY` as the
+publishable tokenization key. *(An earlier attempt used the NMI 3-Step
+Redirect API; its `form-url` is a POST target for your own card form, not a
+hosted UI to redirect to, so a plain browser redirect produced "ccnumber
+field is required" on completion — hence the Collect.js approach.)*
+
+Settlement is **idempotent**: `settleHostedPayment` atomically claims the NMI
+transaction id into `Invoice.payTransactionIds[]` (`$addToSet` guarded), so a
+resubmit settles exactly once; the amount is clamped to the outstanding
+balance so it can never overpay. A captured-but-unrecorded edge (NMI charged,
+bookkeeping then failed) still shows the customer success and is logged for
+reconciliation — we never tell a paying customer it failed.
+
+**Fee + due date.** `immediate` is a card-based hosted charge, so it carries
+the card-style fee `INVOICE_FEE_RATE_IMMEDIATE` (default 3%), baked into
+`amountDue` at creation exactly like card — the hosted charge therefore
+collects the full fee-inclusive amount. Due window: `IMMEDIATE_DUE_DATE`.
+
+**Scheduler.** No CRON change: PASS 1 auto-charge filters
+`paymentMethod ∈ {card, ach}` and the reminder CRON is cheque-only, so
+`immediate` invoices are auto-excluded from every sweep.
+
+**Admin.** Order Details renders a "Payment link" section (clickable link +
+inline QR via `renderPayQrDataUrl` + copy button + payment-status badge).
+The preference is set via admin `POST /api/admin/customers/:id/payment-method`
+(`normalizePaymentMethod` + the model enums already accept `immediate`); the
+**registration-form UI for choosing Immediate Payment is intentionally out of
+scope here** and handled separately.
+
+**Config.** `NMI_COLLECT_JS_URL` (Collect.js script; per-environment default,
+overridable) + `NMI_PUBLIC_KEY` (publishable tokenization key, already
+configured for the registration form). The one-time charge runs through
+`nmi.service.chargeWithPaymentToken` (`type=sale` + `payment_token`). Files:
+`services/payment/payLink.{utils,service}.js`, `app/api/pay/pay.jsx`,
+`app/components/pay-ui.jsx`. New deps: `qrcode`.
+
 ---
 
 ## 10. Scheduler & cron workflow
@@ -2611,6 +2694,7 @@ required values throw immediately.
 | `NMI_PUBLIC_KEY` | (optional) | Collect.js public key for hosted tokenization |
 | `NMI_API_URL` | _auto_ | Override transact.php URL |
 | `NMI_QUERY_URL` | _auto_ | Override query.php URL |
+| `NMI_COLLECT_JS_URL` | _auto_ | Collect.js script URL for the Immediate Payment self-pay page (§9.6). Auto-derived per environment (`secure`/`sandbox`); the page loads it with the publishable `NMI_PUBLIC_KEY` as the tokenization key. |
 | `NMI_TEST_CCNUMBER` | (optional) | Dev test card number (sandbox only) |
 | `NMI_TEST_CCEXP` | (optional) | Dev test card expiry MMYY |
 | `NMI_TEST_CVV` | (optional) | Dev test card CVV |
@@ -2619,10 +2703,12 @@ required values throw immediately.
 | `CHEQUE_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **cheque** invoices (§7.3) |
 | `ACH_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **ACH** invoices (§7.3) |
 | `CARD_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **card** invoices (§7.3) |
+| `IMMEDIATE_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **Immediate Payment** invoices (§9.6) |
 | `INVOICE_TERMS_MINUTES` | `0` | Extra minutes added on top of `INVOICE_TERMS_DAYS` for the local full-datetime `Invoice.dueAt` field. **Testing knob** — set to `1` to flag invoices Overdue ~1 minute after creation without waiting whole days. The QBO date-only `DueDate` ignores this offset (it still rounds to `termsDays`); only the local Order List "Overdue" indicator + cheque-reminder UI uses `dueAt`. |
 | `INVOICE_FEE_RATE_CARD` | `0.03` | Per-method processing fee (decimal): card. Added as a line at invoice creation for card invoices (and at settlement for the cheque → card admin fallback / legacy invoices). `0` disables. |
 | `INVOICE_FEE_RATE_ACH` | `0.01` | Per-method processing fee (decimal): ACH. Added as a line at invoice creation for ACH invoices (and on legacy `kind='ach'` manual receipts). `0` disables. |
 | `INVOICE_FEE_RATE_CHECK` | `0` | Per-method processing fee (decimal): cheque. Defaults to no fee. |
+| `INVOICE_FEE_RATE_IMMEDIATE` | `0.03` | Per-method processing fee (decimal): Immediate Payment (hosted card charge). Baked into `amountDue` at creation like card (§9.6). `0` disables. |
 | **Payments** | | |
 | `PAYMENT_CHARGE_IMMEDIATELY` | `false` | `true` = NMI charge in webhook process |
 | `PAYMENT_MAX_RETRY_ATTEMPTS` | `6` | Cap on NMI charge attempts per invoice |
@@ -3081,7 +3167,16 @@ the embedded admin once to trigger registration. Outcome is logged.
   into the local pipeline. Useful when subscribing to `orders/create`
   for the first time after operating without webhooks.
 
-## 25. Practitioner Portal (CDO referral dashboard)
+## 25. Practitioner Portal (CDO referral dashboard) — MOVED to ns-retail
+
+> **Moved out of this app on 2026-06-08.** The Practitioner Portal is a
+> CDO-program feature, and the sibling **`ns-retail`** app owns and writes the
+> `cdo_*` collections it reads. The entire feature — the Customer Account UI
+> extension AND its `/api/portal/*` backend + `cdo.portal.service.js` — now
+> lives in `ns-retail`, reading the real cdo models there instead of the
+> read-only mirrors this app used to carry. **Canonical spec: `ns-retail/docs/payout.md §18`.**
+> The section below is retained for historical context only; the code it
+> describes no longer exists in the wholesale workspace.
 
 A storefront self-service dashboard for **CDO practitioners** (approved
 wholesale customers who hold a referral code). It is a **read-only view**

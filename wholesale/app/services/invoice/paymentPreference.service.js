@@ -38,6 +38,7 @@ import {
   computeInvoiceDueAt,
 } from './invoice.utils'
 import { appendInvoiceRemark } from './invoice.service'
+import { provisionImmediatePayLink } from '../payment/payLink.service'
 import { normalizePaymentMethod } from '../customer/customer.utils'
 import { createLogger } from '../../utils/logger.utils'
 
@@ -238,6 +239,14 @@ async function realignOneInvoice({ invoiceId, method, performedBy, source }) {
     invoice.lastAttemptError = null
   }
   await invoice.save()
+
+  // Realigning an open invoice TO Immediate Payment: provision its pay link
+  // + QR so it's actually payable by link (createInvoiceForOrder does this
+  // at creation for new immediate invoices; this is the retro path).
+  // Best-effort inside provisionImmediatePayLink — never fails the realign.
+  if (method === 'immediate' && !invoice.payToken) {
+    await provisionImmediatePayLink(invoice)
+  }
 
   const feeMsg = `fee $${oldFee.toFixed(2)} → $${(newFee?.amount || 0).toFixed(2)}`
   await appendInvoiceRemark(invoice._id, {

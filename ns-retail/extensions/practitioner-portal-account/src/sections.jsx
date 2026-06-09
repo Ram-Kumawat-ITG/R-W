@@ -161,10 +161,9 @@ export function CommissionsSection({ mode = 'all', onAuthError }) {
     { key: 'orderName', label: 'Order', render: (r) => <s-text>{r.orderName || '—'}</s-text> },
     { key: 'amount', label: pendingOnly ? 'Expected' : 'Amount', render: (r) => <s-text>{formatMoney(r.amount)}</s-text> },
     { key: 'rate', label: 'Rate', render: (r) => <s-text>{formatPercent(r.rate)}</s-text> },
-    { key: 'status', label: 'Earned', render: (r) => <StatusBadge value={r.status} /> },
     {
       key: 'payoutStatus',
-      label: 'Payout',
+      label: 'Payout status',
       render: (r) => <StatusBadge value={r.payoutStatus || 'awaiting'} />,
     },
     { key: 'earnedAt', label: 'Earned on', render: (r) => <s-text>{formatDate(r.earnedAt)}</s-text> },
@@ -232,6 +231,78 @@ export function CommissionsSection({ mode = 'all', onAuthError }) {
 }
 
 // ── Payouts ──────────────────────────────────────────────────────────────────
+
+// A single key/value cell for the payout summary grid.
+function Field({ label, children }) {
+  return (
+    <s-stack direction="block" gap="small-500">
+      <s-text type="strong" color="subdued">
+        {label}
+      </s-text>
+      {children}
+    </s-stack>
+  )
+}
+
+// Order-level commission breakdown for one payout — the orders whose
+// commissions were settled by this payout, so practitioners can reconcile it.
+const BREAKDOWN_COLUMNS = [
+  { key: 'orderName', label: 'Order ID', render: (r) => <s-text>{r.orderName || '—'}</s-text> },
+  { key: 'orderDate', label: 'Order date', render: (r) => <s-text>{formatDate(r.orderDate)}</s-text> },
+  { key: 'customerName', label: 'Patient', render: (r) => <s-text>{r.customerName || '—'}</s-text> },
+  { key: 'revenue', label: 'Revenue', render: (r) => <s-text>{formatMoney(r.revenue)}</s-text> },
+  { key: 'rate', label: 'Commission %', render: (r) => <s-text>{formatPercent(r.rate)}</s-text> },
+  { key: 'amount', label: 'Commission', render: (r) => <s-text>{formatMoney(r.amount)}</s-text> },
+  { key: 'status', label: 'Status', render: (r) => <StatusBadge value={r.status} /> },
+]
+
+function PayoutCard({ payout }) {
+  const lines = payout.breakdown || []
+  return (
+    <s-box border="base subdued" borderRadius="base" padding="base">
+      <s-stack direction="block" gap="base">
+        <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="base">
+          <Field label="Date">
+            <s-text>{formatDate(payout.date)}</s-text>
+          </Field>
+          <Field label="Amount">
+            <s-text type="strong">{formatMoney(payout.amount, payout.currency)}</s-text>
+          </Field>
+          <Field label="Method">
+            <s-text>{titleCase(payout.method)}</s-text>
+          </Field>
+          <Field label="Status">
+            <StatusBadge value={payout.status} />
+          </Field>
+          <Field label="Reference">
+            <s-text>{payout.reference || '—'}</s-text>
+          </Field>
+          <Field label="Transaction">
+            <s-text>{payout.transactionId || '—'}</s-text>
+          </Field>
+        </s-grid>
+
+        {lines.length > 0 ? (
+          <s-details>
+            <s-summary>
+              Commission breakdown — {lines.length} order{lines.length === 1 ? '' : 's'}
+            </s-summary>
+            <s-box paddingBlockStart="small-300">
+              <Table
+                columns={BREAKDOWN_COLUMNS}
+                rows={lines}
+                empty="No commission lines recorded for this payout."
+              />
+            </s-box>
+          </s-details>
+        ) : (
+          <s-text color="subdued">No commission lines recorded for this payout.</s-text>
+        )}
+      </s-stack>
+    </s-box>
+  )
+}
+
 export function PayoutsSection({ onAuthError }) {
   const [range, setRange] = useState({ from: '', to: '' })
   const [status, setStatus] = useState('')
@@ -243,17 +314,9 @@ export function PayoutsSection({ onAuthError }) {
   )
 
   const rows = data?.rows || []
-  const columns = [
-    { key: 'date', label: 'Date', render: (r) => <s-text>{formatDate(r.date)}</s-text> },
-    { key: 'amount', label: 'Amount', render: (r) => <s-text>{formatMoney(r.amount, r.currency)}</s-text> },
-    { key: 'method', label: 'Method', render: (r) => <s-text>{titleCase(r.method)}</s-text> },
-    { key: 'status', label: 'Status', render: (r) => <StatusBadge value={r.status} /> },
-    { key: 'reference', label: 'Reference', render: (r) => <s-text>{r.reference || '—'}</s-text> },
-    { key: 'transactionId', label: 'Transaction', render: (r) => <s-text>{r.transactionId || '—'}</s-text> },
-  ]
 
   return (
-    <SectionShell heading="Payout history" description="Commission payouts sent to you.">
+    <SectionShell heading="Payout history" description="Commission payouts sent to you. Expand a payout to see the order commissions it covers.">
       <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="base">
         <s-select
           label="Status"
@@ -289,9 +352,13 @@ export function PayoutsSection({ onAuthError }) {
         <ErrorBanner message={error} onRetry={reload} />
       ) : loading && rows.length === 0 ? (
         <Loading />
+      ) : rows.length === 0 ? (
+        <s-text color="subdued">No payouts yet.</s-text>
       ) : (
         <s-stack direction="block" gap="base">
-          <Table columns={columns} rows={rows} empty="No payouts yet." />
+          {rows.map((p) => (
+            <PayoutCard key={p.id} payout={p} />
+          ))}
           <Pagination
             page={data?.page || 1}
             totalPages={data?.totalPages || 1}

@@ -60,9 +60,13 @@ const invoiceSchema = new mongoose.Schema(
     // (api/admin/charge-card.js). For the immutable order-time
     // preference, see `customerPaymentPreference`. For what actually
     // settled the invoice, see `paymentSettledVia`.
+    //   immediate — customer self-pays via a hosted NMI pay-link + QR on
+    //               the QBO invoice (no stored vault). NOT auto-charged by
+    //               the CRON (PASS 1 filters card/ach only). Settles via
+    //               the public /pay/<token> flow → propagateSuccessfulPayment.
     paymentMethod: {
       type: String,
-      enum: ['card', 'check', 'ach'],
+      enum: ['card', 'check', 'ach', 'immediate'],
       default: 'card',
       index: true,
     },
@@ -76,7 +80,7 @@ const invoiceSchema = new mongoose.Schema(
     // cheque → card override existed).
     customerPaymentPreference: {
       type: String,
-      enum: ['card', 'check', 'ach'],
+      enum: ['card', 'check', 'ach', 'immediate'],
     },
 
     // Method that actually settled (or last contributed to settling)
@@ -93,6 +97,27 @@ const invoiceSchema = new mongoose.Schema(
       enum: ['card', 'check', 'ach'],
     },
     paymentSettledAt: Date,
+
+    // ── Immediate Payment — hosted self-pay link + QR ────────────────
+    //
+    // For `paymentMethod: 'immediate'` invoices only. `payToken` is an
+    // opaque, cryptographically-random bearer credential (NOT a signed
+    // amount) minted at invoice creation. The durable public URL
+    // /pay/<payToken> looks the invoice up by this token, computes the
+    // outstanding balance SERVER-SIDE, and mints a fresh short-lived NMI
+    // hosted-checkout session at click time (the redirector decouples the
+    // long-lived QBO invoice link from NMI's short session lifetime).
+    //
+    // `qrAttachableId` / `qrAttachedAt` record the QBO Attachable holding
+    // the QR PNG (IncludeOnSend=true) so it rides with the emailed invoice.
+    // `payTransactionIds` dedups settlement — a returning NMI transaction
+    // id already present here is ignored so a double callback / refresh
+    // can't bump amountPaid twice.
+    payToken: { type: String, index: { unique: true, sparse: true } },
+    payTokenCreatedAt: Date,
+    qrAttachableId: String,
+    qrAttachedAt: Date,
+    payTransactionIds: { type: [String], default: undefined },
 
     // Lifecycle of the invoice's payment, independent of QBO's own status.
     //
@@ -411,7 +436,7 @@ const invoiceSchema = new mongoose.Schema(
     // Payment retries the append on every run until it lands.
     processingFeeAmount: Number,
     processingFeeRate: Number,
-    processingFeeMethod: { type: String, enum: ['card', 'ach', 'check'] },
+    processingFeeMethod: { type: String, enum: ['card', 'ach', 'check', 'immediate'] },
     processingFeeAppliedAt: Date,
 
     // ── Customer email lifecycle (QBO-driven) ────────────────────────

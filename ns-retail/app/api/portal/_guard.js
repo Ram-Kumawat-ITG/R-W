@@ -23,7 +23,7 @@
 // preflight directly. Success/error JSON responses also carry CORS headers
 // (the library `cors` helper on success; sendResponse's wildcard on errors).
 
-import connectDB from "../../services/APIService/mongo.service";
+import connectDB from "../../db/mongo.server";
 import { authenticate } from "../../shopify.server";
 import { resolvePractitionerByCustomerGid } from "../../services/cdo/cdo.portal.service";
 import {

@@ -12,7 +12,7 @@
 //   - models/invoice.server.js (paymentMethod, customerPaymentPreference, paymentSettledVia)
 //   - models/customerMap.server.js (paymentMethod)
 
-export const PAYMENT_METHODS = Object.freeze(['card', 'check', 'ach'])
+export const PAYMENT_METHODS = Object.freeze(['card', 'check', 'ach', 'immediate'])
 
 // Long-form labels for detail pages — enough words to be unambiguous
 // on a wide page with whitespace to spare.
@@ -20,6 +20,7 @@ export const PAYMENT_METHOD_LABEL = Object.freeze({
   card: 'Credit card',
   check: 'Check / Cheque',
   ach: 'ACH / Bank transfer',
+  immediate: 'Immediate Payment (pay link)',
 })
 
 // Compact labels for list/table cells where vertical density matters
@@ -28,6 +29,7 @@ export const PAYMENT_METHOD_SHORT = Object.freeze({
   card: 'Credit card',
   check: 'Cheque',
   ach: 'ACH',
+  immediate: 'Pay link',
 })
 
 // Helpers that fall back to the raw enum value so legacy / unexpected

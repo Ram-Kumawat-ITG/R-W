@@ -2,20 +2,15 @@
 
 client_id = "e4de0235635b192d07f7b96bc1a5e0df"
 name = "dev-rk"
-handle = "dev-rk-2"
 application_url = "https://slide-basin-fence-existing.trycloudflare.com"
 embedded = true
+handle = "dev-rk-2"
+
+[build]
+automatically_update_urls_on_dev = true
 
 [webhooks]
 api_version = "2025-07"
-
-  [[webhooks.subscriptions]]
-  uri = "/webhooks/orders/cancelled"
-  topics = [ "orders/cancelled" ]
-
-  [[webhooks.subscriptions]]
-  uri = "/webhooks/app/uninstalled"
-  topics = [ "app/uninstalled" ]
 
   [[webhooks.subscriptions]]
   uri = "/webhooks/orders/create"
@@ -24,6 +19,14 @@ api_version = "2025-07"
   [[webhooks.subscriptions]]
   uri = "/webhooks/app/scopes_update"
   topics = [ "app/scopes_update" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/orders/cancelled"
+  topics = [ "orders/cancelled" ]
+
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/uninstalled"
+  topics = [ "app/uninstalled" ]
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
@@ -43,6 +46,3 @@ prefix = "apps"
 
 [pos]
 embedded = false
-
-[build]
-automatically_update_urls_on_dev = true

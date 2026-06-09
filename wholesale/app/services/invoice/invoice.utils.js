@@ -145,6 +145,8 @@ export function processingFeeLabel(method) {
       return 'ACH Processing Fee'
     case 'check':
       return 'Cheque Processing Fee'
+    case 'immediate':
+      return 'Payment Processing Fee'
     default:
       return 'Processing Fee'
   }

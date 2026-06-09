@@ -332,6 +332,48 @@ export async function chargeCustomerVault({ customerVaultId, amount, currency, o
   return result
 }
 
+// ── Collect.js one-time charge (Immediate Payment self-pay) ──────────
+//
+// Charge a single payment_token produced by Collect.js on the public
+// /pay/:token page. Collect.js tokenizes the card client-side (card data
+// never touches our server); we then run a one-time `type=sale` for the
+// EXACT amount the server computed. No vault is created — this is a pure
+// one-off charge. Returns the same outcome shape as chargeCustomerVault
+// (classifyNmiResponse) so settlement code treats it like any other sale.
+export async function chargeWithPaymentToken({ paymentToken, amount, currency, orderId, invoiceNumber }) {
+  if (!paymentToken) throw new Error('chargeWithPaymentToken: paymentToken is required')
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error(`chargeWithPaymentToken: amount must be > 0, got ${amount}`)
+  }
+
+  const params = {
+    type: 'sale',
+    payment_token: paymentToken,
+    amount: amount.toFixed(2),
+    currency: currency || 'USD',
+    orderid: orderId,
+    order_description: invoiceNumber ? `Invoice ${invoiceNumber}` : undefined,
+  }
+
+  console.log(`\n[NMI charge:token] amount=$${amount.toFixed(2)} order=${orderId}`)
+  log.info('charge_token.request', { amount, orderId, invoiceNumber })
+
+  const res = await nmiTransact(params, { sensitiveKeys: ['payment_token'] })
+  const result = classifyNmiResponse(res)
+
+  console.log(
+    `[NMI charge:token] outcome=${result.outcome.toUpperCase()} txn=${result.transactionId || '-'} ` +
+      `code=${result.responseCode} "${result.responseText}"`,
+  )
+  log.info('charge_token.response', {
+    outcome: result.outcome,
+    transactionId: result.transactionId,
+    responseCode: result.responseCode,
+    responseText: result.responseText,
+  })
+  return result
+}
+
 // ── Read-only listing helpers (admin dashboard) ──────────────────────
 //
 // NMI's `query.php` returns XML, not the key=value form transact.php uses.
