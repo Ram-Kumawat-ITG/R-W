@@ -11,6 +11,9 @@ import {
   MUTATION_CUSTOMER_UPDATE,
 } from "../services/shopify/shopify.mutations";
 import { createLogger } from "../utils/logger.utils";
+import connectDB from "../services/APIService/mongo.service";
+import WholesaleApplication from "../models/wholesaleApplication.server";
+import { syncPractitionerToRetail } from "../services/retailSync/practitioner.service";
 
 const log = createLogger("webhook.customers_create");
 
@@ -43,6 +46,31 @@ function parseTagsField(tags) {
 function hasTag(tags, target) {
   const t = target.toLowerCase();
   return tags.some((x) => String(x).trim().toLowerCase() === t);
+}
+
+// Mirror this approved wholesale practitioner to the retail Shopify store
+// via services/retailSync/practitioner.service. Best-effort — failures
+// never propagate to the webhook handler.
+async function mirrorToRetail({ shop, customerId, email }) {
+  try {
+    await connectDB();
+    const customerGid = `gid://shopify/Customer/${customerId}`;
+    const application = await WholesaleApplication.findOne({
+      customerId: customerGid,
+      shop,
+    }).lean();
+    if (!application) {
+      log.warn("retail_sync.no_application", { customerId, email });
+      return;
+    }
+    await syncPractitionerToRetail({ application, action: "create" });
+  } catch (err) {
+    log.error("retail_sync.create_failed", {
+      customerId,
+      email,
+      err: err?.message || String(err),
+    });
+  }
 }
 
 export const loader = async () => {
@@ -115,6 +143,8 @@ export const action = async ({ request }) => {
       customerId,
       email: customerEmail,
     });
+    // Mirror this practitioner to the retail Shopify store. Fire-and-forget.
+    mirrorToRetail({ shop, customerId, email: customerEmail }).catch(() => {});
     return new Response(null, { status: 200 });
   }
 
@@ -148,6 +178,12 @@ export const action = async ({ request }) => {
           customerId,
           email: customerEmail,
         });
+        // Mirror late-approved practitioner to retail.
+        mirrorToRetail({
+          shop,
+          customerId,
+          email: customerEmail,
+        }).catch(() => {});
         return;
       }
 

@@ -130,6 +130,13 @@ const wholesaleApplicationSchema = new mongoose.Schema(
       index: true,
     },
     cdoPractitionerCode: { type: String, default: null },
+
+    // Mirror of this practitioner on the retail Shopify store. Set by
+    // services/retailSync/practitioner.service.js when the wholesale
+    // customers/create webhook fires for an Approved practitioner. Used
+    // for subsequent update/delete syncs — looking up by email each time
+    // would be slower and brittle. Full GID: gid://shopify/Customer/<id>.
+    retailShopifyCustomerId: { type: String, default: null, index: true },
   },
   { collection: "wholesale_applications", timestamps: true, strict: false },
 );
