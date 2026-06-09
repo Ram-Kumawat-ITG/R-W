@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Controller, useWatch } from 'react-hook-form'
 import { getStatesForCountry, PAYMENT_METHODS } from '../constants'
 import PaymentCardForm from './PaymentCardForm'
@@ -155,7 +155,212 @@ function AchForm({ control, errors }) {
   )
 }
 
-export default function Step3Payment({ control, errors, onEditBilling, isSubmitted, collectTokenResolverRef }) {
+const COMMISSION_ACCOUNT_TYPES = ['Checking', 'Savings', 'Business Checking']
+
+// Collapsible section for the practitioner's commission bank details.
+// Hidden behind a button by default — only shown when the user opts in
+// (matches the design decision from the registration spec). If their
+// payment method is ACH, a checkbox lets them re-use the same account
+// for commission payouts in one click.
+function CommissionBankSection({ control, errors, setValue }) {
+  const enabled = useWatch({ control, name: 'commission.enabled' })
+  const useSame = useWatch({ control, name: 'commission.useSamePaymentAccount' })
+  const paymentMethod = useWatch({ control, name: 'payment.method' })
+  const achAccountName = useWatch({ control, name: 'payment.achAccountName' })
+  const achRoutingNumber = useWatch({ control, name: 'payment.achRoutingNumber' })
+  const achAccountNumber = useWatch({ control, name: 'payment.achAccountNumber' })
+  const achAccountType = useWatch({ control, name: 'payment.achAccountType' })
+  const [showAccountNumber, setShowAccountNumber] = useState(false)
+  const e = errors?.commission || {}
+
+  // When user ticks "use same as payment ACH", copy values forward.
+  // When they untick, leave whatever is there so they can edit freely.
+  useEffect(() => {
+    if (!enabled || !useSame || paymentMethod !== 'ach') return
+    setValue('commission.bankAccountName', achAccountName || '', { shouldValidate: true })
+    setValue('commission.bankRoutingNumber', achRoutingNumber || '', { shouldValidate: true })
+    setValue('commission.bankAccountNumber', achAccountNumber || '', { shouldValidate: true })
+    setValue('commission.bankAccountType', achAccountType || '', { shouldValidate: true })
+  }, [enabled, useSame, paymentMethod, achAccountName, achRoutingNumber, achAccountNumber, achAccountType, setValue])
+
+  if (!enabled) {
+    return (
+      <>
+        <div className="rf-divider">
+          <h2 className="rf-section-label">Commission payouts (optional)</h2>
+          <p className="rf-section-hint">
+            If you earn commissions on referred patient orders, we'll deposit
+            them to a bank account you provide. You can add this now or later.
+          </p>
+        </div>
+        <button
+          type="button"
+          className="rf-btn rf-btn-secondary"
+          style={{ marginTop: 4 }}
+          onClick={() => setValue('commission.enabled', true, { shouldValidate: false })}
+        >
+          <svg className="rf-icon-svg" viewBox="0 0 24 24">
+            <path d="M12 5v14M5 12h14" />
+          </svg>
+          Add commission bank details
+        </button>
+      </>
+    )
+  }
+
+  const fieldsLocked = useSame && paymentMethod === 'ach'
+
+  return (
+    <>
+      <div className="rf-divider">
+        <h2 className="rf-section-label">Commission payouts</h2>
+        <p className="rf-section-hint">
+          Bank account that will receive commission deposits when patients you
+          refer place orders. Stored separately from your payment method.
+        </p>
+      </div>
+
+      {paymentMethod === 'ach' && (
+        <label className="rf-tc-row" style={{ marginTop: 8 }}>
+          <Controller
+            name="commission.useSamePaymentAccount"
+            control={control}
+            render={({ field }) => (
+              <input
+                type="checkbox"
+                checked={Boolean(field.value)}
+                onChange={(ev) => field.onChange(ev.target.checked)}
+              />
+            )}
+          />
+          <span>Use the same ACH account I entered for payments above.</span>
+        </label>
+      )}
+
+      <div className="rf-field" style={{ marginTop: 12 }}>
+        <label className="rf-label">
+          Account holder name <span className="rf-req">*</span>
+        </label>
+        <Controller
+          name="commission.bankAccountName"
+          control={control}
+          render={({ field }) => (
+            <input
+              {...field}
+              type="text"
+              placeholder="Name on bank account"
+              disabled={fieldsLocked}
+              className={`rf-input ${e.bankAccountName ? 'error' : ''}`}
+            />
+          )}
+        />
+        {e.bankAccountName && <p className="rf-help error">{e.bankAccountName.message}</p>}
+      </div>
+
+      <div className="rf-field rf-row rf-row-2">
+        <div>
+          <label className="rf-label">
+            Routing number <span className="rf-req">*</span>
+          </label>
+          <Controller
+            name="commission.bankRoutingNumber"
+            control={control}
+            render={({ field }) => (
+              <input
+                {...field}
+                type="text"
+                placeholder="9-digit ABA routing number"
+                maxLength={9}
+                disabled={fieldsLocked}
+                className={`rf-input ${e.bankRoutingNumber ? 'error' : ''}`}
+              />
+            )}
+          />
+          {e.bankRoutingNumber && <p className="rf-help error">{e.bankRoutingNumber.message}</p>}
+        </div>
+        <div>
+          <label className="rf-label">
+            Account number <span className="rf-req">*</span>
+          </label>
+          <div className="rf-password-wrap">
+            <Controller
+              name="commission.bankAccountNumber"
+              control={control}
+              render={({ field }) => (
+                <input
+                  {...field}
+                  type={showAccountNumber ? 'text' : 'password'}
+                  placeholder="Bank account number"
+                  maxLength={17}
+                  autoComplete="off"
+                  disabled={fieldsLocked}
+                  className={`rf-input ${e.bankAccountNumber ? 'error' : ''}`}
+                />
+              )}
+            />
+            <button
+              type="button"
+              className="rf-password-toggle"
+              onClick={() => setShowAccountNumber((s) => !s)}
+              aria-label={showAccountNumber ? 'Hide account number' : 'Show account number'}
+            >
+              {showAccountNumber ? (
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
+                  <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24" />
+                  <line x1="1" y1="1" x2="23" y2="23" />
+                </svg>
+              ) : (
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                  <circle cx="12" cy="12" r="3" />
+                </svg>
+              )}
+            </button>
+          </div>
+          {e.bankAccountNumber && <p className="rf-help error">{e.bankAccountNumber.message}</p>}
+        </div>
+      </div>
+
+      <div className="rf-field">
+        <label className="rf-label">
+          Account type <span className="rf-req">*</span>
+        </label>
+        <Controller
+          name="commission.bankAccountType"
+          control={control}
+          render={({ field }) => (
+            <select
+              {...field}
+              disabled={fieldsLocked}
+              className={`rf-select ${e.bankAccountType ? 'error' : ''}`}
+            >
+              <option value="">Select account type</option>
+              {COMMISSION_ACCOUNT_TYPES.map((t) => (
+                <option key={t} value={t}>{t}</option>
+              ))}
+            </select>
+          )}
+        />
+        {e.bankAccountType && <p className="rf-help error">{e.bankAccountType.message}</p>}
+      </div>
+
+      <button
+        type="button"
+        className="rf-btn rf-btn-secondary"
+        style={{ marginTop: 4 }}
+        onClick={() => {
+          setValue('commission.enabled', false, { shouldValidate: false })
+          setValue('commission.useSamePaymentAccount', false, { shouldValidate: false })
+        }}
+      >
+        Remove commission bank details
+      </button>
+    </>
+  )
+}
+
+export default function Step3Payment({ control, errors, onEditBilling, isSubmitted, collectTokenResolverRef, setValue }) {
   const paymentMethod = useWatch({ control, name: 'payment.method' })
   return (
     <section className="rf-step">
@@ -228,6 +433,12 @@ export default function Step3Payment({ control, errors, onEditBilling, isSubmitt
         <label className="rf-label">Card billing address</label>
         <BillingSummary control={control} onEdit={onEditBilling} />
       </div>
+
+      <CommissionBankSection
+        control={control}
+        errors={errors}
+        setValue={setValue}
+      />
 
       <div className="rf-divider">
         <h2 className="rf-section-label">Authorization</h2>

@@ -54,6 +54,61 @@ const signatureSchema = new mongoose.Schema(
   { _id: false },
 );
 
+// IRS Form W-9 — only the fields not already on the parent doc.
+// Name + business name + address + TIN (SSN/EIN) live elsewhere; the
+// W-9 PDF rendering pipeline reads from both this sub-doc and the
+// parent. `signature` mirrors the top-level `signature` shape; it
+// represents the separate IRS perjury certification (NOT the same as
+// the terms-acceptance signature). `submittedAt` is when the W-9 form
+// itself was signed, which is the date that needs to appear on the
+// PDF copy filed with the IRS.
+const w9Schema = new mongoose.Schema(
+  {
+    legalName: String,
+    taxClassification: {
+      type: String,
+      enum: [
+        "individual",
+        "c_corp",
+        "s_corp",
+        "partnership",
+        "trust_estate",
+        "llc",
+        "other",
+      ],
+    },
+    llcClassification: { type: String, enum: ["C", "S", "P", null] },
+    otherClassification: String,
+    exemptPayeeCode: String,
+    fatcaCode: String,
+    signature: { type: signatureSchema, default: null },
+    submittedAt: { type: Date, default: null },
+  },
+  { _id: false },
+);
+
+// Commission payout bank — separate from `payment` (which is HOW the
+// practitioner pays us). This is HOW WE PAY THEM commissions. Storage
+// keeps the last 4 for display + the full account number for future
+// NMI / QBO payout integration. Practitioners can opt out at signup
+// and add details later via the admin.
+const commissionSchema = new mongoose.Schema(
+  {
+    enabled: { type: Boolean, default: false },
+    bankAccountName: String,
+    bankRoutingNumber: String,
+    bankAccountNumber: String,
+    bankAccountLast4: String,
+    bankAccountType: String,
+    // True when the practitioner ticked "use same as payment ACH" — kept
+    // for audit so we know whether to keep the two accounts in sync if
+    // the payment ACH later changes.
+    sourcedFromPaymentAch: { type: Boolean, default: false },
+    updatedAt: { type: Date, default: Date.now },
+  },
+  { _id: false },
+);
+
 // Audit trail of payment-preference changes. One entry per change event
 // (customer self-service via /api/update-profile, or an admin via
 // /api/admin/customers/:id/payment-method). Each entry records the
@@ -99,6 +154,14 @@ const wholesaleApplicationSchema = new mongoose.Schema(
     payment: { type: paymentSchema, default: null },
     paymentMethodHistory: { type: [paymentMethodHistorySchema], default: [] },
     signature: { type: signatureSchema, default: null },
+
+    // Commission payout bank account (Step 3 — collapsed by default).
+    // null when the practitioner opted out at signup; admin can add
+    // later via /api/admin/customers/:id/commission-bank.
+    commission: { type: commissionSchema, default: null },
+
+    // IRS Form W-9 (Step 4 — required). null until submitted.
+    w9: { type: w9Schema, default: null },
 
     termsAccepted: { type: Boolean, default: false },
     subscribeNews: { type: Boolean, default: false },

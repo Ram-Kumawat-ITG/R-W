@@ -23,6 +23,19 @@ const reqWhenAch = (msg) =>
     otherwise: (s) => s.notRequired(),
   })
 
+// Commission bank fields are gated by `commission.enabled` — when the
+// practitioner clicks "Add commission bank details" we flip enabled to
+// true and the fields become required. `useSamePaymentAccount` is a UI
+// shortcut: when payment method is ACH, ticking the box copies those
+// values into the commission fields client-side, so the fields still
+// receive valid input and validate normally.
+const reqWhenCommission = (msg) =>
+  yup.string().when('enabled', {
+    is: true,
+    then: (s) => s.required(msg),
+    otherwise: (s) => s.notRequired(),
+  })
+
 export const step3Schema = yup.object({
   payment: yup.object({
     method: yup
@@ -51,6 +64,33 @@ export const step3Schema = yup.object({
     achAccountType: reqWhenAch('Required'),
     // cardNumber, cardExpiry, cardCvv, cardBrand removed — Collect.js handles validation
   }),
+  commission: yup.object({
+    enabled: yup.boolean(),
+    useSamePaymentAccount: yup.boolean(),
+    bankAccountName: reqWhenCommission('Required'),
+    bankRoutingNumber: yup.string().when('enabled', {
+      is: true,
+      then: (s) =>
+        s
+          .required('Required')
+          .matches(/^\d{9}$/, 'Must be exactly 9 digits')
+          .test(
+            'aba-checksum',
+            'Invalid routing number',
+            (v) => isValidABA(v),
+          ),
+      otherwise: (s) => s.notRequired(),
+    }),
+    bankAccountNumber: yup.string().when('enabled', {
+      is: true,
+      then: (s) =>
+        s
+          .required('Required')
+          .matches(/^\d{4,17}$/, 'Must be 4 – 17 digits'),
+      otherwise: (s) => s.notRequired(),
+    }),
+    bankAccountType: reqWhenCommission('Required'),
+  }),
   signature: yup
     .object({ drawn: yup.mixed().nullable() })
     .test('signature-present', 'Please sign before submitting', (s) => Boolean(s?.drawn)),
@@ -61,4 +101,4 @@ export const step3Schema = yup.object({
     .required('Please accept the Terms & Conditions'),
 })
 
-export const step3Fields = ['payment', 'signature', 'subscribeNews', 'termsAccepted']
+export const step3Fields = ['payment', 'commission', 'signature', 'subscribeNews', 'termsAccepted']

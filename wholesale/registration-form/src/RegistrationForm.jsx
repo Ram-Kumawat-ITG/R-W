@@ -5,6 +5,7 @@ import { fullSchema } from "./schema/full.schema";
 import { step1Fields } from "./schema/step1.schema";
 import { step2Fields } from "./schema/step2.schema";
 import { step3Fields } from "./schema/step3.schema";
+import { step4Fields } from "./schema/step4.schema";
 import { buildFormData } from "./utils/buildFormData";
 import ApiService from "./services/ApiService";
 import { useStepValidation } from "./hooks/useStepValidation";
@@ -12,6 +13,7 @@ import StepIndicator from "./components/StepIndicator";
 import Step1AboutYou from "./components/Step1AboutYou";
 import Step2AddressTax from "./components/Step2AddressTax";
 import Step3Payment from "./components/Step3Payment";
+import Step4W9 from "./components/Step4W9";
 import { CREDENTIALS, REFERRALS } from "./constants";
 import "./styles/variables.css";
 import "./styles/registration-form.css";
@@ -73,7 +75,30 @@ const defaultValues = {
     achAccountNumber: "",
     achAccountType: "",
   },
+  // Commission bank — hidden behind a button on Step 3. enabled flips to
+  // true when practitioner opts in. Field-level required validation gates
+  // on `enabled` (see step3.schema.js).
+  commission: {
+    enabled: false,
+    useSamePaymentAccount: false,
+    bankAccountName: "",
+    bankRoutingNumber: "",
+    bankAccountNumber: "",
+    bankAccountType: "",
+  },
   signature: { drawn: null },
+  // Step 4 — W-9 form. legalName auto-fills from firstName + lastName on
+  // mount (see Step4W9.jsx). Tax classification is required; sub-fields
+  // (llcClassification / otherClassification) gate on selection.
+  w9: {
+    legalName: "",
+    taxClassification: "",
+    llcClassification: "",
+    otherClassification: "",
+    exemptPayeeCode: "",
+    fatcaCode: "",
+    signature: { drawn: null },
+  },
   subscribeNews: false,
   termsAccepted: false,
 };
@@ -214,7 +239,12 @@ function FormBody({ onBack }) {
   };
 
   const next = async () => {
-    const fields = currentStep === 1 ? step1Fields : step2Fields;
+    const fieldsByStep = {
+      1: step1Fields,
+      2: step2Fields,
+      3: step3Fields,
+    };
+    const fields = fieldsByStep[currentStep] || step1Fields;
     const ok = await validateStep(fields);
     if (!ok) {
       console.warn(
@@ -227,7 +257,7 @@ function FormBody({ onBack }) {
     setToast(null);
     setErrorBanner(null);
     clearErrors();
-    setCurrentStep((s) => Math.min(s + 1, 3));
+    setCurrentStep((s) => Math.min(s + 1, 4));
     if (typeof window !== "undefined")
       window.scrollTo({ top: 0, behavior: "smooth" });
   };
@@ -288,15 +318,64 @@ function FormBody({ onBack }) {
         cardPayload.achAccountType = values.payment.achAccountType;
       }
 
-      const payload = { ...values, payment: cardPayload };
+      // Commission bank — if enabled, include FULL details (account name,
+      // routing, full account number, type). useSamePaymentAccount is a
+      // UI-only flag (already used to mirror payment ACH values into the
+      // commission fields client-side) and isn't persisted on its own.
+      const commissionPayload = values.commission?.enabled
+        ? {
+            enabled: true,
+            bankAccountName: values.commission.bankAccountName,
+            bankRoutingNumber: values.commission.bankRoutingNumber,
+            bankAccountNumber: values.commission.bankAccountNumber,
+            bankAccountLast4: (
+              values.commission.bankAccountNumber || ""
+            ).slice(-4),
+            bankAccountType: values.commission.bankAccountType,
+            sourcedFromPaymentAch: Boolean(
+              values.commission.useSamePaymentAccount &&
+                values.payment.method === "ach",
+            ),
+          }
+        : { enabled: false };
 
-      // Signature handled separately so we can attach the PNG as a File
-      const fd = buildFormData({ ...payload, signature: undefined });
+      // W-9 payload — everything except the signature (sent as a File).
+      const w9Payload = {
+        legalName: values.w9?.legalName || "",
+        taxClassification: values.w9?.taxClassification || "",
+        llcClassification: values.w9?.llcClassification || "",
+        otherClassification: values.w9?.otherClassification || "",
+        exemptPayeeCode: values.w9?.exemptPayeeCode || "",
+        fatcaCode: values.w9?.fatcaCode || "",
+      };
+
+      const payload = {
+        ...values,
+        payment: cardPayload,
+        commission: commissionPayload,
+        w9: w9Payload,
+      };
+
+      // Signatures handled separately so we can attach each PNG as a File.
+      // Two signatures: Step 3 (terms / payment authorization) and Step 4
+      // (W-9 IRS certification). Backend persists both as Shopify Files.
+      const fd = buildFormData({
+        ...payload,
+        signature: undefined,
+        w9: { ...w9Payload }, // strip the signature object from the W-9 payload too
+      });
       if (values.signature?.drawn) {
         fd.append("signatureFile", values.signature.drawn, "signature.png");
       }
+      if (values.w9?.signature?.drawn) {
+        fd.append(
+          "w9SignatureFile",
+          values.w9.signature.drawn,
+          "w9-signature.png",
+        );
+      }
 
-      const data = await ApiService.submitRegistration(fd);
+      await ApiService.submitRegistration(fd);
       setSuccessView(true);
     } catch (err) {
       const fieldErrors = err?.responseData?.result?.fieldErrors;
@@ -401,6 +480,12 @@ function FormBody({ onBack }) {
                 clearErrors={clearErrors}
               />
             )}
+            {/*
+              Step 3 stays MOUNTED across steps 3 + 4 (hidden via inline style
+              when not active) so the Collect.js card iframe doesn't tear
+              down and lose its tokenization context. Step 4 is rendered
+              normally — it has no third-party iframe to preserve.
+            */}
             <div
               style={
                 currentStep !== 3
@@ -422,6 +507,16 @@ function FormBody({ onBack }) {
                 collectTokenResolverRef={collectTokenResolverRef}
               />
             </div>
+            {currentStep === 4 && (
+              <Step4W9
+                control={control}
+                errors={errors}
+                setValue={setValue}
+                isSubmitted={isSubmitted}
+                onEditStep1={() => setCurrentStep(1)}
+                onEditStep2={() => setCurrentStep(2)}
+              />
+            )}
 
             <div className="rf-actions">
               {currentStep === 1 ? (
@@ -439,7 +534,7 @@ function FormBody({ onBack }) {
                   Back
                 </button>
               )}
-              {currentStep < 3 ? (
+              {currentStep < 4 ? (
                 <button
                   type="button"
                   className="rf-btn rf-btn-primary"

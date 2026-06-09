@@ -181,6 +181,48 @@ export async function action({ request }) {
   delete payload.signatureType;
   delete payload.signatureValue;
 
+  // W-9 signature — uploaded as `w9SignatureFile`, normalize into the
+  // nested w9.signature shape that matches the Mongoose w9Schema. Also
+  // stamp `w9.submittedAt` so the W-9 PDF/audit copy has a definitive date.
+  if (payload.w9SignatureFile) {
+    if (!payload.w9 || typeof payload.w9 !== "object") payload.w9 = {};
+    payload.w9.signature = {
+      type: "drawn",
+      value: payload.w9SignatureFile,
+      signedAt,
+    };
+    payload.w9.submittedAt = signedAt;
+  }
+  delete payload.w9SignatureFile;
+
+  // Strip empty-string values from W-9 sub-fields that have Mongoose
+  // enums (`llcClassification` accepts only C/S/P/null). The frontend
+  // emits `""` for these when the practitioner didn't pick LLC/Other —
+  // Mongoose then rejects `""` because it isn't in the enum. Convert
+  // empty → undefined so Mongoose treats the field as unset and falls
+  // back to its default (null).
+  if (payload.w9 && typeof payload.w9 === "object") {
+    for (const key of [
+      "llcClassification",
+      "otherClassification",
+      "exemptPayeeCode",
+      "fatcaCode",
+    ]) {
+      if (payload.w9[key] === "") delete payload.w9[key];
+    }
+  }
+
+  // Commission bank — when enabled, stamp updatedAt + derive last4 server-side
+  // so we don't trust the client's hint. When disabled, store null (the schema
+  // default) so admins can later see "opted out" vs "never added".
+  if (payload.commission?.enabled) {
+    const acct = String(payload.commission.bankAccountNumber || "");
+    payload.commission.bankAccountLast4 = acct.slice(-4);
+    payload.commission.updatedAt = new Date();
+  } else if (payload.commission && !payload.commission.enabled) {
+    payload.commission = null;
+  }
+
   payload.shop = shop;
 
   // Reject duplicate submissions before touching Shopify
