@@ -30,7 +30,10 @@ import { createLogger } from "../../utils/logger.utils";
 
 const log = createLogger("retailSync.practitioner");
 
-const PRACTITIONER_TAG = "wholesale-Practitioner";
+// Two clean tags applied to every wholesale-mirrored retail customer.
+// Order doesn't matter; Shopify stores tags as a set. On soft-delete both
+// are removed and ARCHIVED_TAG is added.
+const PRACTITIONER_TAGS = ["practitioner", "Approved"];
 const ARCHIVED_TAG = "archived-practitioner";
 
 const API_VERSION = "2025-07";
@@ -142,6 +145,12 @@ function dropTag(list, tag) {
   );
 }
 
+function dropTags(list, tags) {
+  let next = list || [];
+  for (const t of tags) next = dropTag(next, t);
+  return next;
+}
+
 /**
  * Sync a wholesale practitioner to the retail Shopify store.
  *
@@ -173,15 +182,17 @@ export async function syncPractitionerToRetail({ application, action }) {
 }
 
 async function handleCreate({ application, email, firstName, lastName, phone }) {
-  // Idempotent: if we already mirrored this practitioner, just refresh the tag.
+  // Idempotent: if we already mirrored this practitioner, just refresh the tags.
   if (application.retailShopifyCustomerId) {
     log.info("create.already_mirrored", {
       applicationId: String(application._id),
       retailCustomerId: application.retailShopifyCustomerId,
     });
-    await ensureTag(application.retailShopifyCustomerId, [PRACTITIONER_TAG], [
-      ARCHIVED_TAG,
-    ]);
+    await ensureTag(
+      application.retailShopifyCustomerId,
+      PRACTITIONER_TAGS,
+      [ARCHIVED_TAG],
+    );
     return {
       retailCustomerId: application.retailShopifyCustomerId,
       adopted: false,
@@ -192,8 +203,8 @@ async function handleCreate({ application, email, firstName, lastName, phone }) 
   const existing = await findRetailCustomerByEmail(email);
 
   if (existing?.id) {
-    // ADOPT — add the practitioner tag, keep everything else.
-    const nextTags = dedupeTags(existing.tags, [PRACTITIONER_TAG]);
+    // ADOPT — add the practitioner tags, keep everything else.
+    const nextTags = dedupeTags(existing.tags, PRACTITIONER_TAGS);
     const finalTags = dropTag(nextTags, ARCHIVED_TAG); // un-archive if needed
     await customerUpdate({
       id: existing.id,
@@ -211,13 +222,13 @@ async function handleCreate({ application, email, firstName, lastName, phone }) 
     return { retailCustomerId: existing.id, adopted: true };
   }
 
-  // 2. Not found — create fresh on retail with the tag.
+  // 2. Not found — create fresh on retail with the tags.
   const input = {
     email,
     firstName,
     lastName,
     phone: phone || null,
-    tags: [PRACTITIONER_TAG],
+    tags: PRACTITIONER_TAGS,
   };
   // Phone is optional; Shopify rejects malformed phone strings, so drop
   // it if it isn't E.164-ish. The webhook can still update later.
@@ -303,8 +314,10 @@ async function handleDelete({ application }) {
     });
     return { retailCustomerId, adopted: false };
   }
+  // Remove BOTH practitioner tags ("Practitioner", "Approved") and add
+  // the archived marker. The retail customer record itself stays.
   const nextTags = dedupeTags(
-    dropTag(customer.tags, PRACTITIONER_TAG),
+    dropTags(customer.tags, PRACTITIONER_TAGS),
     [ARCHIVED_TAG],
   );
   await customerUpdate({ id: retailCustomerId, tags: nextTags });
