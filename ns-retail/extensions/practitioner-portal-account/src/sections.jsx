@@ -393,6 +393,23 @@ export function ReferralsSection({ onAuthError }) {
     { key: 'orders', label: 'Orders', render: (r) => <s-text>{formatNumber(r.orders)}</s-text> },
     { key: 'revenue', label: 'Revenue', render: (r) => <s-text>{formatMoney(r.revenue)}</s-text> },
     { key: 'commission', label: 'Commission', render: (r) => <s-text>{formatMoney(r.commission)}</s-text> },
+    // Full shareable referral link. Rendered as an s-link so the customer can
+    // view, click-to-open, and copy/share it (the customer-account sandbox has
+    // no clipboard/DOM API, so the link text itself is the copy affordance).
+    // Given a wider column since the URL is long.
+    {
+      key: 'referralUrl',
+      label: 'Referral Complete URL',
+      width: '2fr',
+      render: (r) =>
+        r.referralUrl ? (
+          <s-link href={r.referralUrl} target="_blank">
+            {r.referralUrl}
+          </s-link>
+        ) : (
+          <s-text color="subdued">Not generated yet</s-text>
+        ),
+    },
   ]
 
   return (

@@ -98,25 +98,20 @@ const invoiceSchema = new mongoose.Schema(
     },
     paymentSettledAt: Date,
 
-    // ── Immediate Payment — hosted self-pay link + QR ────────────────
+    // ── Immediate Payment — self-pay link ────────────────────────────
     //
     // For `paymentMethod: 'immediate'` invoices only. `payToken` is an
     // opaque, cryptographically-random bearer credential (NOT a signed
-    // amount) minted at invoice creation. The durable public URL
-    // /pay/<payToken> looks the invoice up by this token, computes the
-    // outstanding balance SERVER-SIDE, and mints a fresh short-lived NMI
-    // hosted-checkout session at click time (the redirector decouples the
-    // long-lived QBO invoice link from NMI's short session lifetime).
+    // amount) minted at invoice creation and embedded in the durable public
+    // URL /pay/<payToken> (baked into the QBO invoice CustomerMemo). That
+    // page looks the invoice up by this token, computes the outstanding
+    // balance SERVER-SIDE, and collects it via NMI Collect.js.
     //
-    // `qrAttachableId` / `qrAttachedAt` record the QBO Attachable holding
-    // the QR PNG (IncludeOnSend=true) so it rides with the emailed invoice.
     // `payTransactionIds` dedups settlement — a returning NMI transaction
-    // id already present here is ignored so a double callback / refresh
+    // id already present here is ignored so a double charge / resubmit
     // can't bump amountPaid twice.
     payToken: { type: String, index: { unique: true, sparse: true } },
     payTokenCreatedAt: Date,
-    qrAttachableId: String,
-    qrAttachedAt: Date,
     payTransactionIds: { type: [String], default: undefined },
 
     // Lifecycle of the invoice's payment, independent of QBO's own status.

@@ -14,6 +14,8 @@
 //   Every cdo_* query below is scoped by { practitionerId } so a
 //   practitioner can only ever see their own data.
 
+import { unauthenticated } from "../../shopify.server";
+import { createLogger } from "../../utils/logger.utils";
 import WholesaleApplication from "../../models/wholesaleApplication.server";
 import CdoPractitionerCode from "../../models/cdoPractitionerCode.server";
 import CdoOrder from "../../models/cdoOrder.server";
@@ -58,31 +60,157 @@ function parseDate(v) {
 const ERR_UNAUTHENTICATED = "UNAUTHENTICATED";
 const ERR_FORBIDDEN = "FORBIDDEN";
 
+const log = createLogger("cdo.portal.service");
+
+// Tags a Shopify customer MUST carry (BOTH) to access the Practitioner Portal.
+// Matched case-insensitively and as EXACT whole tags — "archived-practitioner"
+// or "wholesale-Practitioner" must NOT satisfy "practitioner".
+const REQUIRED_PORTAL_TAGS = ["practitioner", "approved"];
+
+// True only when `tags` contains every required tag (case-insensitive, exact).
+export function hasRequiredPortalTags(tags) {
+  if (!Array.isArray(tags)) return false;
+  const owned = new Set(tags.map((t) => String(t).trim().toLowerCase()));
+  return REQUIRED_PORTAL_TAGS.every((t) => owned.has(t));
+}
+
+// Look up a customer's email + tags on a given shop via the Admin GraphQL API.
+//
+// Two jobs:
+//  1. AUTHORIZATION — `tags` is the source of truth for portal access (the
+//     customer must carry BOTH "Practitioner" and "Approved"). Read from
+//     Shopify (trusted), NEVER from the client or any MongoDB mirror.
+//  2. IDENTITY BRIDGE — a wholesale_application's `customerId` is the customer
+//     GID ON THE WHOLESALE STORE, but the portal runs on the ns-retail store,
+//     where the same person has a DIFFERENT customer GID. Customer GIDs are
+//     per-store; email is the stable, store-independent key.
+//
+// Requires the `read_customers` (or `write_customers`) scope + an installed
+// offline session for `shop`. Returns null on any failure (caller denies).
+//
+// NO CACHING — this is a LIVE, real-time read on EVERY request, by design, so
+// access is always decided on the customer's CURRENT Shopify tags. A tag
+// added/removed in Shopify takes effect on the very next portal request (e.g.
+// revoking "Approved" denies access immediately). The portal is low-traffic
+// (a practitioner navigating a few tabs), so the per-call Admin query is a fine
+// trade for never granting access on stale data.
+async function fetchCustomerByGid(shop, customerGid) {
+  if (!shop || !customerGid) return null;
+
+  // unauthenticated.admin expects a bare shop domain (no protocol).
+  let shopDomain = String(shop);
+  try {
+    if (/^https?:\/\//i.test(shopDomain)) shopDomain = new URL(shopDomain).host;
+  } catch {
+    /* use as-is */
+  }
+  try {
+    const { admin } = await unauthenticated.admin(shopDomain);
+    const resp = await admin.graphql(
+      `#graphql
+       query PortalCustomer($id: ID!) {
+         customer(id: $id) { email tags }
+       }`,
+      { variables: { id: customerGid } },
+    );
+    const body = await resp.json();
+    const customer = body?.data?.customer;
+    if (!customer) {
+      log.info("resolve.customer_not_found", { shop: shopDomain, customerGid });
+      return null;
+    }
+    return {
+      email: customer.email || null,
+      tags: Array.isArray(customer.tags) ? customer.tags : [],
+    };
+  } catch (e) {
+    log.warn("resolve.customer_lookup_failed", {
+      shop: shopDomain,
+      err: e?.message || String(e),
+    });
+    return null;
+  }
+}
+
 /**
- * Resolve a logged-in Shopify customer (by GID) to an approved practitioner.
- * The customer GID comes from the verified session-token `sub` claim — the
- * caller (portal guard) is responsible for validating the JWT first; this
- * function never trusts a raw request. Throws a typed Error on failure:
+ * Resolve a logged-in Shopify customer (by GID) to an approved practitioner,
+ * enforcing the Practitioner-Portal access policy. The customer GID comes from
+ * the verified session-token `sub` claim — the caller (portal guard) validates
+ * the JWT first; this function never trusts a raw request. Throws a typed
+ * Error on failure:
  *   - code 'UNAUTHENTICATED' → no customer GID (anonymous / sub claim absent)
- *   - code 'FORBIDDEN'       → logged in, but not an approved practitioner
+ *   - code 'FORBIDDEN'       → logged in, but not authorized for the portal
  *
- * `sessionToken.sub` is already in `gid://shopify/Customer/<id>` form, which
- * matches how `wholesale_applications.customerId` is stored.
+ * ACCESS POLICY (enforced on EVERY request, before any portal data is read):
+ *   1. The customer must carry BOTH the "Practitioner" AND "Approved" tags on
+ *      the store the portal runs on. Tags are read from Shopify (trusted) —
+ *      never the client — and matched case-insensitively as exact whole tags.
+ *   2. The customer must resolve to an APPROVED WholesaleApplication, whose
+ *      _id is the tenant key (`practitionerId`) every cdo_* query scopes by.
+ *   Both must hold; either failing → FORBIDDEN.
+ *
+ * `sessionToken.sub` is `gid://shopify/Customer/<id>` ON THE STORE THE PORTAL
+ * RUNS ON (ns-retail). Customer GIDs are per-store, so we bridge to the
+ * wholesale application by the customer's email (store-independent), resolved
+ * from Shopify in the same lookup that reads the tags.
  *
  * @param {string} customerGid - gid://shopify/Customer/<id> (session token `sub`)
+ * @param {string} [shop] - session token `dest` (the store the portal runs on),
+ *   used to read the customer's tags + email via the Admin API.
  * @returns {Promise<{ practitionerId: string, application: object }>}
  */
-export async function resolvePractitionerByCustomerGid(customerGid) {
+export async function resolvePractitionerByCustomerGid(customerGid, shop) {
   if (!customerGid) {
     const e = new Error("Not logged in");
     e.code = ERR_UNAUTHENTICATED;
     throw e;
   }
 
-  const application = await WholesaleApplication.findOne({
+  // Read the authoritative customer record (tags + email) from Shopify. This
+  // is REQUIRED on every request — tags are the access gate and can't be
+  // trusted from the client. If we can't read it, we can't authorize → deny.
+  const customer = await fetchCustomerByGid(shop, customerGid);
+  if (!customer) {
+    const e = new Error("Could not verify your account");
+    e.code = ERR_FORBIDDEN;
+    throw e;
+  }
+
+  // GATE 1 — required tags. Must carry BOTH "Practitioner" and "Approved".
+  if (!hasRequiredPortalTags(customer.tags)) {
+    log.info("resolve.missing_required_tags", {
+      customerGid,
+      tags: customer.tags,
+    });
+    const e = new Error("Not an approved practitioner");
+    e.code = ERR_FORBIDDEN;
+    throw e;
+  }
+
+  // GATE 2 — resolve the tenant key. Try a direct GID match first (covers a
+  // same-store setup), then bridge by email (the ns-retail case). Email match
+  // is case-insensitive + anchored (exact email, not substring).
+  let application = await WholesaleApplication.findOne({
     customerId: customerGid,
     status: "approved",
   }).lean();
+
+  if (!application && customer.email) {
+    const exact = new RegExp(`^${escapeRegex(customer.email.trim())}$`, "i");
+    application = await WholesaleApplication.findOne({
+      email: exact,
+      status: "approved",
+    }).lean();
+    if (application) {
+      log.info("resolve.matched_by_email", {
+        practitionerId: String(application._id),
+      });
+    } else {
+      // Tags present but no approved application for this email — usually a
+      // data mismatch (different email on this store vs. their application).
+      log.info("resolve.email_no_match", { email: customer.email.trim() });
+    }
+  }
 
   if (!application) {
     const e = new Error("Not an approved practitioner");
@@ -581,6 +709,10 @@ export async function getReferralCodes(practitionerId) {
         orders: o.orders || 0,
         revenue: round2(o.revenue),
         commission: round2(o.commission),
+        // Full shareable referral link (Shopify storefront discount URL,
+        // https://<retail-shop>/discount/<code>). Populated once the matching
+        // Shopify discount is created on the retail store; null until then.
+        referralUrl: c.shopifyDiscountUrl || null,
       };
     }),
   };

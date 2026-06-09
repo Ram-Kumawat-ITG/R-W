@@ -10,18 +10,18 @@ import Invoice from '../../models/invoice.server'
 import PaymentAttempt from '../../models/paymentAttempt.server'
 import { propagateSuccessfulPayment, appendInvoiceRemark } from '../invoice/invoice.service'
 import { applyDerivedPaymentStatus } from '../invoice/invoice.utils'
-import { setInvoicePayLinkMemo, attachQrToInvoice } from '../qbo/qbo.service'
-import { mintPayToken, buildPayLinkUrl, renderPayQrPng } from './payLink.utils'
+import { setInvoicePayLinkMemo } from '../qbo/qbo.service'
+import { mintPayToken, buildPayLinkUrl } from './payLink.utils'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('payLink.service')
 
-// Provision the pay link + QR on an EXISTING invoice that was realigned to
-// the `immediate` method after creation (createInvoiceForOrder handles the
-// at-creation path). Mints a token if missing, writes the link into the QBO
-// CustomerMemo, and attaches the QR — both QBO steps best-effort so a QBO
-// hiccup can't fail the realignment. Mutates + saves the passed invoice.
-// Returns the pay URL (or null if the invoice already had a token).
+// Provision the pay link on an EXISTING invoice that was realigned to the
+// `immediate` method after creation (createInvoiceForOrder handles the
+// at-creation path). Mints a token if missing and writes the link into the
+// QBO CustomerMemo (best-effort so a QBO hiccup can't fail the realignment).
+// Mutates + saves the passed invoice. Returns the pay URL (or null if the
+// invoice already had a token).
 export async function provisionImmediatePayLink(invoice) {
   if (invoice.payToken) return buildPayLinkUrl(invoice.payToken)
 
@@ -38,23 +38,30 @@ export async function provisionImmediatePayLink(invoice) {
     log.warn('provision.memo_failed', { invoiceId: invoice._id.toString(), err: err?.message || String(err) })
   }
 
-  try {
-    if (invoice.qboInvoiceId) {
-      const pngBuffer = await renderPayQrPng(payLinkUrl)
-      const attachable = await attachQrToInvoice({
-        qboInvoiceId: invoice.qboInvoiceId,
-        pngBuffer,
-        fileName: `pay-invoice-${invoice.qboDocNumber || invoice.shopifyOrderId}.png`,
-      })
-      invoice.qrAttachableId = attachable?.Id || undefined
-      invoice.qrAttachedAt = new Date()
-    }
-  } catch (err) {
-    log.warn('provision.qr_failed', { invoiceId: invoice._id.toString(), err: err?.message || String(err) })
-  }
-
   await invoice.save()
   log.info('provision.done', { invoiceId: invoice._id.toString() })
+  return payLinkUrl
+}
+
+// Re-stamp the pay link into an existing invoice's QBO CustomerMemo using the
+// CURRENT configured base URL. Use when the link baked at creation points at
+// a now-dead host — e.g. a dev tunnel that rotated, or after PAY_LINK_BASE_URL
+// changed. Mints a token if the invoice somehow lacks one. The token itself
+// never changes (the /pay/<token> path is stable); only the base host is
+// refreshed. Returns the current pay URL. Throws if QBO rejects the update.
+export async function refreshImmediatePayLink(invoice) {
+  if (!invoice.payToken) {
+    invoice.payToken = mintPayToken()
+    invoice.payTokenCreatedAt = new Date()
+  }
+  const payLinkUrl = buildPayLinkUrl(invoice.payToken)
+
+  if (invoice.qboInvoiceId) {
+    const updated = await setInvoicePayLinkMemo({ qboInvoiceId: invoice.qboInvoiceId, payLinkUrl })
+    if (updated?.SyncToken) invoice.qboSyncToken = updated.SyncToken
+  }
+  await invoice.save()
+  log.info('refresh.done', { invoiceId: invoice._id.toString(), payLinkUrl })
   return payLinkUrl
 }
 

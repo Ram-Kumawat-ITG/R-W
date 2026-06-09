@@ -155,8 +155,20 @@ function CollectCheckout({ amount, currency, docNumber, tokenizationKey, collect
             ccexp: { selector: '#collect-ccexp', placeholder: 'MM / YY' },
             cvv: { selector: '#collect-cvv', placeholder: 'CVV' },
           },
-          customCss: { 'font-size': '16px', color: '#1a1a1a' },
+          // Style the contents of the NMI iframes so they sit flush inside our
+          // own bordered field shells (the shell owns the border/focus ring;
+          // the iframe input is borderless + vertically centred).
+          customCss: {
+            'font-size': '16px',
+            'font-family':
+              'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
+            color: '#18181b',
+            'line-height': '44px',
+          },
+          focusCss: { color: '#18181b' },
+          placeholderCss: { color: '#a1a1aa' },
           invalidCss: { color: '#b42318' },
+          validCss: { color: '#0f7b3f' },
           fieldsAvailableCallback: () => setFieldsReady(true),
           validationCallback: (_field, status, message) => {
             if (!status) {
@@ -211,46 +223,78 @@ function CollectCheckout({ amount, currency, docNumber, tokenizationKey, collect
     }
   }
 
+  const disabled = !fieldsReady || submitting
+
   return (
     <div style={SHELL}>
+      <style dangerouslySetInnerHTML={{ __html: PAY_CSS }} />
       <div style={CARD}>
         <div style={{ height: 4, width: 56, background: '#1f6feb', borderRadius: 4, margin: '0 auto 20px' }} />
         <h1 style={{ fontSize: 20, fontWeight: 600, color: '#1a1a1a', margin: '0 0 4px', textAlign: 'center' }}>
           Pay invoice {docNumber ? `#${docNumber}` : ''}
         </h1>
-        <div style={{ fontSize: 32, fontWeight: 700, color: '#1f6feb', textAlign: 'center', margin: '8px 0 24px' }}>
+        <div style={{ fontSize: 34, fontWeight: 700, color: '#1f6feb', textAlign: 'center', margin: '8px 0 26px' }}>
           {formatMoney(amount, currency)}
         </div>
 
-        <div style={LABEL}>Card number</div>
-        <div id="collect-ccnumber" style={FIELD} />
+        <label style={LABEL} htmlFor="collect-ccnumber">Card number</label>
+        <div id="collect-ccnumber" className="pay-field" style={FIELD} />
 
-        <div style={{ display: 'flex', gap: 12 }}>
+        <div style={{ display: 'flex', gap: 14 }}>
           <div style={{ flex: 1 }}>
-            <div style={LABEL}>Expiry</div>
-            <div id="collect-ccexp" style={FIELD} />
+            <label style={LABEL} htmlFor="collect-ccexp">Expiry</label>
+            <div id="collect-ccexp" className="pay-field" style={FIELD} />
           </div>
           <div style={{ flex: 1 }}>
-            <div style={LABEL}>CVV</div>
-            <div id="collect-cvv" style={FIELD} />
+            <label style={LABEL} htmlFor="collect-cvv">CVV</label>
+            <div id="collect-cvv" className="pay-field" style={FIELD} />
           </div>
         </div>
 
-        {shownError && (
-          <p style={{ color: '#b42318', fontSize: 14, margin: '14px 0 0' }}>{shownError}</p>
+        {!fieldsReady && !shownError && (
+          <p style={{ color: '#a1a1aa', fontSize: 13, margin: '14px 0 0', textAlign: 'center' }}>
+            Loading secure payment fields…
+          </p>
         )}
 
-        <button type="button" onClick={onPay} disabled={!fieldsReady || submitting} style={payButtonStyle(!fieldsReady || submitting)}>
+        {shownError && (
+          <div style={ERROR_BOX} role="alert">
+            <span style={ERROR_DOT} aria-hidden="true">!</span>
+            <span>{shownError}</span>
+          </div>
+        )}
+
+        <button
+          type="button"
+          onClick={onPay}
+          disabled={disabled}
+          className="pay-button"
+          style={payButtonStyle(disabled)}
+        >
           {submitting ? 'Processing…' : `Pay ${formatMoney(amount, currency)}`}
         </button>
 
-        <p style={{ fontSize: 12, color: '#a1a1aa', textAlign: 'center', margin: '20px 0 0' }}>
-          Secured by NMI · Natural Solutions Wholesale
+        <p style={{ fontSize: 12, color: '#a1a1aa', textAlign: 'center', margin: '22px 0 0', letterSpacing: 0.2 }}>
+          🔒 Secured by NMI · Natural Solutions Wholesale
         </p>
       </div>
     </div>
   )
 }
+
+// Pseudo-class styling that inline styles can't express: focus-within ring on
+// the field shells, the NMI iframe filling its shell, and button hover.
+const PAY_CSS = `
+  .pay-field { transition: border-color .15s ease, box-shadow .15s ease; }
+  .pay-field:hover { border-color: #b4b4bb; }
+  .pay-field:focus-within {
+    border-color: #1f6feb;
+    box-shadow: 0 0 0 3px rgba(31,111,235,0.15);
+  }
+  .pay-field iframe { width: 100% !important; height: 100% !important; border: 0 !important; }
+  .pay-button:not(:disabled):hover { background: #195bc7 !important; }
+  .pay-button:not(:disabled):active { background: #1550b3 !important; }
+`
 
 // Load NMI's Collect.js once, attaching the publishable tokenization key.
 function loadCollectJs(url, tokenizationKey) {
@@ -296,25 +340,54 @@ const CARD = {
   width: '100%',
   padding: '36px 32px',
 }
-const LABEL = { display: 'block', fontSize: 13, fontWeight: 600, color: '#52525b', margin: '14px 0 6px' }
+const LABEL = { display: 'block', fontSize: 13, fontWeight: 600, color: '#3f3f46', margin: '16px 0 6px' }
 const FIELD = {
   height: 44,
   border: '1px solid #d4d4d8',
   borderRadius: 10,
   padding: '0 12px',
   background: '#fff',
+  boxSizing: 'border-box',
+  overflow: 'hidden',
+}
+const ERROR_BOX = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  background: '#fef3f2',
+  border: '1px solid #fecdca',
+  color: '#b42318',
+  fontSize: 14,
+  lineHeight: 1.4,
+  borderRadius: 10,
+  padding: '10px 12px',
+  margin: '16px 0 0',
+}
+const ERROR_DOT = {
+  flex: '0 0 auto',
+  width: 18,
+  height: 18,
+  borderRadius: '50%',
+  background: '#b42318',
+  color: '#fff',
+  fontSize: 12,
+  fontWeight: 700,
+  lineHeight: '18px',
+  textAlign: 'center',
 }
 function payButtonStyle(disabled) {
   return {
     width: '100%',
-    marginTop: 22,
+    marginTop: 24,
     background: disabled ? '#9dbcf0' : '#1f6feb',
     color: '#fff',
     fontWeight: 600,
     fontSize: 16,
-    padding: '13px 0',
+    padding: '14px 0',
     border: 'none',
     borderRadius: 10,
     cursor: disabled ? 'default' : 'pointer',
+    boxShadow: disabled ? 'none' : '0 1px 2px rgba(31,111,235,0.4)',
+    transition: 'background .15s ease',
   }
 }

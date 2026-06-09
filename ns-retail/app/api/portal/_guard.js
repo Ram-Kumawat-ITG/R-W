@@ -74,7 +74,13 @@ export function portalLoader(handler) {
 
     let ctx;
     try {
-      ctx = await resolvePractitionerByCustomerGid(sessionToken?.sub);
+      // Pass `dest` (the store the portal runs on) so the resolver can bridge
+      // to the wholesale application by email when the per-store customer GID
+      // doesn't match directly (portal now runs on the ns-retail store).
+      ctx = await resolvePractitionerByCustomerGid(
+        sessionToken?.sub,
+        sessionToken?.dest,
+      );
     } catch (e) {
       if (e?.code === resolvePractitionerByCustomerGid.ERR_FORBIDDEN) {
         return sendResponse(

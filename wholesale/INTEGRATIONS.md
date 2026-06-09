@@ -1928,16 +1928,27 @@ banner, plus an optional outbound webhook when `ACH_ALERT_WEBHOOK_URL`
 is configured). A transaction still awaiting settlement past
 `ACH_SYNC_STUCK_DAYS` (default 5) raises a throttled "stuck" alert.
 
-### 9.6 Immediate Payment — hosted self-pay link + QR
+### 9.6 Immediate Payment — self-pay link
 
 A 4th payment method, **`immediate`**, for customers who pay each invoice
 themselves, on demand, for the exact amount — no stored vault, never
-auto-charged. The QBO invoice they receive carries a **payment link** and a
-**QR code**, both leading to an NMI-hosted payment page pre-set to the
-current outstanding balance.
+auto-charged. The QBO invoice they receive carries a clickable **payment
+link** leading to an in-app Collect.js page pre-set to the current outstanding
+balance. (Link only — the QR code was removed per request 2026-06-09.)
 
 **Durable in-app link.** The link baked into the invoice is **our** URL —
-`/pay/:token` — so it stays valid for days. The QR encodes the same URL.
+`/pay/:token`. The base is `PAY_LINK_BASE_URL` (falls back to
+`SHOPIFY_APP_URL`) and **must be a stable public host**: the URL is frozen
+into the QBO invoice `CustomerMemo` at creation, so if the base changes the
+old links die. In production `SHOPIFY_APP_URL` is stable; in dev,
+`shopify app dev` rotates the trycloudflare tunnel each restart, so set
+`PAY_LINK_BASE_URL` to a stable tunnel/domain. The opaque token (and the
+`/pay/<token>` path) never changes — only the host — so an admin can heal an
+already-issued invoice with **"Refresh link on invoice"** on Order Details
+(`POST /api/admin/orders/:id/refresh-pay-link` → `refreshImmediatePayLink`,
+which rewrites the memo's `Pay online:` line to the current URL). The Order
+Details "Payment link" section also rebuilds a live link from the token + the
+current base, so admins always see/copy a working link.
 
 **Token.** `Invoice.payToken` is an opaque 256-bit random string
 (`payLink.utils.mintPayToken`). It carries **no amount** — the outstanding
@@ -1947,21 +1958,41 @@ defeats amount tampering; the random space defeats enumeration. Minted in
 `paymentPreference.service` when an open invoice is realigned to
 `immediate`).
 
-**On the QBO invoice** (QBO has no inline-image API, so):
-- the pay URL is appended to the `CustomerMemo` as a bare `Pay online:
-  <url>` line (auto-linkifies in the emailed invoice / PDF), and
-- the QR PNG is attached to the invoice via the Attachable `/upload`
-  multipart endpoint (`qbo.apis.qboUpload` → `qbo.service.attachQrToInvoice`,
-  `IncludeOnSend:true`) so it is delivered with the invoice email.
+**On the QBO invoice.** The pay URL is appended to the `CustomerMemo` as a
+bare `Pay your invoice online:` label followed by the URL **alone on its own
+line** (QBO has no inline-image/button API; a bare URL auto-linkifies in the
+emailed invoice / PDF). Done in `createInvoiceForOrder` **before** the Phase-4
+`/send` so the first email already carries the link.
 
-Both happen in `createInvoiceForOrder` **before** the Phase-4 `/send`, and
-both are best-effort — a QR/upload failure is logged and skipped, never
-breaking invoicing (the memo link is the primary CTA).
+**Guaranteeing a complete, un-truncated URL.** Two defects could previously
+emit an incomplete/invalid link, independent of the host:
+
+1. `buildPayLinkUrl` returned a host-less `/pay/<token>` when the base URL was
+   empty/misconfigured — a structurally invalid (relative) link. It now
+   **throws** unless the base is a complete absolute `http(s)://host`, so a
+   broken base fails loudly at issue time instead of baking a dead link into a
+   QBO memo for days. Display callers (Order Details loader) guard with
+   try/catch and surface the misconfig in a banner; the admin
+   `refresh-pay-link` endpoint returns the error as a 502.
+2. `setInvoicePayLinkMemo` built `base + payLinkBlock` then sliced the whole
+   string to QBO's 1000-char cap — truncating **from the end**, i.e. chopping
+   the pay URL itself when the base memo was long. Both the creation and
+   refresh paths now share `payLink.utils.appendPayLinkToMemo`, which trims the
+   **base memo** to fit the cap and always appends the pay-link block (label +
+   complete URL) intact.
+
+The token itself is hyphen-free **base62** (`mintPayToken`), so the token can
+never be split by a linkifier that breaks on `-`/`_`. The remaining truncation
+risk is purely cosmetic line-wrapping of a long **host** (a dev trycloudflare
+tunnel like `maintains-talked-cardiac-improved.trycloudflare.com` wraps and
+breaks at its hostname hyphens in the PDF) — solved operationally by setting
+`PAY_LINK_BASE_URL` to a short, stable, hyphen-free production host. The "URL
+alone on its own line" memo layout minimises this.
 
 **Payment flow (NMI Collect.js — single page):**
 
 ```
-QBO invoice (link + QR)  →  GET /pay/:token  (api/pay/pay.jsx)
+QBO invoice (Pay online: link)  →  GET /pay/:token  (api/pay/pay.jsx)
    guard paid/cancelled/outstanding≤0 → friendly page (no form)
    else: render NMI Collect.js card form (iframe fields) + "Pay $X"
 customer enters card → CollectJS tokenizes (card never hits our server)
@@ -1998,7 +2029,7 @@ collects the full fee-inclusive amount. Due window: `IMMEDIATE_DUE_DATE`.
 `immediate` invoices are auto-excluded from every sweep.
 
 **Admin.** Order Details renders a "Payment link" section (clickable link +
-inline QR via `renderPayQrDataUrl` + copy button + payment-status badge).
+copy button + **"Refresh link on invoice"** + payment-status badge).
 The preference is set via admin `POST /api/admin/customers/:id/payment-method`
 (`normalizePaymentMethod` + the model enums already accept `immediate`); the
 **registration-form UI for choosing Immediate Payment is intentionally out of
@@ -2006,10 +2037,11 @@ scope here** and handled separately.
 
 **Config.** `NMI_COLLECT_JS_URL` (Collect.js script; per-environment default,
 overridable) + `NMI_PUBLIC_KEY` (publishable tokenization key, already
-configured for the registration form). The one-time charge runs through
+configured for the registration form) + `PAY_LINK_BASE_URL` (stable link base;
+falls back to `SHOPIFY_APP_URL`). The one-time charge runs through
 `nmi.service.chargeWithPaymentToken` (`type=sale` + `payment_token`). Files:
 `services/payment/payLink.{utils,service}.js`, `app/api/pay/pay.jsx`,
-`app/components/pay-ui.jsx`. New deps: `qrcode`.
+`app/api/admin/refresh-pay-link.js`, `app/components/pay-ui.jsx`.
 
 ---
 
@@ -2695,6 +2727,7 @@ required values throw immediately.
 | `NMI_API_URL` | _auto_ | Override transact.php URL |
 | `NMI_QUERY_URL` | _auto_ | Override query.php URL |
 | `NMI_COLLECT_JS_URL` | _auto_ | Collect.js script URL for the Immediate Payment self-pay page (§9.6). Auto-derived per environment (`secure`/`sandbox`); the page loads it with the publishable `NMI_PUBLIC_KEY` as the tokenization key. |
+| `PAY_LINK_BASE_URL` | `SHOPIFY_APP_URL` | Stable public base URL for the Immediate Payment link baked into the QBO invoice (§9.6). Pin this in dev (the trycloudflare tunnel rotates each restart, killing old links); unset in prod to use the stable `SHOPIFY_APP_URL`. |
 | `NMI_TEST_CCNUMBER` | (optional) | Dev test card number (sandbox only) |
 | `NMI_TEST_CCEXP` | (optional) | Dev test card expiry MMYY |
 | `NMI_TEST_CVV` | (optional) | Dev test card CVV |

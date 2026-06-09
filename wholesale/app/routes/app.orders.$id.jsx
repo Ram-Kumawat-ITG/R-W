@@ -20,7 +20,7 @@ import {
   resolveCustomerAchBillingId,
 } from "../services/customer/customer.service";
 import { syncFulfillmentsFromShopify } from "../services/order/order.service";
-import { buildPayLinkUrl, renderPayQrDataUrl } from "../services/payment/payLink.utils";
+import { buildPayLinkUrl } from "../services/payment/payLink.utils";
 import { invoiceConfig } from "../services/invoice/invoice.config";
 import {
   computeProcessingFee,
@@ -366,24 +366,18 @@ export const loader = async ({ request, params }) => {
     }
   }
 
-  // Immediate Payment — surface the customer's self-pay link + an inline
-  // QR (so an admin can copy/share it or scan it) for invoices that carry a
-  // pay token. The QR data URL is generated on the fly; the durable QR also
-  // lives on the QBO invoice as an attachment.
+  // Immediate Payment — surface the customer's self-pay link for invoices
+  // that carry a pay token. Rebuilt from the current configured base URL so
+  // the admin always sees a live link (the link baked into the QBO invoice
+  // memo is frozen at creation time).
   let payLink = null;
   if (invoice?.payToken) {
-    const url = buildPayLinkUrl(invoice.payToken);
-    let qrDataUrl = null;
     try {
-      qrDataUrl = await renderPayQrDataUrl(url);
+      payLink = { url: buildPayLinkUrl(invoice.payToken) };
     } catch (e) {
-      console.error("[orders] pay-link QR render failed:", e?.message || e);
+      // Misconfigured base URL — surface it instead of 500-ing the page.
+      payLink = { url: null, error: e?.message || "Pay-link base URL not configured" };
     }
-    payLink = {
-      url,
-      qrDataUrl,
-      qrAttachedToInvoice: Boolean(invoice.qrAttachedAt),
-    };
   }
 
   // Card on file — the card captured at registration and vaulted in NMI.
@@ -613,6 +607,7 @@ export default function OrderDetail() {
   const chargeCardFetcher = useFetcher();
   const pdfFetcher = useFetcher();
   const sendInvoiceFetcher = useFetcher();
+  const refreshPayLinkFetcher = useFetcher();
   const pauseAutoChargeFetcher = useFetcher();
   const resumeAutoChargeFetcher = useFetcher();
   const pauseRemindersFetcher = useFetcher();
@@ -643,6 +638,7 @@ export default function OrderDetail() {
   const handledChargeCardRef = useRef(null);
   const handledPdfRef = useRef(null);
   const handledSendInvoiceRef = useRef(null);
+  const handledRefreshPayLinkRef = useRef(null);
   const handledPauseAutoChargeRef = useRef(null);
   const handledResumeAutoChargeRef = useRef(null);
   const handledPauseRemindersRef = useRef(null);
@@ -1312,6 +1308,35 @@ export default function OrderDetail() {
   const sendInvoiceLoading =
     sendInvoiceFetcher.state === "submitting" ||
     sendInvoiceFetcher.state === "loading";
+
+  // Refresh payment link — re-stamp the QBO invoice memo with the pay link
+  // built from the CURRENT app URL (fixes links baked to a rotated dev
+  // tunnel). Loader auto-revalidates, so the displayed link updates too.
+  const onRefreshPayLink = () => {
+    setBannerError(null);
+    setBannerSuccess(null);
+    refreshPayLinkFetcher.submit(null, {
+      method: "POST",
+      action: `/api/admin/orders/${order._id}/refresh-pay-link`,
+    });
+  };
+  useEffect(() => {
+    if (!refreshPayLinkFetcher.data) return;
+    if (refreshPayLinkFetcher.state !== "idle") return;
+    if (handledRefreshPayLinkRef.current === refreshPayLinkFetcher.data) return;
+    handledRefreshPayLinkRef.current = refreshPayLinkFetcher.data;
+    const data = refreshPayLinkFetcher.data;
+    if (data.status === "success") {
+      setBannerSuccess(data.message || "Payment link refreshed");
+      shopify?.toast?.show(data.message || "Payment link refreshed");
+    } else {
+      setBannerError(data.message || "Could not refresh payment link");
+      shopify?.toast?.show(data.message || "Refresh failed", { isError: true });
+    }
+  }, [refreshPayLinkFetcher.data, refreshPayLinkFetcher.state, shopify]);
+  const refreshPayLinkLoading =
+    refreshPayLinkFetcher.state === "submitting" ||
+    refreshPayLinkFetcher.state === "loading";
 
   const outstanding =
     invoice != null
@@ -2408,45 +2433,47 @@ export default function OrderDetail() {
         <s-section heading="Payment link (Immediate Payment)">
           <s-stack direction="block" gap="base">
             <s-paragraph>
-              This customer pays each invoice on demand via a secure link and QR
-              code included on the QuickBooks invoice. The link always charges the
+              This customer pays each invoice on demand via a secure link
+              included on the QuickBooks invoice. The link always charges the
               current outstanding balance.
             </s-paragraph>
             <s-stack direction="inline" gap="base">
               <PaymentStatusBadge status={invoice.paymentStatus} />
             </s-stack>
-            <s-stack direction="inline" gap="base">
-              <s-link href={payLink.url} target="_blank">
-                {payLink.url}
-              </s-link>
-              <s-button
-                variant="secondary"
-                onClick={() => {
-                  if (typeof navigator !== "undefined" && navigator.clipboard) {
-                    navigator.clipboard.writeText(payLink.url);
-                    shopify.toast.show("Payment link copied");
-                  }
-                }}
-              >
-                Copy link
-              </s-button>
-            </s-stack>
-            {payLink.qrDataUrl && (
-              <img
-                src={payLink.qrDataUrl}
-                alt="QR code to pay this invoice"
-                width="160"
-                height="160"
-              />
+            {payLink.url ? (
+              <s-stack direction="inline" gap="base">
+                <s-link href={payLink.url} target="_blank">
+                  {payLink.url}
+                </s-link>
+                <s-button
+                  variant="secondary"
+                  onClick={() => {
+                    if (typeof navigator !== "undefined" && navigator.clipboard) {
+                      navigator.clipboard.writeText(payLink.url);
+                      shopify.toast.show("Payment link copied");
+                    }
+                  }}
+                >
+                  Copy link
+                </s-button>
+                <s-button
+                  variant="secondary"
+                  onClick={onRefreshPayLink}
+                  {...(refreshPayLinkLoading ? { loading: true } : {})}
+                >
+                  Refresh link on invoice
+                </s-button>
+              </s-stack>
+            ) : (
+              <s-banner tone="critical">
+                Can&apos;t build the payment link: {payLink.error}
+              </s-banner>
             )}
-            <KV
-              label="QR on QBO invoice"
-              value={
-                payLink.qrAttachedToInvoice
-                  ? "Attached — included with the invoice email"
-                  : "Not attached (link in invoice memo still works)"
-              }
-            />
+            <s-text tone="subdued">
+              The link is saved on the QuickBooks invoice when it&apos;s created.
+              If the app&apos;s URL has changed since then, click “Refresh link on
+              invoice” to update the emailed/QBO copy to this current link.
+            </s-text>
           </s-stack>
         </s-section>
       )}

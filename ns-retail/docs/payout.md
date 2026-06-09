@@ -618,13 +618,44 @@ the same app).
 extension obtains a session-token JWT via `shopify.sessionToken.get()` and sends
 `Authorization: Bearer`. `portalLoader` (in `_guard.js`) verifies it with
 `authenticate.public.customerAccount`, then `resolvePractitionerByCustomerGid`
-maps the token's `sub` (customer GID) → an **approved** `WholesaleApplication`
-whose `_id` is the `practitionerId`. Every aggregation in `cdo.portal.service.js`
-is scoped by `{ practitionerId }`. Auth failures map to `401` (not signed in /
-no `sub`) and `403` (signed in, not an approved practitioner). A null-origin Web
-Worker + the Authorization header make the fetch non-simple, so `portalAction`
-answers the CORS `OPTIONS` preflight and the library `cors` helper stamps
-success responses.
+applies the access policy on **every** request (it wraps every endpoint), in two
+gates, before any portal data is read:
+
+1. **Required tags** — the customer must carry BOTH the **`Practitioner`** and
+   **`Approved`** tags on the ns-retail store. Tags are read from Shopify (the
+   Admin API, trusted) — never the client — and matched **case-insensitively as
+   exact whole tags** (so `archived-practitioner` / `wholesale-Practitioner` do
+   NOT satisfy `practitioner`). `hasRequiredPortalTags(tags)` is the predicate.
+2. **Tenant resolution** — the customer must resolve to an **approved**
+   `WholesaleApplication` whose `_id` is the `practitionerId`.
+
+Either gate failing → `403`. Every aggregation in `cdo.portal.service.js` is
+scoped by `{ practitionerId }`. Auth failures map to `401` (not signed in / no
+`sub`) and `403` (signed in but not authorized — missing tags or not an approved
+practitioner). A null-origin Web Worker + the Authorization header make the
+fetch non-simple, so `portalAction` answers the CORS `OPTIONS` preflight and the
+library `cors` helper stamps success responses. **Frontend:** the extension
+calls `me` before rendering and shows a "sign in" (`401`) or "Access restricted"
+(`403`) screen instead of the dashboard — but the backend tag gate on every
+endpoint is the authoritative boundary (a direct API call without the tags still
+`403`s). *Note: the customer-account navigation link to the page is rendered by
+Shopify's account shell and can't be conditionally hidden per-customer from the
+extension; the page-level gate + backend `403` are what prevent access.*
+
+> **Cross-store identity (post-move fix, 2026-06-09).** `wholesale_applications.customerId`
+> is the customer's GID **on the wholesale store** (where they registered), but the
+> portal now runs on the **ns-retail store**, where the same person has a *different*
+> customer GID (Shopify customer GIDs are per-store). So `resolvePractitionerByCustomerGid(sub, dest)`
+> first tries a direct `customerId === sub` match (same-store fast path), and on miss
+> **bridges by email**: it reads the logged-in customer's email + tags from the ns-retail
+> store via the Admin API (`unauthenticated.admin(dest)` → `customer(id: sub){ email tags }`,
+> needs `read_customers`/`write_customers`) and matches an approved application on `email`
+> (the stable, store-independent key — read from Shopify, never the client; case-insensitive
+> + anchored). The same lookup supplies the `tags` for the access gate above. **The lookup
+> is LIVE and UNCACHED — it runs on every portal request**, so access is always decided on
+> the customer's CURRENT Shopify tags (adding/removing a tag takes effect on the very next
+> request; nothing is read from a MongoDB mirror). Without the email bridge, every ns-retail
+> login 403s ("Access restricted") — the regression seen right after the move.
 
 **Endpoints** (all GET, served at `${api_base_url}/api/portal/*`): `me`,
 `summary`, `revenue` (month/last/year/lifetime + range), `customers` (referred
@@ -633,9 +664,13 @@ commission breakdown), `referrals` (codes + usage), `discounts` (derived from
 codes). Pagination + search + date-range filters where applicable.
 
 **Prerequisites (Partner dashboard, ns-retail app):** customer accounts
-enabled + protected customer data access (for the `sub` claim). **Merchant step
-after deploy:** add the page to the customer-account navigation menu and set the
-extension's `api_base_url` setting to the ns-retail app URL.
+enabled + protected customer data access (for the `sub` claim) + the
+`read_customers` scope (for the cross-store email bridge above). The
+practitioner must have a **customer account on the ns-retail store using the
+same email** as their approved wholesale application — that email is the bridge
+key. **Merchant step after deploy:** add the page to the customer-account
+navigation menu and set the extension's `api_base_url` setting to the ns-retail
+app URL.
 
 **Dev workflow:** paste the current `shopify app dev` tunnel URL into
 `extensions/practitioner-portal-account/src/config.js` `DEV_API_BASE_URL` (it
