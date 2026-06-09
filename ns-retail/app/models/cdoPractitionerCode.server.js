@@ -34,6 +34,13 @@ const cdoPractitionerCodeSchema = new mongoose.Schema(
     // Falls back to cdo_settings.defaultCommissionRate when null.
     commissionRate: { type: Number, default: null },
 
+    // Populated after the matching Shopify discount object is created on
+    // the retail store. shopifyDiscountUrl is the shareable storefront URL
+    // (https://<retail-shop>/discount/<code>) — visiting auto-applies the
+    // code at checkout. Both stay null if discount creation failed.
+    shopifyDiscountId: { type: String, default: null },
+    shopifyDiscountUrl: { type: String, default: null },
+
     status: {
       type: String,
       enum: ["active", "paused", "archived"],
