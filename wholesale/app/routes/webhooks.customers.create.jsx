@@ -14,6 +14,7 @@ import { createLogger } from "../utils/logger.utils";
 import connectDB from "../services/APIService/mongo.service";
 import WholesaleApplication from "../models/wholesaleApplication.server";
 import { syncPractitionerToRetail } from "../services/retailSync/practitioner.service";
+import { dropshipConfig } from "../services/dropship/dropship.config";
 
 const log = createLogger("webhook.customers_create");
 
@@ -189,6 +190,29 @@ export const action = async ({ request }) => {
 
       const orderCount = Number(live.numberOfOrders || 0);
       const stillNoApprovedTag = !hasTag(liveTags, APPROVED_TAG);
+
+      // Whitelist the synthetic drop-ship customer created by
+      // dropship.service.ensureNsRetailCustomer. It carries the
+      // ns-retail-internal tag (NOT Approved) by design — it's a B2B
+      // anchor for retail-triggered orders, not a practitioner
+      // application. Without this guard the deletion below removes it
+      // immediately after creation, breaking the in-process GID cache
+      // and causing draftOrderCreate to fail with "Record is invalid"
+      // on subsequent drop-ship orders.
+      if (
+        (customerEmail &&
+          customerEmail === dropshipConfig.retailCustomerEmail) ||
+        hasTag(liveTags, dropshipConfig.retailCustomerTag)
+      ) {
+        console.log(
+          `[webhook] keeping drop-ship internal customer ${customerId} (email=${customerEmail})`,
+        );
+        log.info("kept.dropship_internal", {
+          customerId,
+          email: customerEmail,
+        });
+        return;
+      }
 
       if (orderCount === 0 && stillNoApprovedTag) {
         // Safe to delete — no orders attached.
