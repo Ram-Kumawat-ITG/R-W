@@ -101,8 +101,8 @@ export default function PayPage() {
     return (
       <PayResult
         tone="success"
-        title="This invoice is already paid"
-        message="No further payment is needed. Thank you!"
+        title="Payment Successful!"
+        message="Your payment has been received and processed successfully. No further action is required. You may now safely close this window."
       />
     )
   }
@@ -225,16 +225,38 @@ function CollectCheckout({ amount, currency, docNumber, tokenizationKey, collect
     return (
       <PayResult
         tone="success"
-        title="Payment received — thank you!"
+        title="Payment Successful"
         amount={Number.isFinite(fetcher.data.amount) ? fetcher.data.amount : undefined}
         currency={fetcher.data.currency || currency}
-        message="Your payment was processed successfully. A receipt will follow from QuickBooks. You can close this window."
+        message={
+          'Thank you! Your payment has been received and processed successfully.\n\n' +
+          'No further action is required. You may now safely close this window.'
+        }
       />
     )
   }
 
-  const actionError = fetcher.data && fetcher.data.ok === false ? fetcher.data.message : null
-  const shownError = actionError || error
+  // A failed charge from the server is a terminal result — show a clear failure
+  // screen (red ✕) with a Try-again that reloads a fresh payment form. No money
+  // is ever captured on an ok:false outcome, so we can reassure the customer.
+  if (fetcher.data && fetcher.data.ok === false) {
+    return (
+      <PayResult
+        tone="critical"
+        title="Payment Failed"
+        message={
+          (fetcher.data.message || 'Your payment could not be processed.') +
+          '\n\nNo charge was made to your card. Please check your details and try again, ' +
+          'or contact wholesale@naturalsolutionsphc.com if the problem continues.'
+        }
+        action={{ label: 'Try again', onClick: () => window.location.reload() }}
+      />
+    )
+  }
+
+  // Client-side issues (validation / tokenization / load) stay inline so the
+  // customer can correct them without leaving the form.
+  const shownError = error
 
   const onPay = () => {
     setError(null)
