@@ -19,15 +19,22 @@ function getAppBaseUrl() {
   // Shopify resolves $app:cdo at runtime to `app--<your-app-id>--cdo`.
   // We match on the key plus any namespace that ends with `cdo`, so both
   // the literal and the resolved forms are accepted.
+  //
+  // Shape gotcha: the Preact-based checkout-ui-extension API exposes
+  // metafields FLAT — `{ namespace, key, value }` directly. The older
+  // React-based API wrapped them under `.metafield`. Read both shapes
+  // so this works regardless of API version.
   const entry = list.find((m) => {
-    const ns = m?.metafield?.namespace || '';
-    const key = m?.metafield?.key || '';
+    const inner = m?.metafield || m;
+    const ns = inner?.namespace || '';
+    const key = inner?.key || '';
     return (
       key === METAFIELD_KEY &&
       (ns === '$app:cdo' || ns.endsWith('--cdo') || ns.endsWith(':cdo'))
     );
   });
-  const url = entry?.metafield?.value;
+  const inner = entry?.metafield || entry;
+  const url = inner?.value;
   if (!url) {
     throw new Error(
       'App URL not configured. Ask the store admin to open the app once in Shopify admin.',
@@ -68,6 +75,23 @@ const ApiService = {
   async verifyCode(code) {
     const data = await jsonPost('/api/cdo/checkout-validate-code', { code });
     return data?.result || { valid: false };
+  },
+
+  // POST /api/cdo/checkout-find-by-customer-id
+  // For LOGGED-IN customers. Checkout extension can't read customer.tags
+  // directly (known Shopify limitation), so we hand the customer GID +
+  // shop domain to our backend, which queries the customer's tags via
+  // Shopify Admin GraphQL and extracts the `code:*` tag.
+  // Returns { found: boolean, code?, practitionerName?, discountPercent? }
+  async findByCustomerId(
+    /** @type {string} */ customerId,
+    /** @type {string} */ shop,
+  ) {
+    const data = await jsonPost('/api/cdo/checkout-find-by-customer-id', {
+      customerId,
+      shop,
+    });
+    return data?.result || { found: false };
   },
 };
 

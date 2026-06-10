@@ -181,8 +181,8 @@ export const PAYMENT_METHODS = [
   {
     id: "immediate",
     name: "Immediate (pay-by-link)",
-    fee: null,
-    feeLabel: "No fees",
+    fee: "3% fee",
+    feeLabel: "3% fee",
     desc: "Email payment link per invoice. Pay on receipt — no auto-charge.",
   },
 ];

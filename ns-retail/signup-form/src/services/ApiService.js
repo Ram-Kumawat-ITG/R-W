@@ -1,7 +1,13 @@
 // Storefront-side fetch helpers. All routes hit our app via Shopify's app
-// proxy at /apps/<subpath>/api/*. The proxy is configured in
-// ns-retail/shopify.app.toml ([app_proxy] subpath = "retail-signup").
-const PROXY_BASE = 'wholesale-application'
+// proxy at /apps/<subpath>/api/*.
+//
+// PROXY_BASE must MATCH the subpath in ns-retail/shopify.app.toml
+// ([app_proxy] subpath = "retail-signup"). If it doesn't match, Shopify
+// routes the request to a different app OR returns 404, and every API
+// call silently fails. Read from VITE_RETAIL_PROXY_SUBPATH in
+// ns-retail/.env so it can't drift out of sync with the toml.
+const PROXY_BASE =
+  import.meta.env.VITE_RETAIL_PROXY_SUBPATH || 'retail-signup'
 
 const API = {
   checkEmail: `/apps/${PROXY_BASE}/api/auth/check-email`,
