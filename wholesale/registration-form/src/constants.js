@@ -159,7 +159,7 @@ export const REFERRALS = [
 export const PAYMENT_METHODS = [
   {
     id: "check",
-    name: "Check",
+    name: "Check Method",
     fee: null,
     feeLabel: "No fees",
     desc: "Balances emailed 1st & 15th. Check due within 10 business days.",
@@ -177,6 +177,13 @@ export const PAYMENT_METHODS = [
     fee: "3% fee",
     feeLabel: "3% fee",
     desc: "Card on file charged automatically. Most flexible option.",
+  },
+  {
+    id: "immediate",
+    name: "Immediate (pay-by-link)",
+    fee: null,
+    feeLabel: "No fees",
+    desc: "Email payment link per invoice. Pay on receipt — no auto-charge.",
   },
 ];
 

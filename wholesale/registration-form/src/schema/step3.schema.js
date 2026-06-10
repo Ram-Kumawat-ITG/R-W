@@ -23,25 +23,18 @@ const reqWhenAch = (msg) =>
     otherwise: (s) => s.notRequired(),
   })
 
-// Commission bank fields are gated by `commission.enabled` — when the
-// practitioner clicks "Add commission bank details" we flip enabled to
-// true and the fields become required. `useSamePaymentAccount` is a UI
-// shortcut: when payment method is ACH, ticking the box copies those
-// values into the commission fields client-side, so the fields still
-// receive valid input and validate normally.
-const reqWhenCommission = (msg) =>
-  yup.string().when('enabled', {
-    is: true,
-    then: (s) => s.required(msg),
-    otherwise: (s) => s.notRequired(),
-  })
+// Commission bank fields are ALWAYS required for every practitioner —
+// the opt-in toggle was removed per owner direction. `useSamePaymentAccount`
+// is a UI-only shortcut: when payment method is ACH, ticking the box
+// copies those values into the commission fields client-side, so the
+// fields still receive valid input and validate normally.
 
 export const step3Schema = yup.object({
   payment: yup.object({
     method: yup
       .string()
       .required('Required')
-      .oneOf(['check', 'ach', 'card']),
+      .oneOf(['check', 'ach', 'card', 'immediate']),
     cardholderName: yup.string().trim().required('Required'),
     achAccountName: reqWhenAch('Required'),
     achRoutingNumber: yup.string().when('method', {
@@ -65,31 +58,21 @@ export const step3Schema = yup.object({
     // cardNumber, cardExpiry, cardCvv, cardBrand removed — Collect.js handles validation
   }),
   commission: yup.object({
+    // `enabled` retained for back-compat with existing docs in Mongo,
+    // but always saved as `true` now (no opt-out at signup).
     enabled: yup.boolean(),
     useSamePaymentAccount: yup.boolean(),
-    bankAccountName: reqWhenCommission('Required'),
-    bankRoutingNumber: yup.string().when('enabled', {
-      is: true,
-      then: (s) =>
-        s
-          .required('Required')
-          .matches(/^\d{9}$/, 'Must be exactly 9 digits')
-          .test(
-            'aba-checksum',
-            'Invalid routing number',
-            (v) => isValidABA(v),
-          ),
-      otherwise: (s) => s.notRequired(),
-    }),
-    bankAccountNumber: yup.string().when('enabled', {
-      is: true,
-      then: (s) =>
-        s
-          .required('Required')
-          .matches(/^\d{4,17}$/, 'Must be 4 – 17 digits'),
-      otherwise: (s) => s.notRequired(),
-    }),
-    bankAccountType: reqWhenCommission('Required'),
+    bankAccountName: yup.string().trim().required('Required'),
+    bankRoutingNumber: yup
+      .string()
+      .required('Required')
+      .matches(/^\d{9}$/, 'Must be exactly 9 digits')
+      .test('aba-checksum', 'Invalid routing number', (v) => isValidABA(v)),
+    bankAccountNumber: yup
+      .string()
+      .required('Required')
+      .matches(/^\d{4,17}$/, 'Must be 4 – 17 digits'),
+    bankAccountType: yup.string().required('Required'),
   }),
   signature: yup
     .object({ drawn: yup.mixed().nullable() })

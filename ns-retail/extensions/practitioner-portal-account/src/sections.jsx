@@ -399,7 +399,7 @@ export function ReferralsSection({ onAuthError }) {
     // Given a wider column since the URL is long.
     {
       key: 'referralUrl',
-      label: 'Referral Complete URL',
+      label: 'Referral URL',
       width: '2fr',
       render: (r) =>
         r.referralUrl ? (

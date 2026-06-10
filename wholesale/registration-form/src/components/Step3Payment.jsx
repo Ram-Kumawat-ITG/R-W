@@ -157,13 +157,12 @@ function AchForm({ control, errors }) {
 
 const COMMISSION_ACCOUNT_TYPES = ['Checking', 'Savings', 'Business Checking']
 
-// Collapsible section for the practitioner's commission bank details.
-// Hidden behind a button by default — only shown when the user opts in
-// (matches the design decision from the registration spec). If their
-// payment method is ACH, a checkbox lets them re-use the same account
-// for commission payouts in one click.
+// Commission bank details — ALWAYS visible + required for every practitioner.
+// (Previously gated behind an opt-in button; the gating was removed per
+// owner direction so every practitioner provides a payout account at signup.)
+// If payment method is ACH, a "Use same account" checkbox auto-fills the
+// commission fields to save typing.
 function CommissionBankSection({ control, errors, setValue }) {
-  const enabled = useWatch({ control, name: 'commission.enabled' })
   const useSame = useWatch({ control, name: 'commission.useSamePaymentAccount' })
   const paymentMethod = useWatch({ control, name: 'payment.method' })
   const achAccountName = useWatch({ control, name: 'payment.achAccountName' })
@@ -176,37 +175,12 @@ function CommissionBankSection({ control, errors, setValue }) {
   // When user ticks "use same as payment ACH", copy values forward.
   // When they untick, leave whatever is there so they can edit freely.
   useEffect(() => {
-    if (!enabled || !useSame || paymentMethod !== 'ach') return
+    if (!useSame || paymentMethod !== 'ach') return
     setValue('commission.bankAccountName', achAccountName || '', { shouldValidate: true })
     setValue('commission.bankRoutingNumber', achRoutingNumber || '', { shouldValidate: true })
     setValue('commission.bankAccountNumber', achAccountNumber || '', { shouldValidate: true })
     setValue('commission.bankAccountType', achAccountType || '', { shouldValidate: true })
-  }, [enabled, useSame, paymentMethod, achAccountName, achRoutingNumber, achAccountNumber, achAccountType, setValue])
-
-  if (!enabled) {
-    return (
-      <>
-        <div className="rf-divider">
-          <h2 className="rf-section-label">Commission payouts (optional)</h2>
-          <p className="rf-section-hint">
-            If you earn commissions on referred patient orders, we'll deposit
-            them to a bank account you provide. You can add this now or later.
-          </p>
-        </div>
-        <button
-          type="button"
-          className="rf-btn rf-btn-secondary"
-          style={{ marginTop: 4 }}
-          onClick={() => setValue('commission.enabled', true, { shouldValidate: false })}
-        >
-          <svg className="rf-icon-svg" viewBox="0 0 24 24">
-            <path d="M12 5v14M5 12h14" />
-          </svg>
-          Add commission bank details
-        </button>
-      </>
-    )
-  }
+  }, [useSame, paymentMethod, achAccountName, achRoutingNumber, achAccountNumber, achAccountType, setValue])
 
   const fieldsLocked = useSame && paymentMethod === 'ach'
 
@@ -345,17 +319,6 @@ function CommissionBankSection({ control, errors, setValue }) {
         {e.bankAccountType && <p className="rf-help error">{e.bankAccountType.message}</p>}
       </div>
 
-      <button
-        type="button"
-        className="rf-btn rf-btn-secondary"
-        style={{ marginTop: 4 }}
-        onClick={() => {
-          setValue('commission.enabled', false, { shouldValidate: false })
-          setValue('commission.useSamePaymentAccount', false, { shouldValidate: false })
-        }}
-      >
-        Remove commission bank details
-      </button>
     </>
   )
 }
@@ -412,6 +375,32 @@ export default function Step3Payment({ control, errors, onEditBilling, isSubmitt
         </div>
       )}
 
+      {paymentMethod === 'immediate' && (
+        <div className="rf-immediate-info">
+          <div className="rf-immediate-info-head">
+            <svg
+              className="rf-icon-svg"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              style={{ width: 18, height: 18, flexShrink: 0 }}
+            >
+              <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z" />
+              <polyline points="22,6 12,13 2,6" />
+            </svg>
+            <strong>How Immediate billing works</strong>
+          </div>
+          <p>
+            You&apos;ll get an email with a secure payment link for every
+            invoice. Click the link to pay immediately when you receive it
+            — no auto-charge, no card stored.
+          </p>
+        </div>
+      )}
+
       <div className="rf-divider">
         <h2 className="rf-section-label">Card on file</h2>
         <p className="rf-section-hint">
@@ -454,6 +443,11 @@ export default function Step3Payment({ control, errors, onEditBilling, isSubmitt
             <li>Charge my selected payment method for approved purchases and outstanding invoices</li>
             <li>Store my card information on file for future transactions related to my account</li>
             <li>Accept my resale certificate for non-taxable purchases (if applicable)</li>
+            <li>
+              Treat my signature below as my W-9 certification (Part II) — I
+              certify under penalties of perjury that the taxpayer information
+              I provided on Step 4 is correct.
+            </li>
           </ul>
         </div>
         <div className="rf-auth-section">

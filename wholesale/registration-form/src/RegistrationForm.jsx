@@ -5,7 +5,9 @@ import { fullSchema } from "./schema/full.schema";
 import { step1Fields } from "./schema/step1.schema";
 import { step2Fields } from "./schema/step2.schema";
 import { step3Fields } from "./schema/step3.schema";
-import { step4Fields } from "./schema/step4.schema";
+// step4Fields exists in ./schema/step4.schema but isn't triggered separately —
+// Step 4 only has a Submit button (no Continue), so full-schema validation via
+// yupResolver covers w9.* on submit.
 import { buildFormData } from "./utils/buildFormData";
 import ApiService from "./services/ApiService";
 import { useStepValidation } from "./hooks/useStepValidation";
@@ -75,11 +77,11 @@ const defaultValues = {
     achAccountNumber: "",
     achAccountType: "",
   },
-  // Commission bank — hidden behind a button on Step 3. enabled flips to
-  // true when practitioner opts in. Field-level required validation gates
-  // on `enabled` (see step3.schema.js).
+  // Commission bank — ALWAYS required for every practitioner. The
+  // `enabled` field stays in the data model for back-compat with older
+  // docs and future opt-out flows, but defaults to true here.
   commission: {
-    enabled: false,
+    enabled: true,
     useSamePaymentAccount: false,
     bankAccountName: "",
     bankRoutingNumber: "",
@@ -89,7 +91,10 @@ const defaultValues = {
   signature: { drawn: null },
   // Step 4 — W-9 form. legalName auto-fills from firstName + lastName on
   // mount (see Step4W9.jsx). Tax classification is required; sub-fields
-  // (llcClassification / otherClassification) gate on selection.
+  // (llcClassification / otherClassification) gate on selection. There is
+  // NO separate W-9 signature field here — the Step 3 signature serves
+  // dual purpose (terms + W-9 cert). Backend copies it into w9.signature
+  // at save time for audit clarity.
   w9: {
     legalName: "",
     taxClassification: "",
@@ -97,7 +102,6 @@ const defaultValues = {
     otherClassification: "",
     exemptPayeeCode: "",
     fatcaCode: "",
-    signature: { drawn: null },
   },
   subscribeNews: false,
   termsAccepted: false,
@@ -318,28 +322,28 @@ function FormBody({ onBack }) {
         cardPayload.achAccountType = values.payment.achAccountType;
       }
 
-      // Commission bank — if enabled, include FULL details (account name,
-      // routing, full account number, type). useSamePaymentAccount is a
-      // UI-only flag (already used to mirror payment ACH values into the
-      // commission fields client-side) and isn't persisted on its own.
-      const commissionPayload = values.commission?.enabled
-        ? {
-            enabled: true,
-            bankAccountName: values.commission.bankAccountName,
-            bankRoutingNumber: values.commission.bankRoutingNumber,
-            bankAccountNumber: values.commission.bankAccountNumber,
-            bankAccountLast4: (
-              values.commission.bankAccountNumber || ""
-            ).slice(-4),
-            bankAccountType: values.commission.bankAccountType,
-            sourcedFromPaymentAch: Boolean(
-              values.commission.useSamePaymentAccount &&
-                values.payment.method === "ach",
-            ),
-          }
-        : { enabled: false };
+      // Commission bank — ALWAYS included (required for every practitioner).
+      // useSamePaymentAccount is a UI-only flag (already used to mirror
+      // payment ACH values into the commission fields client-side) and
+      // isn't persisted on its own.
+      const commissionPayload = {
+        enabled: true,
+        bankAccountName: values.commission.bankAccountName,
+        bankRoutingNumber: values.commission.bankRoutingNumber,
+        bankAccountNumber: values.commission.bankAccountNumber,
+        bankAccountLast4: (
+          values.commission.bankAccountNumber || ""
+        ).slice(-4),
+        bankAccountType: values.commission.bankAccountType,
+        sourcedFromPaymentAch: Boolean(
+          values.commission.useSamePaymentAccount &&
+            values.payment.method === "ach",
+        ),
+      };
 
-      // W-9 payload — everything except the signature (sent as a File).
+      // W-9 payload — data fields only. No signature here: the Step 3
+      // signature serves dual purpose (terms + W-9 cert). Backend mirrors
+      // the uploaded signature URL into w9.signature at save time.
       const w9Payload = {
         legalName: values.w9?.legalName || "",
         taxClassification: values.w9?.taxClassification || "",
@@ -356,23 +360,12 @@ function FormBody({ onBack }) {
         w9: w9Payload,
       };
 
-      // Signatures handled separately so we can attach each PNG as a File.
-      // Two signatures: Step 3 (terms / payment authorization) and Step 4
-      // (W-9 IRS certification). Backend persists both as Shopify Files.
-      const fd = buildFormData({
-        ...payload,
-        signature: undefined,
-        w9: { ...w9Payload }, // strip the signature object from the W-9 payload too
-      });
+      // ONE signature uploaded — Step 3. The backend duplicates it into
+      // w9.signature server-side so the W-9 sub-doc still has an
+      // auditable signature reference without asking the user to sign twice.
+      const fd = buildFormData({ ...payload, signature: undefined });
       if (values.signature?.drawn) {
         fd.append("signatureFile", values.signature.drawn, "signature.png");
-      }
-      if (values.w9?.signature?.drawn) {
-        fd.append(
-          "w9SignatureFile",
-          values.w9.signature.drawn,
-          "w9-signature.png",
-        );
       }
 
       await ApiService.submitRegistration(fd);
