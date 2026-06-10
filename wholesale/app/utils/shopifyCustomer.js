@@ -12,15 +12,49 @@ export function toE164US(phone) {
   return null
 }
 
+// Top countries our practitioners come from. Used to convert the country
+// NAME stored in the form to the ISO-3166-1 code Shopify expects.
+// Anything not in this map falls back to the deprecated `country` string
+// field — Shopify accepts both but `countryCode` is the canonical input.
+const COUNTRY_NAME_TO_CODE = {
+  "United States": "US",
+  "United States of America": "US",
+  "USA": "US",
+  "Canada": "CA",
+  "Mexico": "MX",
+  "United Kingdom": "GB",
+  "Australia": "AU",
+  "New Zealand": "NZ",
+  "Germany": "DE",
+  "France": "FR",
+  "Ireland": "IE",
+}
+
 function mapAddress(a) {
   if (!a) return null
+  // Shopify `MailingAddressInput` prefers ISO codes:
+  //   country  (DEPRECATED, full name)   → countryCode  (e.g. "US")
+  //   province (DEPRECATED, full name)   → provinceCode (e.g. "PA")
+  //
+  // Our form stores:
+  //   country: "United States"            ← full name, needs mapping
+  //   state:   "PA"                       ← already a 2-letter code,
+  //                                         drop into provinceCode directly
+  //
+  // Before this fix, we sent { province: "PA", country: "United States" } —
+  // Shopify silently dropped the province because the deprecated field
+  // expects a FULL state name ("Pennsylvania"), not the code, and the
+  // resulting address ended up without state info OR was rejected entirely.
+  const countryCode = a.country ? COUNTRY_NAME_TO_CODE[a.country] : null
   return {
     address1: a.line1 || "",
     address2: a.line2 || "",
     city: a.city || "",
-    province: a.state || "",
+    provinceCode: a.state || "",
     zip: a.zip || "",
-    country: a.country || "",
+    ...(countryCode
+      ? { countryCode }
+      : { country: a.country || "" }),
   }
 }
 

@@ -193,6 +193,59 @@ Discover with `npm run cdo:qbo-accounts` (lists every account + `Id`).
 | `CDO_QBO_PAYMENT_ACCOUNT_ID` | Bank | BillPayment source |
 | `CDO_QBO_AP_ACCOUNT_ID` | Accounts Payable | (optional) Bill A/P account |
 
+### 6.5 Commission banking — source of truth + validation gate
+
+The practitioner's payout **destination** bank details are NOT stored in any
+`cdo_*` collection. They live on the canonical **`wholesale_applications.commission`**
+object (written by the wholesale workspace), e.g.:
+
+```jsonc
+"commission": {
+  "enabled": true,
+  "bankAccountName": "Durgesh",
+  "bankRoutingNumber": "490000018",
+  "bankAccountNumber": "24413815",
+  "bankAccountLast4": "3815",
+  "bankAccountType": "Checking",
+  "sourcedFromPaymentAch": false,
+  "updatedAt": "2026-06-10T07:30:08.800Z"
+}
+```
+
+`executeApprovedPayout` reads this **fresh at execution time** (never cached — so
+a payout always uses the LATEST banking on file) via
+`resolvePractitionerBanking(practitionerId)` and **validates before any QBO write
+or disbursement**:
+
+| Field | Rule |
+|---|---|
+| `enabled` | must not be `false` |
+| `bankAccountName` | non-empty |
+| `bankRoutingNumber` | 9 digits, valid ABA mod-10 checksum |
+| `bankAccountNumber` | 4–17 digits |
+| `bankAccountType` | `Checking` or `Savings` (case-insensitive) |
+
+- **Invalid / missing** → the payout is **flagged and aborted**: `status → failed`,
+  `bankingError` set, a `bank_invalid` remark with the specific reasons, a
+  `log.warn("payout.bank_invalid", …)` (reasons only — never the account number).
+  On the manual path the admin sees the reason as a toast; on the CRON the payout
+  becomes a failed batch item + `cdo.payout.alert`. A re-run after the practitioner
+  fixes their details proceeds.
+- **Valid** → a **masked** snapshot is recorded on the payout for audit /
+  reconciliation (`bankSnapshot{ accountName, routingNumber, accountLast4,
+  accountType, sourcedFromPaymentAch, bankingUpdatedAt, capturedAt }`) + a
+  `bank_validated` remark, and the destination (`name · type ••••last4 · routing`)
+  is written to the QBO Bill `PrivateNote`.
+
+**Security:** the full `bankAccountNumber` is used only transiently by the
+execution step — it is **never persisted** (only `accountLast4` + `routingNumber`
+are stored) and **never logged**. `bankingUpdatedAt` records exactly which version
+of the practitioner's banking (`commission.updatedAt`) a payout used.
+
+> This is the validated banking-data foundation the future ACH provider (§8) will
+> consume. QBO `BillPayment` still only records the accounting; it does not move
+> funds to the practitioner's bank.
+
 ---
 
 ## 7. Payout Automation (CRON) — IMPLEMENTED
@@ -211,9 +264,21 @@ Agenda job  process-commission-payouts
  1. accrueCommissionsForOrders()          // safety net (inline accrual already runs)
  2. autoApproveEligibleCommissions()      // pending → approved (skips paused / held)
  3. buildPayoutBatch({ periodEnd })        // aggregate eligible → awaiting_approval
- 4. for each batched payout:
-      approvePayout(system) → executeApprovedPayout(system)   // QBO Bill + BillPayment
- 5. summary { accrued, approved, batched, paid, failed[] }  + failure alerts
+ 4. IF CDO_PAYOUT_REQUIRE_APPROVAL (default true):
+      STOP — payouts wait in awaiting_approval for an admin to Approve + Execute.
+      The CRON moves NO money. (§8.3)
+    ELSE (legacy auto-disburse):
+      for each batched payout: approvePayout → executeApprovedPayout
+        ├─ resolvePractitionerBanking()   // §6.5 — validate banking BEFORE any QBO write
+        │    └─ invalid → status=failed + bank_invalid (no QBO write)
+        ├─ QBO Vendor + Bill              // records the liability
+        └─ provider.initiateTransfer()    // → awaiting_settlement (NOT paid)
+ 5. summary { accrued, approved, batched, awaitingApproval, paid, failed[] }  + alerts
+
+Settlement (separate CRON — §8.4):
+ process-payout-settlements → checkPayoutSettlement(payout):
+   settled → QBO BillPayment + commissions paid + ledger debit → paid
+   returned → failed (R-code captured); commissions kept reserved for retry
 ```
 
 **Wiring:** `app/services/scheduler/{scheduler.config,scheduler.service}.js` +
@@ -307,23 +372,58 @@ txn ref / payout date) and a **Reprocess failed** action.
 
 ---
 
-## 8. ACH Provider Integration (Future Phase)
+## 8. Real-money disbursement + settlement — IMPLEMENTED (provider-agnostic)
 
-QBO records the accounting; it does not, via the `BillPayment` API, move funds to a practitioner's bank. Options for the actual disbursement, to be decided:
+QBO records the accounting; its `BillPayment` API does **not** move funds to a practitioner's bank. The actual bank→bank transfer now flows through a **provider-agnostic disbursement layer** (`app/services/payout/`), and `paid` means **funds settled**, not "recorded in QBO".
+
+### 8.1 Money flow + lifecycle
 
 ```
-            ┌─────────────────────────────────────────────┐
- approved   │  Path A — QBO Bill Pay (Melio)               │
- payout ───▶│    QBO-native ACH; minimal new integration   │
-            ├─────────────────────────────────────────────┤
-            │  Path B — External ACH provider              │
-            │    (Dwolla / Stripe / Modern Treasury):      │
-            │    initiate ACH credit → poll settlement →    │
-            │    mark payout.paidAt only after FUNDS settle │
-            └─────────────────────────────────────────────┘
+ approved ──(admin Execute)──▶ executeApprovedPayout
+   │  banking gate (§6.5)
+   │  QBO Vendor + Bill            ← records the LIABILITY (we owe the commission)
+   │  provider.initiateTransfer()  ← initiates the bank→bank ACH credit
+   ▼
+ awaiting_settlement   (providerTransferId stored; NO "paid" yet)
+   │
+   │  process-payout-settlements CRON (or admin "Sync settlement")
+   │     → provider.getTransferStatus(transferId)
+   ▼
+ ┌── settled  → QBO BillPayment + commissions paid + ledger debit → paid
+ ├── returned → failed (capture R-code); commissions kept reserved → retry re-disburses
+ └── pending  → stay awaiting_settlement (normal 1–3 business-day ACH window)
 ```
 
-**Decisions to lock before go-live:** (a) which path; (b) the semantics of `paid` — "recorded in QBO" vs. "funds settled". If an external provider is used, add a `awaiting_settlement` state + a settlement-poll pass (analogous to the wholesale ACH settlement check), and only set `paid` on confirmed settlement.
+- **FROM** the business bank account (QBO `CDO_QBO_PAYMENT_ACCOUNT_ID`); **TO** the practitioner's account (`wholesale_applications.commission`, §6.5).
+- **`paid` is set only on confirmed settlement.** The QBO BillPayment is recorded at settlement (not at execution), so the books only claim "paid" once money has actually moved.
+- **Returns** (R01 NSF, R02 closed, R03 no account…) flip the payout to `failed` with `returnCode`/`returnReason`/`returnedAt`; the commissions stay reserved to the payout so **Execute** re-disburses the same payout (fresh idempotency key) once banking is fixed — no re-batching, no double-pay.
+
+### 8.2 Provider abstraction
+
+`getPayoutProvider()` (`app/services/payout/provider/`) returns an adapter implementing:
+
+```
+initiateTransfer({ amount, currency, destination, idempotencyKey, reference, metadata })
+  → { transferId, status: pending|settled|failed, returnCode?, returnReason? }
+getTransferStatus(transferId)
+  → { status: pending|settled|returned|failed, returnCode?, returnReason?, settledAt? }
+```
+
+Adapters MUST be idempotent on `idempotencyKey` (`cdo-payout-<payoutId>-<attempt>`) so a retried initiation never double-sends.
+
+- **`sandbox`** (default, `CDO_PAYOUT_PROVIDER=sandbox`) — in-process simulator; no real money. Encodes outcome + initiation time into the transfer id. **Magic test values:** account ending `9999` → rejected at initiation (R03); `0000` → returns (R01) after the settle delay; anything else → settles after `CDO_PAYOUT_SANDBOX_SETTLE_SECONDS`.
+- **`dwolla`** (`CDO_PAYOUT_PROVIDER=dwolla`) — **implemented** real ACH rail (`provider/dwollaProvider.js`, raw REST, no SDK). Per payout it: find-or-creates a **receive-only Customer** for the practitioner (by email), find-or-creates their bank **Funding Source** (routing/account/type — Dwolla dedupes via its duplicate-resource link), then creates a **Transfer** from the business funding source (`DWOLLA_FUNDING_SOURCE`) → the practitioner, with the `idempotencyKey` as Dwolla's `Idempotency-Key`. `getTransferStatus` maps Dwolla `processed → settled`, `failed/cancelled/reclaimed → returned` (with the ACH R-code from `/transfers/{id}/failure`), else `pending`. OAuth2 client-credentials token cached + auto-refreshed. Config: `DWOLLA_ENVIRONMENT` (sandbox|production), `DWOLLA_KEY`, `DWOLLA_SECRET`, `DWOLLA_FUNDING_SOURCE`. *Note: receive-only customers + transfers need a verified business funding source on the Dwolla account; polling is used today — a webhook handler (`customer_bank_transfer_completed/_failed`) would settle faster (future).* 
+- **`stripe` / `modern_treasury`** — not yet implemented; the factory throws a clear error until the adapter file + credentials are added. Dropping one in is a single new file + registering it in the factory; no changes to the payout logic.
+
+### 8.3 Human-approval gate
+
+`CDO_PAYOUT_REQUIRE_APPROVAL` (default **true**): the automated CRON accrues + auto-approves commissions + builds payouts that **wait in `awaiting_approval`** — an admin must **Approve + Execute** to move money. Set to `false` only for the legacy end-to-end auto-disburse path (discouraged with real money).
+
+### 8.4 Settlement reconciliation CRON
+
+`process-payout-settlements` (Agenda) sweeps every `awaiting_settlement` payout and calls `checkPayoutSettlement`. Cadence: `CDO_SETTLEMENT_CRON` (prod, default every 6h) / `CDO_SETTLEMENT_INTERVAL` (dev). The admin **Sync settlement** button runs the same check for one payout on demand.
+
+> **Still to lock before real go-live** (see Commission.md §9): choose + contract a real provider, bank-account ownership verification (micro-deposit/Plaid), encrypt/tokenize stored account numbers, funding-balance pre-check + payout caps, 1099/W-9 enforcement, and the NACHA originator agreement.
 
 ---
 
@@ -356,7 +456,8 @@ wholesale_applications (practitioner)        cdo_qbo_tokens (singleton/realm)
 **`cdo_payout_batches`** — one per automated run (CRON) or manual reprocess of the payout pipeline. The audit/reconciliation record. `reference, mode[cron|manual_reprocess], trigger, executionTime, startedAt, completedAt, status[running|completed|completed_with_errors|failed], totalCommissions, totalAmount, successCount, failedCount, skippedCount, payoutIds[], error, practitionerPayouts[{ practitionerId, practitionerName, practitionerEmail, payoutId, commissionCount, totalAmount, status, txnRef }] (one per practitioner — one aggregated payout each), items[{ commissionId, practitionerId, amount, status[processing|paid|failed|skipped|cancelled], attempt, failureReason, txnRef, payoutId, payoutDate }] (per-commission detail)`. *Indexes:* `(shop, createdAt)`, `(items.commissionId)`.
 
 **`cdo_payouts`** — a disbursement batch.
-`practitionerId, practitionerSource, practitionerEmail, practitionerName, currency, amount, method[ach|bank|paypal|check|manual], status[draft|awaiting_approval|approved|processing|paid|failed|rejected|cancelled], commissionIds[], qboVendorId, qboBillId, qboBillPaymentId, billCreatedAt, paymentRecordedAt, approvedBy/At, rejectedBy/At, rejectionReason, lastError, remarks[], periodStart, periodEnd, reference, paidAt`
+`practitionerId, practitionerSource, practitionerEmail, practitionerName, currency, amount, method[ach|bank|paypal|check|manual], status[draft|awaiting_approval|approved|processing|awaiting_settlement|paid|failed|rejected|cancelled], commissionIds[], qboVendorId, qboBillId, qboBillPaymentId, billCreatedAt, paymentRecordedAt, approvedBy/At, rejectedBy/At, rejectionReason, lastError, remarks[] (kinds incl. bank_validated / bank_invalid / transfer_initiated / settled / returned), bankSnapshot{accountName, routingNumber, accountLast4, accountType, sourcedFromPaymentAch, bankingUpdatedAt, capturedAt} (MASKED destination banking captured at execution from wholesale_applications.commission — §6.5; full account number never stored), bankingError, providerName, providerTransferId, providerStatus[pending|settled|returned|failed], transferInitiatedAt, transferAttemptCount, settledAt, settlementLastCheckedAt, returnCode, returnReason, returnedAt, periodStart, periodEnd, reference, paidAt`
+*Settlement lifecycle (§8): execute → `awaiting_settlement` (transfer initiated, QBO Bill recorded) → settlement poll → `paid` (QBO BillPayment recorded, funds settled) or `failed` (ACH return; commissions kept reserved for retry).*
 *Indexes:* `(practitionerId, periodEnd)` partial-unique on open statuses (idempotent batching).
 
 **`cdo_transactions`** — append-only practitioner ledger.
@@ -434,6 +535,7 @@ A failed execution sets `status = failed` + `lastError`; **Retry** re-runs `exec
 - **Approval gate:** no QBO posting without an admin `approve`; the actor is recorded.
 - **Least privilege:** the CDO QBO app needs only `com.intuit.quickbooks.accounting`.
 - **Accounting hygiene:** consistent expense + A/P accounts; Bill `DocNumber` = payout reference for traceability; amounts rounded to 2 decimals; reversals before payment (never silent edits to posted QBO docs).
+- **Practitioner bank details (§6.5):** read fresh from `wholesale_applications.commission` at execution time, validated before any disbursement. The full `bankAccountNumber` is **transient only** — never persisted to `cdo_payouts` (only `accountLast4` + `routingNumber` are snapshotted) and **never logged** (failure logs carry validation reasons, not the number); the alert webhook already excludes bank details.
 
 ---
 

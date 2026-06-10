@@ -4,10 +4,8 @@ import { useEffect } from "preact/hooks";
 import { useSignal } from "@preact/signals";
 import ApiService from "./services/ApiService";
 
-
 const CART_ATTR_KEY = "cdo_practitioner_code";
 const CODE_PATTERN = /^[a-z]+_[a-f0-9]{8}$/i;
-const CUSTOMER_TAG_PREFIX = "code:";
 
 export default async () => {
   render(<Extension />, document.body);
@@ -40,7 +38,35 @@ function Extension() {
     .map((d) => d?.code || "")
     .find((c) => CODE_PATTERN.test(c));
 
-  const customer = shopify?.customer?.value;
+  // shopify.buyerIdentity.customer is the correct path in checkout UI
+  // extension API 2026-04 (NOT shopify.customer directly — that returns
+  // undefined). Requires PCD Level 1 protected-customer-data access,
+  // which is already approved in the Partner Dashboard for this app.
+  const shopifyAny = /** @type {any} */ (shopify);
+  const customer = shopifyAny?.buyerIdentity?.customer?.value;
+  const shopDomain =
+    shopifyAny?.shop?.myshopifyDomain ||
+    shopifyAny?.shop?.value?.myshopifyDomain ||
+    "";
+
+  // Read appMetafields REACTIVELY in render so this component re-renders
+  // (and the effect below re-fires) when Shopify finishes loading the
+  // shop metafield list. Both `customer` and `appMetafields` are async
+  // signals — without this guard, the effect can fire on customer.id
+  // change BEFORE the metafield is populated, and ApiService throws
+  // "App URL not configured" with no retry.
+  const appMetafieldsValue =
+    /** @type {any[]} */ (shopifyAny?.appMetafields?.value) || [];
+  const hasAppUrl = appMetafieldsValue.some((/** @type {any} */ m) => {
+    const inner = m?.metafield || m;
+    const ns = inner?.namespace || "";
+    const key = inner?.key || "";
+    return (
+      key === "app_url" &&
+      (ns === "$app:cdo" || ns.endsWith("--cdo") || ns.endsWith(":cdo")) &&
+      Boolean(inner?.value)
+    );
+  });
 
   const isApplied =
     applyState.value === "applied" || Boolean(previouslyAppliedCode);
@@ -49,35 +75,69 @@ function Extension() {
       ? verifiedCode.value
       : previouslyAppliedCode || "";
 
-  // ── Auto-apply for logged-in customers ─────────────────────────────
-  // If the customer is logged in and has a "code:<code>" tag on their
-  // Shopify customer record (from signup form or a previous order's
-  // webhook), pre-fill the input, verify the code is still valid, and
-  // apply it automatically. The customer never has to type anything.
+  // ── Auto-apply for logged-in customers (PATH 1 only) ───────────────
+  //
+  // Shopify's checkout UI extension API does NOT expose customer.tags
+  // (documented limitation since July 2024). So we can't read the
+  // "code:<x>" tag in the extension directly. Instead: send the customer
+  // GID + shop domain to our backend, which queries the customer's tags
+  // via Shopify Admin GraphQL and extracts the code. Backend then
+  // re-validates the code is still active in cdo_practitioner_codes
+  // before returning it.
+  //
+  // Manual entry via the Verify button still works as a fallback.
   useEffect(() => {
     if (autoApplyAttempted.value) return;
-    if (!customer) return;
     if (isApplied) return;
     if (canUpdateDiscounts === false) return;
 
-    const tags = Array.isArray(customer.tags) ? customer.tags : [];
-    const codeTag = tags.find(
-      (t) =>
-        typeof t === "string" &&
-        t.toLowerCase().startsWith(CUSTOMER_TAG_PREFIX),
-    );
-    if (!codeTag) return;
+    const customerId = customer?.id;
+    if (!customerId || !shopDomain) return;
 
-    const code = String(codeTag).slice(CUSTOMER_TAG_PREFIX.length).trim();
-    if (!code) return;
+    // Wait for the app-url metafield to finish loading. Without this guard
+    // the effect can fire before shopify.appMetafields populates, and
+    // ApiService.getAppBaseUrl() throws "App URL not configured" with no
+    // automatic retry path.
+    if (!hasAppUrl) return;
 
     autoApplyAttempted.value = true;
-    autoApplyFromTag(code).catch((err) => {
-      console.warn("[checkout-ui-code] auto-apply error:", err);
-    });
-    // Re-run only when the customer identity changes (e.g. late login).
+    autoApplyFromCustomerId(String(customerId), String(shopDomain)).catch(
+      (err) => {
+        console.warn(
+          "[checkout-ui-code] auto-apply (customer-id path) error:",
+          err,
+        );
+      },
+    );
+    // Re-fires when EITHER customer identity changes (e.g. late login) OR
+    // the app-url metafield finishes loading after the customer signal.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [customer?.id]);
+  }, [customer?.id, hasAppUrl]);
+
+  /**
+   * PATH 1 helper — call our backend to read the customer's `code:*` tag
+   * via Shopify Admin GraphQL, then apply via the same flow as manual
+   * entry (so UI feedback is consistent).
+   *
+   * @param {string} customerId  full GID like "gid://shopify/Customer/123"
+   * @param {string} shop        myshopify domain
+   */
+  async function autoApplyFromCustomerId(customerId, shop) {
+    let result;
+    try {
+      result = await ApiService.findByCustomerId(customerId, shop);
+    } catch (err) {
+      console.warn("[checkout-ui-code] findByCustomerId failed:", err);
+      autoApplyAttempted.value = false; // let it retry if a retry happens later
+      return;
+    }
+    if (!result?.found || !result.code) {
+      // Customer has no code:* tag (or tag points to inactive code).
+      // Leave UI in default "enter a code" state — manual entry still works.
+      return;
+    }
+    await autoApplyFromTag(result.code);
+  }
 
   async function autoApplyFromTag(code) {
     inputCode.value = code;
@@ -262,14 +322,15 @@ function Extension() {
     );
   }
 
-
   const isAutoFlow =
     autoApplyAttempted.value &&
     (verifyState.value === "verifying" || applyState.value === "applying");
   if (isAutoFlow) {
     return (
       <s-banner heading="Practitioner discount">
-        <s-text>Applying your saved discount…</s-text>
+        <s-stack direction="inline" gap="small-200">
+          <s-text>Applying your saved discount…</s-text> <s-spinner />
+        </s-stack>
       </s-banner>
     );
   }
@@ -282,11 +343,7 @@ function Extension() {
           Enter your practitioner's referral code to apply your discount.
         </s-text>
 
-        <s-grid
-          gridTemplateColumns="1fr auto"
-          gap="small-200"
-          alignItems="end"
-        >
+        <s-grid gridTemplateColumns="1fr auto" gap="small-200" alignItems="end">
           <s-text-field
             label="Practitioner code"
             value={inputCode.value}

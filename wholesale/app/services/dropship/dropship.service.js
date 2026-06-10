@@ -16,6 +16,7 @@ import { unauthenticated } from '../../shopify.server'
 import { createLogger } from '../../utils/logger.utils'
 import DropshipMapping from '../../models/dropshipMapping.server'
 import SyncIdMap from '../sync/idMap.model'
+import { dropshipConfig } from './dropship.config'
 
 const log = createLogger('dropship.service')
 
@@ -23,8 +24,9 @@ const log = createLogger('dropship.service')
 // The synthetic B2B customer on the wholesale store that every retail-
 // triggered drop-ship order is attached to. The email + tag are
 // resolution anchors so we never have to hard-code the customer GID.
-export const NS_RETAIL_CUSTOMER_EMAIL = 'famixu@denipl.com'
-export const NS_RETAIL_CUSTOMER_TAG = 'ns-retail-internal'
+// Source-of-truth: dropship.config.js (env-driven).
+export const NS_RETAIL_CUSTOMER_EMAIL = dropshipConfig.retailCustomerEmail
+export const NS_RETAIL_CUSTOMER_TAG = dropshipConfig.retailCustomerTag
 
 // Module-memoized GID cache. First call queries Shopify; subsequent
 // calls return the cached value. Survives until the Node process

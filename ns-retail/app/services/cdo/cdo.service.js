@@ -39,6 +39,8 @@ import {
   billWebUrl,
 } from "../qbo/qbo.service";
 import { schedulerConfig } from "../scheduler/scheduler.config";
+import { payoutConfig } from "../payout/payout.config";
+import { getPayoutProvider } from "../payout/provider";
 import { createLogger } from "../../utils/logger.utils";
 
 const log = createLogger("cdo.service");
@@ -168,6 +170,16 @@ export async function listPayouts() {
     qboBillId: r.qboBillId || null,
     qboBillUrl: r.qboBillId ? billWebUrl(r.qboBillId) : null,
     lastError: r.lastError || null,
+    // Disbursement / settlement (real-money lifecycle).
+    providerName: r.providerName || null,
+    providerTransferId: r.providerTransferId || null,
+    providerStatus: r.providerStatus || null,
+    transferInitiatedAt: r.transferInitiatedAt || null,
+    settledAt: r.settledAt || null,
+    settlementLastCheckedAt: r.settlementLastCheckedAt || null,
+    returnCode: r.returnCode || null,
+    returnReason: r.returnReason || null,
+    bankingError: r.bankingError || null,
   }));
 }
 
@@ -1169,6 +1181,91 @@ function pushPayoutRemark(payout, { kind, message, actor, source }) {
   });
 }
 
+// ── Commission banking (payout destination) ──────────────────────────
+//
+// The practitioner's payout bank details live on the canonical
+// `wholesale_applications.commission` object (written by the wholesale
+// workspace) — the single source of truth. The payout process reads them
+// fresh at execution time (never caches them) so it always uses the LATEST
+// banking on file, validates them, and snapshots a MASKED copy onto the
+// payout for audit/reconciliation. The full account number is used only
+// transiently by the disbursement step and is never persisted or logged.
+
+const VALID_ACCOUNT_TYPES = new Set(["checking", "savings"]);
+
+function maskAccountLast4(num) {
+  const s = String(num || "").replace(/\D/g, "");
+  return s ? s.slice(-4) : "";
+}
+
+// US ABA routing number — 9 digits with the standard mod-10 checksum.
+function isValidRoutingNumber(raw) {
+  const s = String(raw || "").replace(/\D/g, "");
+  if (!/^\d{9}$/.test(s)) return false;
+  const d = s.split("").map(Number);
+  const sum =
+    3 * (d[0] + d[3] + d[6]) + 7 * (d[1] + d[4] + d[7]) + (d[2] + d[5] + d[8]);
+  return sum % 10 === 0;
+}
+
+// Fetch + validate a practitioner's commission banking from
+// wholesale_applications.commission. Returns { ok, details, errors }.
+//   • details.accountNumber is the FULL number — transient use only; callers
+//     must persist only the masked snapshot (see executeApprovedPayout).
+//   • errors is a list of human-readable reasons when ok:false.
+export async function resolvePractitionerBanking(practitionerId) {
+  await connectDB();
+  if (!isValidObjectId(practitionerId)) {
+    return { ok: false, details: null, errors: ["invalid practitioner id"] };
+  }
+  const row = await WholesaleApplication.findOne({
+    _id: practitionerId,
+    ...PRACTITIONER_FILTER,
+  })
+    .select("commission")
+    .lean();
+  if (!row) {
+    return { ok: false, details: null, errors: ["practitioner not found or not approved"] };
+  }
+
+  const c = row.commission || null;
+  if (!c) return { ok: false, details: null, errors: ["no commission banking on file"] };
+
+  const errors = [];
+  if (c.enabled === false) errors.push("commission payouts not enabled");
+
+  const accountName = String(c.bankAccountName || "").trim();
+  const routing = String(c.bankRoutingNumber || "").replace(/\D/g, "");
+  const account = String(c.bankAccountNumber || "").replace(/\D/g, "");
+  const type = String(c.bankAccountType || "").trim();
+
+  if (!accountName) errors.push("missing bank account name");
+  if (!routing) errors.push("missing routing number");
+  else if (!isValidRoutingNumber(routing)) errors.push("invalid routing number");
+  if (!account) errors.push("missing account number");
+  else if (!/^\d{4,17}$/.test(account)) errors.push("invalid account number");
+  if (!type) errors.push("missing account type");
+  else if (!VALID_ACCOUNT_TYPES.has(type.toLowerCase())) {
+    errors.push(`unsupported account type "${type}"`);
+  }
+
+  if (errors.length) return { ok: false, details: null, errors };
+
+  return {
+    ok: true,
+    errors: [],
+    details: {
+      accountName,
+      routingNumber: routing,
+      accountNumber: account, // FULL — transient use only, never persisted/logged
+      accountLast4: String(c.bankAccountLast4 || "") || maskAccountLast4(account),
+      accountType: type,
+      sourcedFromPaymentAch: !!c.sourcedFromPaymentAch,
+      updatedAt: c.updatedAt || null,
+    },
+  };
+}
+
 // ── Phase 2: commission accrual + eligibility ────────────────────────
 
 // Create the cdo_commission + ledger credit for a single attributed order.
@@ -1449,6 +1546,55 @@ export async function executeApprovedPayout(payoutId, { actor } = {}) {
   payout.lastError = null;
   await payout.save();
 
+  // ── Banking gate ── Fetch the practitioner's commission banking fresh from
+  // wholesale_applications (canonical source, always the latest) and validate
+  // it BEFORE any QBO write or disbursement. Missing/invalid banking flags the
+  // payout (bankingError + bank_invalid remark) and aborts; once the
+  // practitioner corrects their details, a re-run (manual "Execute" / reprocess
+  // batch, or the next CRON) picks up the change and proceeds.
+  const banking = await resolvePractitionerBanking(payout.practitionerId);
+  if (!banking.ok) {
+    payout.status = "failed";
+    payout.bankingError = banking.errors.join("; ");
+    payout.lastError = `Banking validation failed: ${payout.bankingError}`;
+    pushPayoutRemark(payout, {
+      kind: "bank_invalid",
+      message: `Missing/invalid commission banking — ${payout.bankingError}`,
+      actor,
+      source: actor ? "admin" : "cron",
+    });
+    await payout.save();
+    // Never log the account number — only the validation reasons.
+    log.warn("payout.bank_invalid", {
+      payoutId: String(payout._id),
+      practitionerId: payout.practitionerId,
+      errors: banking.errors,
+    });
+    throw new Error(payout.lastError);
+  }
+
+  // Snapshot the destination banking (MASKED — the full account number is
+  // never persisted) for audit + reconciliation, recording exactly which
+  // version of the banking (commission.updatedAt) this payout used.
+  const bank = banking.details;
+  payout.bankSnapshot = {
+    accountName: bank.accountName,
+    routingNumber: bank.routingNumber,
+    accountLast4: bank.accountLast4,
+    accountType: bank.accountType,
+    sourcedFromPaymentAch: bank.sourcedFromPaymentAch,
+    bankingUpdatedAt: bank.updatedAt,
+    capturedAt: new Date(),
+  };
+  payout.bankingError = null;
+  pushPayoutRemark(payout, {
+    kind: "bank_validated",
+    message: `Banking validated — ${bank.accountType} ••••${bank.accountLast4} (routing ${bank.routingNumber})`,
+    actor,
+    source: actor ? "admin" : "cron",
+  });
+  await payout.save();
+
   try {
     // 1) Vendor (find-or-create, cached in cdo_qbo_vendors).
     if (!payout.qboVendorId) {
@@ -1479,7 +1625,10 @@ export async function executeApprovedPayout(payoutId, { actor } = {}) {
         vendorId: payout.qboVendorId,
         lines,
         docNumber: payout.reference,
-        privateNote: `CDO commission payout ${payout.reference} (period ending ${payout.periodEnd?.toISOString().slice(0, 10)})`,
+        privateNote:
+          `CDO commission payout ${payout.reference} ` +
+          `(period ending ${payout.periodEnd?.toISOString().slice(0, 10)}) — ` +
+          `Destination: ${bank.accountName} · ${bank.accountType} ••••${bank.accountLast4} · routing ${bank.routingNumber}`,
         txnDate: new Date(),
         requestId: `cdo-bill-${payout._id}`,
       });
@@ -1494,47 +1643,68 @@ export async function executeApprovedPayout(payoutId, { actor } = {}) {
       await payout.save();
     }
 
-    // 3) BillPayment (records the disbursement in QBO).
-    if (!payout.qboBillPaymentId) {
-      const payment = await createBillPayment({
-        vendorId: payout.qboVendorId,
-        billId: payout.qboBillId,
+    // 3) Initiate the real bank→bank transfer through the configured payout
+    //    provider. The QBO Bill above records the LIABILITY; the QBO
+    //    BillPayment + `paid` status are DEFERRED until the transfer SETTLES
+    //    (confirmed asynchronously by checkPayoutSettlement). Idempotent per
+    //    attempt: only initiate when there is no live transfer — none yet, or
+    //    the prior one returned/failed (a retry gets a fresh idempotency key).
+    if (!payout.providerTransferId || ["returned", "failed"].includes(payout.providerStatus)) {
+      const provider = getPayoutProvider();
+      const attempt = (payout.transferAttemptCount || 0) + 1;
+      payout.transferAttemptCount = attempt;
+      payout.transferInitiatedAt = new Date();
+      payout.providerName = provider.name;
+
+      const res = await provider.initiateTransfer({
         amount: payout.amount,
-        requestId: `cdo-pay-${payout._id}`,
+        currency: payout.currency,
+        destination: {
+          accountName: bank.accountName,
+          routingNumber: bank.routingNumber,
+          accountNumber: banking.details.accountNumber, // full — transient only, never persisted/logged
+          accountType: bank.accountType,
+        },
+        idempotencyKey: `cdo-payout-${payout._id}-${attempt}`,
+        reference: payout.reference,
+        metadata: {
+          practitionerId: payout.practitionerId,
+          practitionerEmail: payout.practitionerEmail,
+          practitionerName: payout.practitionerName,
+          periodEnd: payout.periodEnd,
+        },
       });
-      payout.qboBillPaymentId = String(payment.Id);
-      payout.paymentRecordedAt = new Date();
+
+      if (res.status === "failed") {
+        // Provider rejected the transfer up front (e.g. bad account). Capture
+        // the reason; the catch below sets status=failed + remark + rethrows.
+        payout.providerStatus = "failed";
+        payout.returnCode = res.returnCode || null;
+        payout.returnReason = res.returnReason || "Transfer rejected at initiation";
+        throw new Error(`Transfer rejected at initiation: ${payout.returnReason}`);
+      }
+
+      payout.providerTransferId = res.transferId;
+      payout.providerStatus = res.status || "pending";
+      payout.returnCode = null;
+      payout.returnReason = null;
+      payout.returnedAt = null;
       pushPayoutRemark(payout, {
-        kind: "payment_recorded",
-        message: `QBO BillPayment ${payment.Id} recorded`,
+        kind: "transfer_initiated",
+        message:
+          `ACH transfer initiated via ${provider.name} — ${payout.amount} ${payout.currency} → ` +
+          `${bank.accountType} ••••${bank.accountLast4} (transfer ${res.transferId})`,
         actor,
         source: actor ? "admin" : "cron",
       });
       await payout.save();
     }
 
-    // 4) Settle commissions + ledger, finalize.
-    await CdoCommission.updateMany(
-      { _id: { $in: payout.commissionIds } },
-      { $set: { status: "paid", payoutId: payout._id } },
-    );
-    const paidAt = new Date();
-    await appendLedgerEntry({
-      shop: payout.shop,
-      practitionerId: payout.practitionerId,
-      practitionerEmail: payout.practitionerEmail,
-      practitionerName: payout.practitionerName,
-      currency: payout.currency,
-      type: "payout",
-      amount: -roundMoney(payout.amount),
-      relatedType: "CdoPayout",
-      relatedId: payout._id,
-      description: `Payout ${payout.reference} via QBO Bill ${payout.qboBillId}`,
-      occurredAt: paidAt,
-    });
-
-    payout.status = "paid";
-    payout.paidAt = paidAt;
+    // 4) Funds are in flight. Settlement (QBO BillPayment + commissions paid +
+    //    ledger debit + `paid`) is confirmed asynchronously by the settlement
+    //    poll (checkPayoutSettlement) — NOT here. ACH takes 1–3 business days
+    //    and can still be returned, so we never claim `paid` at this point.
+    payout.status = "awaiting_settlement";
     await payout.save();
     return payout.toObject();
   } catch (err) {
@@ -1549,6 +1719,177 @@ export async function executeApprovedPayout(payoutId, { actor } = {}) {
     await payout.save();
     throw err;
   }
+}
+
+// ── Settlement (real-money confirmation) ─────────────────────────────
+//
+// A payout in `awaiting_settlement` has had its bank→bank transfer initiated
+// but NOT yet confirmed. The settlement poll (process-payout-settlements CRON,
+// or the admin "Sync settlement" button) calls checkPayoutSettlement, which
+// asks the provider for the transfer's status and transitions the payout:
+//   • settled  → record the QBO BillPayment, settle commissions + ledger, `paid`
+//   • returned/failed → `failed` + capture the return code (R01 NSF, etc.);
+//       commissions stay reserved to the payout so a retry re-disburses
+//   • pending  → leave alone (normal 1–3 business-day ACH window)
+//
+// All money/state writes happen HERE on confirmed settlement — never at
+// initiation — so the books, the commission, and the practitioner record only
+// claim "paid" once funds have actually moved.
+
+// Record the QBO BillPayment + settle commissions + ledger debit + mark paid.
+// Only ever reached from a confirmed `settled` transfer. Each step is guarded
+// so a retried finalize (e.g. ledger append crashed after BillPayment) never
+// double-records.
+async function finalizeSettledPayout(payout, { actor, source } = {}) {
+  // 1) QBO BillPayment — records the disbursement now that funds have settled.
+  if (!payout.qboBillPaymentId) {
+    const payment = await createBillPayment({
+      vendorId: payout.qboVendorId,
+      billId: payout.qboBillId,
+      amount: payout.amount,
+      requestId: `cdo-pay-${payout._id}`,
+    });
+    payout.qboBillPaymentId = String(payment.Id);
+    payout.paymentRecordedAt = new Date();
+    pushPayoutRemark(payout, {
+      kind: "payment_recorded",
+      message: `QBO BillPayment ${payment.Id} recorded (transfer settled)`,
+      actor,
+      source: source || "cron",
+    });
+  }
+
+  // 2) Settle the commissions.
+  const settledAt = payout.settledAt || new Date();
+  await CdoCommission.updateMany(
+    { _id: { $in: payout.commissionIds } },
+    {
+      $set: {
+        status: "paid",
+        payoutId: payout._id,
+        payoutStatus: "paid",
+        payoutDate: settledAt,
+        payoutTxnRef: payout.providerTransferId || payout.qboBillPaymentId || null,
+        payoutFailureReason: null,
+      },
+    },
+  );
+
+  // 3) Ledger debit — idempotent: only append if this payout has no debit yet.
+  const existingDebit = await CdoTransaction.findOne({
+    relatedType: "CdoPayout",
+    relatedId: payout._id,
+    type: "payout",
+  }).lean();
+  if (!existingDebit) {
+    await appendLedgerEntry({
+      shop: payout.shop,
+      practitionerId: payout.practitionerId,
+      practitionerEmail: payout.practitionerEmail,
+      practitionerName: payout.practitionerName,
+      currency: payout.currency,
+      type: "payout",
+      amount: -roundMoney(payout.amount),
+      relatedType: "CdoPayout",
+      relatedId: payout._id,
+      description: `Payout ${payout.reference} settled via ${payout.providerName || "provider"} (${payout.providerTransferId})`,
+      occurredAt: settledAt,
+    });
+  }
+
+  payout.status = "paid";
+  payout.paidAt = settledAt;
+  await payout.save();
+  return payout.toObject();
+}
+
+// Poll the provider for one in-flight payout and apply the outcome. Safe to
+// call repeatedly (the awaiting_settlement guard makes settle/return one-way).
+// Returns { changed, status, reason? }. Shared by the CRON + the admin button.
+export async function checkPayoutSettlement(payoutId, { actor = "system", source = "cron" } = {}) {
+  if (!isValidObjectId(payoutId)) throw new Error("Invalid payout id");
+  await connectDB();
+  const payout = await CdoPayout.findById(payoutId);
+  if (!payout) throw new Error("Payout not found");
+  if (payout.status !== "awaiting_settlement") {
+    return { changed: false, status: payout.status, reason: "not awaiting settlement" };
+  }
+  if (!payout.providerTransferId) {
+    return { changed: false, status: payout.status, reason: "no transfer id on payout" };
+  }
+
+  const provider = getPayoutProvider();
+  let res;
+  try {
+    res = await provider.getTransferStatus(payout.providerTransferId);
+  } catch (err) {
+    payout.settlementLastCheckedAt = new Date();
+    await payout.save();
+    log.warn("payout.settlement_check_failed", {
+      payoutId: String(payout._id),
+      err: err?.message || String(err),
+    });
+    return { changed: false, status: payout.status, reason: "provider lookup failed" };
+  }
+
+  payout.settlementLastCheckedAt = new Date();
+  payout.providerStatus = res.status;
+
+  if (res.status === "settled") {
+    payout.settledAt = res.settledAt ? new Date(res.settledAt) : new Date();
+    pushPayoutRemark(payout, {
+      kind: "settled",
+      message: `Transfer ${payout.providerTransferId} settled — funds confirmed`,
+      actor,
+      source,
+    });
+    await payout.save();
+    await finalizeSettledPayout(payout, { actor, source });
+    log.info("payout.settled", { payoutId: String(payout._id), transferId: payout.providerTransferId });
+    return { changed: true, status: "paid" };
+  }
+
+  if (res.status === "returned" || res.status === "failed") {
+    payout.status = "failed";
+    payout.returnCode = res.returnCode || null;
+    payout.returnReason =
+      res.returnReason || (res.status === "returned" ? "ACH returned" : "Transfer failed");
+    payout.returnedAt = new Date();
+    payout.lastError =
+      `Transfer ${res.status}: ${payout.returnReason}` +
+      (payout.returnCode ? ` (${payout.returnCode})` : "");
+    // Keep the commissions RESERVED to this payout (payoutId unchanged) but
+    // flag them failed, so a retry (Execute) re-disburses the SAME payout once
+    // the practitioner's banking is corrected — no re-batching, no double-pay.
+    await CdoCommission.updateMany(
+      { _id: { $in: payout.commissionIds } },
+      { $set: { payoutStatus: "failed", payoutFailureReason: payout.lastError } },
+    );
+    pushPayoutRemark(payout, { kind: "returned", message: payout.lastError, actor, source });
+    await payout.save();
+    await alertPayoutFailure(payout, new Error(payout.lastError));
+    log.warn("payout.returned", {
+      payoutId: String(payout._id),
+      transferId: payout.providerTransferId,
+      returnCode: payout.returnCode,
+    });
+    return { changed: true, status: "failed" };
+  }
+
+  // Still pending — normal ACH window. Leave the payout in awaiting_settlement.
+  await payout.save();
+  return { changed: false, status: "awaiting_settlement", reason: "pending" };
+}
+
+// In-flight payouts the settlement poll should reconcile.
+export async function listPayoutsAwaitingSettlement() {
+  await connectDB();
+  return CdoPayout.find({
+    status: "awaiting_settlement",
+    providerTransferId: { $ne: null },
+  })
+    .select("_id reference practitionerEmail transferInitiatedAt")
+    .lean();
 }
 
 // Full payout detail for the admin UI — the payout, its settled
@@ -2369,27 +2710,34 @@ async function settlePayoutForBatch(payoutId, payoutItems, { actor }) {
       await approvePayout(String(payoutId), actor);
     }
     const done = await executeApprovedPayout(String(payoutId), { actor });
-    const ok = done.status === "paid";
-    const txnRef = done.qboBillPaymentId || done.qboBillId || null;
+    // With real-money disbursement, executeApprovedPayout returns
+    // `awaiting_settlement` (transfer initiated, in flight) — that is SUCCESS
+    // at this stage, not failure. The transfer settles to `paid` (or returns
+    // to `failed`) later via the settlement poll. `paid` only happens here in
+    // the legacy no-provider path. Anything else = a genuine execution failure.
+    const paid = done.status === "paid";
+    const inFlight = done.status === "awaiting_settlement";
+    const success = paid || inFlight;
+    const txnRef = done.providerTransferId || done.qboBillPaymentId || done.qboBillId || null;
     const payoutDate = done.paidAt || null;
     for (const it of payoutItems) {
-      it.status = ok ? "paid" : "failed";
+      it.status = success ? (paid ? "paid" : "processing") : "failed";
       it.txnRef = txnRef;
       it.payoutDate = payoutDate;
-      it.failureReason = ok ? null : done.lastError || "execution did not complete";
+      it.failureReason = success ? null : done.lastError || "execution did not complete";
       await CdoCommission.updateOne(
         { _id: it.commissionId },
         {
           $set: {
-            payoutStatus: ok ? "paid" : "failed",
-            payoutDate: ok ? payoutDate : null,
+            payoutStatus: success ? (paid ? "paid" : "processing") : "failed",
+            payoutDate: paid ? payoutDate : null,
             payoutTxnRef: txnRef,
-            payoutFailureReason: ok ? null : done.lastError || null,
+            payoutFailureReason: success ? null : done.lastError || null,
           },
         },
       );
     }
-    if (!ok) await alertPayoutFailure(done, new Error(done.lastError || "payout not paid"));
+    if (!success) await alertPayoutFailure(done, new Error(done.lastError || "payout not paid"));
   } catch (err) {
     const msg = err?.message || String(err);
     for (const it of payoutItems) {
@@ -2460,6 +2808,7 @@ export async function runAutomatedPayouts({ shop, periodEnd, mode = "cron", trig
     paid: 0,
     failed: 0,
     skipped: 0,
+    awaitingApproval: 0,
   };
 
   try {
@@ -2476,6 +2825,28 @@ export async function runAutomatedPayouts({ shop, periodEnd, mode = "cron", trig
     // 3. Build payouts (reserves batched commissions via payoutId).
     const build = await buildPayoutBatch({ periodEnd: periodEndDate, actor: "system" });
     summary.batched = build.created.length;
+
+    // Human-approval gate (default ON for real money): stop after building the
+    // payouts. They wait in `awaiting_approval` for an admin to Approve +
+    // Execute, which initiates the actual bank transfer. The CRON disburses
+    // NOTHING. (Set CDO_PAYOUT_REQUIRE_APPROVAL=false for the legacy
+    // end-to-end auto-disburse path.)
+    if (payoutConfig.requireApproval) {
+      batch.payoutIds = build.created.map((p) => p._id);
+      batch.totalCommissions = build.created.reduce(
+        (s, p) => s + (Array.isArray(p.commissionIds) ? p.commissionIds.length : 0),
+        0,
+      );
+      batch.skippedCount = build.skipped.length;
+      batch.practitionerPayouts = await buildPractitionerPayoutRollup(batch.payoutIds);
+      batch.status = "completed";
+      batch.completedAt = new Date();
+      await batch.save();
+      summary.skipped = build.skipped.length;
+      summary.awaitingApproval = build.created.length;
+      log.info("automated_payouts.awaiting_approval", { ...summary });
+      return summary;
+    }
 
     const items = [];
     const batchedIds = new Set();

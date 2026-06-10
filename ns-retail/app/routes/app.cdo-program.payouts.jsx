@@ -10,6 +10,7 @@ import {
   approvePayout,
   rejectPayout,
   executeApprovedPayout,
+  checkPayoutSettlement,
 } from "../services/cdo/cdo.service";
 import DataTable from "../components/cdo/DataTable";
 import StatusBadge from "../components/cdo/StatusBadge";
@@ -61,11 +62,35 @@ export const action = async ({ request }) => {
       }
       case "execute": {
         const p = await executeApprovedPayout(payoutId, { actor });
+        if (p.status === "awaiting_settlement") {
+          return {
+            status: "success",
+            op,
+            message: `Transfer initiated (${p.providerTransferId}) — awaiting settlement (1–3 business days). QBO Bill ${p.qboBillId}.`,
+          };
+        }
+        if (p.status === "paid") {
+          return {
+            status: "success",
+            op,
+            message: `Payout settled — QBO Bill ${p.qboBillId}, payment ${p.qboBillPaymentId}`,
+          };
+        }
         return {
-          status: "success",
+          status: "error",
           op,
-          message: `Payout executed — QBO Bill ${p.qboBillId}, payment ${p.qboBillPaymentId}`,
+          message: `Payout ${p.status}${p.lastError ? `: ${p.lastError}` : ""}`,
         };
+      }
+      case "check-settlement": {
+        const res = await checkPayoutSettlement(payoutId, { actor, source: "admin" });
+        const message =
+          res.status === "paid"
+            ? "Transfer settled — payout marked paid."
+            : res.status === "failed"
+              ? "Transfer returned/failed — payout marked failed (retry once banking is fixed)."
+              : "Still settling — funds not yet confirmed. Check back later.";
+        return { status: res.status === "failed" ? "error" : "success", op, message };
       }
       default:
         return { status: "error", op, message: `Unknown action: ${op}` };
@@ -188,8 +213,8 @@ export default function CdoPayouts() {
                   {
                     confirmText:
                       r.status === "failed"
-                        ? "Retry executing this payout in QuickBooks?"
-                        : `Execute payout for ${r.practitionerName}? This posts a Bill + BillPayment to QuickBooks.`,
+                        ? `Retry payout for ${r.practitionerName}? This initiates a NEW bank transfer for ${formatCurrency(r.amount, r.currency)}.`
+                        : `Execute payout for ${r.practitionerName}? This records the QBO Bill and initiates a real bank transfer of ${formatCurrency(r.amount, r.currency)} to their account on file.`,
                   },
                 )
               }
@@ -197,8 +222,17 @@ export default function CdoPayouts() {
               {r.status === "failed" ? "Retry" : "Execute"}
             </s-button>
           )}
-          {r.status === "failed" && r.lastError ? (
-            <s-text tone="critical">{r.lastError}</s-text>
+          {r.status === "awaiting_settlement" && (
+            <s-button
+              variant="secondary"
+              {...(rowBusy(r, "check-settlement") ? { loading: true } : {})}
+              onClick={() => submit({ _action: "check-settlement", payoutId: r.id })}
+            >
+              Sync settlement
+            </s-button>
+          )}
+          {r.status === "failed" && (r.returnReason || r.lastError) ? (
+            <s-text tone="critical">{r.returnReason || r.lastError}</s-text>
           ) : null}
         </s-stack>
       ),
@@ -215,9 +249,12 @@ export default function CdoPayouts() {
           justifyContent="space-between"
         >
           <s-paragraph tone="subdued">
-            Aggregate eligible approved commissions into payout batches, then
-            approve to post a Vendor Bill + BillPayment to QuickBooks. Payouts
-            below the program minimum are skipped.
+            Aggregate eligible approved commissions into payout batches. Approve,
+            then Execute to record the QBO Vendor Bill and initiate a real bank
+            transfer to the practitioner&rsquo;s account on file. The payout stays
+            in <strong>Awaiting settlement</strong> until funds confirm (1–3
+            business days); a returned transfer flips it to Failed for retry.
+            Payouts below the program minimum are skipped.
           </s-paragraph>
           <s-button
             variant="primary"

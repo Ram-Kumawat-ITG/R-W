@@ -7,6 +7,7 @@
 
 import Agenda from "agenda";
 import { schedulerConfig } from "./scheduler.config";
+import { payoutConfig } from "../payout/payout.config";
 import { createLogger } from "../../utils/logger.utils";
 import { registerJobs, JOB_NAMES } from "./jobs";
 
@@ -54,6 +55,7 @@ async function ensureRecurring(agenda) {
   // locally (the requirement: "every 3 minutes" in dev/test). Cancel the
   // production tick first so a switch from cron → interval doesn't leave
   // both registered.
+  // ── Payout job (accrue → batch → [approve/execute]) ──
   if (schedulerConfig.payoutIntervalOverride) {
     await agenda.cancel({ name: JOB_NAMES.PROCESS_COMMISSION_PAYOUTS });
     await agenda.every(
@@ -68,22 +70,52 @@ async function ensureRecurring(agenda) {
     console.log(
       `\n[scheduler] DEV MODE — process-commission-payouts running every ${schedulerConfig.payoutIntervalOverride}\n`,
     );
-    return;
+  } else {
+    // Production: monthly cron from config (default 00:30 on the 25th).
+    // `every` is idempotent on (interval, name) so re-running doesn't duplicate.
+    await agenda.every(
+      schedulerConfig.payoutCron,
+      JOB_NAMES.PROCESS_COMMISSION_PAYOUTS,
+      { tick: "monthly" },
+      { timezone: schedulerConfig.scheduleTimezone },
+    );
+    log.info("scheduler.recurring_registered", {
+      mode: "cron",
+      timezone: schedulerConfig.scheduleTimezone,
+      cron: schedulerConfig.payoutCron,
+    });
   }
 
-  // Production: monthly cron from config (default 00:30 on the 25th).
-  // `every` is idempotent on (interval, name) so re-running doesn't duplicate.
-  await agenda.every(
-    schedulerConfig.payoutCron,
-    JOB_NAMES.PROCESS_COMMISSION_PAYOUTS,
-    { tick: "monthly" },
-    { timezone: schedulerConfig.scheduleTimezone },
-  );
-  log.info("scheduler.recurring_registered", {
-    mode: "cron",
-    timezone: schedulerConfig.scheduleTimezone,
-    cron: schedulerConfig.payoutCron,
-  });
+  // ── Settlement reconciliation job (poll provider for in-flight transfers) ──
+  // Runs regardless of payout cadence so awaiting_settlement payouts always get
+  // reconciled. Dev override mirrors the payout interval pattern.
+  if (payoutConfig.settlementIntervalOverride) {
+    await agenda.cancel({ name: JOB_NAMES.PROCESS_PAYOUT_SETTLEMENTS });
+    await agenda.every(
+      payoutConfig.settlementIntervalOverride,
+      JOB_NAMES.PROCESS_PAYOUT_SETTLEMENTS,
+      { tick: "dev" },
+    );
+    log.info("scheduler.settlement_registered", {
+      mode: "dev-interval",
+      interval: payoutConfig.settlementIntervalOverride,
+    });
+    console.log(
+      `\n[scheduler] DEV MODE — process-payout-settlements running every ${payoutConfig.settlementIntervalOverride}\n`,
+    );
+  } else {
+    await agenda.every(
+      payoutConfig.settlementCron,
+      JOB_NAMES.PROCESS_PAYOUT_SETTLEMENTS,
+      { tick: "scheduled" },
+      { timezone: schedulerConfig.scheduleTimezone },
+    );
+    log.info("scheduler.settlement_registered", {
+      mode: "cron",
+      timezone: schedulerConfig.scheduleTimezone,
+      cron: payoutConfig.settlementCron,
+    });
+  }
 }
 
 export async function getAgenda() {

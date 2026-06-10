@@ -22,10 +22,8 @@ const TABS = [
   { id: 'overview', label: 'Overview' },
   { id: 'patients', label: 'Patients' },
   { id: 'commissions', label: 'Commissions' },
-  { id: 'pending', label: 'Pending' },
   { id: 'payouts', label: 'Payouts' },
   { id: 'referrals', label: 'Referrals' },
-  { id: 'discounts', label: 'Discounts' },
 ]
 
 const STATE = {
@@ -127,10 +125,8 @@ function App() {
         {tab === 'overview' && <OverviewSection onAuthError={onAuthError} />}
         {tab === 'patients' && <PatientsSection onAuthError={onAuthError} />}
         {tab === 'commissions' && <CommissionsSection mode="all" onAuthError={onAuthError} />}
-        {tab === 'pending' && <CommissionsSection mode="pending" onAuthError={onAuthError} />}
         {tab === 'payouts' && <PayoutsSection onAuthError={onAuthError} />}
         {tab === 'referrals' && <ReferralsSection onAuthError={onAuthError} />}
-        {tab === 'discounts' && <DiscountsSection onAuthError={onAuthError} />}
       </s-stack>
     </s-page>
   )

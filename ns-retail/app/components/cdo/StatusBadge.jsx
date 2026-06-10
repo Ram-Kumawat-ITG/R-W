@@ -9,6 +9,8 @@ const TONE_BY_STATUS = {
   completed: "success",
   pending: "warning",
   processing: "info",
+  awaiting_settlement: "info",
+  awaiting_approval: "warning",
   running: "info",
   completed_with_errors: "warning",
   paused: "warning",
@@ -17,11 +19,14 @@ const TONE_BY_STATUS = {
   reversed: "critical",
   failed: "critical",
   cancelled: "critical",
+  rejected: "critical",
 };
 
 // Friendlier labels for multi-word statuses (default just capitalizes).
 const LABEL_BY_STATUS = {
   completed_with_errors: "Completed with errors",
+  awaiting_settlement: "Awaiting settlement",
+  awaiting_approval: "Awaiting approval",
 };
 
 export default function StatusBadge({ status }) {

@@ -28,6 +28,13 @@ export default [
   route("/api/auth/check-email", "api/auth/check-email.js"),
   route("/api/cdo/validate-code", "api/cdo/validate-code.js"),
   route("/api/cdo/checkout-validate-code", "api/cdo/checkout-validate-code.js"),
+  // Looks up a logged-in customer's `code:*` tag via Shopify Admin GraphQL
+  // (checkout extensions can't read customer.tags directly — known Shopify
+  // limitation). Called from the checkout UI extension on mount.
+  route(
+    "/api/cdo/checkout-find-by-customer-id",
+    "api/cdo/checkout-find-by-customer-id.js",
+  ),
   route("/api/signup-form", "api/signup-form.js"),
   // Practitioner Portal — Customer Account UI extension backend (/api/portal/*).
   // Read-only over the cdo_* collections ns-retail owns; auth via the customer
