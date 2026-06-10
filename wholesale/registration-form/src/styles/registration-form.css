@@ -35,11 +35,6 @@
   letter-spacing: -0.01em;
 }
 
-#collect-ccnumber #ccnumber{
-  border: none !important;
-  padding-bottom: 8000px;
-}
-
 .rf-brand-sub {
   color: var(--color-text-muted);
   font-size: 12px;
@@ -755,6 +750,31 @@
   accent-color: var(--color-primary);
   flex-shrink: 0;
   margin: 0;
+}
+
+/* Immediate (pay-by-link) — info banner shown when method=immediate */
+.rf-immediate-info {
+  margin-top: 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--color-border);
+  border-left: 3px solid var(--color-primary);
+  border-radius: 6px;
+  background: rgba(200, 16, 46, 0.03);
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: var(--color-text);
+}
+.rf-immediate-info-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  color: var(--color-primary);
+  font-weight: 500;
+}
+.rf-immediate-info p {
+  margin: 0;
+  color: var(--color-text-muted);
 }
 
 /* Card number with auto-detected brand badge */

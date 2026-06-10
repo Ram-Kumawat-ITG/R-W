@@ -8,6 +8,11 @@ import * as yup from "yup";
 //   businessName     ← Step 1
 //   address          ← Step 2 billingAddress.*
 //   TIN (SSN/EIN)    ← Step 2 tax.taxIdType + tax.taxId
+//   signature        ← Step 3 collects ONE signature that covers both terms
+//                       acceptance and W-9 IRS Part II perjury certification.
+//                       The backend copies it into w9.signature at save time
+//                       so the W-9 sub-doc still carries an auditable signature
+//                       reference without asking the user to sign twice.
 //
 // New on Step 4:
 //   w9.legalName             — editable, pre-filled from Step 1 names
@@ -16,8 +21,6 @@ import * as yup from "yup";
 //   w9.otherClassification   — required only when taxClassification = 'other'
 //   w9.exemptPayeeCode       — optional
 //   w9.fatcaCode             — optional
-//   w9.signature             — separate from Step 3 terms signature; carries the
-//                              IRS perjury certification
 
 const TAX_CLASSIFICATIONS = [
   "individual",
@@ -59,14 +62,6 @@ export const step4Schema = yup.object({
 
     exemptPayeeCode: yup.string().trim().notRequired(),
     fatcaCode: yup.string().trim().notRequired(),
-
-    signature: yup
-      .object({ drawn: yup.mixed().nullable() })
-      .test(
-        "w9-signature-present",
-        "Please sign the W-9 certification before continuing",
-        (s) => Boolean(s?.drawn),
-      ),
   }),
 });
 

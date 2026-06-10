@@ -1,6 +1,5 @@
 import { useEffect } from "react";
 import { Controller, useWatch } from "react-hook-form";
-import SignaturePad from "./SignaturePad";
 
 const TAX_CLASSIFICATIONS = [
   { id: "individual", label: "Individual / sole proprietor or single-member LLC" },
@@ -106,7 +105,6 @@ export default function Step4W9({
   control,
   errors,
   setValue,
-  isSubmitted,
   onEditStep1,
   onEditStep2,
 }) {
@@ -303,7 +301,7 @@ export default function Step4W9({
         </div>
       </div>
 
-      {/* Part II — Certification + signature */}
+      {/* Part II — Certification (text only — signature is collected once on Step 3) */}
       <div className="rf-divider">
         <h2 className="rf-section-label">Part II — Certification</h2>
       </div>
@@ -329,27 +327,10 @@ export default function Step4W9({
             am exempt from FATCA reporting is correct.
           </li>
         </ol>
-      </div>
-
-      <div className="rf-field" style={{ marginTop: 18 }}>
-        <Controller
-          name="w9.signature"
-          control={control}
-          render={({ field, fieldState }) => (
-            <SignaturePad
-              value={field.value}
-              onChange={(v) => {
-                field.onChange(v);
-                field.onBlur();
-              }}
-              error={
-                (fieldState.isTouched || isSubmitted) && fieldState.error
-                  ? fieldState.error.message
-                  : null
-              }
-            />
-          )}
-        />
+        <p className="rf-auth-footer" style={{ marginTop: 10 }}>
+          Your signature on Step 3 also certifies the statements above for the
+          W-9 form. You do not need to sign again.
+        </p>
       </div>
     </section>
   );

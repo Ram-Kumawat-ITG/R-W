@@ -7,7 +7,12 @@ const log = createLogger("sync.product");
 
 // Build the payload for a retail product create/update from the
 // wholesale webhook payload (Shopify REST format).
-function buildRetailPayload(p) {
+//
+// `includePrice` defaults to FALSE — wholesale and retail have different
+// pricing tiers (retail = ~2× wholesale), so prices should NOT be synced
+// from wholesale to retail. Callers can opt-in with `{ includePrice: true }`
+// for the rare case where prices ARE intentionally mirrored.
+function buildRetailPayload(p, { includePrice = false } = {}) {
   return {
     product: {
       title: p.title,

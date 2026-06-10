@@ -1607,11 +1607,19 @@ export async function resolvePractitionerReferral(rawCode, { shop } = {}) {
   await connectDB();
 
   const escaped = code.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Codes are looked up CROSS-SHOP intentionally: the wholesale app creates
+  // them (so `shop` on the doc = wholesale shop domain), and the ns-retail
+  // app consumes them at order time (with `shop` = retail shop domain).
+  // The two apps share the same MongoDB cdo_practitioner_codes collection;
+  // the code value alone is globally unique by design (random 8-hex suffix).
+  // The `shop` field on the schema is metadata only — never filter on it
+  // here or attribution silently breaks for retail orders. The `shop`
+  // parameter is kept for backwards compat but ignored.
+  void shop; // eslint-disable-line no-unused-expressions
   const codeQuery = {
     code: { $regex: `^${escaped}$`, $options: "i" },
     status: "active",
   };
-  if (shop !== undefined && shop !== null) codeQuery.shop = shop;
   const codeDoc = await CdoPractitionerCode.findOne(codeQuery).lean();
   if (!codeDoc) return null;
 

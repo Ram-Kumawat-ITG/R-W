@@ -181,19 +181,19 @@ export async function action({ request }) {
   delete payload.signatureType;
   delete payload.signatureValue;
 
-  // W-9 signature — uploaded as `w9SignatureFile`, normalize into the
-  // nested w9.signature shape that matches the Mongoose w9Schema. Also
-  // stamp `w9.submittedAt` so the W-9 PDF/audit copy has a definitive date.
-  if (payload.w9SignatureFile) {
+  // W-9 signature — mirrors the Step 3 signature into the nested
+  // w9.signature shape. The form collects ONE signature (on Step 3) that
+  // covers both terms acceptance and the W-9 IRS Part II perjury
+  // certification (per the "I authorize ..." block on Step 3, which now
+  // explicitly includes a W-9 certification bullet). Duplicating into
+  // w9.signature keeps the W-9 sub-doc self-contained for any future
+  // W-9 PDF generation or audit-export pipeline without forcing those
+  // tools to know about the top-level signature.
+  if (payload.signature) {
     if (!payload.w9 || typeof payload.w9 !== "object") payload.w9 = {};
-    payload.w9.signature = {
-      type: "drawn",
-      value: payload.w9SignatureFile,
-      signedAt,
-    };
+    payload.w9.signature = { ...payload.signature };
     payload.w9.submittedAt = signedAt;
   }
-  delete payload.w9SignatureFile;
 
   // Strip empty-string values from W-9 sub-fields that have Mongoose
   // enums (`llcClassification` accepts only C/S/P/null). The frontend
@@ -212,15 +212,15 @@ export async function action({ request }) {
     }
   }
 
-  // Commission bank — when enabled, stamp updatedAt + derive last4 server-side
-  // so we don't trust the client's hint. When disabled, store null (the schema
-  // default) so admins can later see "opted out" vs "never added".
-  if (payload.commission?.enabled) {
+  // Commission bank — ALWAYS required at signup now (opt-in toggle was
+  // removed). Stamp updatedAt + derive last4 server-side so we don't
+  // trust the client's hint. Force enabled = true regardless of what
+  // the client sent (defense in depth — the schema also defaults to true).
+  if (payload.commission && typeof payload.commission === "object") {
     const acct = String(payload.commission.bankAccountNumber || "");
+    payload.commission.enabled = true;
     payload.commission.bankAccountLast4 = acct.slice(-4);
     payload.commission.updatedAt = new Date();
-  } else if (payload.commission && !payload.commission.enabled) {
-    payload.commission = null;
   }
 
   payload.shop = shop;
