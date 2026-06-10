@@ -157,18 +157,42 @@ function CollectCheckout({ amount, currency, docNumber, tokenizationKey, collect
           },
           // Style the contents of the NMI iframes so they sit flush inside our
           // own bordered field shells (the shell owns the border/focus ring;
-          // the iframe input is borderless + vertically centred).
+          // the iframe input must be fully reset — no border/background/padding/
+          // native appearance of its own — or it draws a second box inside our
+          // shell, including a dark focus outline when clicked). This mirrors
+          // the proven config in registration-form/PaymentCardForm.jsx.
           customCss: {
             'font-size': '16px',
             'font-family':
               'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
             color: '#18181b',
             'line-height': '44px',
+            height: '44px',
+            background: 'transparent',
+            'background-color': 'transparent',
+            border: 'none',
+            'border-width': '0',
+            'border-radius': '0',
+            outline: 'none',
+            'box-shadow': 'none',
+            '-webkit-appearance': 'none',
+            '-moz-appearance': 'none',
+            appearance: 'none',
+            width: '100%',
+            margin: '0',
+            padding: '0',
           },
-          focusCss: { color: '#18181b' },
+          focusCss: {
+            color: '#18181b',
+            border: 'none',
+            outline: '0px',
+            'outline-width': '0',
+            'outline-style': 'none',
+            'box-shadow': 'none',
+          },
           placeholderCss: { color: '#a1a1aa' },
-          invalidCss: { color: '#b42318' },
-          validCss: { color: '#0f7b3f' },
+          invalidCss: { color: '#b42318', border: 'none', 'box-shadow': 'none' },
+          validCss: { color: '#0f7b3f', border: 'none' },
           fieldsAvailableCallback: () => setFieldsReady(true),
           validationCallback: (_field, status, message) => {
             if (!status) {
@@ -291,7 +315,8 @@ const PAY_CSS = `
     border-color: #1f6feb;
     box-shadow: 0 0 0 3px rgba(31,111,235,0.15);
   }
-  .pay-field iframe { width: 100% !important; height: 100% !important; border: 0 !important; }
+  .pay-field iframe { width: 100% !important; height: 100% !important; border: 0 !important; outline: 0 !important; box-shadow: none !important; }
+  .pay-field iframe:focus, .pay-field iframe:focus-visible { outline: 0 !important; border: 0 !important; box-shadow: none !important; }
   .pay-button:not(:disabled):hover { background: #195bc7 !important; }
   .pay-button:not(:disabled):active { background: #1550b3 !important; }
 `
