@@ -351,10 +351,13 @@ async function createDropshipWholesaleOrder({
   }
 
   // 2. Build the Draft Order input. Shipping address copied from retail
-  //    order. Shipping line + email follow locked decisions.
+  //    order. Email is intentionally OMITTED — when customerId is set,
+  //    Shopify uses the linked customer's email automatically, and the
+  //    explicit email field triggers a STRICTER MX-record validation
+  //    that fails for any disposable / test domain (e.g., denipl.com).
+  //    Customer-create has lenient validation; draftOrderCreate is strict.
   const draftInput = {
     customerId: customerGid,
-    email: NS_RETAIL_CUSTOMER_EMAIL,
     lineItems,
     shippingAddress: buildShopifyShippingAddress(order),
     tags: [
@@ -368,12 +371,32 @@ async function createDropshipWholesaleOrder({
   const shippingLine = buildShippingLine(order)
   if (shippingLine) draftInput.shippingLine = shippingLine
 
-  // 3. Create the Draft Order.
-  const createRes = await admin.graphql(MUTATION_DRAFT_ORDER_CREATE, {
-    variables: { input: draftInput },
-  })
-  const createData = await createRes.json()
-  const createErrs = createData?.data?.draftOrderCreate?.userErrors || []
+  // 3. Create the Draft Order. If Shopify rejects with "Record is invalid"
+  //    and no field path, the customerId is almost certainly stale (the
+  //    cached customer was deleted out-of-band — either by an admin or by
+  //    the old customers/create deletion path before the whitelist fix
+  //    landed). Clear the in-process cache, re-resolve fresh, retry once.
+  let createData = await runDraftOrderCreate(admin, draftInput)
+  let createErrs = createData?.data?.draftOrderCreate?.userErrors || []
+
+  const looksLikeDeadCustomer = createErrs.some(
+    (e) =>
+      /record is invalid/i.test(String(e?.message || '')) &&
+      (!e?.field || e.field.length === 0),
+  )
+  if (looksLikeDeadCustomer) {
+    log.warn('draft_order.cache_reset_retry', {
+      cachedCustomerGid: customerGid,
+      firstErrors: createErrs,
+    })
+    _resetNsRetailCustomerCache()
+    const freshGid = await ensureNsRetailCustomer(shop)
+    draftInput.customerId = freshGid
+    log.info('draft_order.retrying_with_fresh_customer', { freshGid })
+    createData = await runDraftOrderCreate(admin, draftInput)
+    createErrs = createData?.data?.draftOrderCreate?.userErrors || []
+  }
+
   if (createErrs.length) {
     throw new Error(
       `draftOrderCreate userErrors: ${createErrs.map((e) => `${(e.field || []).join('.')}: ${e.message}`).join('; ')}`,
@@ -408,6 +431,15 @@ async function createDropshipWholesaleOrder({
     orderId: String(realOrder.legacyResourceId || ''),
     orderName: realOrder.name || null,
   }
+}
+
+// Thin wrapper around the GraphQL call so the cache-reset retry above can
+// re-invoke it with the same shape. Keeps the call site readable.
+async function runDraftOrderCreate(admin, draftInput) {
+  const res = await admin.graphql(MUTATION_DRAFT_ORDER_CREATE, {
+    variables: { input: draftInput },
+  })
+  return await res.json()
 }
 
 /**
