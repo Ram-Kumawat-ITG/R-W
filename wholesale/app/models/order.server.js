@@ -42,6 +42,14 @@ const orderSchema = new mongoose.Schema(
         'completed',
         'failed',
         'cancelled',
+        // Terminal state for orders placed by the retail drop-ship customer
+        // (DROPSHIP_RETAIL_CUSTOMER_EMAIL). These are "Admin Orders": already
+        // paid, never invoiced, and deliberately excluded from the QBO/NMI +
+        // commission/payment CRON pipeline. The orchestrator diverts them here
+        // before any payment processing — see services/order/order.service.js.
+        // They surface in the dedicated Admin Orders page, not the wholesale
+        // Orders list.
+        'admin_order',
       ],
       default: 'received',
       index: true,

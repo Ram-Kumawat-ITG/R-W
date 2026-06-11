@@ -783,6 +783,86 @@ builds.
 engine, §4/§7), live Shopify Discount API objects, charts, and CSV export (the
 sandboxed Web Worker has no DOM/Blob).
 
+## 19. Retail order QBO invoicing (`CDO_QBO_Retail_*`) — IMPLEMENTED
+
+Retail **customer** orders → QuickBooks **Invoices** (accounts-receivable,
+"money in"). This is a SECOND, fully independent QBO integration, distinct from:
+
+- the **CDO payouts** QBO account (§5–§8 — `services/qbo/*`, `CDO_QBO_*`, Vendor
+  **Bills** for practitioner commissions), and
+- the **wholesale** workspace's QBO integration (different repo folder).
+
+It runs against its own QBO company via the `CDO_QBO_Retail_*` env vars. Token
+state for the retail realm lives in the same `cdo_qbo_tokens` collection — that
+model is unique-keyed by `realmId`, so the CDO realm and the retail realm
+coexist without colliding.
+
+**Module — `app/services/retailQbo/`:**
+
+| File | Role |
+|---|---|
+| `retailQbo.config.js` | Reads `CDO_QBO_Retail_*` (accepts the mixed-case `Retail` or all-caps `RETAIL` spelling). `isRetailQboConfigured()` lets the feature no-op cleanly when unset. Optional `CDO_QBO_Retail_ITEM_ID` / `ITEM_NAME` / `INCOME_ACCOUNT_ID`. |
+| `retailQbo.apis.js` | A second OAuth2 transport — token rotation, refresh-coalescing, 401-retry-once, `requestid` idempotency, Fault classification. Bound to `retailQboConfig`; tokens stored under the retail `realmId`. Mirrors `services/qbo/qbo.apis.js` but never shares state with it. |
+| `retailQbo.service.js` | Domain ops: `findOrCreateCustomer` (idempotent by DisplayName=email), `resolveSalesItemId` (one generic Sales Service item — override → named item → any Service item → create against a resolved Income account), `createInvoiceForOrder` (product lines + shipping line + discount line + `TxnTaxDetail` tax + a reconciling **adjustment** line so QBO `TotalAmt` == the Shopify order total), `syncInvoiceShipping` (sparse update: ShipDate + TrackingNum + carrier/tracking memo), `invoiceWebUrl`. |
+| `retailOrderInvoice.service.js` | Orchestration: `ensureRetailInvoiceForOrder` (idempotent — atomic claim on `cdo_orders.retailQbo` + QBO `requestid`) and `recordFulfillmentAndSync` (capture tracking → `cdo_orders.fulfillments[]`/`trackingHistory[]`, then mirror to the invoice). Best-effort; never throws to the webhook. |
+
+**Triggers:**
+
+- **`orders/create` + `orders/paid` + `orders/updated`** → after
+  `ingestShopifyOrder`, each fires `ensureRetailInvoiceFromPayload`
+  fire-and-forget. Creation is **gated on payment** — an invoice is created only
+  when `financial_status === "paid"`. Unpaid orders are ingested but deferred
+  (`auto_invoice.deferred_unpaid`); when payment lands, the paid/updated event
+  invoices them. Idempotent across all three (claim + QBO `requestid`). No QBO
+  Payment is recorded — invoice + email delivery only.
+- **Invoice delivery:** immediately after a successful create the invoice is
+  **emailed to the customer** via QBO `/invoice/{id}/send` (recipient = order
+  email). Idempotent + self-healing — a failed send is retried on the next order
+  event (guarded by `retailQbo.invoiceSentAt`). Toggle: `CDO_QBO_Retail_SEND_INVOICE`.
+- **`fulfillments/create` + `fulfillments/update`** → capture carrier / tracking
+  number / tracking URL / shipment status / fulfillment date, re-sync them onto
+  the QBO invoice, **then notify the customer** by re-sending the invoice (its
+  memo now carries order number + carrier + tracking + URL + status). Deduped on
+  the tracking string (`retailQbo.lastNotifiedTracking`) so it emails once per
+  tracking change. Toggle: `CDO_QBO_Retail_NOTIFY_ON_SHIP`.
+
+**State on `cdo_orders` (additive, backward-compatible):** snapshot fields
+`tags`, `note`, `noteAttributes`, `sourceName`, `transactions`; tracking
+`fulfillments[]`, `trackingHistory[]`, `shippedAt`; and the `retailQbo` sub-doc
+(`qboCustomerId`, `qboInvoiceId`, `qboInvoiceDocNumber`, `qboInvoiceTotal`,
+`qboSyncToken`, `invoiceUrl`, `qboCreatedAt`, `qboSyncStatus`, `qboSyncedAt`,
+`qboSyncError`, email-delivery `invoiceSentAt` / `invoiceEmailedTo` /
+`invoiceEmailStatus`, shipment-notify `lastShipmentNotifiedAt` /
+`lastNotifiedTracking`, and an append-only `syncLog[]` whose events are
+`invoice_created` / `invoice_create_failed` / `invoice_sent` /
+`invoice_send_failed` / `invoice_send_skipped` / `shipping_synced` /
+`shipping_sync_failed` / `shipment_notified` / `shipment_notify_failed`).
+`mapShopifyOrderToDoc` captures the snapshot fields only — it never writes the
+tracking/QBO fields, so order re-ingests (orders/paid, orders/updated) never
+clobber them. `retailQbo` has **no `default: null`** (a scalar-null parent
+breaks dot-path `$set`); the claim uses an `$ifNull`/`$mergeObjects` pipeline so
+legacy null rows still work.
+
+**Retail Order Details page** (`app/routes/app.orders.$id.jsx`): Order info
+(+ tags/notes/source), Customer info (+ billing/shipping), Product info
+(name/SKU/variant/qty/unit/discount/total), Pricing + Tax & discount details,
+Shipping & Fulfillment (method/charges + carrier/tracking #/URL/status/date),
+Payment info (method/transaction id/amounts), **QuickBooks information**
+(customer id / invoice id+link / number / status / created / last sync /
+invoice-sent status / error), Commission (unchanged), and Audit & Activity
+(order timeline + QBO sync history + shipment update history). Action buttons:
+**Create QBO invoice** (create/retry), **Preview invoice** (opens the
+QBO-rendered invoice PDF — `getRetailInvoicePdf` → QBO `/invoice/{id}/pdf` via
+`qboRetailGetBinary`, relayed base64 → browser blob URL), **Send invoice**
+(email it), **Re-sync shipping**.
+
+**Idempotency:** one invoice per order — the `cdo_orders.retailQbo` claim plus
+the QBO `requestid` (`retail-inv-<orderGid>`) make re-deliveries and concurrent
+webhooks safe. **Go-live:** `shopify app deploy` to register the two fulfillment
+webhook topics; ensure `CDO_QBO_Retail_REFRESH_TOKEN` is freshly minted (Intuit
+rotates the refresh token on every use — see the §14 token-reset note, which
+applies per realm).
+
 ---
 
 ### Appendix — Environment variables
@@ -795,8 +875,19 @@ CDO_QBO_MINOR_VERSION=73
 CDO_QBO_COMMISSION_EXPENSE_ACCOUNT_ID=
 CDO_QBO_PAYMENT_ACCOUNT_ID=
 CDO_QBO_AP_ACCOUNT_ID=                      # optional
-# optional retry tuning
+# optional retry tuning (shared by both QBO clients)
 CDO_QBO_HTTP_RETRY_ATTEMPTS=4  CDO_QBO_HTTP_RETRY_BASE_MS=500  CDO_QBO_HTTP_RETRY_MAX_MS=4000
+
+# ── Retail order invoicing (§19) — SEPARATE QBO company (A/R) ──
+CDO_QBO_Retail_ENVIRONMENT=sandbox|production
+CDO_QBO_Retail_CLIENT_ID=        CDO_QBO_Retail_CLIENT_SECRET=
+CDO_QBO_Retail_REALM_ID=         CDO_QBO_Retail_REFRESH_TOKEN=
+CDO_QBO_Retail_MINOR_VERSION=73
+CDO_QBO_Retail_ITEM_ID=                     # optional — post all lines to this QBO Item (CDO_QBO_Retail_DEFAULT_ITEM_ID also accepted)
+CDO_QBO_Retail_ITEM_NAME=Retail Sales       # optional — name of the auto-resolved Service item
+CDO_QBO_Retail_INCOME_ACCOUNT_ID=           # optional — income account for the auto-created item
+CDO_QBO_Retail_SEND_INVOICE=true            # optional — email the invoice to the customer after create (default on)
+CDO_QBO_Retail_NOTIFY_ON_SHIP=true          # optional — re-send the invoice (with tracking) on shipment, as the notification (default on)
 
 # ── Payout scheduler (§7) ──
 CDO_PAYOUT_CRON=30 0 25 * *                 # prod: 00:30 on the 25th

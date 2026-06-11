@@ -501,7 +501,9 @@ still receive Shopify's native shipping-confirmation email with tracking.
 ### 5.1 Lifecycle states (`ShopifyOrder.processingStatus`)
 
 ```
-received  → processing ──┬─→ pending_approval ──(admin approves)──┐
+received  → processing ──┬─→ admin_order   (retail drop-ship customer — already paid; see §5.6)
+                         │
+                         ├─→ pending_approval ──(admin approves)──┐
                          │                                         │
                          └─→ customer_ready → invoiced → scheduled → completed
                                   │
@@ -516,12 +518,18 @@ work entirely for these orders. They are re-entered into the pipeline by
 `replayPendingOrdersForCustomer` (triggered from `admin/review.js` when an
 admin approves the customer) — see §5.4 below.
 
+`admin_order` is the terminal hold state for orders placed by the retail
+drop-ship customer (`DROPSHIP_RETAIL_CUSTOMER_EMAIL`). These are already
+paid and must never touch QBO / NMI or the payment / commission CRON, so the
+orchestrator diverts them **immediately after the atomic claim** — before the
+approval gate, customer setup, invoice creation, and any charge. See §5.6.
+
 ### 5.2 The three idempotency layers (in this function)
 
 | Layer | Mechanism | Catches |
 |---|---|---|
 | Webhook-id dedup | `seenWebhookIds[]` on ShopifyOrder | Shopify retries — same `x-shopify-webhook-id` |
-| Terminal-status return | `if status ∈ {completed, invoiced, scheduled, rejected, cancelled} → return` | Order already processed (or cancelled before / during creation) |
+| Terminal-status return | `if status ∈ {completed, invoiced, scheduled, rejected, cancelled, admin_order} → return` | Order already processed (or cancelled before / during creation, or diverted as an Admin Order) |
 | Atomic claim | `findOneAndUpdate(filter, $set: { status: 'processing' })` | Two concurrent workers |
 
 The claim filter:
@@ -615,6 +623,60 @@ Returns `{ total, processed, failed, skipped }` logged to console + structured l
 does not need to re-fetch from Shopify. If an order's `rawPayload` is
 missing (legacy data, schema migration), it's recorded as skipped and the
 admin must re-trigger via another mechanism.
+
+### 5.6 Admin Orders (retail drop-ship customer)
+
+Orders placed by the retail drop-ship customer — the synthetic
+"Natural Solutions Retail" customer that the drop-ship orchestrator (§ drop-ship)
+attaches every retail-triggered wholesale order to — are **Admin Orders**, not
+wholesale orders. They are already paid and must run on a completely separate
+flow: no QBO invoice, no NMI charge, and the payment / commission CRON must
+never see them.
+
+**Detection.** The single source of truth is the customer email. The anchor is
+`DROPSHIP_RETAIL_CUSTOMER_EMAIL` (read once at boot into
+`services/dropship/dropship.config.js` as the pre-normalized `RETAIL_CUSTOMER_EMAIL`).
+`isRetailCustomerEmail(email)` does the case-insensitive comparison.
+
+**Diversion (orchestrator).** `processShopifyOrder` checks the order's email
+(`order.email || order.customer?.email`) **immediately after the atomic claim**
+— before validation, the approval gate, `ensureCustomerForOrder`, invoice
+creation, and any charge. On a match it sets `processingStatus = 'admin_order'`
+(a terminal state) and returns. Because this runs on the **replay path** too
+(`replayPendingOrdersForCustomer` → `processShopifyOrder`), a drop-ship order
+can never be pulled back into the wholesale pipeline even if the synthetic
+customer were ever tagged `Approved`.
+
+**Why the CRON is automatically safe.** The payment / commission scheduler
+(`processPendingPayments.job.js`, §11) iterates the **`Invoice`** collection,
+never `ShopifyOrder`. Admin Orders are diverted before invoice creation, so
+they produce no `Invoice` doc — there is literally nothing for the scheduler to
+pick up. No CRON-side filter is required (the order-level diversion is the
+guard); the order doc still lives in `shopify_orders` for audit.
+
+**Separation in the UI.**
+
+- The wholesale **Orders** list (`app.orders._index.jsx`) excludes them with
+  `customerEmail: { $ne: RETAIL_CUSTOMER_EMAIL }` on both the row query and the
+  chip-count aggregation (`$ne` still matches null/absent emails, so ordinary
+  wholesale orders are unaffected).
+- A dedicated **Admin Orders** nav item exposes two read-only routes:
+  - `app.admin-orders._index.jsx` — list, anchored on
+    `{ customerEmail: RETAIL_CUSTOMER_EMAIL }` (captures every such order
+    regardless of `processingStatus`, including any ingested before this
+    diversion existed), with fulfillment-status chips + search + pagination.
+  - `app.admin-orders.$id.jsx` — full detail (order info, customer info, tags,
+    line items + quantities/pricing, shipping + billing addresses, shipping
+    method, fulfillment + tracking numbers/URLs, order note + note attributes,
+    and additional Shopify metadata). It reuses the same best-effort
+    `syncFulfillmentsFromShopify` live-pull as the wholesale Order Details page;
+    that helper's QBO-memo push is gated on `invoiceRef`, which Admin Orders
+    never have, so it only reads Shopify + writes tracking locally. The loader
+    hard-guards with `isRetailCustomerEmail` so a wholesale order id cannot
+    resolve here (and vice versa).
+
+There are **no payment actions** on the Admin Order Details page — these orders
+are already settled and carry no invoice.
 
 ---
 

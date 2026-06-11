@@ -25,6 +25,7 @@ import {
   resolveCarrierTrackingUrl,
 } from '../../utils/shipping.constants'
 import { trackingConfig } from './tracking.config'
+import { isRetailCustomerEmail } from '../dropship/dropship.config'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('order.service')
@@ -36,6 +37,10 @@ const TERMINAL_STATUSES = new Set([
   'scheduled',
   'rejected',
   'cancelled',
+  // Admin Orders (retail drop-ship customer) are terminal the moment they're
+  // recognized — there's no payment pipeline to run, so any webhook re-delivery
+  // for the same order returns the existing doc untouched.
+  'admin_order',
 ])
 // Statuses that mean "another worker owns this right now".
 const LOCKED_STATUSES = new Set(['processing'])
@@ -160,6 +165,29 @@ export async function processShopifyOrder({ shop, order, webhookId }) {
   console.log(
     `[orders] CLAIMED order ${shopifyOrderId} (status was → processing, claimedAt=${now.toISOString()})`,
   )
+
+  // Admin Order short-circuit — orders placed by the retail drop-ship
+  // customer (DROPSHIP_RETAIL_CUSTOMER_EMAIL) are NOT wholesale orders. They
+  // are already paid and must never touch QBO / NMI or the commission/payment
+  // CRON. Divert them to the terminal `admin_order` state immediately, before
+  // the approval gate, customer setup, invoice creation, and any charge. This
+  // also runs on the replay path (replayPendingOrdersForCustomer → here), so a
+  // drop-ship order can never be pulled back into the wholesale pipeline. The
+  // order still lives in `shopify_orders` (so it's auditable + appears on the
+  // dedicated Admin Orders page) — it just carries no invoice and is invisible
+  // to the scheduler (which only iterates the Invoice collection).
+  const orderEmail = order.email || order.customer?.email || ''
+  if (isRetailCustomerEmail(orderEmail)) {
+    console.log(
+      `[orders] ADMIN ORDER — ${shopifyOrderId} placed by retail drop-ship customer ` +
+        `(${orderEmail}); skipping QBO/NMI + CRON. Marking processingStatus=admin_order.`,
+    )
+    log.info('admin_order.diverted', { shopifyOrderId, email: orderEmail.toLowerCase() })
+    local.processingStatus = 'admin_order'
+    local.processingError = undefined
+    await local.save()
+    return local
+  }
 
   // Pre-flight validation. Bad payloads are persisted as `rejected`
   // (not thrown) so the audit trail captures the reason and the

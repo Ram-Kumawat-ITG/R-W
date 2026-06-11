@@ -2175,6 +2175,31 @@ function mapShopifyOrderToDoc(payload, { referral, attribution, shop }) {
     financialStatus: o.financial_status || null,
     fulfillmentStatus: o.fulfillment_status || null,
 
+    // Extra snapshot fields surfaced on the Retail Order Details page. Pure
+    // snapshot of the payload — safe to overwrite on re-ingest. (Tracking +
+    // QBO state live in separate fields managed by services/retailQbo and are
+    // intentionally NOT set here, so re-ingests never clobber them.)
+    tags:
+      typeof o.tags === "string"
+        ? o.tags.split(",").map((t) => t.trim()).filter(Boolean)
+        : Array.isArray(o.tags)
+          ? o.tags
+          : [],
+    note: o.note || null,
+    noteAttributes: (o.note_attributes || []).map((a) => ({
+      name: a?.name || "",
+      value: a?.value != null ? String(a.value) : "",
+    })),
+    sourceName: o.source_name || null,
+    transactions: (o.transactions || []).map((t) => ({
+      id: t?.id != null ? String(t.id) : null,
+      kind: t?.kind || null,
+      status: t?.status || null,
+      gateway: t?.gateway || null,
+      amount: money(t?.amount),
+      processedAt: t?.processed_at ? new Date(t.processed_at) : undefined,
+    })),
+
     referral: referral || null,
     referralCode: referral?.code || null,
     attribution: attribution || { source: null, code: null, matchedAt: null },
@@ -3250,6 +3275,63 @@ export async function getCdoOrderDetail(id) {
     billingAddress: o.billingAddress || null,
     shippingAddress: o.shippingAddress || null,
     payment: o.payment || {},
+    // ── Extra Shopify snapshot ──
+    tags: o.tags || [],
+    note: o.note || null,
+    noteAttributes: o.noteAttributes || [],
+    sourceName: o.sourceName || null,
+    transactions: (o.transactions || []).map((t) => ({
+      id: t.id || null,
+      kind: t.kind || null,
+      status: t.status || null,
+      gateway: t.gateway || null,
+      amount: t.amount ?? null,
+      processedAt: t.processedAt || null,
+    })),
+    // ── Fulfillment + tracking ──
+    shippedAt: o.shippedAt || null,
+    fulfillments: (o.fulfillments || []).map((f) => ({
+      fulfillmentId: f.fulfillmentId || null,
+      trackingNumber: f.trackingNumber || null,
+      trackingCompany: f.trackingCompany || null,
+      trackingUrl: f.trackingUrl || null,
+      shipmentStatus: f.shipmentStatus || null,
+      status: f.status || null,
+      fulfilledAt: f.fulfilledAt || null,
+      updatedAt: f.updatedAt || null,
+    })),
+    trackingHistory: (o.trackingHistory || []).map((h) => ({
+      at: h.at || null,
+      trackingNumber: h.trackingNumber || null,
+      trackingCompany: h.trackingCompany || null,
+      shipmentStatus: h.shipmentStatus || null,
+      event: h.event || null,
+    })),
+    // ── Retail QBO invoice ──
+    retailQbo: o.retailQbo
+      ? {
+          qboCustomerId: o.retailQbo.qboCustomerId || null,
+          qboInvoiceId: o.retailQbo.qboInvoiceId || null,
+          qboInvoiceDocNumber: o.retailQbo.qboInvoiceDocNumber || null,
+          qboInvoiceTotal: o.retailQbo.qboInvoiceTotal ?? null,
+          invoiceUrl: o.retailQbo.invoiceUrl || null,
+          qboCreatedAt: o.retailQbo.qboCreatedAt || null,
+          qboSyncStatus: o.retailQbo.qboSyncStatus || null,
+          qboSyncedAt: o.retailQbo.qboSyncedAt || null,
+          qboSyncError: o.retailQbo.qboSyncError || null,
+          invoiceSentAt: o.retailQbo.invoiceSentAt || null,
+          invoiceEmailedTo: o.retailQbo.invoiceEmailedTo || null,
+          invoiceEmailStatus: o.retailQbo.invoiceEmailStatus || null,
+          lastShipmentNotifiedAt: o.retailQbo.lastShipmentNotifiedAt || null,
+          lastNotifiedTracking: o.retailQbo.lastNotifiedTracking || null,
+          syncLog: (o.retailQbo.syncLog || []).map((s) => ({
+            at: s.at || null,
+            event: s.event || null,
+            ok: s.ok === true,
+            message: s.message || null,
+          })),
+        }
+      : null,
     commissions: commissions.map((c) => ({
       id: c._id.toString(),
       amount: c.amount || 0,
@@ -3267,6 +3349,13 @@ export async function getCdoOrderDetail(id) {
         ? { label: `Referral matched (${o.attribution.source || "code"})`, at: o.attribution.matchedAt }
         : null,
       o.createdAt ? { label: "Synced to CDO", at: o.createdAt } : null,
+      o.retailQbo?.qboCreatedAt
+        ? {
+            label: `QBO invoice created${o.retailQbo.qboInvoiceDocNumber ? ` (#${o.retailQbo.qboInvoiceDocNumber})` : ""}`,
+            at: o.retailQbo.qboCreatedAt,
+          }
+        : null,
+      o.shippedAt ? { label: "Shipped", at: o.shippedAt } : null,
       o.updatedAt ? { label: "Last updated", at: o.updatedAt } : null,
     ].filter(Boolean),
   };

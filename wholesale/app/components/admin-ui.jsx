@@ -60,6 +60,9 @@ const PROCESSING_TONE_MAP = {
   completed: { tone: "success", label: "Completed" },
   failed: { tone: "critical", label: "Failed" },
   cancelled: { tone: "default", label: "Cancelled" },
+  // Retail drop-ship "Admin Order" — already paid, never invoiced, excluded
+  // from the payment/commission CRON. See models/order.server.js.
+  admin_order: { tone: "info", label: "Admin order" },
 };
 
 // "Scheduled" implies the CRON will auto-charge the card — true for

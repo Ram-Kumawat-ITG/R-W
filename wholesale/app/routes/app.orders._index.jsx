@@ -10,6 +10,7 @@ import { authenticate } from "../shopify.server";
 import connectDB from "../services/APIService/mongo.service";
 import ShopifyOrder from "../models/order.server";
 import Invoice from "../models/invoice.server";
+import { RETAIL_CUSTOMER_EMAIL } from "../services/dropship/dropship.config";
 import { ProcessingBadge, PaymentMethodShortText } from "../components/admin-ui";
 import {
   formatAmount,
@@ -111,7 +112,14 @@ export const loader = async ({ request }) => {
   const q = (url.searchParams.get("q") || "").trim();
   const page = Math.max(1, Number(url.searchParams.get("page") || 1));
 
-  const filter = { shop: session.shop };
+  // Exclude Admin Orders (placed by the retail drop-ship customer) from the
+  // wholesale Orders list entirely — they live in the dedicated Admin Orders
+  // page and never enter the QBO/NMI pipeline. `$ne` still matches orders with
+  // a null/absent customerEmail, so ordinary wholesale orders are unaffected.
+  const filter = {
+    shop: session.shop,
+    customerEmail: { $ne: RETAIL_CUSTOMER_EMAIL },
+  };
 
   // Invoice-side filters: resolve via Invoice.find first so we get the
   // matching invoice _ids, then constrain the ShopifyOrder query to
@@ -172,7 +180,10 @@ export const loader = async ({ request }) => {
   // chips) and three independent count queries on Invoice (covers the
   // invoice-scoped chips). Both respect the search filter so the counts
   // reflect what the user is actually looking at.
-  const orderCountFilter = { shop: session.shop };
+  const orderCountFilter = {
+    shop: session.shop,
+    customerEmail: { $ne: RETAIL_CUSTOMER_EMAIL },
+  };
   if (q) orderCountFilter.$or = filter.$or;
   const counts = await ShopifyOrder.aggregate([
     { $match: orderCountFilter },

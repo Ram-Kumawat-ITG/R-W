@@ -1,5 +1,6 @@
 import { authenticate } from "../shopify.server";
 import { ingestShopifyOrder } from "../services/cdo/cdo.service";
+import { ensureRetailInvoiceFromPayload } from "../services/retailQbo/retailOrderInvoice.service";
 import { extractPractitionerCode } from "../utils/orderCode";
 
 // In-memory dedup of webhook ids (the DB layer is also idempotent).
@@ -36,12 +37,17 @@ export async function action({ request }) {
   }
 
   const { code, source } = extractPractitionerCode(payload);
-  ingestShopifyOrder({ shop, payload, rawCode: code, attributionSource: source }).catch((err) => {
-    console.error(
-      `[webhooks.orders.paid] processing order ${payload?.id} failed:`,
-      err?.message || err,
-    );
-  });
+  // Ingest first (so the cdo_orders doc exists), THEN ensure the retail QBO
+  // invoice — idempotent, so this retries a missed/failed create from
+  // orders/create. Chained + fire-and-forget so the webhook still 200s fast.
+  ingestShopifyOrder({ shop, payload, rawCode: code, attributionSource: source })
+    .then(() => ensureRetailInvoiceFromPayload({ shop, payload, trigger: "orders/paid" }))
+    .catch((err) => {
+      console.error(
+        `[webhooks.orders.paid] processing order ${payload?.id} failed:`,
+        err?.message || err,
+      );
+    });
 
   return new Response(null, { status: 200 });
 }

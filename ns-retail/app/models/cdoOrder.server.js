@@ -53,6 +53,82 @@ const lineItemSchema = new mongoose.Schema(
   { _id: false },
 );
 
+// ── Shipment tracking (populated by fulfillments/create|update webhooks) ──
+// `fulfillments[]` is the current state (one row per Shopify fulfillment id,
+// upserted in place). `trackingHistory[]` is an append-only audit trail.
+const fulfillmentSchema = new mongoose.Schema(
+  {
+    fulfillmentId: { type: String, required: true },
+    trackingNumber: String,
+    trackingCompany: String, // carrier (Shopify tracking_company)
+    trackingUrl: String,
+    shipmentStatus: String, // carrier-driven shipment_status
+    status: String, // fulfillment.status (pending/open/success/cancelled)
+    fulfilledAt: Date,
+    createdAt: { type: Date, default: Date.now },
+    updatedAt: { type: Date, default: Date.now },
+  },
+  { _id: false },
+);
+
+const trackingHistorySchema = new mongoose.Schema(
+  {
+    at: { type: Date, default: Date.now },
+    fulfillmentId: String,
+    trackingNumber: String,
+    trackingCompany: String,
+    shipmentStatus: String,
+    event: { type: String, enum: ["created", "updated"] },
+  },
+  { _id: false },
+);
+
+// ── Retail QBO invoice (the CDO_QBO_Retail_* realm — A/R "money in") ──
+// Distinct from the CDO payouts QBO (Bills). Managed solely by
+// services/retailQbo/* — the ingestion pipeline never writes this block.
+// `syncLog[]` is an append-only audit of every QBO create/sync attempt.
+const retailQboSchema = new mongoose.Schema(
+  {
+    qboCustomerId: String,
+    qboInvoiceId: String,
+    qboInvoiceDocNumber: String,
+    qboInvoiceTotal: Number,
+    qboSyncToken: String,
+    invoiceUrl: String,
+    qboCreatedAt: Date,
+    // pending | creating | created | shipping_synced | error
+    qboSyncStatus: { type: String, default: null },
+    qboSyncedAt: Date,
+    qboSyncError: { type: String, default: null },
+    lastAttemptAt: Date,
+    // Invoice email delivery (QBO send).
+    invoiceSentAt: Date,
+    invoiceEmailedTo: String,
+    invoiceEmailStatus: String, // QBO EmailStatus (EmailSent / NeedToSend) or "error"
+    // Shipment notification (invoice re-send carrying tracking). Deduped on
+    // lastNotifiedTracking so the customer is emailed once per tracking change.
+    lastShipmentNotifiedAt: Date,
+    lastNotifiedTracking: String,
+    // Transient in-flight guard so concurrent webhooks don't double-create.
+    creating: { type: Boolean, default: false },
+    syncLog: {
+      type: [
+        new mongoose.Schema(
+          {
+            at: { type: Date, default: Date.now },
+            event: String, // invoice_created | invoice_create_failed | shipping_synced | shipping_sync_failed
+            ok: Boolean,
+            message: String,
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+  },
+  { _id: false },
+);
+
 // Immutable snapshot of the practitioner + discount the order was placed
 // under. Same shape as cdo_applications.referral.
 const referralSchema = new mongoose.Schema(
@@ -177,6 +253,44 @@ const cdoOrderSchema = new mongoose.Schema(
     },
 
     placedAt: { type: Date, index: true },
+
+    // ── Extra Shopify snapshot (for the Retail Order Details page) ──────
+    // Additive — captured at ingest by mapShopifyOrderToDoc. Safe to
+    // overwrite on re-ingest (pure snapshot of the order payload).
+    tags: { type: [String], default: [] },
+    note: { type: String, default: null },
+    noteAttributes: {
+      type: [{ name: String, value: String }],
+      default: [],
+    },
+    sourceName: { type: String, default: null },
+    transactions: {
+      type: [
+        {
+          id: String,
+          kind: String,
+          status: String,
+          gateway: String,
+          amount: Number,
+          processedAt: Date,
+        },
+      ],
+      default: [],
+    },
+
+    // ── Fulfillment + tracking ──────────────────────────────────────────
+    // Managed by the fulfillments/* webhooks via services/retailQbo. NOT
+    // written by the ingestion pipeline, so they survive order re-ingests.
+    fulfillments: { type: [fulfillmentSchema], default: [] },
+    trackingHistory: { type: [trackingHistorySchema], default: [] },
+    shippedAt: Date,
+
+    // ── Retail QBO invoice ──────────────────────────────────────────────
+    // No `default: null` — a scalar-null parent breaks dot-path `$set` of
+    // sub-fields (services/retailQbo claims `retailQbo.creating`). Left absent
+    // until the retail-invoice flow first writes it (which uses an
+    // $ifNull/$mergeObjects pipeline so existing null rows still work).
+    retailQbo: { type: retailQboSchema },
   },
   { collection: "cdo_orders", timestamps: true, strict: false },
 );

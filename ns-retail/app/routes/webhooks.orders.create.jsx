@@ -1,5 +1,6 @@
 import { authenticate, unauthenticated } from "../shopify.server";
 import { ingestShopifyOrder } from "../services/cdo/cdo.service";
+import { ensureRetailInvoiceFromPayload } from "../services/retailQbo/retailOrderInvoice.service";
 import { extractPractitionerCode, extractCodeFromTags } from "../utils/orderCode";
 
 // In-memory dedup of webhook ids — Shopify delivers at-least-once and
@@ -159,6 +160,17 @@ async function processOrder({ shop, payload }) {
     rawCode: code,
     attributionSource: source,
   });
+
+  // Retail QBO invoice — every retail order gets a corresponding QBO Invoice
+  // in the retail realm (CDO_QBO_Retail_*), created right after the order is
+  // synced into cdo_orders. Idempotent (claims on cdo_orders.retailQbo +
+  // QBO requestid) and best-effort: a QBO failure must never break order
+  // ingestion or the webhook 200. No-ops cleanly if retail QBO isn't
+  // configured. The invoice id + sync state persist on cdo_orders.retailQbo.
+  // The helper logs the outcome (success / reason it was skipped / error), and
+  // the orders/paid + orders/updated handlers retry the same idempotent call,
+  // so a transient QBO failure here self-heals on the next order event.
+  await ensureRetailInvoiceFromPayload({ shop, payload, trigger: "orders/create" });
 
   // Tag the customer with the canonical code when the order attributed and
   // we have a linked customer. Guest checkouts may have no customer — the
