@@ -64,6 +64,13 @@ export const retailQboConfig = {
   //     shipment notification. Deduped on the tracking string.
   sendInvoiceOnCreate: readBool("CDO_QBO_Retail_SEND_INVOICE", true),
   notifyOnShip: readBool("CDO_QBO_Retail_NOTIFY_ON_SHIP", true),
+
+  // Payment recording — when the Shopify order is PAID, create a QBO Payment
+  // applied to the invoice so QBO shows it Paid (default ON). Optional
+  // CDO_QBO_Retail_DEPOSIT_ACCOUNT_ID routes the payment to a specific account
+  // (Bank / Undeposited Funds); omit to let QBO use its default.
+  recordPaymentOnPaid: readBool("CDO_QBO_Retail_RECORD_PAYMENT", true),
+  depositAccountId: readRetail("DEPOSIT_ACCOUNT_ID"),
 };
 
 // True when the four credentials needed to talk to the retail realm are set.

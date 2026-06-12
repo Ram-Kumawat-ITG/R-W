@@ -3245,6 +3245,10 @@ export async function listCdoOrders({
             docNumber: r.retailQbo.qboInvoiceDocNumber || null,
             syncStatus: r.retailQbo.qboSyncStatus || null,
             invoiceUrl: r.retailQbo.invoiceUrl || null,
+            // Invoice settlement state in QBO + Shopify payment status, so the
+            // list can show a "Paid" indicator that matches the payment.
+            invoiceStatus: r.retailQbo.invoiceStatus || null,
+            paymentStatus: r.retailQbo.paymentSyncStatus || null,
           }
         : null,
     })),
@@ -3348,6 +3352,17 @@ export async function getCdoOrderDetail(id) {
           qboSyncStatus: o.retailQbo.qboSyncStatus || null,
           qboSyncedAt: o.retailQbo.qboSyncedAt || null,
           qboSyncError: o.retailQbo.qboSyncError || null,
+          // ── Payment (invoice marked Paid in QBO) ──
+          invoiceStatus: o.retailQbo.invoiceStatus || null,
+          qboPaymentId: o.retailQbo.qboPaymentId || null,
+          qboPaymentRefNum: o.retailQbo.qboPaymentRefNum || null,
+          qboPaymentTotal: o.retailQbo.qboPaymentTotal ?? null,
+          qboPaymentUrl: o.retailQbo.qboPaymentUrl || null,
+          shopifyTransactionId: o.retailQbo.shopifyTransactionId || null,
+          shopifyPaymentGateway: o.retailQbo.shopifyPaymentGateway || null,
+          paymentAppliedAt: o.retailQbo.paymentAppliedAt || null,
+          paymentSyncStatus: o.retailQbo.paymentSyncStatus || null,
+          paymentSyncError: o.retailQbo.paymentSyncError || null,
           invoiceSentAt: o.retailQbo.invoiceSentAt || null,
           invoiceEmailedTo: o.retailQbo.invoiceEmailedTo || null,
           invoiceEmailStatus: o.retailQbo.invoiceEmailStatus || null,

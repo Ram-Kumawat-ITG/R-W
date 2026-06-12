@@ -826,8 +826,8 @@ coexist without colliding.
 |---|---|
 | `retailQbo.config.js` | Reads `CDO_QBO_Retail_*` (accepts the mixed-case `Retail` or all-caps `RETAIL` spelling). `isRetailQboConfigured()` lets the feature no-op cleanly when unset. Optional `CDO_QBO_Retail_ITEM_ID` / `ITEM_NAME` / `INCOME_ACCOUNT_ID`. |
 | `retailQbo.apis.js` | A second OAuth2 transport — token rotation, refresh-coalescing, 401-retry-once, `requestid` idempotency, Fault classification. Bound to `retailQboConfig`; tokens stored under the retail `realmId`. Mirrors `services/qbo/qbo.apis.js` but never shares state with it. |
-| `retailQbo.service.js` | Domain ops: `findOrCreateCustomer` (idempotent by DisplayName=email), `resolveSalesItemId` (one generic Sales Service item — override → named item → any Service item → create against a resolved Income account), `createInvoiceForOrder` (product lines + shipping line + discount line + `TxnTaxDetail` tax + a reconciling **adjustment** line so QBO `TotalAmt` == the Shopify order total), `syncInvoiceShipping` (sparse update: ShipDate + TrackingNum + carrier/tracking memo), `invoiceWebUrl`. |
-| `retailOrderInvoice.service.js` | Orchestration: `ensureRetailInvoiceForOrder` (idempotent — atomic claim on `cdo_orders.retailQbo` + QBO `requestid`) and `recordFulfillmentAndSync` (capture tracking → `cdo_orders.fulfillments[]`/`trackingHistory[]`, then mirror to the invoice). Best-effort; never throws to the webhook. |
+| `retailQbo.service.js` | Domain ops: `findOrCreateCustomer` (idempotent by DisplayName=email), `resolveSalesItemId` (one generic Sales Service item — override → named item → any Service item → create against a resolved Income account), `createInvoiceForOrder` (product lines + shipping line + discount line + `TxnTaxDetail` tax + a reconciling **adjustment** line so QBO `TotalAmt` == the Shopify order total), `syncInvoiceShipping` (sparse update: ShipDate + TrackingNum + carrier/tracking memo), `createPaymentForInvoice` (a QBO Payment with a `LinkedTxn` to the invoice — marks it Paid), `invoiceWebUrl`, `paymentWebUrl`. |
+| `retailOrderInvoice.service.js` | Orchestration: `ensureRetailInvoiceForOrder` (idempotent — atomic claim on `cdo_orders.retailQbo` + QBO `requestid`), `ensureRetailPaymentForOrder` (idempotent payment record-and-apply; atomic claim on `retailQbo.qboPaymentId` + `paymentCreating`), and `recordFulfillmentAndSync` (capture tracking → `cdo_orders.fulfillments[]`/`trackingHistory[]`, then mirror to the invoice). `fetchOrderPaymentDetails` reads the order's transactions from the Shopify Admin API. Best-effort; never throws to the webhook. |
 
 **Triggers:**
 
@@ -836,8 +836,17 @@ coexist without colliding.
   fire-and-forget. Creation is **gated on payment** — an invoice is created only
   when `financial_status === "paid"`. Unpaid orders are ingested but deferred
   (`auto_invoice.deferred_unpaid`); when payment lands, the paid/updated event
-  invoices them. Idempotent across all three (claim + QBO `requestid`). No QBO
-  Payment is recorded — invoice + email delivery only.
+  invoices them. Idempotent across all three (claim + QBO `requestid`).
+- **Payment → invoice marked Paid:** right after the invoice is created (and on
+  the already-invoiced retry path), `ensureRetailPaymentForOrder` creates a **QBO
+  Payment fully applied to the invoice** (`LinkedTxn`) so QBO shows it **Paid**,
+  matching the Shopify payment status. Gated on `financialStatus === "paid"`. The
+  payment amount is the invoice's freshly re-fetched **Balance** (a 0 balance ⇒
+  already settled ⇒ skip). The Shopify transaction reference is captured from the
+  Admin API (`fetchOrderPaymentDetails`) and stored. Idempotent — atomic claim on
+  `retailQbo.qboPaymentId` (+ `paymentCreating` guard) + a stable QBO `requestid`
+  (`retail-pay-<orderId>`). Toggle: `CDO_QBO_Retail_RECORD_PAYMENT` (default on);
+  optional `CDO_QBO_Retail_DEPOSIT_ACCOUNT_ID` routes the deposit account.
 - **Invoice delivery:** immediately after a successful create the invoice is
   **emailed to the customer** via QBO `/invoice/{id}/send` (recipient = order
   email). Idempotent + self-healing — a failed send is retried on the next order
@@ -856,10 +865,14 @@ coexist without colliding.
 `qboSyncToken`, `invoiceUrl`, `qboCreatedAt`, `qboSyncStatus`, `qboSyncedAt`,
 `qboSyncError`, email-delivery `invoiceSentAt` / `invoiceEmailedTo` /
 `invoiceEmailStatus`, shipment-notify `lastShipmentNotifiedAt` /
-`lastNotifiedTracking`, and an append-only `syncLog[]` whose events are
-`invoice_created` / `invoice_create_failed` / `invoice_sent` /
+`lastNotifiedTracking`, payment `qboPaymentId` / `qboPaymentRefNum` /
+`qboPaymentUrl` / `qboPaymentTotal` / `shopifyTransactionId` /
+`shopifyPaymentGateway` / `paymentAppliedAt` / `paymentSyncStatus` /
+`paymentSyncError` / `invoiceStatus`, and an append-only `syncLog[]` whose events
+are `invoice_created` / `invoice_create_failed` / `invoice_sent` /
 `invoice_send_failed` / `invoice_send_skipped` / `shipping_synced` /
-`shipping_sync_failed` / `shipment_notified` / `shipment_notify_failed`).
+`shipping_sync_failed` / `shipment_notified` / `shipment_notify_failed` /
+`payment_created` / `payment_create_failed` / `payment_skipped`).
 `mapShopifyOrderToDoc` captures the snapshot fields only — it never writes the
 tracking/QBO fields, so order re-ingests (orders/paid, orders/updated) never
 clobber them. `retailQbo` has **no `default: null`** (a scalar-null parent
@@ -873,12 +886,15 @@ Shipping & Fulfillment (**Shipping status + Delivery status badges** (§17) +
 method/charges + carrier/tracking #/URL/shipment status/date),
 Payment info (method/transaction id/amounts), **QuickBooks information**
 (customer id / invoice id+link / number / status / created / last sync /
-invoice-sent status / error), Commission (unchanged), and Audit & Activity
+invoice-sent status / error, plus **payment**: Paid badge / QBO payment id+link /
+payment reference # / Shopify transaction id / gateway / amount / recorded date /
+payment error), Commission (unchanged), and Audit & Activity
 (order timeline + QBO sync history + shipment update history). Action buttons:
 **Create QBO invoice** (create/retry), **Preview invoice** (opens the
 QBO-rendered invoice PDF — `getRetailInvoicePdf` → QBO `/invoice/{id}/pdf` via
 `qboRetailGetBinary`, relayed base64 → browser blob URL), **Send invoice**
-(email it), **Re-sync shipping**.
+(email it), **Re-sync shipping**, **Record payment** (create/apply the QBO
+payment for a paid order).
 
 **Idempotency:** one invoice per order — the `cdo_orders.retailQbo` claim plus
 the QBO `requestid` (`retail-inv-<orderGid>`) make re-deliveries and concurrent

@@ -5,6 +5,7 @@ import { authenticate } from "../shopify.server";
 import { getCdoOrderDetail } from "../services/cdo/cdo.service";
 import {
   ensureRetailInvoiceForOrder,
+  ensureRetailPaymentForOrder,
   resyncInvoiceShippingForOrder,
   sendRetailInvoiceForOrder,
   getRetailInvoicePdf,
@@ -52,6 +53,28 @@ export const action = async ({ request }) => {
         status: "error",
         message: r.error || "Invoice was not created — see QBO sync history below for the reason.",
       };
+    }
+    if (op === "record-payment") {
+      const r = await ensureRetailPaymentForOrder({ shop, shopifyOrderId });
+      if (r.ok && (r.paymentId || r.reason === "invoice_already_settled")) {
+        return { status: "success", message: `Payment recorded — invoice marked Paid in QBO.` };
+      }
+      if (r.reason === "already_paid") {
+        return { status: "success", message: `Invoice already has a QBO payment (${r.paymentId}).` };
+      }
+      if (r.reason === "no_invoice") {
+        return { status: "error", message: "Create the QBO invoice first, then record the payment." };
+      }
+      if (r.reason === "not_paid") {
+        return { status: "error", message: "The Shopify order isn't paid yet — payment recorded only for paid orders." };
+      }
+      if (r.reason === "payment_disabled") {
+        return { status: "error", message: "Payment recording is disabled (CDO_QBO_Retail_RECORD_PAYMENT=false)." };
+      }
+      if (r.reason === "not_configured") {
+        return { status: "error", message: "Retail QBO is not configured." };
+      }
+      return { status: "error", message: r.error || "Could not record the payment in QBO." };
     }
     if (op === "resync-shipping") {
       const r = await resyncInvoiceShippingForOrder({ shop, shopifyOrderId });
@@ -518,12 +541,56 @@ export default function OrderDetail() {
                 label="Customer notified (shipment)"
                 value={q.lastShipmentNotifiedAt ? formatDateTime(q.lastShipmentNotifiedAt) : "—"}
               />
+              {/* ── Payment (invoice marked Paid in QBO) ── */}
+              <s-stack direction="block" gap="none">
+                <s-text tone="subdued">Invoice payment</s-text>
+                {q.qboPaymentId || q.invoiceStatus === "paid" ? (
+                  <s-badge tone="success">Paid in QBO</s-badge>
+                ) : q.paymentSyncStatus === "error" ? (
+                  <s-badge tone="critical">Payment error</s-badge>
+                ) : q.paymentSyncStatus === "creating" ? (
+                  <s-badge tone="info">Recording…</s-badge>
+                ) : (
+                  <s-badge tone="neutral">Not paid</s-badge>
+                )}
+              </s-stack>
+              <s-stack direction="block" gap="none">
+                <s-text tone="subdued">QBO payment ID</s-text>
+                {q.qboPaymentId ? (
+                  q.qboPaymentUrl ? (
+                    <s-link href={q.qboPaymentUrl} target="_blank">
+                      {q.qboPaymentId} ↗
+                    </s-link>
+                  ) : (
+                    <s-text>{q.qboPaymentId}</s-text>
+                  )
+                ) : (
+                  <s-text>—</s-text>
+                )}
+              </s-stack>
+              <Row label="Payment reference #" value={q.qboPaymentRefNum} />
+              <Row label="Shopify transaction ID" value={q.shopifyTransactionId} />
+              <Row label="Payment gateway" value={q.shopifyPaymentGateway} />
+              <Row
+                label="Payment amount"
+                value={q.qboPaymentTotal != null ? formatCurrency(q.qboPaymentTotal, cur) : "—"}
+              />
+              <Row
+                label="Payment recorded"
+                value={q.paymentAppliedAt ? formatDateTime(q.paymentAppliedAt) : "—"}
+              />
             </s-grid>
           )}
 
           {q?.qboSyncError ? (
             <s-banner tone="critical" heading="Last QBO sync error">
               <s-paragraph>{q.qboSyncError}</s-paragraph>
+            </s-banner>
+          ) : null}
+
+          {q?.paymentSyncError ? (
+            <s-banner tone="critical" heading="Last QBO payment error">
+              <s-paragraph>{q.paymentSyncError}</s-paragraph>
             </s-banner>
           ) : null}
 
@@ -567,6 +634,19 @@ export default function OrderDetail() {
                 >
                   Re-sync shipping
                 </s-button>
+                {!q.qboPaymentId && q.invoiceStatus !== "paid" ? (
+                  <s-button
+                    disabled={qboBusy}
+                    onClick={() =>
+                      qboFetcher.submit(
+                        { _action: "record-payment", shopifyOrderId: order.shopifyOrderId || "" },
+                        { method: "POST" },
+                      )
+                    }
+                  >
+                    Record payment
+                  </s-button>
+                ) : null}
               </>
             ) : null}
             {qboBusy || pdfLoading ? <s-text tone="subdued">Working…</s-text> : null}

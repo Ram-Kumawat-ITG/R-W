@@ -302,6 +302,68 @@ export async function getInvoice(invoiceId) {
   return res?.Invoice || null;
 }
 
+// ── Payments (mark an invoice Paid) ──────────────────────────────────
+
+// Create a QBO Payment that fully applies to one invoice, so QBO shows the
+// invoice Paid (Balance → 0). Idempotent at the QBO layer via `requestid`.
+// `amount` should equal the invoice's current Balance. `paymentRefNum` carries
+// the Shopify payment reference (QBO caps it at 21 chars). Returns the Payment.
+export async function createPaymentForInvoice({
+  customerId,
+  invoiceId,
+  amount,
+  txnDate,
+  paymentRefNum,
+  currency,
+  privateNote,
+  requestId,
+}) {
+  if (!customerId) throw new Error("createPaymentForInvoice: customerId is required");
+  if (!invoiceId) throw new Error("createPaymentForInvoice: invoiceId is required");
+  const total = round2(amount);
+  if (!(total > 0)) {
+    throw new Error(`createPaymentForInvoice: amount must be > 0 (got ${amount})`);
+  }
+
+  const payload = {
+    CustomerRef: { value: String(customerId) },
+    TotalAmt: total,
+    ...(txnDate ? { TxnDate: toQboDate(txnDate) } : {}),
+    ...(paymentRefNum ? { PaymentRefNum: String(paymentRefNum).slice(0, 21) } : {}),
+    ...(currency ? { CurrencyRef: { value: currency } } : {}),
+    ...(retailQboConfig.depositAccountId
+      ? { DepositToAccountRef: { value: String(retailQboConfig.depositAccountId) } }
+      : {}),
+    ...(privateNote ? { PrivateNote: String(privateNote).slice(0, 4000) } : {}),
+    Line: [
+      {
+        Amount: total,
+        LinkedTxn: [{ TxnId: String(invoiceId), TxnType: "Invoice" }],
+      },
+    ],
+  };
+
+  const res = await retailQbo.post("/payment", payload, undefined, {
+    requestId: (requestId || `retail-pay-${invoiceId}`).slice(0, 50),
+  });
+  const payment = res?.Payment;
+  if (!payment?.Id) {
+    throw new Error("createPaymentForInvoice: QBO did not return a Payment id");
+  }
+  log.info("payment.created", {
+    invoiceId,
+    paymentId: payment.Id,
+    total: payment.TotalAmt,
+    paymentRefNum: payment.PaymentRefNum,
+  });
+  return payment;
+}
+
+// Deep link for the admin UI so operators can open the payment in QBO.
+export function paymentWebUrl(paymentId) {
+  return `${retailQboConfig.appBaseUrl}/app/recvpayment?txnId=${paymentId}`;
+}
+
 // Mirror shipment carrier + tracking + ship date onto the QBO invoice via a
 // sparse update. Re-fetches the invoice first for a fresh SyncToken so we
 // never collide on a stale token. Returns the updated Invoice (carries the

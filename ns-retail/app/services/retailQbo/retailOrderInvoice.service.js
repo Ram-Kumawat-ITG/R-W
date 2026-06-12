@@ -12,6 +12,7 @@
 
 import connectDB from "../../db/mongo.server";
 import CdoOrder from "../../models/cdoOrder.server";
+import { unauthenticated } from "../../shopify.server";
 import { isRetailQboConfigured, retailQboConfig } from "./retailQbo.config";
 import {
   findOrCreateCustomer,
@@ -19,8 +20,11 @@ import {
   createInvoiceForOrder,
   syncInvoiceShipping,
   sendInvoice,
+  getInvoice,
   getInvoicePdf,
   invoiceWebUrl,
+  createPaymentForInvoice,
+  paymentWebUrl,
 } from "./retailQbo.service";
 import { createLogger } from "../../utils/logger.utils";
 
@@ -167,6 +171,9 @@ export async function ensureRetailInvoiceForOrder({ shop, shopifyOrderId, force 
           shopifyOrderId,
         });
       }
+      // Self-heal the payment too: invoice exists but may not be marked paid in
+      // QBO yet (created pre-payment, or a prior payment attempt failed).
+      await ensureRetailPaymentForOrder({ shop, shopifyOrderId });
       return { ok: true, reason: "already_invoiced", invoiceId: existing.retailQbo.qboInvoiceId };
     }
     return { ok: true, reason: "creating_elsewhere" };
@@ -255,6 +262,11 @@ export async function ensureRetailInvoiceForOrder({ shop, shopifyOrderId, force 
       shopifyOrderId,
     });
 
+    // Mark the invoice Paid in QBO when the Shopify order is paid — create a
+    // QBO Payment fully applied to it. Idempotent + self-gating (paid + not
+    // already paid + configured); best-effort so it never undoes the invoice.
+    await ensureRetailPaymentForOrder({ shop, shopifyOrderId });
+
     return { ok: true, invoiceId: String(invoice.Id) };
   } catch (err) {
     const msg = errMsg(err);
@@ -335,6 +347,238 @@ export async function ensureRetailInvoiceFromPayload({ shop, payload, trigger = 
     });
   }
   return r;
+}
+
+function money2(n) {
+  const v = Number(n);
+  return Number.isFinite(v) ? Math.round(v * 100) / 100 : null;
+}
+
+// Pull the order's payment transaction reference from Shopify. The orders/*
+// webhook payloads don't embed transactions, so we read them from the Admin
+// API. Best-effort — returns {} on any failure so payment recording still
+// proceeds with order-level fallbacks (order name as the reference). Picks the
+// successful sale/capture transaction.
+async function fetchOrderPaymentDetails(shop, shopifyOrderId) {
+  try {
+    const { admin } = await unauthenticated.admin(shop);
+    const res = await admin.graphql(
+      `#graphql
+      query RetailOrderTxns($id: ID!) {
+        order(id: $id) {
+          id
+          transactions(first: 25) {
+            id
+            kind
+            status
+            gateway
+            processedAt
+            authorizationCode
+            amountSet { shopMoney { amount } }
+          }
+        }
+      }`,
+      { variables: { id: shopifyOrderId } },
+    );
+    const data = await res.json();
+    const txns = data?.data?.order?.transactions || [];
+    const norm = txns.map((t) => ({
+      id: t?.id || null,
+      kind: String(t?.kind || "").toLowerCase(),
+      status: String(t?.status || "").toLowerCase(),
+      gateway: t?.gateway || null,
+      processedAt: t?.processedAt || null,
+      authorizationCode: t?.authorizationCode || null,
+    }));
+    const best =
+      norm.find((t) => ["sale", "capture"].includes(t.kind) && t.status === "success") ||
+      norm.find((t) => t.status === "success") ||
+      norm[0] ||
+      null;
+    if (!best) return {};
+    const numericId = String(best.id || "").split("/").pop() || null;
+    const refNum = best.authorizationCode || numericId || null;
+    return {
+      transactionId: best.id || null,
+      gateway: best.gateway || null,
+      refNum: refNum ? String(refNum) : null,
+      processedAt: best.processedAt || null,
+    };
+  } catch (err) {
+    log.warn("payment.txn_fetch_failed", { shopifyOrderId, err: errMsg(err) });
+    return {};
+  }
+}
+
+// Create a QBO Payment for a paid retail order and fully apply it to the order's
+// QBO invoice, so QBO shows the invoice Paid — matching the Shopify payment
+// status. Captures the Shopify transaction reference for reconciliation.
+// Idempotent via an atomic claim on cdo_orders.retailQbo.qboPaymentId (+ a QBO
+// `requestid`): only one worker records the payment; re-deliveries / concurrent
+// webhooks that find a payment already recorded exit cleanly. Self-gates on:
+// configured, payment-recording enabled, an invoice present, the order paid,
+// and no payment yet. Best-effort — NEVER throws to the caller.
+export async function ensureRetailPaymentForOrder({ shop, shopifyOrderId }) {
+  if (!shopifyOrderId) return { ok: false, reason: "missing_order_id" };
+  if (!isRetailQboConfigured()) return { ok: false, reason: "not_configured" };
+  if (!retailQboConfig.recordPaymentOnPaid) return { ok: false, reason: "payment_disabled" };
+
+  await connectDB();
+
+  // Atomic claim — only an order that has an invoice, is paid, has no payment
+  // yet, and isn't mid-create. (retailQbo is already an object here, created by
+  // the invoice flow, so the dot-path $set is safe.)
+  const claimed = await CdoOrder.findOneAndUpdate(
+    {
+      shop,
+      shopifyOrderId,
+      financialStatus: "paid",
+      "retailQbo.qboInvoiceId": { $nin: [null, undefined, ""] },
+      "retailQbo.qboPaymentId": { $in: [null, undefined, ""] },
+      "retailQbo.paymentCreating": { $ne: true },
+    },
+    {
+      $set: {
+        "retailQbo.paymentCreating": true,
+        "retailQbo.paymentSyncStatus": "creating",
+        "retailQbo.lastAttemptAt": new Date(),
+      },
+    },
+    { new: true },
+  );
+
+  if (!claimed) {
+    // Distinguish the no-op reasons so a manual retry / log reads clearly.
+    const existing = await CdoOrder.findOne({ shop, shopifyOrderId })
+      .select("financialStatus retailQbo")
+      .lean();
+    if (!existing) return { ok: false, reason: "order_not_found" };
+    if (!existing.retailQbo?.qboInvoiceId) return { ok: true, reason: "no_invoice" };
+    if (existing.retailQbo?.qboPaymentId) {
+      return { ok: true, reason: "already_paid", paymentId: existing.retailQbo.qboPaymentId };
+    }
+    if (existing.financialStatus !== "paid") return { ok: true, reason: "not_paid" };
+    return { ok: true, reason: "creating_elsewhere" };
+  }
+
+  const invoiceId = claimed.retailQbo.qboInvoiceId;
+  try {
+    // Fetch the invoice for its CURRENT balance + customer + currency. A fresh
+    // read also guards against double-paying: if it's already settled in QBO we
+    // record that and skip the create.
+    const invoice = await getInvoice(invoiceId);
+    if (!invoice?.Id) throw new Error(`invoice ${invoiceId} not found in QBO`);
+
+    const customerId = invoice.CustomerRef?.value || claimed.retailQbo.qboCustomerId;
+    const currency = invoice.CurrencyRef?.value || undefined;
+    const balance =
+      money2(invoice.Balance) ??
+      money2(claimed.retailQbo.qboInvoiceTotal) ??
+      money2(claimed.amount) ??
+      0;
+
+    if (!(balance > 0)) {
+      await CdoOrder.updateOne(
+        { _id: claimed._id },
+        {
+          $set: {
+            "retailQbo.paymentCreating": false,
+            "retailQbo.paymentSyncStatus": "paid",
+            "retailQbo.invoiceStatus": "paid",
+            "retailQbo.paymentSyncError": null,
+          },
+          $push: {
+            "retailQbo.syncLog": {
+              at: new Date(),
+              event: "payment_skipped",
+              ok: true,
+              message: `Invoice ${invoiceId} already fully paid in QBO (balance ${balance})`,
+            },
+          },
+        },
+      );
+      log.info("payment.already_settled", { shopifyOrderId, invoiceId });
+      return { ok: true, reason: "invoice_already_settled", invoiceId };
+    }
+
+    // Capture the Shopify payment reference (best-effort), fall back to the
+    // order name when no transaction is retrievable.
+    const pay = await fetchOrderPaymentDetails(shop, shopifyOrderId);
+    const refNum =
+      (pay.refNum || String(claimed.orderName || claimed.orderNumber || "").trim()).slice(0, 21) ||
+      undefined;
+    const txnDate = pay.processedAt || claimed.placedAt || new Date();
+    const privateNote =
+      `Shopify ${claimed.orderName || shopifyOrderId}` +
+      (pay.transactionId ? ` — txn ${pay.transactionId}` : "") +
+      (pay.gateway ? ` (${pay.gateway})` : "");
+
+    const shortOrderId = String(shopifyOrderId).split("/").pop() || shopifyOrderId;
+    const payment = await createPaymentForInvoice({
+      customerId,
+      invoiceId,
+      amount: balance,
+      txnDate,
+      paymentRefNum: refNum,
+      currency,
+      privateNote,
+      requestId: `retail-pay-${shortOrderId}`.slice(0, 50),
+    });
+
+    await CdoOrder.updateOne(
+      { _id: claimed._id },
+      {
+        $set: {
+          "retailQbo.qboPaymentId": String(payment.Id),
+          "retailQbo.qboPaymentRefNum": payment.PaymentRefNum || refNum || null,
+          "retailQbo.qboPaymentTotal": payment.TotalAmt ?? balance,
+          "retailQbo.qboPaymentUrl": paymentWebUrl(payment.Id),
+          "retailQbo.shopifyTransactionId": pay.transactionId || null,
+          "retailQbo.shopifyPaymentGateway": pay.gateway || null,
+          "retailQbo.paymentAppliedAt": new Date(),
+          "retailQbo.paymentSyncStatus": "paid",
+          "retailQbo.invoiceStatus": "paid",
+          "retailQbo.paymentSyncError": null,
+          "retailQbo.paymentCreating": false,
+        },
+        $push: {
+          "retailQbo.syncLog": {
+            at: new Date(),
+            event: "payment_created",
+            ok: true,
+            message:
+              `Payment ${payment.Id} recorded & applied to invoice ${invoiceId} — ${payment.TotalAmt ?? balance}` +
+              (pay.transactionId ? ` (Shopify txn ${pay.transactionId})` : ""),
+          },
+        },
+      },
+    );
+    log.info("payment.applied", {
+      shopifyOrderId,
+      invoiceId,
+      paymentId: payment.Id,
+      total: payment.TotalAmt ?? balance,
+      shopifyTransactionId: pay.transactionId,
+    });
+    return { ok: true, paymentId: String(payment.Id), invoiceId };
+  } catch (err) {
+    const msg = errMsg(err);
+    await CdoOrder.updateOne(
+      { _id: claimed._id },
+      {
+        $set: {
+          "retailQbo.paymentCreating": false,
+          "retailQbo.paymentSyncStatus": "error",
+          "retailQbo.paymentSyncError": msg,
+        },
+        $push: {
+          "retailQbo.syncLog": { at: new Date(), event: "payment_create_failed", ok: false, message: msg },
+        },
+      },
+    );
+    log.error("payment.create_failed", { shopifyOrderId, invoiceId, err });
+    return { ok: false, reason: "error", error: msg };
+  }
 }
 
 // Normalize a Shopify Fulfillment REST payload to our stored tracking shape.

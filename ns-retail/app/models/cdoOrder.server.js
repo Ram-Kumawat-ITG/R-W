@@ -109,8 +109,26 @@ const retailQboSchema = new mongoose.Schema(
     // lastNotifiedTracking so the customer is emailed once per tracking change.
     lastShipmentNotifiedAt: Date,
     lastNotifiedTracking: String,
-    // Transient in-flight guard so concurrent webhooks don't double-create.
+    // ── Payment (mark the invoice Paid in QBO when Shopify is paid) ──
+    // A QBO Payment is created against the invoice once the Shopify order is
+    // paid, fully applying it so QBO shows the invoice Paid. References are
+    // captured so QBO ↔ Shopify reconcile.
+    qboPaymentId: String, // QBO Payment entity id
+    qboPaymentRefNum: String, // QBO Payment PaymentRefNum (the reference number)
+    qboPaymentTotal: Number,
+    qboPaymentUrl: String, // deep link to the payment in QBO
+    shopifyTransactionId: String, // gid://shopify/OrderTransaction/<id>
+    shopifyPaymentGateway: String,
+    paymentAppliedAt: Date,
+    // pending | creating | paid | error | skipped
+    paymentSyncStatus: { type: String, default: null },
+    paymentSyncError: { type: String, default: null },
+    // QBO invoice settlement state mirrored from QBO: open | paid
+    invoiceStatus: { type: String, default: null },
+    // Transient in-flight guard so concurrent webhooks don't double-create the
+    // invoice (creating) or the payment (paymentCreating).
     creating: { type: Boolean, default: false },
+    paymentCreating: { type: Boolean, default: false },
     syncLog: {
       type: [
         new mongoose.Schema(
