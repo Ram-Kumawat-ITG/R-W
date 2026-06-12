@@ -10,6 +10,7 @@ import {
   getRetailInvoicePdf,
 } from "../services/retailQbo/retailOrderInvoice.service";
 import StatusBadge from "../components/cdo/StatusBadge";
+import { ShippingBadge, DeliveryBadge } from "../components/cdo/StatusBadges";
 import { formatCurrency, formatDate, formatDateTime, formatPercent } from "../utils/format";
 
 export const loader = async ({ request, params }) => {
@@ -214,7 +215,14 @@ export default function OrderDetail() {
           <Row label="Total" value={formatCurrency(order.amount, cur)} />
           <Row label="Placed" value={formatDateTime(order.placedAt)} />
           <Row label="Payment" value={order.financialStatus || "—"} />
-          <Row label="Fulfillment" value={order.fulfillmentStatus || "—"} />
+          <s-stack direction="block" gap="none">
+            <s-text tone="subdued">Shipping</s-text>
+            <ShippingBadge status={order.shippingStatus} />
+          </s-stack>
+          <s-stack direction="block" gap="none">
+            <s-text tone="subdued">Delivery</s-text>
+            <DeliveryBadge status={order.deliveryStatus} />
+          </s-stack>
         </s-stack>
       </s-section>
 
@@ -225,7 +233,14 @@ export default function OrderDetail() {
           <Row label="Order date" value={formatDateTime(order.placedAt)} />
           <Row label="Order status" value={order.status} />
           <Row label="Financial status" value={order.financialStatus} />
-          <Row label="Fulfillment status" value={order.fulfillmentStatus} />
+          <s-stack direction="block" gap="none">
+            <s-text tone="subdued">Shipping status</s-text>
+            <ShippingBadge status={order.shippingStatus} />
+          </s-stack>
+          <s-stack direction="block" gap="none">
+            <s-text tone="subdued">Delivery status</s-text>
+            <DeliveryBadge status={order.deliveryStatus} />
+          </s-stack>
           <Row label="Source channel" value={order.sourceName} />
         </s-grid>
         <s-box paddingBlockStart="base">
@@ -362,12 +377,20 @@ export default function OrderDetail() {
       {/* ── Shipping & fulfillment ── */}
       <s-section heading="Shipping & fulfillment">
         <s-grid gap="base" gridTemplateColumns="repeat(3, minmax(0, 1fr))">
+          <s-stack direction="block" gap="none">
+            <s-text tone="subdued">Shipping status</s-text>
+            <ShippingBadge status={order.shippingStatus} />
+          </s-stack>
+          <s-stack direction="block" gap="none">
+            <s-text tone="subdued">Delivery status</s-text>
+            <DeliveryBadge status={order.deliveryStatus} />
+          </s-stack>
+          <Row label="Ship date" value={order.shippedAt ? formatDate(order.shippedAt) : "—"} />
           <Row
             label="Shipping method"
             value={(order.shippingLines || []).map((s) => s.title).filter(Boolean).join(", ") || "—"}
           />
           <Row label="Shipping charges" value={formatCurrency(p.totalShipping, cur)} />
-          <Row label="Ship date" value={order.shippedAt ? formatDate(order.shippedAt) : "—"} />
         </s-grid>
         <s-box paddingBlockStart="base">
           {fulfillments.length === 0 ? (

@@ -1,9 +1,10 @@
 /* eslint-disable react/prop-types */
-import { useRef, useState } from "react";
-import { useLoaderData, useNavigate, useNavigation } from "react-router";
+import { useEffect, useRef, useState } from "react";
+import { useLoaderData, useNavigate, useNavigation, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import { listCdoOrders } from "../services/cdo/cdo.service";
-import StatusBadge from "../components/cdo/StatusBadge";
+import { getRetailInvoicePdf } from "../services/retailQbo/retailOrderInvoice.service";
+import { ShippingBadge, DeliveryBadge } from "../components/cdo/StatusBadges";
 import { formatCurrency, formatDate } from "../utils/format";
 
 const PAGE_SIZE = 25;
@@ -44,6 +45,24 @@ export const loader = async ({ request }) => {
 
   const result = await listCdoOrders({ page, pageSize: PAGE_SIZE, sort, dir, filters });
   return { result, filters, sort, dir };
+};
+
+// In-app QBO invoice PDF preview (same proxy pattern as the detail page) — the
+// admin views the invoice without holding QBO credentials. Returns the PDF
+// base64 in a JSON envelope; the browser turns it into a blob URL.
+export const action = async ({ request }) => {
+  const { session } = await authenticate.admin(request);
+  const form = await request.formData();
+  const op = String(form.get("_action") || "");
+  const shopifyOrderId = String(form.get("shopifyOrderId") || "");
+  if (op !== "invoice-pdf") return { status: "error", message: "Unknown action." };
+  if (!shopifyOrderId) return { status: "error", op, message: "Missing order id." };
+  const r = await getRetailInvoicePdf({ shop: session.shop, shopifyOrderId });
+  if (r.ok) {
+    return { status: "success", op, base64: r.base64, contentType: r.contentType, filename: r.filename };
+  }
+  if (r.reason === "no_invoice") return { status: "error", op, message: "No QBO invoice for this order yet." };
+  return { status: "error", op, message: r.error || "Could not load the invoice PDF." };
 };
 
 export default function OrdersList() {
@@ -99,6 +118,56 @@ export default function OrdersList() {
   const setPage = (p) => goto({ ...filters, sort, dir, page: String(p) });
 
   const sortArrow = (field) => (sort === field ? (dir === "asc" ? " ▲" : " ▼") : "");
+
+  // In-app QBO invoice PDF preview. One fetcher serves the whole list (only one
+  // preview opens at a time). The window must be opened synchronously in the
+  // click (user gesture) to survive popup blockers; we swap in the blob URL
+  // once the base64 returns.
+  const pdfFetcher = useFetcher();
+  const pdfWindowRef = useRef(null);
+  const handledPdfRef = useRef(null);
+  const previewingId =
+    pdfFetcher.state !== "idle" ? pdfFetcher.formData?.get("shopifyOrderId") : null;
+
+  const onPreviewInvoice = (shopifyOrderId) => {
+    pdfWindowRef.current = window.open("about:blank", "_blank");
+    pdfFetcher.submit(
+      { _action: "invoice-pdf", shopifyOrderId: shopifyOrderId || "" },
+      { method: "POST" },
+    );
+  };
+
+  useEffect(() => {
+    if (!pdfFetcher.data || pdfFetcher.state !== "idle") return;
+    if (pdfFetcher.data.op !== "invoice-pdf") return;
+    if (handledPdfRef.current === pdfFetcher.data) return;
+    handledPdfRef.current = pdfFetcher.data;
+    const data = pdfFetcher.data;
+    if (data.status === "success" && data.base64) {
+      const binary = atob(data.base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const blob = new Blob([bytes], { type: data.contentType || "application/pdf" });
+      const blobUrl = URL.createObjectURL(blob);
+      const win = pdfWindowRef.current;
+      if (win && !win.closed) {
+        win.location.href = blobUrl;
+      } else {
+        const a = document.createElement("a");
+        a.href = blobUrl;
+        a.download = data.filename || "invoice.pdf";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+      pdfWindowRef.current = null;
+    } else if (data.status === "error") {
+      const win = pdfWindowRef.current;
+      if (win && !win.closed) win.close();
+      pdfWindowRef.current = null;
+    }
+  }, [pdfFetcher.data, pdfFetcher.state]);
 
   const { rows, total, page, pageCount } = result;
 
@@ -160,7 +229,9 @@ export default function OrdersList() {
         ) : (
           <s-table loading={loading}>
             <s-table-header-row>
-              <s-table-header>Order</s-table-header>
+              <s-table-header>
+                <s-clickable onClick={() => setSort("placedAt")}>Order{sortArrow("placedAt")}</s-clickable>
+              </s-table-header>
               <s-table-header>Customer</s-table-header>
               <s-table-header>Practitioner</s-table-header>
               <s-table-header>Referral</s-table-header>
@@ -170,26 +241,60 @@ export default function OrdersList() {
               <s-table-header>
                 <s-clickable onClick={() => setSort("commissionAmount")}>Commission{sortArrow("commissionAmount")}</s-clickable>
               </s-table-header>
-              <s-table-header>Order status</s-table-header>
               <s-table-header>Payment</s-table-header>
-              <s-table-header>
-                <s-clickable onClick={() => setSort("placedAt")}>Date{sortArrow("placedAt")}</s-clickable>
-              </s-table-header>
+              <s-table-header>Shipping status</s-table-header>
+              <s-table-header>Delivery status</s-table-header>
+              <s-table-header>QBO Invoice</s-table-header>
+              <s-table-header>Actions</s-table-header>
             </s-table-header-row>
             <s-table-body>
               {rows.map((o) => (
-                <s-table-row key={o.id} onClick={() => navigate(`/app/orders/${o.id}`)}>
+                <s-table-row key={o.id}>
                   <s-table-cell>
-                    <s-link href={`/app/orders/${o.id}`}>{o.orderName}</s-link>
+                    <s-stack direction="block" gap="none">
+                      <s-text>{o.orderName}</s-text>
+                      <s-text tone="subdued">{formatDate(o.placedAt)}</s-text>
+                    </s-stack>
                   </s-table-cell>
                   <s-table-cell>{o.customerName}</s-table-cell>
                   <s-table-cell>{o.practitionerName}</s-table-cell>
                   <s-table-cell>{o.referralCode}</s-table-cell>
                   <s-table-cell>{formatCurrency(o.amount, o.currency)}</s-table-cell>
                   <s-table-cell>{o.attributed ? formatCurrency(o.commissionAmount, o.currency) : "—"}</s-table-cell>
-                  <s-table-cell><StatusBadge status={o.status} /></s-table-cell>
                   <s-table-cell>{o.financialStatus}</s-table-cell>
-                  <s-table-cell>{formatDate(o.placedAt)}</s-table-cell>
+                  <s-table-cell>
+                    <s-stack direction="block" gap="small-200">
+                      {o.shippedAt ? (
+                        <s-text tone="subdued">{formatDate(o.shippedAt)}</s-text>
+                      ) : null}
+                      <ShippingBadge status={o.shippingStatus} />
+                      <TrackingLinks tracking={o.tracking} />
+                    </s-stack>
+                  </s-table-cell>
+                  <s-table-cell>
+                    <s-stack direction="block" gap="small-200">
+                      {o.deliveredAt ? (
+                        <s-text tone="subdued">{formatDate(o.deliveredAt)}</s-text>
+                      ) : null}
+                      <DeliveryBadge status={o.deliveryStatus} />
+                    </s-stack>
+                  </s-table-cell>
+                  <s-table-cell>
+                    <QboInvoiceCell
+                      qbo={o.qbo}
+                      previewing={previewingId === o.shopifyOrderId}
+                      onPreview={() => onPreviewInvoice(o.shopifyOrderId)}
+                    />
+                  </s-table-cell>
+                  <s-table-cell>
+                    <s-button
+                      variant="tertiary"
+                      accessibilityLabel={`View order ${o.orderName}`}
+                      onClick={() => navigate(`/app/orders/${o.id}`)}
+                    >
+                      View
+                    </s-button>
+                  </s-table-cell>
                 </s-table-row>
               ))}
             </s-table-body>
@@ -207,6 +312,58 @@ export default function OrdersList() {
           </s-stack>
         </s-box>
       </s-section>
+    </s-stack>
+  );
+}
+
+// Carrier name(s) under the shipping badge — each a clickable link through to
+// that carrier's tracking page (trackingUrl), mirroring the Order Details page.
+// The tracking ID itself is intentionally not shown. Falls back to "Track" when
+// the carrier name is unknown; renders nothing until the order ships.
+function TrackingLinks({ tracking }) {
+  if (!Array.isArray(tracking) || tracking.length === 0) return null;
+  return (
+    <s-stack direction="block" gap="none">
+      {tracking.map((t, i) =>
+        t.url ? (
+          <s-link key={i} href={t.url} target="_blank">
+            {t.company || "Track"} ↗
+          </s-link>
+        ) : t.company ? (
+          <s-text key={i} tone="subdued">
+            {t.company}
+          </s-text>
+        ) : null,
+      )}
+    </s-stack>
+  );
+}
+
+// QBO invoice summary cell: invoice number + status, plus actions to preview
+// it in-app and open it in QuickBooks Online.
+function QboInvoiceCell({ qbo, onPreview, previewing }) {
+  if (!qbo?.invoiceId) return <s-text tone="subdued">—</s-text>;
+  const statusMap = {
+    created: { tone: "success", label: "Created" },
+    shipping_synced: { tone: "success", label: "Synced" },
+    creating: { tone: "info", label: "Creating…" },
+    error: { tone: "critical", label: "Error" },
+  };
+  const m = statusMap[qbo.syncStatus] || { tone: "neutral", label: qbo.syncStatus || "—" };
+  return (
+    <s-stack direction="block" gap="small-200">
+      {/* <s-text>{qbo.docNumber ? `#${qbo.docNumber}` : qbo.invoiceId}</s-text> */}
+      {/* <s-badge tone={m.tone}>{m.label}</s-badge> */}
+      <s-stack direction="inline" gap="small-200" alignItems="center">
+        <s-button variant="tertiary" disabled={previewing} onClick={onPreview}>
+          Preview
+        </s-button>
+        {qbo.invoiceUrl ? (
+          <s-link href={qbo.invoiceUrl} target="_blank">
+           Open in QBO {qbo.docNumber ? `${qbo.docNumber}` : qbo.invoiceId}  ↗
+          </s-link>
+        ) : null}
+      </s-stack>
     </s-stack>
   );
 }

@@ -42,6 +42,12 @@ import { schedulerConfig } from "../scheduler/scheduler.config";
 import { payoutConfig } from "../payout/payout.config";
 import { getPayoutProvider } from "../payout/provider";
 import { createLogger } from "../../utils/logger.utils";
+import {
+  deriveShippingStatus,
+  deriveDeliveryStatus,
+  deriveDeliveredAt,
+  extractTracking,
+} from "../../utils/orderStatus";
 
 const log = createLogger("cdo.service");
 
@@ -3200,7 +3206,7 @@ export async function listCdoOrders({
       .skip((pageNum - 1) * size)
       .limit(size)
       .select(
-        "shopifyOrderId orderName orderNumber customerName customerEmail practitionerName practitionerEmail referralCode amount commissionAmount currency status financialStatus fulfillmentStatus attributed placedAt createdAt",
+        "shopifyOrderId orderName orderNumber customerName customerEmail practitionerName practitionerEmail referralCode amount commissionAmount currency status financialStatus fulfillmentStatus fulfillments shippedAt attributed placedAt createdAt retailQbo",
       )
       .lean(),
   ]);
@@ -3208,6 +3214,7 @@ export async function listCdoOrders({
   return {
     rows: rows.map((r) => ({
       id: r._id.toString(),
+      shopifyOrderId: r.shopifyOrderId || null,
       orderName: r.orderName || r.orderNumber || r.shopifyOrderId || "—",
       orderNumber: r.orderNumber || null,
       customerName: r.customerName || r.customerEmail || "—",
@@ -3218,9 +3225,28 @@ export async function listCdoOrders({
       currency: r.currency || "USD",
       status: r.status || "pending",
       financialStatus: r.financialStatus || "—",
-      fulfillmentStatus: r.fulfillmentStatus || "—",
+      // Raw Shopify field kept for back-compat; the derived keys below are what
+      // the UI renders (self-healing, in sync with fulfillments[]).
+      fulfillmentStatus: r.fulfillmentStatus || "unfulfilled",
+      shippingStatus: deriveShippingStatus(r),
+      deliveryStatus: deriveDeliveryStatus(r),
+      // Carrier tracking number(s) + URL(s) for the Shipping status column —
+      // clickable through to the carrier's tracking page (mirrors detail page).
+      tracking: extractTracking(r),
       attributed: r.attributed === true,
       placedAt: r.placedAt || r.createdAt || null,
+      // Ship + delivered dates shown alongside the shipping/delivery badges.
+      shippedAt: r.shippedAt || null,
+      deliveredAt: deriveDeliveredAt(r),
+      // QBO invoice summary for the list's "QBO Invoice" column.
+      qbo: r.retailQbo
+        ? {
+            invoiceId: r.retailQbo.qboInvoiceId || null,
+            docNumber: r.retailQbo.qboInvoiceDocNumber || null,
+            syncStatus: r.retailQbo.qboSyncStatus || null,
+            invoiceUrl: r.retailQbo.invoiceUrl || null,
+          }
+        : null,
     })),
     total,
     page: pageNum,
@@ -3248,6 +3274,9 @@ export async function getCdoOrderDetail(id) {
     status: o.status || "pending",
     financialStatus: o.financialStatus || null,
     fulfillmentStatus: o.fulfillmentStatus || null,
+    // Derived, self-healing display statuses (in sync with fulfillments[]).
+    shippingStatus: deriveShippingStatus(o),
+    deliveryStatus: deriveDeliveryStatus(o),
     currency: o.currency || "USD",
     amount: o.amount || 0,
     commissionAmount: o.commissionAmount || 0,

@@ -416,6 +416,23 @@ export async function recordFulfillmentAndSync({ shop, shopifyOrderId, fulfillme
     .filter((t) => Number.isFinite(t));
   if (times.length) order.shippedAt = new Date(Math.min(...times));
 
+  // Self-heal the order-level fulfillmentStatus from the fulfillments we hold.
+  // The order-level field is normally written by orders/updated, but that
+  // webhook can be missed/late — leaving a shipped order reading "unfulfilled".
+  // Only UPGRADE from an empty/unfulfilled value to "fulfilled"; never clobber a
+  // Shopify-reported "partial"/"restocked" (orders/updated remains authoritative
+  // for the partial-vs-full distinction).
+  const currentFf = String(order.fulfillmentStatus || "").toLowerCase();
+  if (!["fulfilled", "partial", "restocked"].includes(currentFf)) {
+    const active = order.fulfillments.filter(
+      (x) => String(x.status || "").toLowerCase() !== "cancelled",
+    );
+    const anyShipped = active.some(
+      (x) => x.shipmentStatus || ["success", "open"].includes(String(x.status || "").toLowerCase()),
+    );
+    if (anyShipped) order.fulfillmentStatus = "fulfilled";
+  }
+
   await order.save();
   log.info("fulfillment.captured", {
     shopifyOrderId,

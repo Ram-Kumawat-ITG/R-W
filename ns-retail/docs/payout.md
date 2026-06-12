@@ -698,6 +698,29 @@ timeline + attribution audit) for the detail page.
 **Service API additions:** `getUpcomingPayouts` · `listCdoOrders` · `getCdoOrderDetail`
 (reporting/reads, in `cdo.service.js`).
 
+**Shipping + Delivery status (derived, self-healing).** The list and detail
+pages show two distinct, derived statuses (never a single stored field):
+
+- **Shipping status** = fulfillment state — `unfulfilled · partially_fulfilled ·
+  fulfilled · restocked · returned · cancelled`.
+- **Delivery status** = carrier shipment state — `not_shipped · shipped ·
+  label_printed · confirmed · ready_for_pickup · in_transit · out_for_delivery ·
+  attempted_delivery · delivered · failure · returned · cancelled`.
+
+`app/utils/orderStatus.js` (pure; safe to import from both the service and the
+route badges) derives both from `order.fulfillmentStatus` **+** `order.fulfillments[]`
+(`.status` lifecycle and `.shipmentStatus` carrier events). It self-heals a
+stale/missing order-level field (a missed/late `orders/updated` no longer leaves
+a shipped order reading "unfulfilled"); delivery rolls up across fulfillments
+(least-progressed shipment until all delivered; a failed scan surfaces first).
+`recordFulfillmentAndSync` also upgrades a blank/"unfulfilled" stored
+`fulfillmentStatus` to "fulfilled" once a shipment exists (never clobbering a
+Shopify "partial"/"restocked"). Kept in sync automatically by the subscribed
+`orders/updated` + `fulfillments/create|update` webhooks. `listCdoOrders` /
+`getCdoOrderDetail` return `shippingStatus` + `deliveryStatus`; the list's old
+"Order status" column (a duplicate of the program status) was replaced by a
+"Delivery status" column. Shared badges: `app/components/cdo/StatusBadges.jsx`.
+
 ## 18. Practitioner Portal (Customer Account UI extension)
 
 Self-service dashboard for CDO practitioners, rendered **inside the Shopify
@@ -846,7 +869,8 @@ legacy null rows still work.
 **Retail Order Details page** (`app/routes/app.orders.$id.jsx`): Order info
 (+ tags/notes/source), Customer info (+ billing/shipping), Product info
 (name/SKU/variant/qty/unit/discount/total), Pricing + Tax & discount details,
-Shipping & Fulfillment (method/charges + carrier/tracking #/URL/status/date),
+Shipping & Fulfillment (**Shipping status + Delivery status badges** (§17) +
+method/charges + carrier/tracking #/URL/shipment status/date),
 Payment info (method/transaction id/amounts), **QuickBooks information**
 (customer id / invoice id+link / number / status / created / last sync /
 invoice-sent status / error), Commission (unchanged), and Audit & Activity
