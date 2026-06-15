@@ -79,7 +79,7 @@ async function doSendInvoice({ orderId, invoiceId, email, shopifyOrderId }) {
 }
 
 // Auto-send wrapper used after creation / on the already-invoiced retry path.
-// Honors the CDO_QBO_Retail_SEND_INVOICE flag and no-ops (with an audit line)
+// Honors the QBO_RETAIL_SEND_INVOICE flag and no-ops (with an audit line)
 // when there's no recipient email.
 async function maybeSendInvoiceOnCreate({ orderId, invoiceId, email, shopifyOrderId }) {
   if (!retailQboConfig.sendInvoiceOnCreate) return;
@@ -751,7 +751,7 @@ async function syncOrderShippingToInvoice(order) {
     // invoice, whose memo now carries the order number + carrier + tracking
     // number + tracking URL + shipment status. Deduped on the tracking string
     // (`lastNotifiedTracking`) so we email once per tracking change, never on
-    // an unchanged re-sync. Gated by CDO_QBO_Retail_NOTIFY_ON_SHIP.
+    // an unchanged re-sync. Gated by QBO_RETAIL_NOTIFY_ON_SHIP.
     const email = order.customerEmail || order.customer?.email || null;
     const alreadyNotified = order.retailQbo?.lastNotifiedTracking || null;
     if (retailQboConfig.notifyOnShip && trackingNum && email && trackingNum !== alreadyNotified) {

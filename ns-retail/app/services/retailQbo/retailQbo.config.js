@@ -1,16 +1,15 @@
-// Retail QuickBooks Online configuration — the SEPARATE QBO company used
-// only for RETAIL CUSTOMER ORDER INVOICES (accounts-receivable / "money in").
+// Retail QuickBooks Online configuration — the QBO company used for RETAIL
+// CUSTOMER ORDER INVOICES (accounts-receivable / "money in").
 //
-// Fully independent from:
-//   - the CDO payouts QBO account (services/qbo/* — CDO_QBO_* — Bills/payouts)
-//   - the wholesale workspace's QBO integration (different repo folder)
+// App-level OAuth credentials are SHARED across QBO companies and read from the
+// bare QBO_* env vars; company-specific config (realm, token, item/account ids,
+// toggles) is read from QBO_RETAIL_*. The CDO commission-payout client
+// (services/qbo/* — Bills/payouts) targets this SAME company, so the two share
+// the realm's OAuth token. Independent from the wholesale workspace's QBO
+// integration (different repo folder).
 //
-// Reads CDO_QBO_Retail_* env vars (note the mixed-case `Retail` the operator
-// used). For resilience we also accept the all-caps CDO_QBO_RETAIL_* spelling.
-//
-// Token state for this realm lives in the SAME cdo_qbo_tokens collection as
-// the CDO realm — that model is keyed by `realmId` (unique), so the two
-// realms coexist without colliding. See retailQbo.apis.js.
+// Token state lives in the cdo_qbo_tokens collection, keyed by `realmId`
+// (unique). See retailQbo.apis.js.
 //
 // SERVER-ONLY: reads process.env at module init. Import only from
 // services / webhook routes / loaders — never from a route's render path.
@@ -18,42 +17,37 @@
 import { readEnv, readBool } from "../../utils/env.utils";
 import { QBO_BASE_URLS, QBO_APP_URLS, QBO_OAUTH_TOKEN_URL } from "../qbo/qbo.constants";
 
-// Read CDO_QBO_Retail_<KEY>, falling back to the all-caps CDO_QBO_RETAIL_<KEY>
-// spelling, then to `fallback`. Keeps us robust to either env-var casing.
-function readRetail(key, fallback) {
-  const exact = readEnv(`CDO_QBO_Retail_${key}`);
-  if (exact !== undefined && exact !== "") return exact;
-  return readEnv(`CDO_QBO_RETAIL_${key}`, { fallback });
-}
-
 // Clamp to a known environment (don't throw at import — a missing/garbled
-// retail config must not crash app boot; the feature degrades gracefully and
+// config must not crash app boot; the feature degrades gracefully and
 // surfaces the misconfig per-order instead).
-const rawEnv = readRetail("ENVIRONMENT", "sandbox");
+const rawEnv = readEnv("QBO_ENVIRONMENT", { fallback: "sandbox" });
 const environment = QBO_BASE_URLS[rawEnv] ? rawEnv : "sandbox";
 
 export const retailQboConfig = {
-  clientId: readRetail("CLIENT_ID"),
-  clientSecret: readRetail("CLIENT_SECRET"),
-  realmId: readRetail("REALM_ID"),
+  // Shared app credentials (QBO_*).
+  clientId: readEnv("QBO_CLIENT_ID"),
+  clientSecret: readEnv("QBO_CLIENT_SECRET"),
+  environment,
+  apiBaseUrl: readEnv("QBO_API_BASE_URL", { fallback: QBO_BASE_URLS[environment] }),
+  appBaseUrl: readEnv("QBO_APP_BASE_URL", { fallback: QBO_APP_URLS[environment] }),
+  oauthTokenUrl: readEnv("QBO_OAUTH_TOKEN_URL", { fallback: QBO_OAUTH_TOKEN_URL }),
+  minorVersion: readEnv("QBO_MINOR_VERSION", { fallback: "73" }),
+
+  // Company-specific config (QBO_RETAIL_*).
+  realmId: readEnv("QBO_RETAIL_REALM_ID"),
   // Seed refresh token on first run; after that cdo_qbo_tokens (keyed by this
   // realmId) is the source of truth — see retailQbo.apis.js.
-  bootstrapRefreshToken: readRetail("REFRESH_TOKEN"),
-  environment,
-  apiBaseUrl: readRetail("API_BASE_URL", QBO_BASE_URLS[environment]),
-  appBaseUrl: readRetail("APP_BASE_URL", QBO_APP_URLS[environment]),
-  oauthTokenUrl: readRetail("OAUTH_TOKEN_URL", QBO_OAUTH_TOKEN_URL),
-  minorVersion: readRetail("MINOR_VERSION", "73"),
+  bootstrapRefreshToken: readEnv("QBO_RETAIL_REFRESH_TOKEN"),
 
   // Invoice line posting. Per the locked decision, every product line posts
   // to ONE generic Sales item. If a QBO Item id is set we use it verbatim
-  // (both CDO_QBO_Retail_ITEM_ID and CDO_QBO_Retail_DEFAULT_ITEM_ID are
-  // accepted); otherwise the service auto-resolves (or creates) a Service item
-  // named CDO_QBO_Retail_ITEM_NAME (default "Retail Sales"), deriving the
-  // income account from an existing item or CDO_QBO_Retail_INCOME_ACCOUNT_ID.
-  salesItemId: readRetail("ITEM_ID") || readRetail("DEFAULT_ITEM_ID"),
-  salesItemName: readRetail("ITEM_NAME", "Retail Sales"),
-  incomeAccountId: readRetail("INCOME_ACCOUNT_ID"),
+  // (both QBO_RETAIL_ITEM_ID and QBO_RETAIL_DEFAULT_ITEM_ID are accepted);
+  // otherwise the service auto-resolves (or creates) a Service item named
+  // QBO_RETAIL_ITEM_NAME (default "Retail Sales"), deriving the income account
+  // from an existing item or QBO_RETAIL_INCOME_ACCOUNT_ID.
+  salesItemId: readEnv("QBO_RETAIL_ITEM_ID") || readEnv("QBO_RETAIL_DEFAULT_ITEM_ID"),
+  salesItemName: readEnv("QBO_RETAIL_ITEM_NAME", { fallback: "Retail Sales" }),
+  incomeAccountId: readEnv("QBO_RETAIL_INCOME_ACCOUNT_ID"),
 
   // Customer-facing email behavior — QBO is the delivery channel. Both default
   // ON per the retail spec; set the env to "false"/"0" to disable.
@@ -62,15 +56,15 @@ export const retailQboConfig = {
   //   notifyOnShip — re-send the invoice (now carrying carrier + tracking +
   //     URL + shipment status in its memo) when tracking changes, as the
   //     shipment notification. Deduped on the tracking string.
-  sendInvoiceOnCreate: readBool("CDO_QBO_Retail_SEND_INVOICE", true),
-  notifyOnShip: readBool("CDO_QBO_Retail_NOTIFY_ON_SHIP", true),
+  sendInvoiceOnCreate: readBool("QBO_RETAIL_SEND_INVOICE", true),
+  notifyOnShip: readBool("QBO_RETAIL_NOTIFY_ON_SHIP", true),
 
   // Payment recording — when the Shopify order is PAID, create a QBO Payment
   // applied to the invoice so QBO shows it Paid (default ON). Optional
-  // CDO_QBO_Retail_DEPOSIT_ACCOUNT_ID routes the payment to a specific account
+  // QBO_RETAIL_DEPOSIT_ACCOUNT_ID routes the payment to a specific account
   // (Bank / Undeposited Funds); omit to let QBO use its default.
-  recordPaymentOnPaid: readBool("CDO_QBO_Retail_RECORD_PAYMENT", true),
-  depositAccountId: readRetail("DEPOSIT_ACCOUNT_ID"),
+  recordPaymentOnPaid: readBool("QBO_RETAIL_RECORD_PAYMENT", true),
+  depositAccountId: readEnv("QBO_RETAIL_DEPOSIT_ACCOUNT_ID"),
 };
 
 // True when the four credentials needed to talk to the retail realm are set.
@@ -91,10 +85,10 @@ export function assertRetailQboConfigured() {
   );
   if (missing.length) {
     const map = {
-      clientId: "CDO_QBO_Retail_CLIENT_ID",
-      clientSecret: "CDO_QBO_Retail_CLIENT_SECRET",
-      realmId: "CDO_QBO_Retail_REALM_ID",
-      bootstrapRefreshToken: "CDO_QBO_Retail_REFRESH_TOKEN",
+      clientId: "QBO_CLIENT_ID",
+      clientSecret: "QBO_CLIENT_SECRET",
+      realmId: "QBO_RETAIL_REALM_ID",
+      bootstrapRefreshToken: "QBO_RETAIL_REFRESH_TOKEN",
     };
     throw new Error(
       `Retail QBO not configured. Missing: ${missing.map((k) => map[k]).join(", ")}`,

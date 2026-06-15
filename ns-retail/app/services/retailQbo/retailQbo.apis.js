@@ -3,12 +3,12 @@
 // 401-retry-once, `requestid` idempotency, and Fault-structured error
 // classification. Pure transport; domain methods live in retailQbo.service.js.
 //
-// This is a SECOND, independent QBO client (the retail A/R realm). It mirrors
+// This is a SECOND, independent QBO client (the retail A/R surface). It mirrors
 // services/qbo/qbo.apis.js (the CDO payouts client) but is bound to
-// retailQboConfig and stores its tokens under the retail realmId in the SAME
-// cdo_qbo_tokens collection (that model is unique on realmId, so the two
-// realms never collide). Kept separate from the CDO client so retail invoice
-// work can never affect the payout pipeline.
+// retailQboConfig and stores its tokens under the realmId in the cdo_qbo_tokens
+// collection (unique on realmId). Both clients target the same QBO company, so
+// they share that realm's token row. Kept as a separate client so retail
+// invoice work stays isolated in code from the payout pipeline.
 
 import { randomUUID } from "node:crypto";
 import { retailQboConfig, assertRetailQboConfigured } from "./retailQbo.config";
@@ -21,9 +21,9 @@ import CdoQboToken from "../../models/cdoQboToken.server";
 const log = createLogger("retail.qbo.apis");
 
 const RETRY = {
-  attempts: readInt("CDO_QBO_HTTP_RETRY_ATTEMPTS", 4),
-  baseMs: readInt("CDO_QBO_HTTP_RETRY_BASE_MS", 500),
-  maxMs: readInt("CDO_QBO_HTTP_RETRY_MAX_MS", 4000),
+  attempts: readInt("QBO_HTTP_RETRY_ATTEMPTS", 4),
+  baseMs: readInt("QBO_HTTP_RETRY_BASE_MS", 500),
+  maxMs: readInt("QBO_HTTP_RETRY_MAX_MS", 4000),
 };
 
 function truncate(str, max = 1000) {
@@ -40,7 +40,7 @@ async function readTokenDoc() {
 async function bootstrapTokenDocFromEnv() {
   if (!retailQboConfig.bootstrapRefreshToken) {
     throw new PermanentError(
-      "Retail QBO has no stored token and CDO_QBO_Retail_REFRESH_TOKEN is empty. " +
+      "Retail QBO has no stored token and QBO_RETAIL_REFRESH_TOKEN is empty. " +
         "Seed an initial refresh token via the Intuit OAuth Playground.",
     );
   }

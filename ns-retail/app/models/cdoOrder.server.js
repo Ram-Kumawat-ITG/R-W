@@ -83,7 +83,7 @@ const trackingHistorySchema = new mongoose.Schema(
   { _id: false },
 );
 
-// ── Retail QBO invoice (the CDO_QBO_Retail_* realm — A/R "money in") ──
+// ── Retail QBO invoice (the QBO_RETAIL_* company — A/R "money in") ──
 // Distinct from the CDO payouts QBO (Bills). Managed solely by
 // services/retailQbo/* — the ingestion pipeline never writes this block.
 // `syncLog[]` is an append-only audit of every QBO create/sync attempt.

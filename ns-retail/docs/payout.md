@@ -12,7 +12,7 @@ The CDO Program pays practitioners a commission on referral-attributed orders. T
 
 Two principles drive the design:
 
-1. **The CDO QBO account is fully independent.** It uses its own credentials (`CDO_QBO_*`), its own OAuth token store (`cdo_qbo_tokens`), and its own client (`app/services/qbo`). It shares nothing with the wholesale workspace's QBO integration.
+1. **The QBO integration is independent from wholesale.** It uses its own Intuit app (shared `QBO_*` app credentials + the `QBO_RETAIL_*` company), its own OAuth token store (`cdo_qbo_tokens`), and its own clients (`app/services/qbo` for payout Bills, `app/services/retailQbo` for A/R invoices). It shares nothing with the wholesale workspace's QBO integration.
 2. **Money movement is gated.** Payouts follow an **approve-then-auto-execute** model — a human approves each batch before any QBO posting happens.
 
 > **Scope note on "payment":** QBO `BillPayment` *records* a disbursement in the ledger; it does **not** itself move money over ACH. The actual funds transfer (QBO Bill Pay or an external ACH provider) is a deferred decision — see §8.
@@ -116,11 +116,11 @@ executeApprovedPayout(payoutId)
         │                                                                    ▼
         ├─(2) Bill   ── createBill() ── POST /bill                    QBO Vendor.Id
         │      one AccountBasedExpenseLine per commission                    │
-        │      → AccountRef = CDO_QBO_COMMISSION_EXPENSE_ACCOUNT_ID          │
+        │      → AccountRef = QBO_RETAIL_COMMISSION_EXPENSE_ACCOUNT_ID          │
         │      requestid = cdo-bill-<payoutId>  (idempotent)                 ▼
         │                                                              QBO Bill.Id
         ├─(3) BillPayment ── createBillPayment() ── POST /billpayment        │
-        │      PayType "Check", BankAccountRef = CDO_QBO_PAYMENT_ACCOUNT_ID  │
+        │      PayType "Check", BankAccountRef = QBO_RETAIL_PAYMENT_ACCOUNT_ID  │
         │      LinkedTxn → Bill   requestid = cdo-pay-<payoutId>             ▼
         │                                                         QBO BillPayment.Id
         └─(4) Settle: commissions → paid · ledger debit · payout → paid
@@ -149,7 +149,7 @@ Resolution order in `findOrCreateVendor`:
 POST /v3/company/{realmId}/bill?minorversion=73&requestid=cdo-bill-<payoutId>
 {
   "VendorRef": { "value": "<qboVendorId>" },
-  "APAccountRef": { "value": "<CDO_QBO_AP_ACCOUNT_ID>" },   // optional
+  "APAccountRef": { "value": "<QBO_RETAIL_AP_ACCOUNT_ID>" },   // optional
   "DocNumber": "CDO-202606-1b3760",                         // payout.reference
   "PrivateNote": "CDO commission payout … (period ending YYYY-MM-DD)",
   "Line": [
@@ -158,7 +158,7 @@ POST /v3/company/{realmId}/bill?minorversion=73&requestid=cdo-bill-<payoutId>
       "Amount": 20.00,
       "Description": "Commission — #CDO-AARAV-1001 (rate 10.0%)",
       "AccountBasedExpenseLineDetail": {
-        "AccountRef": { "value": "<CDO_QBO_COMMISSION_EXPENSE_ACCOUNT_ID>" }
+        "AccountRef": { "value": "<QBO_RETAIL_COMMISSION_EXPENSE_ACCOUNT_ID>" }
       }
     }
     // … one line per commission in the payout
@@ -174,7 +174,7 @@ POST /v3/company/{realmId}/billpayment?minorversion=73&requestid=cdo-pay-<payout
   "VendorRef": { "value": "<qboVendorId>" },
   "TotalAmt": 20.00,
   "PayType": "Check",
-  "CheckPayment": { "BankAccountRef": { "value": "<CDO_QBO_PAYMENT_ACCOUNT_ID>" } },
+  "CheckPayment": { "BankAccountRef": { "value": "<QBO_RETAIL_PAYMENT_ACCOUNT_ID>" } },
   "Line": [
     { "Amount": 20.00, "LinkedTxn": [ { "TxnId": "<qboBillId>", "TxnType": "Bill" } ] }
   ]
@@ -189,9 +189,9 @@ Discover with `npm run cdo:qbo-accounts` (lists every account + `Id`).
 
 | Env var | QBO account type | Use |
 |---|---|---|
-| `CDO_QBO_COMMISSION_EXPENSE_ACCOUNT_ID` | Expense | Bill expense line |
-| `CDO_QBO_PAYMENT_ACCOUNT_ID` | Bank | BillPayment source |
-| `CDO_QBO_AP_ACCOUNT_ID` | Accounts Payable | (optional) Bill A/P account |
+| `QBO_RETAIL_COMMISSION_EXPENSE_ACCOUNT_ID` | Expense | Bill expense line |
+| `QBO_RETAIL_PAYMENT_ACCOUNT_ID` | Bank | BillPayment source |
+| `QBO_RETAIL_AP_ACCOUNT_ID` | Accounts Payable | (optional) Bill A/P account |
 
 ### 6.5 Commission banking — source of truth + validation gate
 
@@ -394,7 +394,7 @@ QBO records the accounting; its `BillPayment` API does **not** move funds to a p
  └── pending  → stay awaiting_settlement (normal 1–3 business-day ACH window)
 ```
 
-- **FROM** the business bank account (QBO `CDO_QBO_PAYMENT_ACCOUNT_ID`); **TO** the practitioner's account (`wholesale_applications.commission`, §6.5).
+- **FROM** the business bank account (QBO `QBO_RETAIL_PAYMENT_ACCOUNT_ID`); **TO** the practitioner's account (`wholesale_applications.commission`, §6.5).
 - **`paid` is set only on confirmed settlement.** The QBO BillPayment is recorded at settlement (not at execution), so the books only claim "paid" once money has actually moved.
 - **Returns** (R01 NSF, R02 closed, R03 no account…) flip the payout to `failed` with `returnCode`/`returnReason`/`returnedAt`; the commissions stay reserved to the payout so **Execute** re-disburses the same payout (fresh idempotency key) once banking is fixed — no re-batching, no double-pay.
 
@@ -505,7 +505,7 @@ Mutations are React Router **route actions** (embedded-admin), dispatched by a s
 
 ### 11.1 Error model
 
-- `qbo.apis.js` classifies failures: `TransientError` (5xx / 429 / network) → retried with exponential backoff + jitter (`CDO_QBO_HTTP_RETRY_*`); `PermanentError` (4xx auth/validation, QBO `Fault`) → no retry.
+- `qbo.apis.js` classifies failures: `TransientError` (5xx / 429 / network) → retried with exponential backoff + jitter (`QBO_HTTP_RETRY_*`); `PermanentError` (4xx auth/validation, QBO `Fault`) → no retry.
 - `401` → one forced token refresh + retry.
 
 ### 11.2 Idempotency (no duplicate money)
@@ -529,7 +529,7 @@ A failed execution sets `status = failed` + `lastError`; **Retry** re-runs `exec
 
 ## 12. Security Considerations
 
-- **Credential isolation:** CDO uses dedicated `CDO_QBO_*` secrets + a dedicated token collection; no overlap with the wholesale QBO realm.
+- **Credential isolation:** CDO uses dedicated QBO secrets (`QBO_*` / `QBO_RETAIL_*`) + a dedicated token collection; no overlap with the wholesale QBO realm.
 - **Secrets in env only:** all credentials read via config (`qbo.config.js`); never logged. `.env` is gitignored; `.env.example` documents the keys.
 - **Token rotation persisted atomically** to survive crash-after-refresh.
 - **Approval gate:** no QBO posting without an admin `approve`; the actor is recorded.
@@ -580,8 +580,8 @@ execute → qboVendorId present (skip) → qboBillId present (skip)
 
 ## 14. Production Deployment Notes
 
-1. **Provision the CDO QBO app** (Intuit Developer): set `CDO_QBO_CLIENT_ID/SECRET`, `CDO_QBO_REALM_ID`, `CDO_QBO_ENVIRONMENT=production`, and seed `CDO_QBO_REFRESH_TOKEN`.
-2. **Set Chart-of-Accounts ids:** run `npm run cdo:qbo-accounts`, copy `CDO_QBO_COMMISSION_EXPENSE_ACCOUNT_ID`, `CDO_QBO_PAYMENT_ACCOUNT_ID`, (`CDO_QBO_AP_ACCOUNT_ID`).
+1. **Provision the QBO app** (Intuit Developer): set `QBO_CLIENT_ID/SECRET`, `QBO_RETAIL_REALM_ID`, `QBO_ENVIRONMENT=production`, and seed `QBO_RETAIL_REFRESH_TOKEN`.
+2. **Set Chart-of-Accounts ids:** run `npm run cdo:qbo-accounts`, copy `QBO_RETAIL_COMMISSION_EXPENSE_ACCOUNT_ID`, `QBO_RETAIL_PAYMENT_ACCOUNT_ID`, (`QBO_RETAIL_AP_ACCOUNT_ID`).
 3. **Verify connection** with the same helper (lists accounts on success).
 4. **Tune program settings** (`cdo_settings`): `minimumPayoutAmount`, `autoApproveCommissions`, `payoutSchedule`, `defaultCommissionRate`, `currency`.
 5. **Token lifecycle:** Mongo (`cdo_qbo_tokens`) is the source of truth after first run; production refresh tokens last ~100 days and auto-rotate. Keep a procedure to re-seed (`-- --reset`) if revoked.
@@ -806,26 +806,26 @@ builds.
 engine, §4/§7), live Shopify Discount API objects, charts, and CSV export (the
 sandboxed Web Worker has no DOM/Blob).
 
-## 19. Retail order QBO invoicing (`CDO_QBO_Retail_*`) — IMPLEMENTED
+## 19. Retail order QBO invoicing (`QBO_RETAIL_*`) — IMPLEMENTED
 
 Retail **customer** orders → QuickBooks **Invoices** (accounts-receivable,
-"money in"). This is a SECOND, fully independent QBO integration, distinct from:
+"money in"). This is a SECOND, independent QBO code path, distinct from:
 
-- the **CDO payouts** QBO account (§5–§8 — `services/qbo/*`, `CDO_QBO_*`, Vendor
-  **Bills** for practitioner commissions), and
+- the **CDO payouts** QBO client (§5–§8 — `services/qbo/*`, Vendor **Bills**
+  for practitioner commissions), and
 - the **wholesale** workspace's QBO integration (different repo folder).
 
-It runs against its own QBO company via the `CDO_QBO_Retail_*` env vars. Token
-state for the retail realm lives in the same `cdo_qbo_tokens` collection — that
-model is unique-keyed by `realmId`, so the CDO realm and the retail realm
-coexist without colliding.
+It posts to the SAME QBO company as the payout client: app-level OAuth creds
+come from the shared `QBO_*` vars and the company (realm, token, accounts) from
+`QBO_RETAIL_*`. Token state lives in the `cdo_qbo_tokens` collection, unique-keyed
+by `realmId`; because both clients use that one realm, they share its token row.
 
 **Module — `app/services/retailQbo/`:**
 
 | File | Role |
 |---|---|
-| `retailQbo.config.js` | Reads `CDO_QBO_Retail_*` (accepts the mixed-case `Retail` or all-caps `RETAIL` spelling). `isRetailQboConfigured()` lets the feature no-op cleanly when unset. Optional `CDO_QBO_Retail_ITEM_ID` / `ITEM_NAME` / `INCOME_ACCOUNT_ID`. |
-| `retailQbo.apis.js` | A second OAuth2 transport — token rotation, refresh-coalescing, 401-retry-once, `requestid` idempotency, Fault classification. Bound to `retailQboConfig`; tokens stored under the retail `realmId`. Mirrors `services/qbo/qbo.apis.js` but never shares state with it. |
+| `retailQbo.config.js` | Reads shared app creds from `QBO_*` and company config from `QBO_RETAIL_*`. `isRetailQboConfigured()` lets the feature no-op cleanly when unset. Optional `QBO_RETAIL_ITEM_ID` / `ITEM_NAME` / `INCOME_ACCOUNT_ID`. |
+| `retailQbo.apis.js` | A second OAuth2 transport — token rotation, refresh-coalescing, 401-retry-once, `requestid` idempotency, Fault classification. Bound to `retailQboConfig`; tokens stored under the `realmId`. Mirrors `services/qbo/qbo.apis.js`; both target the same company, so they share that realm's token row. |
 | `retailQbo.service.js` | Domain ops: `findOrCreateCustomer` (idempotent by DisplayName=email), `resolveSalesItemId` (one generic Sales Service item — override → named item → any Service item → create against a resolved Income account), `createInvoiceForOrder` (product lines + shipping line + discount line + `TxnTaxDetail` tax + a reconciling **adjustment** line so QBO `TotalAmt` == the Shopify order total), `syncInvoiceShipping` (sparse update: ShipDate + TrackingNum + carrier/tracking memo), `createPaymentForInvoice` (a QBO Payment with a `LinkedTxn` to the invoice — marks it Paid), `invoiceWebUrl`, `paymentWebUrl`. |
 | `retailOrderInvoice.service.js` | Orchestration: `ensureRetailInvoiceForOrder` (idempotent — atomic claim on `cdo_orders.retailQbo` + QBO `requestid`), `ensureRetailPaymentForOrder` (idempotent payment record-and-apply; atomic claim on `retailQbo.qboPaymentId` + `paymentCreating`), and `recordFulfillmentAndSync` (capture tracking → `cdo_orders.fulfillments[]`/`trackingHistory[]`, then mirror to the invoice). `fetchOrderPaymentDetails` reads the order's transactions from the Shopify Admin API. Best-effort; never throws to the webhook. |
 
@@ -845,18 +845,18 @@ coexist without colliding.
   already settled ⇒ skip). The Shopify transaction reference is captured from the
   Admin API (`fetchOrderPaymentDetails`) and stored. Idempotent — atomic claim on
   `retailQbo.qboPaymentId` (+ `paymentCreating` guard) + a stable QBO `requestid`
-  (`retail-pay-<orderId>`). Toggle: `CDO_QBO_Retail_RECORD_PAYMENT` (default on);
-  optional `CDO_QBO_Retail_DEPOSIT_ACCOUNT_ID` routes the deposit account.
+  (`retail-pay-<orderId>`). Toggle: `QBO_RETAIL_RECORD_PAYMENT` (default on);
+  optional `QBO_RETAIL_DEPOSIT_ACCOUNT_ID` routes the deposit account.
 - **Invoice delivery:** immediately after a successful create the invoice is
   **emailed to the customer** via QBO `/invoice/{id}/send` (recipient = order
   email). Idempotent + self-healing — a failed send is retried on the next order
-  event (guarded by `retailQbo.invoiceSentAt`). Toggle: `CDO_QBO_Retail_SEND_INVOICE`.
+  event (guarded by `retailQbo.invoiceSentAt`). Toggle: `QBO_RETAIL_SEND_INVOICE`.
 - **`fulfillments/create` + `fulfillments/update`** → capture carrier / tracking
   number / tracking URL / shipment status / fulfillment date, re-sync them onto
   the QBO invoice, **then notify the customer** by re-sending the invoice (its
   memo now carries order number + carrier + tracking + URL + status). Deduped on
   the tracking string (`retailQbo.lastNotifiedTracking`) so it emails once per
-  tracking change. Toggle: `CDO_QBO_Retail_NOTIFY_ON_SHIP`.
+  tracking change. Toggle: `QBO_RETAIL_NOTIFY_ON_SHIP`.
 
 **State on `cdo_orders` (additive, backward-compatible):** snapshot fields
 `tags`, `note`, `noteAttributes`, `sourceName`, `transactions`; tracking
@@ -899,7 +899,7 @@ payment for a paid order).
 **Idempotency:** one invoice per order — the `cdo_orders.retailQbo` claim plus
 the QBO `requestid` (`retail-inv-<orderGid>`) make re-deliveries and concurrent
 webhooks safe. **Go-live:** `shopify app deploy` to register the two fulfillment
-webhook topics; ensure `CDO_QBO_Retail_REFRESH_TOKEN` is freshly minted (Intuit
+webhook topics; ensure `QBO_RETAIL_REFRESH_TOKEN` is freshly minted (Intuit
 rotates the refresh token on every use — see the §14 token-reset note, which
 applies per realm).
 
@@ -908,31 +908,42 @@ applies per realm).
 ### Appendix — Environment variables
 
 ```
-CDO_QBO_ENVIRONMENT=sandbox|production
-CDO_QBO_CLIENT_ID=            CDO_QBO_CLIENT_SECRET=
-CDO_QBO_REALM_ID=            CDO_QBO_REFRESH_TOKEN=
-CDO_QBO_MINOR_VERSION=73
-CDO_QBO_COMMISSION_EXPENSE_ACCOUNT_ID=
-CDO_QBO_PAYMENT_ACCOUNT_ID=
-CDO_QBO_AP_ACCOUNT_ID=                      # optional
+# ── Shared QBO app credentials (one Intuit app; QBO_*) ──
+QBO_ENVIRONMENT=sandbox|production
+QBO_CLIENT_ID=               QBO_CLIENT_SECRET=
+QBO_MINOR_VERSION=73
 # optional retry tuning (shared by both QBO clients)
-CDO_QBO_HTTP_RETRY_ATTEMPTS=4  CDO_QBO_HTTP_RETRY_BASE_MS=500  CDO_QBO_HTTP_RETRY_MAX_MS=4000
+QBO_HTTP_RETRY_ATTEMPTS=4  QBO_HTTP_RETRY_BASE_MS=500  QBO_HTTP_RETRY_MAX_MS=4000
 
-# ── Retail order invoicing (§19) — SEPARATE QBO company (A/R) ──
-CDO_QBO_Retail_ENVIRONMENT=sandbox|production
-CDO_QBO_Retail_CLIENT_ID=        CDO_QBO_Retail_CLIENT_SECRET=
-CDO_QBO_Retail_REALM_ID=         CDO_QBO_Retail_REFRESH_TOKEN=
-CDO_QBO_Retail_MINOR_VERSION=73
-CDO_QBO_Retail_ITEM_ID=                     # optional — post all lines to this QBO Item (CDO_QBO_Retail_DEFAULT_ITEM_ID also accepted)
-CDO_QBO_Retail_ITEM_NAME=Retail Sales       # optional — name of the auto-resolved Service item
-CDO_QBO_Retail_INCOME_ACCOUNT_ID=           # optional — income account for the auto-created item
-CDO_QBO_Retail_SEND_INVOICE=true            # optional — email the invoice to the customer after create (default on)
-CDO_QBO_Retail_NOTIFY_ON_SHIP=true          # optional — re-send the invoice (with tracking) on shipment, as the notification (default on)
+# ── Retail company (QBO_RETAIL_*) — ONE QBO company for BOTH the retail A/R
+#    invoices (§19) AND the commission-payout Bills/BillPayments (§5–§8) ──
+QBO_RETAIL_REALM_ID=         QBO_RETAIL_REFRESH_TOKEN=
+QBO_RETAIL_COMMISSION_EXPENSE_ACCOUNT_ID=   # Bill expense line
+QBO_RETAIL_PAYMENT_ACCOUNT_ID=              # BillPayment bank source
+QBO_RETAIL_AP_ACCOUNT_ID=                   # optional — Bill A/P account
+QBO_RETAIL_DEFAULT_ITEM_ID=                 # optional — post all invoice lines to this QBO Item (QBO_RETAIL_ITEM_ID also accepted)
+QBO_RETAIL_ITEM_NAME=Retail Sales           # optional — name of the auto-resolved Service item
+QBO_RETAIL_INCOME_ACCOUNT_ID=               # optional — income account for the auto-created item
+QBO_RETAIL_DEPOSIT_ACCOUNT_ID=              # optional — deposit account for recorded payments
+QBO_RETAIL_SEND_INVOICE=true                # optional — email the invoice after create (default on)
+QBO_RETAIL_NOTIFY_ON_SHIP=true              # optional — re-send the invoice (with tracking) on shipment (default on)
+QBO_RETAIL_RECORD_PAYMENT=true              # optional — record a QBO Payment when the Shopify order is paid (default on)
 
 # ── Payout scheduler (§7) ──
-CDO_PAYOUT_CRON=30 0 25 * *                 # prod: 00:30 on the 25th
-CDO_PAYOUT_TZ=America/Los_Angeles
-CDO_PAYOUT_INTERVAL=3 minutes               # DEV ONLY — overrides the cron; leave unset in prod
-CDO_SCHEDULER_DISABLED=                     # set "true" to never boot the scheduler
-CDO_PAYOUT_ALERT_WEBHOOK_URL=               # optional — POSTed on a failed payout
+# CDO_PAYOUT_CRON=30 0 25 * *               # optional — prod payout cron (defaults to 00:30 on the 25th)
+# CDO_PAYOUT_TZ=America/Los_Angeles         # optional — cron timezone (defaults to America/Los_Angeles)
+CDO_PAYOUT_INTERVAL=20 minutes              # DEV ONLY — overrides the payout cron; leave unset in prod
+CDO_SETTLEMENT_INTERVAL=1 minute            # DEV ONLY — overrides the 6-hourly settlement cron; leave unset in prod
+# CDO_SCHEDULER_DISABLED=true               # optional — never boot the scheduler
+# CDO_PAYOUT_ALERT_WEBHOOK_URL=             # optional — POSTed on a failed payout
+
+# ── Payout disbursement (§9) ──
+CDO_PAYOUT_PROVIDER=sandbox|dwolla          # default "sandbox" (in-process simulator)
+# CDO_PAYOUT_REQUIRE_APPROVAL=false         # optional — gate real money behind manual approve+execute
+# CDO_PAYOUT_SANDBOX_SETTLE_SECONDS=60      # sandbox provider ONLY — seconds until a sim transfer settles
+# CDO_SETTLEMENT_CRON=0 */6 * * *           # optional — prod settlement-poll cadence
+# CDO_SETTLEMENT_STUCK_DAYS=5               # optional — flag transfers not settled after N days
+DWOLLA_ENVIRONMENT=sandbox|production       # required when CDO_PAYOUT_PROVIDER=dwolla
+DWOLLA_KEY=                  DWOLLA_SECRET=
+DWOLLA_FUNDING_SOURCE=                      # business funding source (URL or id)
 ```

@@ -130,13 +130,13 @@ async function resolveIncomeAccountRef() {
   if (acct?.Id) return { value: String(acct.Id) };
   throw new Error(
     "Retail QBO: no Income account found to back the sales item. " +
-      "Set CDO_QBO_Retail_INCOME_ACCOUNT_ID or CDO_QBO_Retail_ITEM_ID.",
+      "Set QBO_RETAIL_INCOME_ACCOUNT_ID or QBO_RETAIL_ITEM_ID.",
   );
 }
 
 // Resolve the single QBO Item every retail invoice line posts to:
-//   1. CDO_QBO_Retail_ITEM_ID override (verbatim)
-//   2. an existing item named CDO_QBO_Retail_ITEM_NAME
+//   1. QBO_RETAIL_ITEM_ID override (verbatim)
+//   2. an existing item named QBO_RETAIL_ITEM_NAME
 //   3. any existing Service item (simplest — avoids a create + account lookup)
 //   4. create the named Service item against a resolved Income account
 export async function resolveSalesItemId() {

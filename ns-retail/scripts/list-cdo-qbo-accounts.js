@@ -1,17 +1,17 @@
 /* eslint-env node */
-// List the CDO QuickBooks Online company's Chart of Accounts with their
-// API Ids — so you can fill in the three account env vars:
-//   CDO_QBO_COMMISSION_EXPENSE_ACCOUNT_ID  (an Expense account)
-//   CDO_QBO_PAYMENT_ACCOUNT_ID             (a Bank account)
-//   CDO_QBO_AP_ACCOUNT_ID                  (an Accounts Payable account)
+// List the QuickBooks Online company's Chart of Accounts with their
+// API Ids — so you can fill in the three payout-posting account env vars:
+//   QBO_RETAIL_COMMISSION_EXPENSE_ACCOUNT_ID  (an Expense account)
+//   QBO_RETAIL_PAYMENT_ACCOUNT_ID             (a Bank account)
+//   QBO_RETAIL_AP_ACCOUNT_ID                  (an Accounts Payable account)
 //
-// It also doubles as a "verify CDO QBO connection" tool: on first run it
-// seeds the cdo_qbo_tokens doc from CDO_QBO_REFRESH_TOKEN and refreshes,
+// It also doubles as a "verify QBO connection" tool: on first run it
+// seeds the cdo_qbo_tokens doc from QBO_RETAIL_REFRESH_TOKEN and refreshes,
 // using the SAME token store + rotation the app's QBO client uses (so the
 // two never desync).
 //
-// Prereq: set CDO_QBO_CLIENT_ID / CDO_QBO_CLIENT_SECRET / CDO_QBO_REALM_ID
-// / CDO_QBO_REFRESH_TOKEN in .env first.
+// Prereq: set QBO_CLIENT_ID / QBO_CLIENT_SECRET / QBO_RETAIL_REALM_ID
+// / QBO_RETAIL_REFRESH_TOKEN in .env first.
 //
 // Run with:  npm run cdo:qbo-accounts
 
@@ -27,13 +27,22 @@ const OAUTH_TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bear
 const SAFETY_MS = 60 * 1000;
 
 const cfg = {
-  environment: process.env.CDO_QBO_ENVIRONMENT || "sandbox",
-  clientId: process.env.CDO_QBO_CLIENT_ID,
-  clientSecret: process.env.CDO_QBO_CLIENT_SECRET,
-  realmId: process.env.CDO_QBO_REALM_ID,
-  refreshToken: process.env.CDO_QBO_REFRESH_TOKEN,
-  apiBaseUrl: process.env.CDO_QBO_API_BASE_URL,
-  minorVersion: process.env.CDO_QBO_MINOR_VERSION || "73",
+  environment: process.env.QBO_ENVIRONMENT || "sandbox",
+  clientId: process.env.QBO_CLIENT_ID,
+  clientSecret: process.env.QBO_CLIENT_SECRET,
+  realmId: process.env.QBO_RETAIL_REALM_ID,
+  refreshToken: process.env.QBO_RETAIL_REFRESH_TOKEN,
+  apiBaseUrl: process.env.QBO_API_BASE_URL,
+  minorVersion: process.env.QBO_MINOR_VERSION || "73",
+};
+
+// config key → env var name (the mapping is non-uniform: app-level creds use
+// the bare QBO_ prefix, company-level values use QBO_RETAIL_).
+const ENV_NAMES = {
+  clientId: "QBO_CLIENT_ID",
+  clientSecret: "QBO_CLIENT_SECRET",
+  realmId: "QBO_RETAIL_REALM_ID",
+  refreshToken: "QBO_RETAIL_REFRESH_TOKEN",
 };
 
 function fail(msg) {
@@ -90,9 +99,9 @@ async function getAccessToken() {
   let doc = await CdoQboToken.findOne({ realmId: cfg.realmId }).lean();
   if (!doc) {
     if (!cfg.refreshToken) {
-      fail("No stored token and CDO_QBO_REFRESH_TOKEN is empty. Seed a refresh token from the Intuit OAuth Playground.");
+      fail("No stored token and QBO_RETAIL_REFRESH_TOKEN is empty. Seed a refresh token from the Intuit OAuth Playground.");
     }
-    console.log("[cdo-qbo-accounts] no stored token — seeding from CDO_QBO_REFRESH_TOKEN…");
+    console.log("[cdo-qbo-accounts] no stored token — seeding from QBO_RETAIL_REFRESH_TOKEN…");
     await CdoQboToken.findOneAndUpdate(
       { realmId: cfg.realmId },
       {
@@ -119,19 +128,19 @@ async function getAccessToken() {
     // fresher) one, try it before giving up — covers the setup case where
     // a bad token was seeded earlier and you've since pasted a new one.
     if (err.invalidGrant && cfg.refreshToken && cfg.refreshToken !== doc.refreshToken) {
-      console.log("[cdo-qbo-accounts] stored refresh token rejected — retrying with CDO_QBO_REFRESH_TOKEN from .env…");
+      console.log("[cdo-qbo-accounts] stored refresh token rejected — retrying with QBO_RETAIL_REFRESH_TOKEN from .env…");
       try {
         return await refreshAccessToken(cfg.refreshToken);
       } catch (err2) {
         if (err2.invalidGrant) {
-          fail("Refresh token expired/revoked — generate a fresh one in the Intuit OAuth Playground, paste it into CDO_QBO_REFRESH_TOKEN, and re-run.");
+          fail("Refresh token expired/revoked — generate a fresh one in the Intuit OAuth Playground, paste it into QBO_RETAIL_REFRESH_TOKEN, and re-run.");
         }
         throw err2;
       }
     }
     if (err.invalidGrant) {
       fail(
-        "Refresh token expired/revoked. Generate a fresh one in the Intuit OAuth Playground, set CDO_QBO_REFRESH_TOKEN in .env, then run `npm run cdo:qbo-accounts -- --reset` to clear the stored token and re-seed.",
+        "Refresh token expired/revoked. Generate a fresh one in the Intuit OAuth Playground, set QBO_RETAIL_REFRESH_TOKEN in .env, then run `npm run cdo:qbo-accounts -- --reset` to clear the stored token and re-seed.",
       );
     }
     fail(err.message);
@@ -142,16 +151,14 @@ async function main() {
   const missing = ["clientId", "clientSecret", "realmId", "refreshToken"].filter((k) => !cfg[k]);
   if (missing.length) {
     fail(
-      `Missing env: ${missing
-        .map((k) => `CDO_QBO_${k.replace(/([A-Z])/g, "_$1").toUpperCase()}`)
-        .join(", ")}. Fill these in .env first.`,
+      `Missing env: ${missing.map((k) => ENV_NAMES[k]).join(", ")}. Fill these in .env first.`,
     );
   }
 
   await connectDB();
 
   // Escape hatch: clear the stored token so the next run re-seeds from
-  // the current CDO_QBO_REFRESH_TOKEN in .env.
+  // the current QBO_RETAIL_REFRESH_TOKEN in .env.
   if (process.argv.includes("--reset")) {
     const r = await CdoQboToken.deleteOne({ realmId: cfg.realmId });
     console.log(`[cdo-qbo-accounts] reset — cleared ${r.deletedCount} stored token doc. Re-run without --reset.`);
@@ -175,9 +182,9 @@ async function main() {
 
   // Group by AccountType; flag the three types the payout engine needs.
   const NEEDED = {
-    Expense: "CDO_QBO_COMMISSION_EXPENSE_ACCOUNT_ID",
-    Bank: "CDO_QBO_PAYMENT_ACCOUNT_ID",
-    "Accounts Payable": "CDO_QBO_AP_ACCOUNT_ID",
+    Expense: "QBO_RETAIL_COMMISSION_EXPENSE_ACCOUNT_ID",
+    Bank: "QBO_RETAIL_PAYMENT_ACCOUNT_ID",
+    "Accounts Payable": "QBO_RETAIL_AP_ACCOUNT_ID",
   };
   const byType = new Map();
   for (const a of accounts) {

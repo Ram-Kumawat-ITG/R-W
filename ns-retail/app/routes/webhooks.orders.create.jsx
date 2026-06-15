@@ -162,7 +162,7 @@ async function processOrder({ shop, payload }) {
   });
 
   // Retail QBO invoice — every retail order gets a corresponding QBO Invoice
-  // in the retail realm (CDO_QBO_Retail_*), created right after the order is
+  // in the retail company (QBO_RETAIL_*), created right after the order is
   // synced into cdo_orders. Idempotent (claims on cdo_orders.retailQbo +
   // QBO requestid) and best-effort: a QBO failure must never break order
   // ingestion or the webhook 200. No-ops cleanly if retail QBO isn't

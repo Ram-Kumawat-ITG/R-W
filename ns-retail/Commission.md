@@ -109,7 +109,7 @@ At execution time (`executeApprovedPayout`), the payout:
 
 ```
   Natural Solutions' BUSINESS BANK ACCOUNT
-  (linked in QBO as CDO_QBO_PAYMENT_ACCOUNT_ID)
+  (linked in QBO as QBO_RETAIL_PAYMENT_ACCOUNT_ID)
                 │
                 │   ACH credit  ── of the commission amount ──▶
                 ▼
@@ -117,7 +117,7 @@ At execution time (`executeApprovedPayout`), the payout:
   (routing + account + type from wholesale_applications.commission)
 ```
 
-- **FROM (debit / funding source):** the company's operating/clearing **bank account**, represented in QBO by `CDO_QBO_PAYMENT_ACCOUNT_ID`.
+- **FROM (debit / funding source):** the company's operating/clearing **bank account**, represented in QBO by `QBO_RETAIL_PAYMENT_ACCOUNT_ID`.
 - **TO (credit / destination):** the **practitioner's bank account** — routing + account number + type from `wholesale_applications.commission`.
 
 ### 5.2 What happens now (post-2026-06-10)
@@ -152,8 +152,8 @@ QBO is the **accounting system of record** for the payout. It provides:
 | QBO object | Purpose | Code |
 |---|---|---|
 | **Vendor** | Each practitioner is a QBO Vendor (find-or-create, cached in `cdo_qbo_vendors`). Enables 1099 tracking. | `findOrCreateVendor` |
-| **Bill** | Records the commission **expense** — one line per commission, against `CDO_QBO_COMMISSION_EXPENSE_ACCOUNT_ID`. `DocNumber` = payout reference. | `createBill` |
-| **BillPayment** | Records the **disbursement** against the bill, drawn from `CDO_QBO_PAYMENT_ACCOUNT_ID` (a bank account). Reduces A/P. | `createBillPayment` |
+| **Bill** | Records the commission **expense** — one line per commission, against `QBO_RETAIL_COMMISSION_EXPENSE_ACCOUNT_ID`. `DocNumber` = payout reference. | `createBill` |
+| **BillPayment** | Records the **disbursement** against the bill, drawn from `QBO_RETAIL_PAYMENT_ACCOUNT_ID` (a bank account). Reduces A/P. | `createBillPayment` |
 | **Deep links** | `billWebUrl` / `vendorWebUrl` let operators open the exact QBO record. | `qbo.service.js` |
 
 What QBO gives you: accurate books (expenses + A/P + bank register), a vendor ledger per practitioner, 1099 groundwork, and an audit trail cross-referenced to `qboBillId` / `qboBillPaymentId`.
@@ -210,7 +210,7 @@ The disbursement layer passes a per-attempt `idempotencyKey` (`cdo-payout-<id>-<
 No escalation (email/PagerDuty/Slack) by default. A failed real-money payout could go unnoticed.
 
 ### 8.12 🟡 Operational caveats (documented)
-Each app process boots its own scheduler — run a single scheduler owner or set `CDO_SCHEDULER_DISABLED=true` on the others. QBO is in **sandbox** unless `CDO_QBO_ENVIRONMENT=production` with a real refresh token + production account IDs.
+Each app process boots its own scheduler — run a single scheduler owner or set `CDO_SCHEDULER_DISABLED=true` on the others. QBO is in **sandbox** unless `QBO_ENVIRONMENT=production` with a real refresh token + production account IDs.
 
 ---
 
@@ -253,7 +253,7 @@ Check source-account balance (or provider balance) before a run; add a per-payou
 Mark practitioner QBO Vendors **1099-eligible**, enforce W-9 collection at onboarding, and confirm year-end 1099-NEC generation (QBO can do this once vendors are flagged).
 
 ### 9.8 Production config & cutover
-- `CDO_QBO_ENVIRONMENT=production` + production refresh token + production `CDO_QBO_COMMISSION_EXPENSE_ACCOUNT_ID` / `CDO_QBO_PAYMENT_ACCOUNT_ID` / `CDO_QBO_AP_ACCOUNT_ID` (discover via `npm run cdo:qbo-accounts`).
+- `QBO_ENVIRONMENT=production` + production refresh token + production `QBO_RETAIL_COMMISSION_EXPENSE_ACCOUNT_ID` / `QBO_RETAIL_PAYMENT_ACCOUNT_ID` / `QBO_RETAIL_AP_ACCOUNT_ID` (discover via `npm run cdo:qbo-accounts`).
 - Single scheduler owner (or `CDO_SCHEDULER_DISABLED=true` elsewhere).
 - Real funding bank account linked + funded.
 

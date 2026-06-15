@@ -43,7 +43,7 @@ export const action = async ({ request }) => {
         return {
           status: "error",
           message:
-            "Retail QBO is not configured. Set CDO_QBO_Retail_CLIENT_ID / CLIENT_SECRET / REALM_ID / REFRESH_TOKEN and restart the server.",
+            "Retail QBO is not configured. Set QBO_CLIENT_ID / QBO_CLIENT_SECRET / QBO_RETAIL_REALM_ID / QBO_RETAIL_REFRESH_TOKEN and restart the server.",
         };
       }
       if (r.reason === "order_not_found") {
@@ -69,7 +69,7 @@ export const action = async ({ request }) => {
         return { status: "error", message: "The Shopify order isn't paid yet — payment recorded only for paid orders." };
       }
       if (r.reason === "payment_disabled") {
-        return { status: "error", message: "Payment recording is disabled (CDO_QBO_Retail_RECORD_PAYMENT=false)." };
+        return { status: "error", message: "Payment recording is disabled (QBO_RETAIL_RECORD_PAYMENT=false)." };
       }
       if (r.reason === "not_configured") {
         return { status: "error", message: "Retail QBO is not configured." };
