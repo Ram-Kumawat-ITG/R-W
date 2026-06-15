@@ -185,7 +185,7 @@ These are pulled from [wholesale/README.md](wholesale/README.md) and the integra
 
 - **Embedded-app navigation** — inside the admin iframe, use `Link` from `react-router` (not `<a>`), use the `redirect` returned from `authenticate.admin` (not `react-router`'s `redirect`), and use `useSubmit` from `react-router`.
 - **NMI sandbox vs production hosts** — sandbox keys are rejected on `secure.nmi.com` and vice versa. Always match `NMI_ENVIRONMENT` to the key. Same idea for QBO.
-- **QBO refresh tokens rotate on every refresh** — they're seeded once from `QBO_REFRESH_TOKEN` env, then Mongo is the source of truth (`qbo_tokens` collection). Concurrent refreshes are coalesced via an in-flight promise.
+- **QBO refresh tokens rotate on every refresh** — they're seeded once from `QBO_WHOLESALE_REFRESH_TOKEN` env, then Mongo is the source of truth (`qbo_tokens` collection). Concurrent refreshes are coalesced via an in-flight promise.
 - **Webhook handler returns 200 immediately.** Downstream work is fire-and-forget. Never block the webhook response on QBO/NMI calls.
 - **`orders/create` is a protected customer data topic.** It requires Partners-dashboard approval. Until then, use synthetic webhook triggers and the programmatic registration path.
 - **Windows + Prisma ARM64 error** — if you hit `query_engine-windows.dll.node is not a valid Win32 application`, set `PRISMA_CLIENT_ENGINE_TYPE=binary`. (Mostly irrelevant since session storage is MongoDB now, but the Prisma client still initializes.)

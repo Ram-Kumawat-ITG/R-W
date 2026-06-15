@@ -38,9 +38,9 @@ function printBootBanner() {
   console.log(`  QBO_API_BASE_URL          : ${qboConfig.apiBaseUrl}`);
   console.log(`  QBO_CLIENT_ID             : ${mask(qboConfig.clientId)}`);
   console.log(`  QBO_CLIENT_SECRET         : ${mask(qboConfig.clientSecret)}`);
-  console.log(`  QBO_REALM_ID              : ${qboConfig.realmId || "MISSING"}`);
-  console.log(`  QBO_REFRESH_TOKEN (seed)  : ${mask(qboConfig.bootstrapRefreshToken)}`);
-  console.log(`  QBO_DEFAULT_ITEM_ID       : ${qboConfig.defaultItemId}`);
+  console.log(`  QBO_WHOLESALE_REALM_ID    : ${qboConfig.realmId || "MISSING"}`);
+  console.log(`  QBO_WHOLESALE_REFRESH_TOKEN (seed): ${mask(qboConfig.bootstrapRefreshToken)}`);
+  console.log(`  QBO_WHOLESALE_DEFAULT_ITEM_ID    : ${qboConfig.defaultItemId}`);
   console.log("  --- NMI ---");
   console.log(`  NMI_ENVIRONMENT           : ${nmiConfig.environment}`);
   console.log(`  NMI_API_URL               : ${nmiConfig.apiUrl}`);

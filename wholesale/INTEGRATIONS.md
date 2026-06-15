@@ -831,7 +831,7 @@ If a request gets a `401` from QBO mid-call, the client force-refreshes and retr
 
 ### 7.2 Bootstrapping
 
-First run: `qbo_tokens` is empty. We seed from `QBO_REFRESH_TOKEN` env
+First run: `qbo_tokens` is empty. We seed from `QBO_WHOLESALE_REFRESH_TOKEN` env
 var (obtained once from the Intuit OAuth Playground), refresh
 immediately, and persist the resulting access + new refresh token. The
 env var can then be cleared — Mongo is the source of truth.
@@ -855,7 +855,7 @@ POST /v3/company/{realmId}/invoice?minorversion=73
       "Amount": 23.16,
       "Description": "Wholesale pack",
       "SalesItemLineDetail": {
-        "ItemRef": { "value": "<QBO_DEFAULT_ITEM_ID>" },
+        "ItemRef": { "value": "<QBO_WHOLESALE_DEFAULT_ITEM_ID>" },
         "Qty": 4, "UnitPrice": 5.79
       }
     },
@@ -877,7 +877,7 @@ POST /v3/company/{realmId}/invoice?minorversion=73
 ```
 
 Line items mirror Shopify's: per-product line + Shipping line + Tax
-line. Every line needs an `Item` reference — `QBO_DEFAULT_ITEM_ID`
+line. Every line needs an `Item` reference — `QBO_WHOLESALE_DEFAULT_ITEM_ID`
 (default `"1"`) is used unless `line.qboItemId` is set.
 
 `DueDate` is computed in this app as **order date + per-method terms**,
@@ -928,11 +928,11 @@ from the referenced **`Item.Sku`** — there is no per-line SKU field. So
 `createInvoice` resolves each **product** line's SKU to a per-product QBO
 **Item** carrying that SKU and sets `line.qboItemId` (which
 `qbo.utils.toInvoiceLine` already honors, falling back to
-`QBO_DEFAULT_ITEM_ID`). `qbo.service.findOrCreateItemBySku({ sku, name })`
+`QBO_WHOLESALE_DEFAULT_ITEM_ID`). `qbo.service.findOrCreateItemBySku({ sku, name })`
 mirrors `findOrCreateCustomer`: cache (`qbo_item_maps`, `sku` unique) →
 `findItemBySku` (QL `WHERE Sku=…`) → `createItem` (`POST /item`,
 `Type:'Service'`, `Sku`, `IncomeAccountRef` derived once from the default
-item via `resolveIncomeAccountRef`, optional `QBO_INCOME_ACCOUNT_ID`
+item via `resolveIncomeAccountRef`, optional `QBO_WHOLESALE_INCOME_ACCOUNT_ID`
 fallback). **Best-effort + graceful** — a null/failed resolution or a line
 with no SKU leaves the line on the default item, so invoicing never breaks.
 `shopifyLinesToQboLines` carries `sku`+`name` on product lines; shipping /
@@ -2717,7 +2717,7 @@ use, scheduler mode, and the result of index verification:
   --- QBO ---
   QBO_ENVIRONMENT           : sandbox
   QBO_API_BASE_URL          : https://sandbox-quickbooks.api.intuit.com
-  QBO_REFRESH_TOKEN (seed)  : set (40 chars)
+  QBO_WHOLESALE_REFRESH_TOKEN (seed)  : set (40 chars)
   --- NMI ---
   NMI_ENVIRONMENT           : sandbox
   NMI_API_URL               : https://sandbox.nmi.com/api/transact.php
@@ -2775,11 +2775,11 @@ required values throw immediately.
 | **QBO** | | |
 | `QBO_CLIENT_ID` | _required_ | Intuit OAuth2 client id |
 | `QBO_CLIENT_SECRET` | _required_ | Intuit OAuth2 client secret |
-| `QBO_REALM_ID` | _required_ | Company / realm to invoice into |
-| `QBO_REFRESH_TOKEN` | _required first run_ | Seed refresh token (from OAuth Playground) |
+| `QBO_WHOLESALE_REALM_ID` | _required_ | Company / realm to invoice into |
+| `QBO_WHOLESALE_REFRESH_TOKEN` | _required first run_ | Seed refresh token (from OAuth Playground) |
 | `QBO_ENVIRONMENT` | `sandbox` | `sandbox` or `production` |
 | `QBO_MINOR_VERSION` | `73` | API minor version |
-| `QBO_DEFAULT_ITEM_ID` | `1` | QBO Item Id for invoice lines |
+| `QBO_WHOLESALE_DEFAULT_ITEM_ID` | `1` | QBO Item Id for invoice lines |
 | `QBO_API_BASE_URL` | _auto_ | Override API host |
 | `QBO_OAUTH_TOKEN_URL` | _auto_ | Override OAuth endpoint |
 | **NMI** | | |
@@ -3005,7 +3005,7 @@ when no real card is available. Production env scrubs them.
 
 Get an initial refresh token from Intuit's OAuth Playground
 (https://developer.intuit.com/app/developer/playground) using the
-sandbox company. Paste it into `QBO_REFRESH_TOKEN`. The first call
+sandbox company. Paste it into `QBO_WHOLESALE_REFRESH_TOKEN`. The first call
 exchanges it for an access token; subsequent calls use the persisted
 token in `qbo_tokens`.
 
@@ -3076,7 +3076,7 @@ Failed".
 
 `QBO token refresh failed: invalid_grant` from
 `refreshAccessToken`. Re-fetch a fresh refresh token from the Intuit
-OAuth Playground and replace `QBO_REFRESH_TOKEN` in env. The next call
+OAuth Playground and replace `QBO_WHOLESALE_REFRESH_TOKEN` in env. The next call
 will reseed `qbo_tokens`.
 
 ### 22.4 Boot reports `[boot] index MISSING — Invoice unique (shop, shopifyOrderId)`
@@ -3186,7 +3186,7 @@ cp .env.example .env   # fill in QBO + NMI credentials
 Required env values for first boot:
 - `MONGODB_URI`
 - Shopify credentials (`SHOPIFY_API_KEY`, etc — managed by Shopify CLI)
-- `QBO_CLIENT_ID`, `QBO_CLIENT_SECRET`, `QBO_REALM_ID`, `QBO_REFRESH_TOKEN`
+- `QBO_CLIENT_ID`, `QBO_CLIENT_SECRET`, `QBO_WHOLESALE_REALM_ID`, `QBO_WHOLESALE_REFRESH_TOKEN`
 - `NMI_SECURITY_KEY`
 
 ```bash
@@ -3208,8 +3208,8 @@ the embedded admin once to trigger registration. Outcome is logged.
 ### 23.3 Production deployment checklist
 
 - [ ] `NMI_ENVIRONMENT=production` and `NMI_SECURITY_KEY` is the production key
-- [ ] `QBO_ENVIRONMENT=production` and `QBO_REALM_ID` is the production realm
-- [ ] `QBO_REFRESH_TOKEN` is set from a production OAuth Playground exchange
+- [ ] `QBO_ENVIRONMENT=production` and `QBO_WHOLESALE_REALM_ID` is the production realm
+- [ ] `QBO_WHOLESALE_REFRESH_TOKEN` is set from a production OAuth Playground exchange
 - [ ] `NMI_TEST_CCNUMBER`, `NMI_TEST_CCEXP`, `NMI_TEST_CVV` are **unset** (boot logs confirm scrubbing if accidentally set)
 - [ ] `PAYMENT_CHARGE_IMMEDIATELY=false`
 - [ ] `PAYMENT_RETRY_INTERVAL=` (empty) — cron takes over

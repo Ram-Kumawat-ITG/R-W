@@ -1,5 +1,8 @@
 // QuickBooks Online configuration.
-// Reads QBO_* env vars and validates `QBO_ENVIRONMENT` against the known
+// App-level OAuth credentials are shared and read from the bare QBO_* env vars
+// (QBO_ENVIRONMENT / QBO_CLIENT_ID / QBO_CLIENT_SECRET / QBO_MINOR_VERSION);
+// the wholesale company this client posts to (realm, token, item/account ids)
+// is read from QBO_WHOLESALE_*. Validates `QBO_ENVIRONMENT` against the known
 // hosts. Use `assertQboConfigured()` at call sites that need credentials
 // to fail fast with a clear error instead of letting Intuit reject the
 // request with a generic 401.
@@ -15,26 +18,34 @@ if (!QBO_BASE_URLS[qboEnvironment]) {
 export const qboConfig = {
   clientId: readEnv('QBO_CLIENT_ID'),
   clientSecret: readEnv('QBO_CLIENT_SECRET'),
-  realmId: readEnv('QBO_REALM_ID'),
+  realmId: readEnv('QBO_WHOLESALE_REALM_ID'),
   // Seed refresh token from env on first run. After that, Mongo is the
   // source of truth — see qboToken.server model.
-  bootstrapRefreshToken: readEnv('QBO_REFRESH_TOKEN'),
+  bootstrapRefreshToken: readEnv('QBO_WHOLESALE_REFRESH_TOKEN'),
   environment: qboEnvironment,
   apiBaseUrl: readEnv('QBO_API_BASE_URL', { fallback: QBO_BASE_URLS[qboEnvironment] }),
   oauthTokenUrl: readEnv('QBO_OAUTH_TOKEN_URL', { fallback: QBO_OAUTH_TOKEN_URL }),
   minorVersion: readEnv('QBO_MINOR_VERSION', { fallback: '73' }),
-  defaultItemId: readEnv('QBO_DEFAULT_ITEM_ID', { fallback: '1' }),
+  defaultItemId: readEnv('QBO_WHOLESALE_DEFAULT_ITEM_ID', { fallback: '1' }),
   // Income account for auto-created per-product Items (SKU column support).
   // Optional — normally we derive the income account from the default item
-  // (QBO_DEFAULT_ITEM_ID); this is only the fallback when that item exposes
-  // no IncomeAccountRef. See qbo.service.findOrCreateItemBySku.
-  incomeAccountId: readEnv('QBO_INCOME_ACCOUNT_ID', { fallback: null }),
+  // (QBO_WHOLESALE_DEFAULT_ITEM_ID); this is only the fallback when that item
+  // exposes no IncomeAccountRef. See qbo.service.findOrCreateItemBySku.
+  incomeAccountId: readEnv('QBO_WHOLESALE_INCOME_ACCOUNT_ID', { fallback: null }),
 }
 
 export function assertQboConfigured() {
   const missing = ['clientId', 'clientSecret', 'realmId', 'bootstrapRefreshToken']
     .filter((k) => !qboConfig[k])
   if (missing.length) {
-    throw new Error(`QBO not configured. Missing: ${missing.map((k) => `QBO_${k}`).join(', ')}`)
+    // config key → env var name (non-uniform: app-level creds use the bare
+    // QBO_ prefix, company-level values use QBO_WHOLESALE_).
+    const envNames = {
+      clientId: 'QBO_CLIENT_ID',
+      clientSecret: 'QBO_CLIENT_SECRET',
+      realmId: 'QBO_WHOLESALE_REALM_ID',
+      bootstrapRefreshToken: 'QBO_WHOLESALE_REFRESH_TOKEN',
+    }
+    throw new Error(`QBO not configured. Missing: ${missing.map((k) => envNames[k]).join(', ')}`)
   }
 }

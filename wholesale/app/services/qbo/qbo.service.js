@@ -59,7 +59,7 @@ export async function findOrCreateCustomer(profile) {
 
 // Income account for newly-created Items. Resolved once from the default
 // item's IncomeAccountRef (so new items book to the same account as the
-// existing generic item), falling back to QBO_INCOME_ACCOUNT_ID. Cached
+// existing generic item), falling back to QBO_WHOLESALE_INCOME_ACCOUNT_ID. Cached
 // in-module; `undefined` = not yet resolved, `null` = resolved-but-none.
 let cachedIncomeAccountRef
 async function resolveIncomeAccountRef() {
