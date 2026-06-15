@@ -29,6 +29,12 @@ export default [
   route("/pay/:token", "api/pay/pay.jsx"),
   // Practitioner Portal moved to the ns-retail app (extension + /api/portal/*
   // backend now live there — it owns the cdo_* collections). See ns-retail.
+  //
+  // EXCEPTION: profile-update lives HERE in wholesale because it edits the
+  // WholesaleApplication (wholesale's own collection). The profile-update
+  // Customer Account UI extension at extensions/profile-update/ calls
+  // /api/portal/profile (fetch + update via `action` field in the body).
+  route("/api/portal/profile", "api/portal/profile.js"),
   route("/api/admin/customers", "api/admin/customers.js"),
   route("/api/admin/customers/:id", "api/admin/customer.js"),
   route("/api/admin/customers/:id/decline", "api/admin/decline.js"),

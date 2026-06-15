@@ -1,0 +1,33 @@
+# Practitioner Profile Update — Customer Account UI extension (full-page).
+# Lets an approved practitioner edit the data they entered at registration
+# (business / tax / credentials / payment / W-9 etc.) from inside their
+# Shopify customer account.
+#
+# Configuration reference:
+# https://shopify.dev/api/customer-account-ui-extensions/unstable/configuration
+
+api_version = "2026-04"
+
+[[extensions]]
+name = "profile-update"
+handle = "profile-update"
+type = "ui_extension"
+uid = "ccbd7b37-897f-37ef-0bbe-6f528a1fcfe16d0f2f65"
+description = "Self-service profile update form for approved wholesale practitioners."
+
+# Full-page target — the extension renders as a dedicated page inside
+# the customer account (merchants add it to the customer-account
+# navigation menu in the customer-account editor).
+[[extensions.targeting]]
+module = "./src/ProfileUpdate.jsx"
+target = "customer-account.page.render"
+
+[extensions.capabilities]
+# Direct Storefront API access — not used today but kept on for parity
+# with the registration form's auth model.
+api_access = true
+
+# REQUIRED. The extension fetch()es the wholesale app backend at
+# `${SHOPIFY_APP_URL}/api/portal/profile` and friends. Without this the
+# Web Worker sandbox blocks all external network calls.
+network_access = true

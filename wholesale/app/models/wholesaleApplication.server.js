@@ -97,7 +97,11 @@ const commissionSchema = new mongoose.Schema(
     enabled: { type: Boolean, default: false },
     bankAccountName: String,
     bankRoutingNumber: String,
+    // Legacy plaintext field — kept for back-compat with rows written
+    // before the encryption migration. New writes ONLY populate
+    // bankAccountEncrypted (AES-256-GCM, see utils/crypto.utils.js).
     bankAccountNumber: String,
+    bankAccountEncrypted: String,
     bankAccountLast4: String,
     bankAccountType: String,
     // True when the practitioner ticked "use same as payment ACH" — kept
