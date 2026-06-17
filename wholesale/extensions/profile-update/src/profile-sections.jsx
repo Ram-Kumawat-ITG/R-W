@@ -350,7 +350,10 @@ function Collapsible({ title, description, defaultOpen = false, children }) {
 }
 
 // 1. About you — merged personal contact, business identity, and address
-function PersonalAndAddressSection({ form, setForm, profile }) {
+function PersonalAndAddressSection({ form, setForm, profile, errorMap = {} }) {
+  // Helper to read a field's error from the validation map. The key in
+  // errorMap matches the dotted path of the field (e.g. 'billingAddress.zip').
+  const err = (k) => errorMap[k] || undefined
   function setBilling(patch) {
     setForm({ ...form, billingAddress: { ...form.billingAddress, ...patch } })
   }
@@ -368,22 +371,39 @@ function PersonalAndAddressSection({ form, setForm, profile }) {
         <s-stack direction="block" gap="base">
           <s-grid gridTemplateColumns="1fr 1fr" gap="base">
             <s-text-field
+              id="field-firstName"
               label="First name"
               value={form.firstName}
               oninput={(e) => setForm({ ...form, firstName: e.target.value })}
+              autocomplete="given-name"
+              maxLength={50}
+              required
+              error={err('firstName')}
             />
             <s-text-field
+              id="field-lastName"
               label="Last name"
               value={form.lastName}
               oninput={(e) => setForm({ ...form, lastName: e.target.value })}
+              autocomplete="family-name"
+              maxLength={50}
+              required
+              error={err('lastName')}
             />
           </s-grid>
           <s-grid gridTemplateColumns="1fr 1fr" gap="base">
             <s-text-field label="Email" value={form.email} disabled />
             <s-text-field
+              id="field-phone"
               label="Phone"
+              placeholder="+15146669999"
               value={form.phone}
               oninput={(e) => setForm({ ...form, phone: e.target.value })}
+              autocomplete="tel"
+              inputMode="tel"
+              maxLength={16}
+              required
+              error={err('phone')}
             />
           </s-grid>
         </s-stack>
@@ -398,13 +418,12 @@ function PersonalAndAddressSection({ form, setForm, profile }) {
             value={form.businessName}
             oninput={(e) => setForm({ ...form, businessName: e.target.value })}
           />
-          <s-stack direction="inline" gap="small" alignItems="center">
-            <s-checkbox
-              checked={!!form.resellsProducts}
-              onchange={(e) => setForm({ ...form, resellsProducts: e.target.checked })}
-            />
-            <s-text>I resell products to my patients</s-text>
-          </s-stack>
+          <s-checkbox
+            label="I resell products to my patients"
+            accessibilityLabel="I resell products to my patients"
+            checked={!!form.resellsProducts}
+            onchange={(e) => setForm({ ...form, resellsProducts: e.target.checked })}
+          />
 
           {/* Referrals — read-only display of how the practitioner heard
               about us (captured at registration, not editable here). */}
@@ -417,9 +436,12 @@ function PersonalAndAddressSection({ form, setForm, profile }) {
         <s-stack direction="block" gap="base">
           <s-text type="strong">Billing address</s-text>
           <s-text-field
+            id="field-billingAddress.line1"
             label="Street address"
             value={form.billingAddress.line1}
             oninput={(e) => setBilling({ line1: e.target.value })}
+            required
+            error={err('billingAddress.line1')}
           />
           <s-text-field
             label="Suite / apartment (optional)"
@@ -428,14 +450,20 @@ function PersonalAndAddressSection({ form, setForm, profile }) {
           />
           <s-grid gridTemplateColumns="2fr 1fr 1fr" gap="base">
             <s-text-field
+              id="field-billingAddress.city"
               label="City"
               value={form.billingAddress.city}
               oninput={(e) => setBilling({ city: e.target.value })}
+              required
+              error={err('billingAddress.city')}
             />
             <s-select
+              id="field-billingAddress.state"
               label="State"
               value={form.billingAddress.state}
               onchange={(e) => setBilling({ state: e.target.value })}
+              required
+              error={err('billingAddress.state')}
             >
               <s-option value="">Select…</s-option>
               {US_STATES.map((s) => (
@@ -443,9 +471,16 @@ function PersonalAndAddressSection({ form, setForm, profile }) {
               ))}
             </s-select>
             <s-text-field
+              id="field-billingAddress.zip"
               label="ZIP"
+              placeholder="90210"
               value={form.billingAddress.zip}
               oninput={(e) => setBilling({ zip: e.target.value })}
+              autocomplete="postal-code"
+              inputMode="numeric"
+              maxLength={10}
+              required
+              error={err('billingAddress.zip')}
             />
           </s-grid>
           <s-grid gridTemplateColumns="1fr 1fr" gap="base">
@@ -469,15 +504,14 @@ function PersonalAndAddressSection({ form, setForm, profile }) {
             </s-select>
           </s-grid>
 
-          <s-stack direction="inline" gap="small" alignItems="center">
-            <s-checkbox
-              checked={!!form.shippingSameAsBilling}
-              onchange={(e) =>
-                setForm({ ...form, shippingSameAsBilling: e.target.checked })
-              }
-            />
-            <s-text>Shipping address is the same as billing</s-text>
-          </s-stack>
+          <s-checkbox
+            label="Shipping address is the same as billing"
+            accessibilityLabel="Shipping address is the same as billing"
+            checked={!!form.shippingSameAsBilling}
+            onchange={(e) =>
+              setForm({ ...form, shippingSameAsBilling: e.target.checked })
+            }
+          />
         </s-stack>
 
         {/* Shipping address — only when different from billing */}
@@ -514,8 +548,13 @@ function PersonalAndAddressSection({ form, setForm, profile }) {
                 </s-select>
                 <s-text-field
                   label="ZIP"
+                  placeholder="90210"
                   value={form.shippingAddress.zip}
                   oninput={(e) => setShipping({ zip: e.target.value })}
+                  autocomplete="postal-code"
+                  inputMode="numeric"
+                  maxLength={10}
+                  required
                 />
               </s-grid>
               <s-select
@@ -552,14 +591,15 @@ function ReferralsReadOnly({ profile }) {
         {REFERRALS.map((r) => {
           const entry = referrals[r.id] || {}
           if (!entry.selected) return null
+          const display = `${r.label}${r.hasField && entry.value ? ` — ${entry.value}` : ''}`
           return (
-            <s-stack key={r.id} direction="inline" gap="small" alignItems="center">
-              <s-checkbox checked disabled />
-              <s-text>
-                {r.label}
-                {r.hasField && entry.value ? ` — ${entry.value}` : ''}
-              </s-text>
-            </s-stack>
+            <s-checkbox
+              key={r.id}
+              label={display}
+              accessibilityLabel={`Referral source on file: ${display}`}
+              checked
+              disabled
+            />
           )
         })}
       </s-stack>
@@ -683,17 +723,26 @@ function CredentialsSection({ form, setForm, pendingFiles, setPendingFiles, prof
     )
   }
 
+  // Compact "tap to add" tile — no border, no individual card chrome.
+  // Reads as a checklist instead of a stack of card-sized boxes; matches
+  // the registration form's `rf-checkbox-grid` density.
   function renderCompactTile(c) {
     return (
-      <s-box key={c.id} padding="base-300" borderRadius="base" border="base">
+      <s-clickable
+        key={c.id}
+        onclick={() => updateCred(c.id, { selected: true })}
+        background="transparent"
+        padding="small-200"
+        accessibilityLabel={`Add ${c.label}`}
+      >
         <s-stack direction="inline" gap="small" alignItems="center">
           <s-checkbox
             checked={false}
             onchange={(e) => updateCred(c.id, { selected: e.target.checked })}
           />
-          <s-text type="strong">{c.label}</s-text>
+          <s-text>{c.label}</s-text>
         </s-stack>
-      </s-box>
+      </s-clickable>
     )
   }
 
@@ -709,13 +758,13 @@ function CredentialsSection({ form, setForm, pendingFiles, setPendingFiles, prof
           </s-grid>
         )}
         {unselected.length > 0 && (
-          <s-stack direction="block" gap="small-300">
+          <s-stack direction="block" gap="small-200">
             {selected.length > 0 && (
               <s-text color="subdued">
                 Other credentials — tap to add another to your record.
               </s-text>
             )}
-            <s-grid gridTemplateColumns="1fr 1fr" gap="small-300">
+            <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="small-200">
               {unselected.map(renderCompactTile)}
             </s-grid>
           </s-stack>
@@ -841,10 +890,20 @@ function _UNUSED_AddressSection({ form, setForm }) {
 }
 
 // 5. Tax info
-function TaxSection({ form, setForm }) {
+function TaxSection({ form, setForm, errorMap = {} }) {
+  const err = (k) => errorMap[k] || undefined
   function setTax(patch) {
     setForm({ ...form, tax: { ...form.tax, ...patch } })
   }
+  // BUG-06: switching between EIN ↔ SSN must clear the prior value
+  // (EIN format and SSN format are different — leaving the old value
+  // in place causes silent validation pass on the wrong format).
+  function changeTaxIdType(nextType) {
+    if (nextType !== form.tax.taxIdType) {
+      setTax({ taxIdType: nextType, taxId: '' })
+    }
+  }
+  const isSsn = form.tax.taxIdType === 'ssn'
   return (
     <Collapsible title="Tax information">
       <s-stack direction="block" gap="base">
@@ -852,16 +911,23 @@ function TaxSection({ form, setForm }) {
           <s-select
             label="Tax ID type"
             value={form.tax.taxIdType}
-            onchange={(e) => setTax({ taxIdType: e.target.value })}
+            onchange={(e) => changeTaxIdType(e.target.value)}
           >
             {TAX_ID_TYPES.map((o) => (
               <s-option key={o.value} value={o.value}>{o.label}</s-option>
             ))}
           </s-select>
           <s-text-field
-            label={form.tax.taxIdType === 'ssn' ? 'SSN number' : 'EIN number'}
+            id="field-tax.taxId"
+            label={isSsn ? 'SSN number' : 'EIN number'}
+            placeholder={isSsn ? '123-45-6789' : '12-3456789'}
             value={form.tax.taxId}
             oninput={(e) => setTax({ taxId: e.target.value })}
+            type="password"
+            autocomplete="off"
+            maxLength={11}
+            required
+            error={err('tax.taxId')}
           />
         </s-grid>
         <s-grid gridTemplateColumns="1fr 1fr" gap="base">
@@ -871,9 +937,12 @@ function TaxSection({ form, setForm }) {
             oninput={(e) => setTax({ salesPermit: e.target.value })}
           />
           <s-select
+            id="field-tax.exemptState"
             label="Tax-exempt state"
             value={form.tax.exemptState}
             onchange={(e) => setTax({ exemptState: e.target.value })}
+            required
+            error={err('tax.exemptState')}
           >
             <s-option value="">Select…</s-option>
             {US_STATES.map((s) => (
@@ -883,14 +952,20 @@ function TaxSection({ form, setForm }) {
         </s-grid>
         <s-grid gridTemplateColumns="1fr 1fr" gap="base">
           <s-text-field
+            id="field-tax.itemsToResell"
             label="Items you intend to resell"
             value={form.tax.itemsToResell}
             oninput={(e) => setTax({ itemsToResell: e.target.value })}
+            required
+            error={err('tax.itemsToResell')}
           />
           <s-text-field
+            id="field-tax.businessActivity"
             label="Primary business activity"
             value={form.tax.businessActivity}
             oninput={(e) => setTax({ businessActivity: e.target.value })}
+            required
+            error={err('tax.businessActivity')}
           />
         </s-grid>
       </s-stack>
@@ -1063,10 +1138,14 @@ function ACHSection({ form, setForm }) {
         <s-grid gridTemplateColumns="1fr 1fr" gap="base">
           <s-text-field
             label="Routing number (9 digits)"
+            placeholder="123456789"
             value={form.ach.achRoutingNumber}
             oninput={(e) =>
               setAch({ achRoutingNumber: String(e.target.value).replace(/\D/g, '') })
             }
+            autocomplete="off"
+            inputMode="numeric"
+            maxLength={9}
           />
           <s-text-field
             label="Account number (leave blank to keep current)"
@@ -1074,6 +1153,10 @@ function ACHSection({ form, setForm }) {
             oninput={(e) =>
               setAch({ achAccountNumber: String(e.target.value).replace(/\D/g, '') })
             }
+            type="password"
+            autocomplete="off"
+            inputMode="numeric"
+            maxLength={17}
           />
         </s-grid>
       </s-stack>
@@ -1115,24 +1198,22 @@ function CommissionSection({ form, setForm }) {
       description="Where we deposit your commission payouts. Different from your ACH payment account."
     >
       <s-stack direction="block" gap="base">
-        <s-stack direction="inline" gap="small" alignItems="center">
-          <s-checkbox
-            checked={!!form.commission.enabled}
-            onchange={(e) => setComm({ enabled: e.target.checked })}
-          />
-          <s-text>Enable commission payouts to this account</s-text>
-        </s-stack>
+        <s-checkbox
+          label="Enable commission payouts to this account"
+          accessibilityLabel="Enable commission payouts to this account"
+          checked={!!form.commission.enabled}
+          onchange={(e) => setComm({ enabled: e.target.checked })}
+        />
 
         {form.commission.enabled && (
           <>
             {hasAchOnFile && (
-              <s-stack direction="inline" gap="small" alignItems="center">
-                <s-checkbox
-                  checked={fromAch}
-                  onchange={(e) => toggleSourcedFromAch(e.target.checked)}
-                />
-                <s-text>Use my ACH payment account for commission payouts</s-text>
-              </s-stack>
+              <s-checkbox
+                label="Use my ACH payment account for commission payouts"
+                accessibilityLabel="Use my ACH payment account for commission payouts"
+                checked={fromAch}
+                onchange={(e) => toggleSourcedFromAch(e.target.checked)}
+              />
             )}
             {last4 && (
               <s-text color="subdued">
@@ -1159,14 +1240,22 @@ function CommissionSection({ form, setForm }) {
             <s-grid gridTemplateColumns="1fr 1fr" gap="base">
               <s-text-field
                 label="Routing number"
+                placeholder="123456789"
                 value={form.commission.bankRoutingNumber}
                 disabled={fromAch}
                 oninput={(e) =>
                   setComm({ bankRoutingNumber: String(e.target.value).replace(/\D/g, '') })
                 }
+                autocomplete="off"
+                inputMode="numeric"
+                maxLength={9}
               />
               <s-text-field
                 label="Account number (leave blank to keep current)"
+                type="password"
+                autocomplete="off"
+                inputMode="numeric"
+                maxLength={17}
                 value={form.commission.bankAccountNumber}
                 disabled={fromAch}
                 oninput={(e) =>
@@ -1182,7 +1271,8 @@ function CommissionSection({ form, setForm }) {
 }
 
 // 10. W-9 form — typed signature only (sandbox has no <canvas>)
-function W9Section({ form, setForm, profile }) {
+function W9Section({ form, setForm, profile, errorMap = {} }) {
+  const err = (k) => errorMap[k] || undefined
   function setW9(patch) {
     setForm({ ...form, w9: { ...form.w9, ...patch } })
   }
@@ -1211,14 +1301,20 @@ function W9Section({ form, setForm, profile }) {
         )}
         <s-grid gridTemplateColumns="1fr 1fr" gap="base">
           <s-text-field
+            id="field-w9.legalName"
             label="Legal name (as on tax return)"
             value={form.w9.legalName}
             oninput={(e) => setW9({ legalName: e.target.value })}
+            required
+            error={err('w9.legalName')}
           />
           <s-select
+            id="field-w9.taxClassification"
             label="Federal tax classification"
             value={form.w9.taxClassification}
             onchange={(e) => setW9({ taxClassification: e.target.value })}
+            required
+            error={err('w9.taxClassification')}
           >
             <s-option value="">Select classification…</s-option>
             {TAX_CLASSIFICATIONS.map((o) => (
@@ -1232,9 +1328,12 @@ function W9Section({ form, setForm, profile }) {
           <s-grid gridTemplateColumns="1fr 1fr" gap="base">
             {form.w9.taxClassification === 'llc' && (
               <s-select
+                id="field-w9.llcClassification"
                 label="LLC tax classification"
                 value={form.w9.llcClassification}
                 onchange={(e) => setW9({ llcClassification: e.target.value })}
+                required
+                error={err('w9.llcClassification')}
               >
                 {LLC_CLASSIFICATIONS.map((o) => (
                   <s-option key={o.value} value={o.value}>{o.label}</s-option>
@@ -1243,9 +1342,12 @@ function W9Section({ form, setForm, profile }) {
             )}
             {form.w9.taxClassification === 'other' && (
               <s-text-field
+                id="field-w9.otherClassification"
                 label="Other classification (please specify)"
                 value={form.w9.otherClassification}
                 oninput={(e) => setW9({ otherClassification: e.target.value })}
+                required
+                error={err('w9.otherClassification')}
               />
             )}
           </s-grid>
@@ -1289,6 +1391,10 @@ export function ProfileSections({ api, customerId, profile, onSaved }) {
   const [errorMsg, setErrorMsg] = useState('')
   const [errors, setErrors] = useState([])
   const [warnings, setWarnings] = useState([])
+  // BUG-07/08: field-keyed error map. Each s-text-field reads its own
+  // error via `error={errorMap['<path>']}` — Polaris s-text-field renders
+  // the error styling + sets aria-invalid automatically when this is truthy.
+  const [errorMap, setErrorMap] = useState({})
   const [realignSummary, setRealignSummary] = useState(null)
 
   // Re-sync local state when the server-side profile prop changes
@@ -1297,6 +1403,26 @@ export function ProfileSections({ api, customerId, profile, onSaved }) {
     if (profile) setForm(initialForm(profile))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile])
+
+  // BUG-14: Clear stale save banners (success/error) the moment the user
+  // edits any field. Without this, a "Couldn't save" or "Saved" banner
+  // sits on screen until the next save click, which makes the form feel
+  // out of sync with what the user is currently doing.
+  //
+  // saveStatus === 'idle' on mount → no clear fires on initial setForm.
+  // Only clears AFTER a save has resolved (saved/error), so 'saving'
+  // is unaffected.
+  useEffect(() => {
+    if (saveStatus === 'saved' || saveStatus === 'error') {
+      setSaveStatus('idle')
+      setErrors([])
+      setWarnings([])
+      setErrorMap({})
+      setErrorMsg('')
+      setRealignSummary(null)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form])
 
   async function refreshProfile() {
     try {
@@ -1381,37 +1507,229 @@ export function ProfileSections({ api, customerId, profile, onSaved }) {
 
   function validate() {
     const out = []
-    // ACH routing number must pass ABA checksum if provided.
+    // BUG-07/08: Field-keyed error map. Both updated together with `out`
+    // so the banner summary AND the per-field inline error stay in sync.
+    // Keys use dotted paths matching s-text-field id="field-<path>".
+    const map = {}
+    const setErr = (field, message, section = field.split('.')[0]) => {
+      if (!map[field]) map[field] = message
+      out.push({ section, field, message })
+    }
+
+    // ── Validation rules MIRROR the registration form's Yup schemas at
+    //    registration-form/src/schema/step{1,2,4}.schema.js. Cross-bundle
+    //    import is impossible (Customer Account UI extension is a separate
+    //    Web Worker bundle), so they're re-implemented in plain JS here.
+    //    If you change a rule on either side, change it on the OTHER side too.
+    //    Regex patterns are copy-pasted verbatim from step*.schema.js.
+
+    const NAME_REGEX = /^[A-Za-zÀ-ÖØ-öø-ÿ' -]+$/
+    const PHONE_REGEX = /^\+?[0-9]+$/
+
+    // BUG-11: Field labels shown to the user MUST match the visible UI
+    // labels, not the internal model keys (`line1`, `state`, etc.).
+    const ADDR_LABELS = {
+      line1: 'Street address',
+      city: 'City',
+      state: 'State',
+      zip: 'ZIP',
+      country: 'Country',
+    }
+
+    // ── Personal (step1) ──────────────────────────────────────────────
+    if (!form.firstName?.trim()) {
+      setErr('firstName', 'First name is required.', 'personal')
+    } else if (form.firstName.trim().length < 3) {
+      setErr('firstName', 'First name must be at least 3 characters.', 'personal')
+    } else if (!NAME_REGEX.test(form.firstName.trim())) {
+      setErr('firstName', 'Only letters, spaces, hyphens, and apostrophes.', 'personal')
+    }
+    if (!form.lastName?.trim()) {
+      setErr('lastName', 'Last name is required.', 'personal')
+    } else if (form.lastName.trim().length < 3) {
+      setErr('lastName', 'Last name must be at least 3 characters.', 'personal')
+    } else if (!NAME_REGEX.test(form.lastName.trim())) {
+      setErr('lastName', 'Only letters, spaces, hyphens, and apostrophes.', 'personal')
+    }
+    if (!form.phone?.trim()) {
+      setErr('phone', 'Phone number is required.', 'personal')
+    } else if (!PHONE_REGEX.test(form.phone.trim())) {
+      setErr('phone', "Only digits and optional '+' at start (e.g., +15146669999).", 'personal')
+    } else {
+      const digits = String(form.phone).replace(/\D/g, '')
+      if (digits.length < 11 || digits.length > 15) {
+        setErr(
+          'phone',
+          'Phone must include country code (e.g., +15146669999 for US).',
+          'personal',
+        )
+      }
+    }
+
+    // ── Address (step2) ───────────────────────────────────────────────
+    const billingRequired = ['line1', 'city', 'state', 'zip', 'country']
+    for (const k of billingRequired) {
+      if (!form.billingAddress?.[k]?.trim()) {
+        setErr(
+          `billingAddress.${k}`,
+          `${ADDR_LABELS[k]} is required.`,
+          'address',
+        )
+      }
+    }
+    if (form.billingAddress?.country === 'United States' && form.billingAddress?.zip) {
+      if (!/^\d{5}(-\d{4})?$/.test(form.billingAddress.zip.trim())) {
+        setErr(
+          'billingAddress.zip',
+          'Enter a valid US ZIP (e.g. 90210 or 90210-1234).',
+          'address',
+        )
+      }
+    }
+    if (!form.shippingSameAsBilling) {
+      for (const k of billingRequired) {
+        if (!form.shippingAddress?.[k]?.trim()) {
+          setErr(
+            `shippingAddress.${k}`,
+            `Shipping ${ADDR_LABELS[k]} is required.`,
+            'address',
+          )
+        }
+      }
+      if (form.shippingAddress?.country === 'United States' && form.shippingAddress?.zip) {
+        if (!/^\d{5}(-\d{4})?$/.test(form.shippingAddress.zip.trim())) {
+          setErr(
+            'shippingAddress.zip',
+            'Enter a valid US shipping ZIP (e.g. 90210).',
+            'address',
+          )
+        }
+      }
+    }
+    if (!form.shippingPropertyType || !['Residential', 'Commercial'].includes(form.shippingPropertyType)) {
+      out.push({ section: 'address', message: 'Select a shipping property type.' })
+    }
+
+    // ── Tax (step2.tax) ───────────────────────────────────────────────
+    if (!['ein', 'ssn'].includes(form.tax?.taxIdType)) {
+      setErr('tax.taxIdType', 'Select a tax ID type.', 'tax')
+    }
+    if (!form.tax?.taxId?.trim()) {
+      setErr('tax.taxId', 'Tax ID is required.', 'tax')
+    } else if (form.tax.taxIdType === 'ein' && !/^\d{2}-?\d{7}$/.test(form.tax.taxId.trim())) {
+      setErr('tax.taxId', 'Enter a valid 9-digit EIN (e.g. 12-3456789).', 'tax')
+    } else if (form.tax.taxIdType === 'ssn' && !/^\d{3}-?\d{2}-?\d{4}$/.test(form.tax.taxId.trim())) {
+      setErr('tax.taxId', 'Enter a valid 9-digit SSN (e.g. 123-45-6789).', 'tax')
+    }
+    if (!form.tax?.exemptState?.trim()) {
+      setErr('tax.exemptState', 'Tax-exempt state is required.', 'tax')
+    }
+    if (!form.tax?.itemsToResell?.trim()) {
+      setErr('tax.itemsToResell', 'Items to resell are required.', 'tax')
+    }
+    if (!form.tax?.businessActivity?.trim()) {
+      setErr('tax.businessActivity', 'Business activity is required.', 'tax')
+    }
+
+    // ── ACH (step3) ───────────────────────────────────────────────────
     if (form.ach.achRoutingNumber && !isValidABA(form.ach.achRoutingNumber)) {
       out.push({ section: 'ach', message: 'ACH routing number failed checksum.' })
     }
+    if (form.ach.achAccountNumber) {
+      const acct = String(form.ach.achAccountNumber).replace(/\D/g, '')
+      if (acct.length < 4 || acct.length > 17) {
+        out.push({ section: 'ach', message: 'ACH account number must be 4–17 digits.' })
+      }
+    }
+
+    // ── Card (step3) — only when user typed a new card ────────────────
+    if (form.card.cardNumber) {
+      const digits = String(form.card.cardNumber).replace(/\D/g, '')
+      if (digits.length < 12 || digits.length > 19) {
+        out.push({ section: 'card', message: 'Card number must be 12–19 digits.' })
+      }
+      const exp = String(form.card.cardExpiry || '').replace(/\D/g, '')
+      if (exp.length !== 4) {
+        out.push({ section: 'card', message: 'Expiry must be in MMYY format.' })
+      } else {
+        const mm = Number.parseInt(exp.slice(0, 2), 10)
+        if (mm < 1 || mm > 12) {
+          out.push({ section: 'card', message: 'Expiry month must be 01–12.' })
+        }
+      }
+      const cvv = String(form.card.cardCvv || '').replace(/\D/g, '')
+      if (cvv.length < 3 || cvv.length > 4) {
+        out.push({ section: 'card', message: 'CVV must be 3 or 4 digits.' })
+      }
+    }
+
+    // ── Commission (step3 ish) ────────────────────────────────────────
     if (
       form.commission.enabled &&
       form.commission.bankRoutingNumber &&
       !isValidABA(form.commission.bankRoutingNumber)
     ) {
-      out.push({
-        section: 'commission',
-        message: 'Commission routing number failed checksum.',
-      })
+      out.push({ section: 'commission', message: 'Commission routing number failed checksum.' })
     }
-    return out
+    if (form.commission.enabled && form.commission.bankAccountNumber) {
+      const acct = String(form.commission.bankAccountNumber).replace(/\D/g, '')
+      if (acct.length < 4 || acct.length > 17) {
+        out.push({ section: 'commission', message: 'Commission account number must be 4–17 digits.' })
+      }
+    }
+
+    // ── W-9 (step4) ───────────────────────────────────────────────────
+    if (!form.w9?.legalName?.trim() || form.w9.legalName.trim().length < 2) {
+      setErr('w9.legalName', 'Legal name is required (min 2 characters).', 'w9')
+    }
+    if (!form.w9?.taxClassification) {
+      setErr('w9.taxClassification', 'Select a federal tax classification.', 'w9')
+    }
+    if (form.w9?.taxClassification === 'llc') {
+      if (!form.w9.llcClassification || !['C', 'S', 'P'].includes(form.w9.llcClassification)) {
+        setErr('w9.llcClassification', 'LLC classification (C, S, or P) is required.', 'w9')
+      }
+    }
+    if (form.w9?.taxClassification === 'other') {
+      if (!form.w9.otherClassification?.trim()) {
+        setErr('w9.otherClassification', 'Describe your "Other" classification.', 'w9')
+      }
+    }
+
+    return { out, map }
   }
 
   async function handleSave() {
+    // Aggressively clear stale state BEFORE starting (BUG-14).
     setErrorMsg('')
     setErrors([])
     setWarnings([])
+    setErrorMap({})
     setRealignSummary(null)
+    setSaveStatus('saving')
 
-    const validationErrors = validate()
+    const { out: validationErrors, map: validationMap } = validate()
     if (validationErrors.length > 0) {
       setSaveStatus('error')
       setErrors(validationErrors)
+      setErrorMap(validationMap)
+
+      // BUG-07: scroll to the first error field so the user immediately
+      // sees what's wrong, instead of needing to hunt above the banner.
+      const firstField = Object.keys(validationMap)[0]
+      if (firstField && typeof document !== 'undefined') {
+        const el = document.getElementById(`field-${firstField}`)
+        if (el) {
+          // setTimeout deferred so the render with the error styling lands first.
+          setTimeout(() => {
+            el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+            el.focus?.()
+          }, 50)
+        }
+      }
       return
     }
 
-    setSaveStatus('saving')
     try {
       const token = await getToken()
       const payload = buildPayload()
@@ -1423,12 +1741,23 @@ export function ProfileSections({ api, customerId, profile, onSaved }) {
         : () => api.updateProfile(token, customerId, payload)
       const res = await callApi()
 
-      if (!res || res.status === 'error') {
+      // BUG-02 root cause: backend's sendResponse envelope sets status='partial'
+      // (NOT 'error') when result.ok === false (i.e., the save was BLOCKED by
+      // errors[]). The old check only treated status==='error' as failure, so
+      // 'partial' fell into the success path and showed "Saved with warnings"
+      // banner with "Could not save" body — logically contradictory.
+      // 'partial' means errors[] is populated and the save did NOT persist —
+      // treat as full error.
+      const apiFailed = !res || res.status === 'error' || res.status === 'partial'
+      if (apiFailed) {
         setSaveStatus('error')
+        setErrors(Array.isArray(res?.result?.errors) ? res.result.errors : [])
         setErrorMsg(res?.message || 'Save failed.')
         return
       }
 
+      // success path — only warnings[] should populate here; errors[] from
+      // backend is reserved for blocked-save state and is handled above.
       const partial = Array.isArray(res?.result?.errors) ? res.result.errors : []
       const warns = Array.isArray(res?.result?.warnings) ? res.result.warnings : []
       setErrors(partial)
@@ -1463,7 +1792,7 @@ export function ProfileSections({ api, customerId, profile, onSaved }) {
   return (
     <s-stack direction="block" gap="large">
       {/* About you — merged personal + business + address (open by default) */}
-      <PersonalAndAddressSection form={form} setForm={setForm} profile={profile} />
+      <PersonalAndAddressSection form={form} setForm={setForm} profile={profile} errorMap={errorMap} />
 
       {/* Credentials — full-width grid of credential cards */}
       <CredentialsSection
@@ -1478,7 +1807,7 @@ export function ProfileSections({ api, customerId, profile, onSaved }) {
           alignItems="start" prevents a collapsed/shorter card from being
           stretched to the height of its taller sibling. */}
       <s-grid gridTemplateColumns="1fr 1fr" gap="large" alignItems="start">
-        <TaxSection form={form} setForm={setForm} />
+        <TaxSection form={form} setForm={setForm} errorMap={errorMap} />
         <PaymentMethodSection form={form} setForm={setForm} />
       </s-grid>
 
@@ -1492,7 +1821,7 @@ export function ProfileSections({ api, customerId, profile, onSaved }) {
       </s-grid>
 
       {/* W-9 form — full width (perjury text needs space) */}
-      <W9Section form={form} setForm={setForm} profile={profile} />
+      <W9Section form={form} setForm={setForm} profile={profile} errorMap={errorMap} />
 
       {/* ── Save footer: subscribe toggle + status banners + save button ── */}
       <SaveFooter
@@ -1572,13 +1901,12 @@ function SaveFooter({
           alignItems="center"
           justifyContent="space-between"
         >
-          <s-stack direction="inline" gap="small" alignItems="center">
-            <s-checkbox
-              checked={!!form.subscribeNews}
-              onchange={(e) => setForm({ ...form, subscribeNews: e.target.checked })}
-            />
-            <s-text>Subscribe to product news &amp; educational updates</s-text>
-          </s-stack>
+          <s-checkbox
+            label="Subscribe to product news & educational updates"
+            accessibilityLabel="Subscribe to product news and educational updates"
+            checked={!!form.subscribeNews}
+            onchange={(e) => setForm({ ...form, subscribeNews: e.target.checked })}
+          />
           <s-button variant="primary" onclick={onSave} disabled={saveStatus === 'saving'}>
             {saveStatus === 'saving' ? 'Saving…' : 'Save all changes'}
           </s-button>

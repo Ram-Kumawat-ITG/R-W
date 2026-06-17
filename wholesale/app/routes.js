@@ -35,6 +35,12 @@ export default [
   // Customer Account UI extension at extensions/profile-update/ calls
   // /api/portal/profile (fetch + update via `action` field in the body).
   route("/api/portal/profile", "api/portal/profile.js"),
+  // Shopify Carrier Service callback — receives the cart origin + destination
+  // + items at checkout, fetches live rates from EasyPost, applies the
+  // wholesale quantity-based markup, and returns rates to Shopify.
+  // Registered with Shopify via the `carrierServiceCreate` GraphQL mutation
+  // (one-time per store; the callbackUrl must point HERE).
+  route("/api/shipping/rates", "api/shipping/rates.js"),
   route("/api/admin/customers", "api/admin/customers.js"),
   route("/api/admin/customers/:id", "api/admin/customer.js"),
   route("/api/admin/customers/:id/decline", "api/admin/decline.js"),
@@ -57,4 +63,5 @@ export default [
   route("/api/admin/sync/backfill", "api/admin/sync-backfill.js"),
   route("/api/admin/sync/inventory-snapshot", "api/admin/sync-inventory-snapshot.js"),
   route("/api/admin/backfill-customer-tags", "api/admin/backfill-customer-tags.js"),
+
 ];

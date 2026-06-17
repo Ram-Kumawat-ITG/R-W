@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@easypost/api": "^8.8.0"
+  }
+}

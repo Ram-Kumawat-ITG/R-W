@@ -550,6 +550,18 @@ export async function updateProfileApplication({
       if (sigValue) signature = { type: sigType, value: sigValue, signedAt: new Date() }
     }
 
+    // Determine which classifications need to be cleared FIRST, so the
+    // $set loop below can skip them. Mongo refuses to $set and $unset the
+    // same path in a single update — "Updating the path 'X' would create
+    // a conflict at 'X'" — and the frontend always sends an empty string
+    // for the inapplicable classification (e.g., `otherClassification: ''`
+    // when taxClassification !== 'other'), which would otherwise land in
+    // both operators.
+    const clearLlc =
+      payload.w9.taxClassification && payload.w9.taxClassification !== 'llc'
+    const clearOther =
+      payload.w9.taxClassification && payload.w9.taxClassification !== 'other'
+
     const w9Keys = [
       'legalName',
       'taxClassification',
@@ -559,20 +571,13 @@ export async function updateProfileApplication({
       'fatcaCode',
     ]
     for (const k of w9Keys) {
+      if (k === 'llcClassification' && clearLlc) continue
+      if (k === 'otherClassification' && clearOther) continue
       if (w9[k] != null) $set[`w9.${k}`] = w9[k]
     }
 
-    // Clear orphaned classifications. The frontend sends an EMPTY STRING
-    // for `llcClassification` when the taxClassification isn't 'llc'
-    // (same pattern for `otherClassification`), but stripEmptyEnums
-    // removed `llcClassification` from `w9` before the loop above, so
-    // the field never gets cleared in Mongo without an explicit $unset.
-    if (payload.w9.taxClassification && payload.w9.taxClassification !== 'llc') {
-      $unset['w9.llcClassification'] = ''
-    }
-    if (payload.w9.taxClassification && payload.w9.taxClassification !== 'other') {
-      $unset['w9.otherClassification'] = ''
-    }
+    if (clearLlc) $unset['w9.llcClassification'] = ''
+    if (clearOther) $unset['w9.otherClassification'] = ''
 
     if (signature) {
       $set['w9.signature'] = signature
