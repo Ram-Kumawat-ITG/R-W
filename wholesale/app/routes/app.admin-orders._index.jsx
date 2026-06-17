@@ -14,13 +14,16 @@ import { carrierDisplayName } from "../utils/shipping.constants";
 import { formatAmount } from "../utils/format.utils";
 
 // Admin Orders — orders placed by the retail drop-ship customer
-// (DROPSHIP_RETAIL_CUSTOMER_EMAIL). These are already paid and run on a
-// completely separate flow from the wholesale order pipeline: no QBO invoice,
-// no NMI charge, and the payment/commission CRON never touches them (it only
-// iterates the Invoice collection, and Admin Orders never produce invoices).
+// (DROPSHIP_RETAIL_CUSTOMER_EMAIL). These run on a separate flow from the
+// wholesale order pipeline: each new order gets an UNPAID QBO invoice on
+// creation, and the dedicated process-dropship-payments CRON collects it
+// against the configured drop-ship NMI vault (DROPSHIP_NMI_VAULT_ID) — they
+// are NOT touched by the wholesale payment CRON. (Orders ingested before
+// drop-ship invoicing existed remain as legacy "Admin order" rows with no
+// invoice.)
 //
 // This page is read-only — it surfaces what Shopify sent us so an admin can
-// audit drop-ship fulfillment without the wholesale payment machinery.
+// audit drop-ship fulfillment.
 
 const PAGE_SIZE = 15;
 
@@ -243,10 +246,11 @@ export default function AdminOrdersList() {
           <s-stack direction="block" gap="base">
             <s-paragraph tone="subdued">
               Orders placed by the retail drop-ship customer
-              {customerEmail ? ` (${customerEmail})` : ""}. These are already
-              paid and are handled separately from the wholesale flow — no
-              invoice is created and the payment / commission jobs never process
-              them.
+              {customerEmail ? ` (${customerEmail})` : ""}. Each new order gets
+              an unpaid QBO invoice on creation; the drop-ship payment job
+              collects it automatically against the card on file and marks it
+              paid in QBO. They are handled separately from the wholesale
+              payment flow.
             </s-paragraph>
             <form onSubmit={onSearchSubmit}>
               <s-stack direction="inline" gap="small-200" alignItems="end">

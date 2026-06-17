@@ -60,9 +60,12 @@ const PROCESSING_TONE_MAP = {
   completed: { tone: "success", label: "Completed" },
   failed: { tone: "critical", label: "Failed" },
   cancelled: { tone: "default", label: "Cancelled" },
-  // Retail drop-ship "Admin Order" — already paid, never invoiced, excluded
-  // from the payment/commission CRON. See models/order.server.js.
+  // Retail drop-ship "Admin Order" (legacy) — pre-invoicing orders that were
+  // never invoiced. See models/order.server.js.
   admin_order: { tone: "info", label: "Admin order" },
+  // Drop-ship order with an UNPAID QBO invoice created — queued for the
+  // dedicated process-dropship-payments CRON to collect.
+  dropship_invoiced: { tone: "info", label: "Drop-ship invoiced" },
 };
 
 // "Scheduled" implies the CRON will auto-charge the card — true for
@@ -115,6 +118,10 @@ const PAYMENT_METHOD_TONE_MAP = {
   card: { tone: "info", label: PAYMENT_METHOD_LABEL.card },
   check: { tone: "default", label: PAYMENT_METHOD_LABEL.check },
   ach: { tone: "default", label: PAYMENT_METHOD_LABEL.ach },
+  // Drop-ship invoices: collected by the dropship CRON against the configured
+  // NMI vault. Rendered for completeness if a drop-ship invoice ever surfaces
+  // in a method-badge context.
+  dropship: { tone: "info", label: "Drop-ship" },
 };
 
 // Renders an Invoice's `paymentMethod` (current active) or the

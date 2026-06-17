@@ -1,24 +1,64 @@
-import { Fragment } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import mongoose from "mongoose";
-import { useLoaderData, useNavigate } from "react-router";
+import { useLoaderData, useNavigate, useFetcher } from "react-router";
+import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import connectDB from "../services/APIService/mongo.service";
 import ShopifyOrder from "../models/order.server";
+import Invoice from "../models/invoice.server";
+import PaymentAttempt from "../models/paymentAttempt.server";
+import QboItemMap from "../models/qboItemMap.server";
 import {
   RETAIL_CUSTOMER_EMAIL,
   isRetailCustomerEmail,
 } from "../services/dropship/dropship.config";
+import { dropshipPaymentConfig } from "../services/dropship/dropshipPayment.config";
+import { getInvoice as getQboInvoice, getInvoiceWebUrl } from "../services/qbo/qbo.service";
 import { syncFulfillmentsFromShopify } from "../services/order/order.service";
-import { KV, TotalsRow, ProcessingBadge, ShipmentStatusBadge } from "../components/admin-ui";
+import { projectQboInvoice } from "../utils/qboInvoice.utils";
+import {
+  KV,
+  TotalsRow,
+  ProcessingBadge,
+  ShipmentStatusBadge,
+  PaymentStatusBadge,
+  PaymentMethodBadge,
+  OutcomeBadge,
+} from "../components/admin-ui";
 import { carrierDisplayName } from "../utils/shipping.constants";
 import { formatAmount, fmtDateTime } from "../utils/format.utils";
 
+// Remark-kind → badge label/tone for the Remarks timeline (mirrors the
+// wholesale Order Details map; includes the drop-ship collection kind).
+const REMARK_KIND_META = {
+  cron_card_attempt: { label: "CRON charge", tone: "info" },
+  cron_ach_attempt: { label: "ACH charge", tone: "info" },
+  cron_dropship_attempt: { label: "Drop-ship collection", tone: "info" },
+  cron_ach_settlement_check: { label: "ACH settlement", tone: "info" },
+  cron_cheque_reminder: { label: "Cheque reminder", tone: "warning" },
+  cron_ach_reminder: { label: "ACH reminder", tone: "warning" },
+  cron_payment_reminder: { label: "Payment reminder", tone: "warning" },
+  cron_failed_followup: { label: "Failed follow-up", tone: "critical" },
+  admin_action: { label: "Admin action", tone: "default" },
+  system_note: { label: "Note", tone: "default" },
+};
+
+// emailEvents[].source → friendly label for the Email history table.
+const EMAIL_SOURCE_LABEL = {
+  invoice_created: "Invoice created",
+  payment_recorded: "Payment recorded",
+  status_changed: "Status changed",
+  manual_resend: "Manual resend",
+  payment_reminder: "Payment reminder",
+};
+
 // Admin Order Details — read-only view of a single order placed by the retail
-// drop-ship customer (DROPSHIP_RETAIL_CUSTOMER_EMAIL). These orders are
-// already paid and run on a separate flow: no QBO invoice, no NMI charge, and
-// the payment/commission CRON never touches them. So unlike the wholesale
-// Order Details page, there are no payment actions here — just everything
-// Shopify told us about the order, for auditing the drop-ship fulfillment.
+// drop-ship customer (DROPSHIP_RETAIL_CUSTOMER_EMAIL). These orders run on a
+// separate flow from the wholesale Order Details page: each gets an UNPAID QBO
+// invoice on creation, collected automatically by the dedicated
+// process-dropship-payments CRON (charges the configured DROPSHIP_NMI_VAULT_ID
+// and records the QBO payment). There are no manual payment actions here —
+// this page surfaces what Shopify told us, for auditing drop-ship fulfillment.
 
 export const loader = async ({ request, params }) => {
   const { admin, session } = await authenticate.admin(request);
@@ -62,13 +102,73 @@ export const loader = async ({ request, params }) => {
     }
   }
 
+  // ── Invoice + payment ─────────────────────────────────────────────
+  // Drop-ship orders carry a full Invoice + QBO invoice (created UNPAID on
+  // order creation, collected by the process-dropship-payments CRON). Surface
+  // the same invoice view + actions the wholesale Order Details page offers —
+  // live QBO pull, PDF, send email, collect now — so admins manage drop-ship
+  // billing from this page. Legacy `admin_order` rows have no invoiceRef, so
+  // this all degrades gracefully to "no invoice yet".
+  const invoice = order.invoiceRef
+    ? await Invoice.findById(order.invoiceRef).lean()
+    : null;
+  const attempts = invoice
+    ? await PaymentAttempt.find({ invoiceRef: invoice._id })
+        .sort({ attemptedAt: -1 })
+        .limit(20)
+        .lean()
+    : [];
+
+  // Live-fetch the QBO invoice (graceful: a QBO outage must NOT 500 the page).
+  let qboInvoice = null;
+  let qboInvoiceError = null;
+  let qboInvoiceUrl = null;
+  if (invoice?.qboInvoiceId) {
+    qboInvoiceUrl = getInvoiceWebUrl(invoice.qboInvoiceId);
+    try {
+      const raw = await getQboInvoice(invoice.qboInvoiceId);
+      qboInvoice = raw ? projectQboInvoice(raw) : null;
+      if (!qboInvoice) qboInvoiceError = "QBO returned no invoice for this id";
+      // Attach each product line's SKU (reverse-lookup from qbo_item_maps),
+      // same as the wholesale page's QBO panel.
+      if (qboInvoice?.productLines?.length) {
+        const itemIds = [
+          ...new Set(qboInvoice.productLines.map((l) => l.itemId).filter(Boolean)),
+        ];
+        if (itemIds.length) {
+          const maps = await QboItemMap.find({ qboItemId: { $in: itemIds } })
+            .select("qboItemId sku")
+            .lean();
+          const skuByItemId = new Map(maps.map((m) => [m.qboItemId, m.sku]));
+          qboInvoice.productLines = qboInvoice.productLines.map((l) => ({
+            ...l,
+            sku: skuByItemId.get(l.itemId) || null,
+          }));
+        }
+      }
+    } catch (e) {
+      console.error("[admin-order-detail] QBO invoice fetch failed:", e?.message || e);
+      qboInvoiceError = e?.message || "Failed to fetch QBO invoice";
+    }
+  }
+
   // Project everything we render out of the raw Shopify webhook payload so we
   // don't ship the whole blob (gateway data, etc.) to the client.
   const details = extractDetails(order.rawPayload, order.currency);
   const orderForClient = serialize(order);
   delete orderForClient.rawPayload;
 
-  return { order: orderForClient, details, retailCustomerEmail: RETAIL_CUSTOMER_EMAIL };
+  return {
+    order: orderForClient,
+    details,
+    retailCustomerEmail: RETAIL_CUSTOMER_EMAIL,
+    invoice: invoice ? serialize(invoice) : null,
+    attempts: attempts.map(serialize),
+    qbo: { invoice: qboInvoice, error: qboInvoiceError, url: qboInvoiceUrl },
+    // Gates the "Collect payment now" button — collection needs a configured
+    // drop-ship vault. (The endpoint re-checks server-side regardless.)
+    dropshipVaultConfigured: Boolean(dropshipPaymentConfig.vaultId),
+  };
 };
 
 // Project a Shopify REST address into the flat shape the UI renders.
@@ -263,8 +363,138 @@ function AddressBlock({ address }) {
 }
 
 export default function AdminOrderDetail() {
-  const { order, details, retailCustomerEmail } = useLoaderData();
+  const { order, details, retailCustomerEmail, invoice, attempts, qbo, dropshipVaultConfigured } =
+    useLoaderData();
   const navigate = useNavigate();
+  const shopify = useAppBridge();
+
+  const [bannerError, setBannerError] = useState(null);
+  const [bannerSuccess, setBannerSuccess] = useState(null);
+
+  // ── Invoice actions (reuse the shared /api/admin/orders/:id/* endpoints) ──
+  const pdfFetcher = useFetcher();
+  const sendInvoiceFetcher = useFetcher();
+  const collectFetcher = useFetcher();
+  const pdfWindowRef = useRef(null);
+  const handledPdfRef = useRef(null);
+  const handledSendRef = useRef(null);
+  const handledCollectRef = useRef(null);
+
+  // View invoice PDF — open the tab synchronously (popup-blocker safe), then
+  // redirect it to the blob URL once the base64 PDF returns.
+  const onViewPdf = () => {
+    setBannerError(null);
+    pdfWindowRef.current = window.open("about:blank", "_blank");
+    pdfFetcher.submit(null, {
+      method: "POST",
+      action: `/api/admin/orders/${order._id}/qbo-invoice-pdf`,
+    });
+  };
+  useEffect(() => {
+    if (!pdfFetcher.data || pdfFetcher.state !== "idle") return;
+    if (handledPdfRef.current === pdfFetcher.data) return;
+    handledPdfRef.current = pdfFetcher.data;
+    const data = pdfFetcher.data;
+    if (data.status === "success" && data.result?.base64) {
+      const { base64, contentType, filename } = data.result;
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const blob = new Blob([bytes], { type: contentType || "application/pdf" });
+      const blobUrl = URL.createObjectURL(blob);
+      const win = pdfWindowRef.current;
+      if (win && !win.closed) {
+        win.location.href = blobUrl;
+        try {
+          win.document.title = filename;
+        } catch {
+          // cross-origin / not-yet-loaded — ignore
+        }
+      } else {
+        const a = document.createElement("a");
+        a.href = blobUrl;
+        a.download = filename || "invoice.pdf";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+      pdfWindowRef.current = null;
+    } else if (data.status === "error") {
+      const win = pdfWindowRef.current;
+      if (win && !win.closed) win.close();
+      pdfWindowRef.current = null;
+      setBannerError(data.message || "Failed to load QBO invoice PDF");
+      shopify?.toast?.show(data.message || "Failed to load PDF", { isError: true });
+    }
+  }, [pdfFetcher.data, pdfFetcher.state, shopify]);
+  const pdfLoading =
+    pdfFetcher.state === "submitting" || pdfFetcher.state === "loading";
+
+  // Send invoice email — QBO mails the CURRENT invoice document.
+  const onSendInvoice = () => {
+    setBannerError(null);
+    setBannerSuccess(null);
+    sendInvoiceFetcher.submit(null, {
+      method: "POST",
+      action: `/api/admin/orders/${order._id}/send-invoice`,
+    });
+  };
+  useEffect(() => {
+    if (!sendInvoiceFetcher.data || sendInvoiceFetcher.state !== "idle") return;
+    if (handledSendRef.current === sendInvoiceFetcher.data) return;
+    handledSendRef.current = sendInvoiceFetcher.data;
+    const data = sendInvoiceFetcher.data;
+    if (data.status === "success") {
+      setBannerSuccess(data.message || "Invoice email sent");
+      shopify?.toast?.show(data.message || "Invoice email sent");
+    } else {
+      setBannerError(data.message || "Could not send invoice email");
+      shopify?.toast?.show(data.message || "Send failed", { isError: true });
+    }
+  }, [sendInvoiceFetcher.data, sendInvoiceFetcher.state, shopify]);
+  const sendInvoiceLoading =
+    sendInvoiceFetcher.state === "submitting" ||
+    sendInvoiceFetcher.state === "loading";
+
+  // Collect payment now — charge the configured drop-ship NMI vault
+  // immediately instead of waiting for the monthly CRON. Reuses the
+  // retry-payment endpoint (drop-ship branch injects the configured vault).
+  const onCollectNow = () => {
+    setBannerError(null);
+    setBannerSuccess(null);
+    collectFetcher.submit(null, {
+      method: "POST",
+      action: `/api/admin/orders/${order._id}/retry-payment`,
+    });
+  };
+  useEffect(() => {
+    if (!collectFetcher.data || collectFetcher.state !== "idle") return;
+    if (handledCollectRef.current === collectFetcher.data) return;
+    handledCollectRef.current = collectFetcher.data;
+    const data = collectFetcher.data;
+    if (data.status === "success") {
+      const r = data.result || {};
+      if (r.skipped) {
+        setBannerError(`Collection skipped: ${r.reason || "see remarks"}`);
+        shopify?.toast?.show(`Skipped: ${r.reason || "see remarks"}`, { isError: true });
+      } else if (r.outcome === "approved") {
+        setBannerSuccess(`Payment collected (NMI txn ${r.transactionId || "?"})`);
+        shopify?.toast?.show("Payment collected");
+      } else if (r.outcome === "declined") {
+        setBannerError(`Declined: ${r.responseText || "no reason given"}`);
+        shopify?.toast?.show("Declined", { isError: true });
+      } else {
+        setBannerError(`Error: ${r.error || r.responseText || "unknown"}`);
+        shopify?.toast?.show("Charge error", { isError: true });
+      }
+    } else {
+      setBannerError(data.message || "Could not collect payment");
+      shopify?.toast?.show(data.message || "Collection failed", { isError: true });
+    }
+  }, [collectFetcher.data, collectFetcher.state, shopify]);
+  const collectLoading =
+    collectFetcher.state === "submitting" || collectFetcher.state === "loading";
 
   const orderLabel =
     order.shopifyOrderName ||
@@ -277,6 +507,16 @@ export default function AdminOrderDetail() {
   const fulfillments = Array.isArray(order.fulfillments)
     ? order.fulfillments
     : [];
+
+  // Whether the invoice still has a balance to collect.
+  const invoiceOutstanding = invoice
+    ? Number((invoice.amountDue || 0) - (invoice.amountPaid || 0))
+    : 0;
+  const canCollect =
+    !!invoice &&
+    invoice.qboInvoiceId &&
+    !["paid", "cancelled", "in_progress"].includes(invoice.paymentStatus) &&
+    invoiceOutstanding > 0.005;
 
   return (
     <s-page inlineSize="large" heading={`Admin Order ${orderLabel}`}>
@@ -294,15 +534,298 @@ export default function AdminOrderDetail() {
       </s-box>
 
       <s-box paddingInline="base" paddingBlockEnd="base">
-        <s-banner tone="info" heading="Admin order — already paid">
+        <s-banner tone="info" heading="Drop-ship order">
           <s-paragraph>
             This order was placed by the retail drop-ship customer
             {retailCustomerEmail ? ` (${retailCustomerEmail})` : ""}. It is
-            handled separately from the wholesale flow: no QBO invoice is
-            created and the payment / commission jobs never process it.
+            handled separately from the wholesale flow: an unpaid QBO invoice is
+            created on order creation, and the drop-ship payment job collects it
+            automatically against the card on file. You can also view, email, or
+            collect the invoice manually below.
           </s-paragraph>
         </s-banner>
       </s-box>
+
+      {(bannerError || bannerSuccess) && (
+        <s-box paddingInline="base" paddingBlockEnd="base">
+          {bannerError && (
+            <s-banner tone="critical" heading="Action failed">
+              <s-paragraph>{bannerError}</s-paragraph>
+            </s-banner>
+          )}
+          {bannerSuccess && (
+            <s-banner tone="success" heading="Done">
+              <s-paragraph>{bannerSuccess}</s-paragraph>
+            </s-banner>
+          )}
+        </s-box>
+      )}
+
+      {/* ───── Invoice & payment ───── */}
+      <s-section heading="Invoice & payment">
+        {!invoice ? (
+          <s-paragraph tone="subdued">
+            No invoice has been created for this order yet.
+          </s-paragraph>
+        ) : (
+          <s-stack direction="block" gap="base">
+            <s-stack direction="inline" gap="base" alignItems="center">
+              <PaymentStatusBadge status={invoice.paymentStatus} />
+              <PaymentMethodBadge method={invoice.paymentMethod} />
+              <s-text tone="subdued">
+                {invoice.attemptCount}/{invoice.maxAttempts} attempts
+              </s-text>
+            </s-stack>
+
+            <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
+              <s-grid-item>
+                <KV
+                  label="Amount due"
+                  value={formatAmount(invoice.amountDue, invoice.currency)}
+                />
+              </s-grid-item>
+              <s-grid-item>
+                <KV
+                  label="Amount paid"
+                  value={formatAmount(invoice.amountPaid || 0, invoice.currency)}
+                />
+              </s-grid-item>
+              <s-grid-item>
+                <KV
+                  label="Balance"
+                  value={formatAmount(invoiceOutstanding, invoice.currency)}
+                />
+              </s-grid-item>
+              <s-grid-item>
+                <KV label="Due date" value={invoice.qboDueDate} />
+              </s-grid-item>
+              <s-grid-item>
+                <KV
+                  label="Paid at"
+                  value={invoice.paidAt ? fmtDateTime(invoice.paidAt) : null}
+                />
+              </s-grid-item>
+              <s-grid-item>
+                <KV
+                  label="Last attempt"
+                  value={
+                    invoice.lastAttemptAt ? fmtDateTime(invoice.lastAttemptAt) : null
+                  }
+                />
+              </s-grid-item>
+            </s-grid>
+
+            {invoice.lastAttemptError && (
+              <s-banner tone="warning" heading="Last attempt error">
+                <s-paragraph>{invoice.lastAttemptError}</s-paragraph>
+              </s-banner>
+            )}
+
+            <s-stack direction="inline" gap="base">
+              {canCollect && (
+                <s-button
+                  variant="primary"
+                  onClick={onCollectNow}
+                  disabled={!dropshipVaultConfigured}
+                  {...(collectLoading ? { loading: true } : {})}
+                >
+                  Collect payment now
+                </s-button>
+              )}
+            </s-stack>
+            {canCollect && !dropshipVaultConfigured && (
+              <s-paragraph tone="subdued">
+                Set <s-text>DROPSHIP_NMI_VAULT_ID</s-text> to enable manual
+                collection (the monthly drop-ship CRON needs it too).
+              </s-paragraph>
+            )}
+          </s-stack>
+        )}
+      </s-section>
+
+      {/* ───── QuickBooks invoice (live) ───── */}
+      {invoice?.qboInvoiceId && (
+        <s-section heading="QuickBooks invoice">
+          <s-stack direction="block" gap="base">
+            <s-stack
+              direction="inline"
+              gap="base"
+              alignItems="center"
+              justifyContent="space-between"
+            >
+              <s-stack direction="inline" gap="base" alignItems="center">
+                {qbo?.invoice?.docNumber && (
+                  <s-badge tone="info">#{qbo.invoice.docNumber}</s-badge>
+                )}
+                <s-text tone="subdued">QBO id: {invoice.qboInvoiceId}</s-text>
+                {qbo?.url && (
+                  <s-link href={qbo.url} target="_blank">
+                    Open in QuickBooks ↗
+                  </s-link>
+                )}
+              </s-stack>
+              <s-stack direction="inline" gap="base">
+                <s-button
+                  variant="secondary"
+                  onClick={onSendInvoice}
+                  {...(sendInvoiceLoading ? { loading: true } : {})}
+                >
+                  Send invoice
+                </s-button>
+                <s-button
+                  variant="secondary"
+                  onClick={onViewPdf}
+                  {...(pdfLoading ? { loading: true } : {})}
+                >
+                  View invoice PDF
+                </s-button>
+              </s-stack>
+            </s-stack>
+
+            {qbo?.error && (
+              <s-banner tone="warning" heading="Could not load live QBO invoice">
+                <s-paragraph>{qbo.error}</s-paragraph>
+                <s-paragraph tone="subdued">
+                  Use the QuickBooks link to view the current state.
+                </s-paragraph>
+              </s-banner>
+            )}
+
+            {qbo?.invoice && (
+              <>
+                <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
+                  <s-grid-item>
+                    <KV label="Customer" value={qbo.invoice.customerName} />
+                  </s-grid-item>
+                  <s-grid-item>
+                    <KV label="Bill email" value={qbo.invoice.billEmail} />
+                  </s-grid-item>
+                  <s-grid-item>
+                    <KV label="Currency" value={qbo.invoice.currency} />
+                  </s-grid-item>
+                  <s-grid-item>
+                    <KV label="Txn date" value={qbo.invoice.txnDate} />
+                  </s-grid-item>
+                  <s-grid-item>
+                    <KV label="Due date" value={qbo.invoice.dueDate} />
+                  </s-grid-item>
+                  <s-grid-item>
+                    <KV label="Email status" value={qbo.invoice.emailStatus} />
+                  </s-grid-item>
+                </s-grid>
+
+                {qbo.invoice.productLines.length === 0 ? (
+                  <s-paragraph tone="subdued">
+                    QBO invoice has no product lines.
+                  </s-paragraph>
+                ) : (
+                  <s-table>
+                    <s-table-header-row>
+                      <s-table-header>Qty</s-table-header>
+                      <s-table-header>Product(s)</s-table-header>
+                      <s-table-header>SKU</s-table-header>
+                      <s-table-header>Rate</s-table-header>
+                      <s-table-header>Amount</s-table-header>
+                    </s-table-header-row>
+                    <s-table-body>
+                      {qbo.invoice.productLines.map((l, i) => (
+                        <s-table-row key={l.id || i}>
+                          <s-table-cell>{l.qty ?? "—"}</s-table-cell>
+                          <s-table-cell>
+                            {l.description || l.itemName || "—"}
+                          </s-table-cell>
+                          <s-table-cell>{l.sku || "—"}</s-table-cell>
+                          <s-table-cell>
+                            {l.unitPrice != null
+                              ? formatAmount(l.unitPrice, qbo.invoice.currency)
+                              : "—"}
+                          </s-table-cell>
+                          <s-table-cell>
+                            {l.amount != null
+                              ? formatAmount(l.amount, qbo.invoice.currency)
+                              : "—"}
+                          </s-table-cell>
+                        </s-table-row>
+                      ))}
+                    </s-table-body>
+                  </s-table>
+                )}
+
+                <s-box
+                  padding="base"
+                  border="base"
+                  borderRadius="base"
+                  background="subdued"
+                >
+                  <s-stack direction="block" gap="tight">
+                    <TotalsRow
+                      label="Subtotal"
+                      value={formatAmount(
+                        qbo.invoice.productSubtotal,
+                        qbo.invoice.currency,
+                      )}
+                    />
+                    <TotalsRow
+                      label="Discount"
+                      value={
+                        qbo.invoice.discount > 0
+                          ? `− ${formatAmount(qbo.invoice.discount, qbo.invoice.currency)}`
+                          : formatAmount(0, qbo.invoice.currency)
+                      }
+                      tone={qbo.invoice.discount > 0 ? "success" : undefined}
+                    />
+                    <TotalsRow
+                      label="Shipping charges"
+                      value={formatAmount(qbo.invoice.shipping, qbo.invoice.currency)}
+                    />
+                    <TotalsRow
+                      label="Sales tax"
+                      value={formatAmount(qbo.invoice.totalTax, qbo.invoice.currency)}
+                    />
+                    {qbo.invoice.processingFee > 0 && (
+                      <TotalsRow
+                        label={qbo.invoice.processingFeeLabel || "Processing fee"}
+                        value={formatAmount(
+                          qbo.invoice.processingFee,
+                          qbo.invoice.currency,
+                        )}
+                      />
+                    )}
+                    {Math.abs(qbo.invoice.otherCharges) > 0.005 && (
+                      <TotalsRow
+                        label="Other charges"
+                        value={formatAmount(
+                          qbo.invoice.otherCharges,
+                          qbo.invoice.currency,
+                        )}
+                      />
+                    )}
+                    <s-divider />
+                    <TotalsRow
+                      label="Grand total"
+                      value={formatAmount(qbo.invoice.totalAmt, qbo.invoice.currency)}
+                      strong
+                    />
+                    <TotalsRow
+                      label="Balance due"
+                      value={formatAmount(qbo.invoice.balance, qbo.invoice.currency)}
+                      strong
+                      tone={qbo.invoice.balance === 0 ? "success" : undefined}
+                    />
+                  </s-stack>
+                </s-box>
+
+                {qbo.invoice.linkedPayments.length > 0 && (
+                  <s-paragraph tone="subdued">
+                    Linked QBO payments:{" "}
+                    {qbo.invoice.linkedPayments.map((p) => p.id).join(", ")}
+                  </s-paragraph>
+                )}
+              </>
+            )}
+          </s-stack>
+        </s-section>
+      )}
 
       {/* ───── Order information ───── */}
       <s-section heading="Order information">
@@ -777,6 +1300,151 @@ export default function AdminOrderDetail() {
           </s-box>
         )}
       </s-section>
+
+      {/* ───── Email history ───── */}
+      {invoice && (
+        <s-section heading={`Email history (${invoice.emailEvents?.length || 0})`}>
+          {!invoice.emailEvents || invoice.emailEvents.length === 0 ? (
+            <s-paragraph tone="subdued">
+              No invoice emails have been sent yet for this order.
+            </s-paragraph>
+          ) : (
+            <s-table>
+              <s-table-header-row>
+                <s-table-header>When</s-table-header>
+                <s-table-header>Type</s-table-header>
+                <s-table-header>Trigger</s-table-header>
+                <s-table-header>Recipient</s-table-header>
+                <s-table-header>Status</s-table-header>
+                <s-table-header>Triggered by</s-table-header>
+              </s-table-header-row>
+              <s-table-body>
+                {[...invoice.emailEvents]
+                  .sort((a, b) =>
+                    String(b.createdAt).localeCompare(String(a.createdAt)),
+                  )
+                  .map((e, i) => (
+                    <s-table-row key={i}>
+                      <s-table-cell>
+                        {e.createdAt ? new Date(e.createdAt).toLocaleString() : "—"}
+                      </s-table-cell>
+                      <s-table-cell>
+                        <s-badge tone={e.triggerType === "manual" ? "info" : "default"}>
+                          {e.triggerType === "manual" ? "Manual" : "Auto"}
+                        </s-badge>
+                      </s-table-cell>
+                      <s-table-cell>
+                        {EMAIL_SOURCE_LABEL[e.source] || e.source}
+                      </s-table-cell>
+                      <s-table-cell>{e.recipient || "—"}</s-table-cell>
+                      <s-table-cell>
+                        <s-badge tone={e.status === "sent" ? "success" : "critical"}>
+                          {e.status === "sent" ? "Sent" : "Failed"}
+                        </s-badge>
+                      </s-table-cell>
+                      <s-table-cell>{e.triggeredBy || "—"}</s-table-cell>
+                    </s-table-row>
+                  ))}
+              </s-table-body>
+            </s-table>
+          )}
+        </s-section>
+      )}
+
+      {/* ───── Attempt history ───── */}
+      {invoice && (
+        <s-section heading={`Attempt history (${attempts.length})`}>
+          {attempts.length === 0 ? (
+            <s-paragraph tone="subdued">No charge attempts yet.</s-paragraph>
+          ) : (
+            <s-table>
+              <s-table-header-row>
+                <s-table-header>#</s-table-header>
+                <s-table-header>When</s-table-header>
+                <s-table-header>Outcome</s-table-header>
+                <s-table-header>Amount</s-table-header>
+                <s-table-header>NMI txn</s-table-header>
+                <s-table-header>Code</s-table-header>
+                <s-table-header>Response</s-table-header>
+              </s-table-header-row>
+              <s-table-body>
+                {attempts.map((a) => (
+                  <s-table-row key={a._id}>
+                    <s-table-cell>{a.attemptNumber}</s-table-cell>
+                    <s-table-cell>
+                      {a.attemptedAt ? new Date(a.attemptedAt).toLocaleString() : "—"}
+                    </s-table-cell>
+                    <s-table-cell>
+                      <OutcomeBadge outcome={a.outcome} />
+                    </s-table-cell>
+                    <s-table-cell>{formatAmount(a.amount, a.currency)}</s-table-cell>
+                    <s-table-cell>{a.nmiTransactionId || "—"}</s-table-cell>
+                    <s-table-cell>{a.nmiResponseCode || "—"}</s-table-cell>
+                    <s-table-cell>
+                      {a.nmiResponseText || a.errorMessage || "—"}
+                    </s-table-cell>
+                  </s-table-row>
+                ))}
+              </s-table-body>
+            </s-table>
+          )}
+        </s-section>
+      )}
+
+      {/* ───── Remarks (CRON + admin follow-up timeline) ───── */}
+      {invoice && (
+        <s-section heading={`Remarks (${invoice.remarks?.length || 0})`}>
+          {!invoice.remarks?.length ? (
+            <s-paragraph tone="subdued">
+              No remarks yet. Drop-ship collection ticks and admin actions
+              (send invoice, collect now) append entries here automatically.
+            </s-paragraph>
+          ) : (
+            <s-table>
+              <s-table-header-row>
+                <s-table-header>When</s-table-header>
+                <s-table-header>Kind</s-table-header>
+                <s-table-header>Source</s-table-header>
+                <s-table-header>Message</s-table-header>
+                <s-table-header>Amount</s-table-header>
+              </s-table-header-row>
+              <s-table-body>
+                {[...invoice.remarks].reverse().map((r, i) => {
+                  const meta = REMARK_KIND_META[r.kind] || {
+                    label: r.kind || "—",
+                    tone: "default",
+                  };
+                  return (
+                    <s-table-row key={`${r.createdAt || i}-${i}`}>
+                      <s-table-cell>
+                        {r.createdAt ? new Date(r.createdAt).toLocaleString() : "—"}
+                      </s-table-cell>
+                      <s-table-cell>
+                        <s-badge tone={meta.tone}>{meta.label}</s-badge>
+                      </s-table-cell>
+                      <s-table-cell>
+                        <s-text tone="subdued">
+                          {r.source === "admin"
+                            ? "Admin"
+                            : r.source === "cron"
+                              ? "CRON"
+                              : "System"}
+                        </s-text>
+                      </s-table-cell>
+                      <s-table-cell>{r.message || "—"}</s-table-cell>
+                      <s-table-cell>
+                        {r.amount != null
+                          ? formatAmount(r.amount, r.currency || invoice.currency)
+                          : "—"}
+                      </s-table-cell>
+                    </s-table-row>
+                  );
+                })}
+              </s-table-body>
+            </s-table>
+          )}
+        </s-section>
+      )}
     </s-page>
   );
 }

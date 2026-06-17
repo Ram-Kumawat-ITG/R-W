@@ -52,8 +52,18 @@ const log = createLogger('invoice.service')
 const CLAIM_WAIT_MS = 30_000
 const CLAIM_POLL_MS = 500
 
-export async function createInvoiceForOrder({ shop, order, localOrder, customerMap }) {
+export async function createInvoiceForOrder({ shop, order, localOrder, customerMap, isDropship = false }) {
   const shopifyOrderId = String(order.id)
+
+  // Drop-ship invoices lock `paymentMethod: 'dropship'` regardless of the
+  // customer map (the synthetic retail customer has no registration-time
+  // preference). 'dropship' falls outside the wholesale CRON's card/ach
+  // PASS 1 filter and carries no processing fee (no rate configured), and
+  // the `isDropship` flag below segregates the row for the dedicated
+  // process-dropship-payments CRON. Everything else (claim-first dedup, QBO
+  // create, due date, ship address, invoice email) is shared with the
+  // wholesale path.
+  const lockedMethod = isDropship ? 'dropship' : customerMap.paymentMethod || 'card'
 
   // Phase 1 — ATOMIC CLAIM via unique-index protected insert.
   //
@@ -81,8 +91,9 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
       // card admin fallback flips it. `customerPaymentPreference` is
       // the immutable order-time snapshot; even if the customer changes
       // their preference later, this stays. Both start equal.
-      paymentMethod: customerMap.paymentMethod || 'card',
-      customerPaymentPreference: customerMap.paymentMethod || 'card',
+      paymentMethod: lockedMethod,
+      customerPaymentPreference: lockedMethod,
+      isDropship: Boolean(isDropship),
       paymentStatus: 'pending',
       maxAttempts: paymentConfig.maxRetryAttempts,
       qboCreationStatus: 'claimed',

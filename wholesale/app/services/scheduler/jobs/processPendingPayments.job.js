@@ -45,9 +45,16 @@ export function registerProcessPendingPaymentsJob(agenda) {
       // absent entirely — those default to "not paused". When an admin
       // hits Resume the flag flips back to false and the next tick
       // picks the invoice up again.
+      // `isDropship: { $ne: true }` excludes drop-ship invoices — those are
+      // collected by the dedicated process-dropship-payments CRON against the
+      // configured DROPSHIP_NMI_VAULT_ID, never here. ($ne also matches legacy
+      // rows where the field is absent.) Their `paymentMethod: 'dropship'`
+      // already falls outside the card/ach filter; the flag is the explicit,
+      // method-independent guard applied across all three passes below.
       const pendingCursor = Invoice.find({
         paymentStatus: 'pending',
         paymentMethod: { $in: ['card', 'ach'] },
+        isDropship: { $ne: true },
         autoChargePaused: { $ne: true },
         $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
       }).cursor()
@@ -162,6 +169,7 @@ export function registerProcessPendingPaymentsJob(agenda) {
       // one alone" signal.
       const followupCursor = Invoice.find({
         autoChargePaused: { $ne: true },
+        isDropship: { $ne: true }, // drop-ship follow-ups belong to the dropship CRON
         paymentStatus: 'failed',
       }).cursor()
       let followupsLogged = 0
@@ -222,6 +230,9 @@ export function registerProcessPendingPaymentsJob(agenda) {
       // sync skips work that's already done, and chargeInvoice's
       // own save() runs after this loop completes.
       const sweepFilter = {
+        // Drop-ship invoices sync via the dedicated dropship CRON's own
+        // sync-retry pass — keep them out of the wholesale sweep entirely.
+        isDropship: { $ne: true },
         paymentStatus: { $in: ['paid', 'partially_paid', 'partially_refunded', 'in_progress'] },
         $or: [
           { qboPaymentRecorded: false },

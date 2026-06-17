@@ -43,13 +43,19 @@ const orderSchema = new mongoose.Schema(
         'failed',
         'cancelled',
         // Terminal state for orders placed by the retail drop-ship customer
-        // (DROPSHIP_RETAIL_CUSTOMER_EMAIL). These are "Admin Orders": already
-        // paid, never invoiced, and deliberately excluded from the QBO/NMI +
-        // commission/payment CRON pipeline. The orchestrator diverts them here
-        // before any payment processing — see services/order/order.service.js.
-        // They surface in the dedicated Admin Orders page, not the wholesale
-        // Orders list.
+        // (DROPSHIP_RETAIL_CUSTOMER_EMAIL). LEGACY: before drop-ship invoicing
+        // existed these were "Admin Orders" — already paid, never invoiced,
+        // excluded from QBO/NMI + the payment CRON. Orders ingested before that
+        // change keep this status (no backfill). They surface in the dedicated
+        // Admin Orders page, not the wholesale Orders list.
         'admin_order',
+        // Terminal state for NEW drop-ship orders: the orchestrator created an
+        // UNPAID QBO invoice for the drop-ship customer and queued it for the
+        // dedicated process-dropship-payments CRON, which charges the
+        // configured NMI vault and records the QBO payment. Transitions to
+        // `completed` once the CRON collects payment. See
+        // services/order/order.service.js + services/dropship.
+        'dropship_invoiced',
       ],
       default: 'received',
       index: true,

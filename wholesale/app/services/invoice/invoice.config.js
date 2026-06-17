@@ -33,6 +33,11 @@ export const invoiceConfig = {
     // Immediate Payment — customer self-pays each invoice on demand via
     // a hosted pay-link/QR, so the due window is typically short.
     immediate: readInt('IMMEDIATE_DUE_DATE', DEFAULT_TERMS_DAYS),
+    // Drop-ship — invoices for the retail drop-ship customer, collected by
+    // the dedicated process-dropship-payments CRON (production: once per
+    // month). The due window is independent of the wholesale terms; defaults
+    // to INVOICE_TERMS_DAYS unless DROPSHIP_DUE_DATE is set.
+    dropship: readInt('DROPSHIP_DUE_DATE', DEFAULT_TERMS_DAYS),
   },
 
   // Additional minutes added to the due date — primarily a TESTING aid

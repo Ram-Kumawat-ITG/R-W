@@ -13,6 +13,19 @@ const invoiceSchema = new mongoose.Schema(
     customerMapRef: { type: mongoose.Schema.Types.ObjectId, ref: 'CustomerMap' },
     customerEmail: { type: String, lowercase: true, index: true },
 
+    // Drop-ship invoice marker. True for invoices created for the synthetic
+    // retail drop-ship customer (DROPSHIP_RETAIL_CUSTOMER_EMAIL) — see
+    // services/order/order.service.js + services/dropship. These are created
+    // UNPAID and collected by a DEDICATED CRON (process-dropship-payments)
+    // against a single configured NMI vault (DROPSHIP_NMI_VAULT_ID), NOT a
+    // per-customer registration vault. The flag segregates them from the
+    // wholesale payment CRON (process-pending-payments excludes
+    // `isDropship: { $ne: true }` from all of its passes) and is the cursor
+    // key the dropship CRON sweeps on. `paymentMethod: 'dropship'` is the
+    // companion segregation key (it falls outside the wholesale PASS 1
+    // card/ach filter and carries a 0% processing fee).
+    isDropship: { type: Boolean, default: false, index: true },
+
     // Optional during the brief window between claiming the (shop,
     // shopifyOrderId) slot and actually creating the invoice in QBO.
     // Set after the QBO POST succeeds.
@@ -64,9 +77,17 @@ const invoiceSchema = new mongoose.Schema(
     //               the QBO invoice (no stored vault). NOT auto-charged by
     //               the CRON (PASS 1 filters card/ach only). Settles via
     //               the public /pay/<token> flow → propagateSuccessfulPayment.
+    //   dropship  — invoice for the synthetic retail drop-ship customer
+    //               (see `isDropship`). NOT auto-charged by the wholesale
+    //               CRON (PASS 1 filters card/ach only); collected by the
+    //               dedicated process-dropship-payments CRON against the
+    //               configured DROPSHIP_NMI_VAULT_ID. Carries no processing
+    //               fee (no rate configured → computeProcessingFee returns
+    //               null). Locked at creation; never flipped by an admin
+    //               fallback.
     paymentMethod: {
       type: String,
-      enum: ['card', 'check', 'ach', 'immediate'],
+      enum: ['card', 'check', 'ach', 'immediate', 'dropship'],
       default: 'card',
       index: true,
     },
@@ -80,7 +101,7 @@ const invoiceSchema = new mongoose.Schema(
     // cheque → card override existed).
     customerPaymentPreference: {
       type: String,
-      enum: ['card', 'check', 'ach', 'immediate'],
+      enum: ['card', 'check', 'ach', 'immediate', 'dropship'],
     },
 
     // Method that actually settled (or last contributed to settling)
@@ -291,6 +312,12 @@ const invoiceSchema = new mongoose.Schema(
     //                          once per day to avoid spamming the
     //                          remarks panel during the normal 1–3 day
     //                          wait window.
+    //   cron_dropship_attempt — the dedicated process-dropship-payments
+    //                          CRON tried to collect a drop-ship invoice by
+    //                          charging the configured DROPSHIP_NMI_VAULT_ID.
+    //                          Kept distinct from cron_card_attempt so the
+    //                          Order Details / Remarks feed reads "Drop-ship
+    //                          collection" rather than a wholesale card charge.
     //   cron_cheque_reminder — PASS 1.5 CRON logged a reminder for a
     //                          pending cheque invoice (no charge
     //                          attempted — admins still need to act)
@@ -314,6 +341,7 @@ const invoiceSchema = new mongoose.Schema(
               enum: [
                 'cron_card_attempt',
                 'cron_ach_attempt',
+                'cron_dropship_attempt',
                 'cron_ach_settlement_check',
                 'cron_cheque_reminder',
                 'cron_ach_reminder',

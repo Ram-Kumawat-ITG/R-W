@@ -501,7 +501,8 @@ still receive Shopify's native shipping-confirmation email with tracking.
 ### 5.1 Lifecycle states (`ShopifyOrder.processingStatus`)
 
 ```
-received  → processing ──┬─→ admin_order   (retail drop-ship customer — already paid; see §5.6)
+received  → processing ──┬─→ dropship_invoiced  (retail drop-ship customer — unpaid QBO invoice; see §5.6)
+                         │        └─→ completed  (collected by the drop-ship CRON, §10.6)
                          │
                          ├─→ pending_approval ──(admin approves)──┐
                          │                                         │
@@ -510,6 +511,8 @@ received  → processing ──┬─→ admin_order   (retail drop-ship custome
                                   ├── rejected  (validation failed or no customer)
                                   ├── failed    (downstream error)
                                   └── cancelled (orders/cancelled webhook — see §4.5)
+
+(legacy: admin_order — pre-invoicing drop-ship orders, never invoiced; see §5.6)
 ```
 
 `pending_approval` is the hold state for orders from Shopify customers that
@@ -518,18 +521,20 @@ work entirely for these orders. They are re-entered into the pipeline by
 `replayPendingOrdersForCustomer` (triggered from `admin/review.js` when an
 admin approves the customer) — see §5.4 below.
 
-`admin_order` is the terminal hold state for orders placed by the retail
-drop-ship customer (`DROPSHIP_RETAIL_CUSTOMER_EMAIL`). These are already
-paid and must never touch QBO / NMI or the payment / commission CRON, so the
-orchestrator diverts them **immediately after the atomic claim** — before the
-approval gate, customer setup, invoice creation, and any charge. See §5.6.
+`dropship_invoiced` is the terminal state for orders placed by the retail
+drop-ship customer (`DROPSHIP_RETAIL_CUSTOMER_EMAIL`). The orchestrator
+diverts them **immediately after the atomic claim** — before the approval gate
+and the wholesale customer setup — and creates an **UNPAID** QBO invoice; the
+dedicated `process-dropship-payments` CRON (§10.6) later collects it and the
+order transitions to `completed`. The legacy `admin_order` state is retained
+for orders ingested before drop-ship invoicing existed (no backfill). See §5.6.
 
 ### 5.2 The three idempotency layers (in this function)
 
 | Layer | Mechanism | Catches |
 |---|---|---|
 | Webhook-id dedup | `seenWebhookIds[]` on ShopifyOrder | Shopify retries — same `x-shopify-webhook-id` |
-| Terminal-status return | `if status ∈ {completed, invoiced, scheduled, rejected, cancelled, admin_order} → return` | Order already processed (or cancelled before / during creation, or diverted as an Admin Order) |
+| Terminal-status return | `if status ∈ {completed, invoiced, scheduled, rejected, cancelled, admin_order, dropship_invoiced} → return` | Order already processed (or cancelled before / during creation, or diverted as a drop-ship / legacy Admin Order) |
 | Atomic claim | `findOneAndUpdate(filter, $set: { status: 'processing' })` | Two concurrent workers |
 
 The claim filter:
@@ -624,14 +629,22 @@ does not need to re-fetch from Shopify. If an order's `rawPayload` is
 missing (legacy data, schema migration), it's recorded as skipped and the
 admin must re-trigger via another mechanism.
 
-### 5.6 Admin Orders (retail drop-ship customer)
+### 5.6 Drop-ship orders (retail drop-ship customer)
 
 Orders placed by the retail drop-ship customer — the synthetic
 "Natural Solutions Retail" customer that the drop-ship orchestrator (§ drop-ship)
-attaches every retail-triggered wholesale order to — are **Admin Orders**, not
-wholesale orders. They are already paid and must run on a completely separate
-flow: no QBO invoice, no NMI charge, and the payment / commission CRON must
-never see them.
+attaches every retail-triggered wholesale order to — run on a **separate flow**
+from the wholesale order pipeline: they get an **UNPAID QBO invoice** on
+creation, and a dedicated CRON (`process-dropship-payments`, §10.6) collects
+that invoice later by charging a single configured NMI vault and recording the
+QBO payment. They skip the wholesale **approval gate** and the wholesale
+**NMI-vault customer setup** entirely, and are excluded from the wholesale
+payment CRON.
+
+> **History.** Before drop-ship invoicing existed these were "Admin Orders" —
+> diverted to a terminal `admin_order` state, never invoiced, never charged.
+> Orders ingested under that regime keep `processingStatus='admin_order'` (no
+> backfill); the new flow applies to orders created from this change forward.
 
 **Detection.** The single source of truth is the customer email. The anchor is
 `DROPSHIP_RETAIL_CUSTOMER_EMAIL` (read once at boot into
@@ -640,19 +653,33 @@ never see them.
 
 **Diversion (orchestrator).** `processShopifyOrder` checks the order's email
 (`order.email || order.customer?.email`) **immediately after the atomic claim**
-— before validation, the approval gate, `ensureCustomerForOrder`, invoice
-creation, and any charge. On a match it sets `processingStatus = 'admin_order'`
-(a terminal state) and returns. Because this runs on the **replay path** too
-(`replayPendingOrdersForCustomer` → `processShopifyOrder`), a drop-ship order
-can never be pulled back into the wholesale pipeline even if the synthetic
-customer were ever tagged `Approved`.
+— before validation, the approval gate, and `ensureCustomerForOrder`. On a
+match it hands off to `invoiceDropshipOrder`, which:
 
-**Why the CRON is automatically safe.** The payment / commission scheduler
-(`processPendingPayments.job.js`, §11) iterates the **`Invoice`** collection,
-never `ShopifyOrder`. Admin Orders are diverted before invoice creation, so
-they produce no `Invoice` doc — there is literally nothing for the scheduler to
-pick up. No CRON-side filter is required (the order-level diversion is the
-guard); the order doc still lives in `shopify_orders` for audit.
+1. `ensureDropshipCustomerMap({ shop, order })` — find-or-create the QBO
+   customer (by email, so every drop-ship invoice consolidates under one QBO
+   customer) and upsert a `CustomerMap`. Unlike the wholesale
+   `ensureCustomerForOrder`, this does **not** source/validate an NMI vault and
+   does **not** hard-fail on a missing billing address (the drop-ship customer
+   has no `wholesale_applications` doc and may arrive without billing).
+2. `createInvoiceForOrder({ ..., isDropship: true })` — the SAME claim-first,
+   duplicate-safe QBO invoice creation as the wholesale path, but with
+   `paymentMethod` locked to `'dropship'` and `isDropship: true` stamped on the
+   row. `'dropship'` carries no processing fee (no configured rate) and falls
+   outside the wholesale PASS 1 `card/ach` charge filter.
+3. Sets `processingStatus = 'dropship_invoiced'` (terminal) + `invoiceRef`.
+
+Because this runs on the **replay path** too (`replayPendingOrdersForCustomer`
+→ `processShopifyOrder`), a drop-ship order can never be pulled into the
+wholesale pipeline even if the synthetic customer were ever tagged `Approved`.
+A cancellation-race guard (mirroring the wholesale path) voids the
+just-created invoice if `orders/cancelled` overtook creation.
+
+**Segregation from the wholesale CRON.** Drop-ship invoices DO produce an
+`Invoice` doc, so the wholesale `process-pending-payments` job
+(§11) now excludes them with `isDropship: { $ne: true }` on **all three**
+passes (charge / failed-followup / sync-retry). Collection is owned solely by
+`process-dropship-payments` (§10.6), which sweeps `isDropship: true`.
 
 **Separation in the UI.**
 
@@ -663,20 +690,38 @@ guard); the order doc still lives in `shopify_orders` for audit.
 - A dedicated **Admin Orders** nav item exposes two read-only routes:
   - `app.admin-orders._index.jsx` — list, anchored on
     `{ customerEmail: RETAIL_CUSTOMER_EMAIL }` (captures every such order
-    regardless of `processingStatus`, including any ingested before this
-    diversion existed), with fulfillment-status chips + search + pagination.
+    regardless of `processingStatus`, including legacy `admin_order` rows),
+    with fulfillment-status chips + search + pagination.
   - `app.admin-orders.$id.jsx` — full detail (order info, customer info, tags,
     line items + quantities/pricing, shipping + billing addresses, shipping
     method, fulfillment + tracking numbers/URLs, order note + note attributes,
     and additional Shopify metadata). It reuses the same best-effort
     `syncFulfillmentsFromShopify` live-pull as the wholesale Order Details page;
-    that helper's QBO-memo push is gated on `invoiceRef`, which Admin Orders
-    never have, so it only reads Shopify + writes tracking locally. The loader
+    new drop-ship orders now carry an `invoiceRef`, so that helper's QBO-memo
+    push (carrier/tracking) lands on the drop-ship invoice too. The loader
     hard-guards with `isRetailCustomerEmail` so a wholesale order id cannot
     resolve here (and vice versa).
 
-There are **no payment actions** on the Admin Order Details page — these orders
-are already settled and carry no invoice.
+    **Invoice view + actions (parity with the wholesale Order Details page).**
+    The detail page surfaces the full invoice the same way the wholesale page
+    does: an **Invoice & payment** summary (status / method / amounts / balance
+    / due date / attempt count) and a **QuickBooks invoice** panel that
+    **live-pulls** the QBO invoice (`getInvoice` + `projectQboInvoice`, the
+    pure projection extracted to `app/utils/qboInvoice.utils.js` and shared by
+    both pages) — itemized product lines with SKUs, the full
+    subtotal/discount/shipping/tax/fee/total breakdown, balance due, and a
+    link to **Open in QuickBooks** — plus an **Email history**, **Attempt
+    history**, and **Remarks** timeline. Three actions are wired to the shared
+    `/api/admin/orders/:id/*` endpoints (keyed on the order `_id`, which admin
+    orders have): **View invoice PDF** (`qbo-invoice-pdf`), **Send invoice**
+    email (`send-invoice`), and **Collect payment now** (`retry-payment`). The
+    retry-payment endpoint gained a drop-ship branch: when `invoice.isDropship`
+    it bypasses the wholesale per-customer vault/ACH resolution and injects the
+    configured `DROPSHIP_NMI_VAULT_ID` (mirroring the CRON's charge path), so
+    an admin can collect immediately instead of waiting for the monthly tick.
+    The wholesale-only manual actions (mark cheque paid, charge card fallback,
+    ACH retry, pause auto-charge/reminders) are intentionally absent — they
+    don't apply to the auto-collected drop-ship method.
 
 ---
 
@@ -2265,6 +2310,76 @@ auto-charge pause (`autoChargePaused`) — different flag, different sweep.
 invoices; idempotent per stage; safe to re-run; paid or paused invoices
 are skipped.
 
+### 10.6 Drop-ship payment CRON (`process-dropship-payments`)
+
+A **dedicated, independent job** — separate from the wholesale payment
+ticks — that collects the UNPAID QBO invoices created for the retail
+drop-ship customer (`DROPSHIP_RETAIL_CUSTOMER_EMAIL`). See §5.6 for how
+those invoices are created. Registered in
+`scheduler.service.ensureRecurring` **before** the `PAYMENT_RETRY_INTERVAL`
+dev-override early-return (like the ACH-sync job), so it runs in dev too.
+
+**Cadence** (per requirement):
+
+```
+DROPSHIP_PAYMENT_CRON=30 0 1 * *     # PRODUCTION default: once per month, 00:30 on the 1st (PAYMENT_SCHEDULE_TZ)
+DROPSHIP_PAYMENT_INTERVAL=2 minutes  # TESTING override: Agenda "every" expression (every 2 minutes)
+```
+
+**Collection target.** The synthetic drop-ship customer has no
+per-registration NMI vault, so the CRON charges a SINGLE configured vault:
+
+```
+DROPSHIP_NMI_VAULT_ID=<NMI customer vault id for the drop-ship account>
+```
+
+When unset, every invoice is skipped with a clear
+`no DROPSHIP_NMI_VAULT_ID configured` reason (recorded on a PaymentAttempt
++ a `cron_dropship_attempt` remark) — the job never silently no-ops.
+
+**Code:** `services/dropship/dropshipPayment.service.collectDropshipPayments()`
++ `dropshipPayment.config.js`; thin Agenda wrapper
+`services/scheduler/jobs/processDropshipPayments.job.js` (concurrency:1).
+
+**Two passes per tick** (mirrors §11's PASS 1 + PASS 2, scoped to
+`isDropship: true`):
+
+- **PASS A — charge.** Sweeps
+  `{ isDropship: true, paymentStatus: 'pending', autoChargePaused: { $ne: true }, attemptCount < maxAttempts }`.
+  For each, it loads the invoice's `CustomerMap`, **injects**
+  `nmiCustomerVaultId = DROPSHIP_NMI_VAULT_ID` (config stays the single
+  source of truth; the id is never persisted on the map), and calls
+  `payment.service.chargeInvoice`. Because `paymentMethod: 'dropship'`
+  routes through the vault's default billing (no `billing_id`, like a
+  card sale), an approval runs the existing inline
+  `propagateSuccessfulPayment` → QBO `recordPayment` + Shopify
+  `orderMarkAsPaid` + local mirror (order → `completed`). Each attempt
+  appends a `cron_dropship_attempt` remark.
+- **PASS B — sync-retry.** Sweeps drop-ship invoices that were charged
+  (paid/in_progress) but whose QBO/Shopify sync is behind, and replays
+  `propagateSuccessfulPayment` only (never re-charges NMI).
+
+**Why a separate CRON (not the wholesale job).** Different cadence
+(monthly vs 15th + last), a single shared vault vs per-customer vaults,
+and a clean audit boundary. The wholesale `process-pending-payments`
+**excludes** drop-ship invoices from all three of its passes via
+`isDropship: { $ne: true }`, so the two jobs never race on the same rows.
+
+**Idempotency / duplicate prevention.** `chargeInvoice` skips
+paid/cancelled/in_progress invoices and holds the `in_progress` lock (the
+job is also `concurrency:1`), so overlapping ticks can't double-charge.
+`propagateSuccessfulPayment` records only the
+`amountPaid − qboRecordedTotal` delta, so QBO never books a duplicate
+Payment. Invoice creation is itself dedup'd by the claim-first unique
+`(shop, shopifyOrderId)` index (§13).
+
+**Known characteristic.** In production the job runs monthly, so a
+downstream-sync failure after a successful charge (rare — QBO/Shopify
+calls retry 3× inside `propagateSuccessfulPayment`) waits until the next
+monthly tick for PASS B to heal it. The failure is visible meanwhile on
+`Invoice.lastSyncError` + the remarks feed. The testing cadence (2 min)
+heals it almost immediately.
+
 ---
 
 ## 11. Payment retry mechanism
@@ -2816,6 +2931,13 @@ required values throw immediately.
 | `ACH_SYNC_INTERVAL` | (unset) | Testing override, e.g. `1 minute` — runs the sweep every minute; takes precedence over `ACH_SYNC_CRON` when set |
 | `ACH_SYNC_STUCK_DAYS` | `5` | Days awaiting settlement before a "stuck" admin alert |
 | `ACH_ALERT_WEBHOOK_URL` | (unset) | Optional outbound webhook for critical ACH alerts (off unless set) |
+| **Drop-ship (retail customer)** | | |
+| `DROPSHIP_RETAIL_CUSTOMER_EMAIL` | `famixu@denipl.com` | Email of the synthetic retail drop-ship customer. Orders from it get an unpaid QBO invoice + are collected by the drop-ship CRON (§5.6, §10.6) |
+| `DROPSHIP_RETAIL_CUSTOMER_TAG` | `ns-retail-internal` | Shopify tag used to resolve / create the synthetic drop-ship customer |
+| `DROPSHIP_NMI_VAULT_ID` | (unset) | **Required for collection.** The single NMI customer vault the drop-ship CRON charges for every drop-ship invoice. When unset, the CRON skips with a clear reason |
+| `DROPSHIP_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **drop-ship** invoices |
+| `DROPSHIP_PAYMENT_CRON` | `30 0 1 * *` | Production cron for the drop-ship payment CRON (once per month, 00:30 on the 1st) |
+| `DROPSHIP_PAYMENT_INTERVAL` | (unset) | Testing override, e.g. `2 minutes` — runs collection every 2 minutes; takes precedence over `DROPSHIP_PAYMENT_CRON` when set |
 | **HTTP retries** | | |
 | `HTTP_RETRY_ATTEMPTS` | `4` | Per-request retry cap (QBO + NMI) |
 | `HTTP_RETRY_BASE_MS` | `500` | Base backoff |

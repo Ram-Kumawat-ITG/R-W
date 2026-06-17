@@ -7,7 +7,7 @@
 
 import ShopifyOrder from '../../models/order.server'
 import Invoice from '../../models/invoice.server'
-import { ensureCustomerForOrder } from '../customer/customer.service'
+import { ensureCustomerForOrder, ensureDropshipCustomerMap } from '../customer/customer.service'
 import {
   createInvoiceForOrder,
   appendInvoiceRemark,
@@ -37,10 +37,13 @@ const TERMINAL_STATUSES = new Set([
   'scheduled',
   'rejected',
   'cancelled',
-  // Admin Orders (retail drop-ship customer) are terminal the moment they're
-  // recognized — there's no payment pipeline to run, so any webhook re-delivery
-  // for the same order returns the existing doc untouched.
+  // Admin Orders (legacy retail drop-ship state) are terminal — kept for
+  // orders ingested before drop-ship invoicing existed.
   'admin_order',
+  // Drop-ship orders that have had their UNPAID QBO invoice created. Terminal
+  // for the orchestrator (re-deliveries return the existing doc untouched);
+  // the dedicated process-dropship-payments CRON drives them to `completed`.
+  'dropship_invoiced',
 ])
 // Statuses that mean "another worker owns this right now".
 const LOCKED_STATUSES = new Set(['processing'])
@@ -166,27 +169,20 @@ export async function processShopifyOrder({ shop, order, webhookId }) {
     `[orders] CLAIMED order ${shopifyOrderId} (status was → processing, claimedAt=${now.toISOString()})`,
   )
 
-  // Admin Order short-circuit — orders placed by the retail drop-ship
-  // customer (DROPSHIP_RETAIL_CUSTOMER_EMAIL) are NOT wholesale orders. They
-  // are already paid and must never touch QBO / NMI or the commission/payment
-  // CRON. Divert them to the terminal `admin_order` state immediately, before
-  // the approval gate, customer setup, invoice creation, and any charge. This
-  // also runs on the replay path (replayPendingOrdersForCustomer → here), so a
-  // drop-ship order can never be pulled back into the wholesale pipeline. The
-  // order still lives in `shopify_orders` (so it's auditable + appears on the
-  // dedicated Admin Orders page) — it just carries no invoice and is invisible
-  // to the scheduler (which only iterates the Invoice collection).
+  // Drop-ship short-circuit — orders placed by the retail drop-ship customer
+  // (DROPSHIP_RETAIL_CUSTOMER_EMAIL) are NOT wholesale orders and skip the
+  // wholesale approval gate + NMI-vault customer setup. Instead they get an
+  // UNPAID QBO invoice immediately (right after the atomic claim, before the
+  // approval gate / wholesale customer setup), and the dedicated
+  // process-dropship-payments CRON collects payment later against the
+  // configured DROPSHIP_NMI_VAULT_ID and records it in QBO. This runs on the
+  // replay path too (replayPendingOrdersForCustomer → here). The order is
+  // excluded from the wholesale Orders list (by email) and surfaces on the
+  // dedicated Admin Orders page; its invoice is excluded from the wholesale
+  // payment CRON (isDropship flag) and swept only by the dropship CRON.
   const orderEmail = order.email || order.customer?.email || ''
   if (isRetailCustomerEmail(orderEmail)) {
-    console.log(
-      `[orders] ADMIN ORDER — ${shopifyOrderId} placed by retail drop-ship customer ` +
-        `(${orderEmail}); skipping QBO/NMI + CRON. Marking processingStatus=admin_order.`,
-    )
-    log.info('admin_order.diverted', { shopifyOrderId, email: orderEmail.toLowerCase() })
-    local.processingStatus = 'admin_order'
-    local.processingError = undefined
-    await local.save()
-    return local
+    return await invoiceDropshipOrder({ shop, order, local })
   }
 
   // Pre-flight validation. Bad payloads are persisted as `rejected`
@@ -353,6 +349,100 @@ export async function processShopifyOrder({ shop, order, webhookId }) {
     console.log(`[orders] FAILED order=${order.id}: ${err.message}`)
     console.error(err.stack || err)
     log.error('process.failed', { shopifyOrderId: order.id, err })
+    local.processingStatus = 'failed'
+    local.processingError = err.message
+    await local.save()
+    throw err
+  }
+}
+
+// Drop-ship order handler — orders placed by the retail drop-ship customer
+// (DROPSHIP_RETAIL_CUSTOMER_EMAIL) get an UNPAID QBO invoice on creation; the
+// dedicated process-dropship-payments CRON later charges the configured NMI
+// vault (DROPSHIP_NMI_VAULT_ID) and records the QBO payment. This supersedes
+// the old "Admin Order" diversion (which never invoiced these orders).
+//
+// Idempotent + concurrency-safe: createInvoiceForOrder does a claim-first
+// insert against the unique (shop, shopifyOrderId) index, so concurrent
+// webhook deliveries (or a replay) produce exactly one invoice. On any
+// failure the order is left `failed` (reclaimable on the next delivery).
+async function invoiceDropshipOrder({ shop, order, local }) {
+  const shopifyOrderId = String(order.id)
+  const orderEmail = order.email || order.customer?.email || ''
+  console.log(
+    `[orders] DROP-SHIP — ${shopifyOrderId} placed by retail drop-ship customer ` +
+      `(${orderEmail}); creating UNPAID QBO invoice (collection deferred to dropship CRON).`,
+  )
+  try {
+    const customerMap = await ensureDropshipCustomerMap({ shop, order })
+    console.log(`[orders] drop-ship customer ready — qboId=${customerMap.qboCustomerId}`)
+
+    const invoice = await createInvoiceForOrder({
+      shop,
+      order,
+      localOrder: local,
+      customerMap,
+      isDropship: true,
+    })
+
+    local.qboInvoiceId = invoice.qboInvoiceId
+    local.invoiceRef = invoice._id
+    local.processingStatus = 'dropship_invoiced'
+    local.processingError = undefined
+    await local.save()
+
+    // Cancellation race guard — mirror the wholesale path. If orders/cancelled
+    // overtook us mid-creation, void the just-created (still UNPAID) invoice
+    // and restore the cancelled status our save() above may have overwritten.
+    const cancelCheck = await ShopifyOrder.findById(local._id)
+      .select('cancelledAt cancelReason')
+      .lean()
+    if (cancelCheck?.cancelledAt) {
+      console.log(
+        `[orders] drop-ship — orders/cancelled overtook creation (reason="${cancelCheck.cancelReason || 'cancelled'}"); voiding new invoice`,
+      )
+      log.warn('dropship.cancel_during_creation', {
+        shopifyOrderId,
+        invoiceId: invoice._id.toString(),
+        qboInvoiceId: invoice.qboInvoiceId,
+      })
+      invoice.paymentStatus = 'cancelled'
+      await invoice.save()
+      if (invoice.qboInvoiceId) {
+        try {
+          await voidQboInvoice(invoice.qboInvoiceId)
+          console.log(`[orders] drop-ship race-fix — voided QBO invoice ${invoice.qboInvoiceId}`)
+        } catch (qboErr) {
+          console.error(`[orders] drop-ship race-fix — QBO void failed: ${qboErr.message}`)
+          log.error('dropship.cancel_race_void_failed', {
+            invoiceId: invoice._id.toString(),
+            qboInvoiceId: invoice.qboInvoiceId,
+            err: qboErr,
+          })
+        }
+      }
+      await ShopifyOrder.updateOne(
+        { _id: local._id },
+        { $set: { processingStatus: 'cancelled' } },
+      )
+      return await ShopifyOrder.findById(local._id)
+    }
+
+    console.log(
+      `[orders] DROP-SHIP DONE order=${shopifyOrderId} qboInvoice=${invoice.qboInvoiceId} ` +
+        `($${invoice.amountDue}) — UNPAID, queued for process-dropship-payments CRON`,
+    )
+    log.info('dropship.invoiced', {
+      shopifyOrderId,
+      qboInvoiceId: invoice.qboInvoiceId,
+      invoiceId: invoice._id.toString(),
+      amountDue: invoice.amountDue,
+    })
+    return local
+  } catch (err) {
+    console.error(`[orders] DROP-SHIP FAILED order=${shopifyOrderId}: ${err.message}`)
+    console.error(err.stack || err)
+    log.error('dropship.failed', { shopifyOrderId, err })
     local.processingStatus = 'failed'
     local.processingError = err.message
     await local.save()
