@@ -3249,6 +3249,9 @@ export async function listCdoOrders({
             // list can show a "Paid" indicator that matches the payment.
             invoiceStatus: r.retailQbo.invoiceStatus || null,
             paymentStatus: r.retailQbo.paymentSyncStatus || null,
+            // Vendor Bill (A/P) summary — the dropship cost owed to the supplier.
+            billId: r.retailQbo.qboBillId || null,
+            billStatus: r.retailQbo.billSyncStatus || null,
           }
         : null,
     })),
@@ -3368,6 +3371,16 @@ export async function getCdoOrderDetail(id) {
           invoiceEmailStatus: o.retailQbo.invoiceEmailStatus || null,
           lastShipmentNotifiedAt: o.retailQbo.lastShipmentNotifiedAt || null,
           lastNotifiedTracking: o.retailQbo.lastNotifiedTracking || null,
+          // ── Vendor Bill (A/P — dropship cost owed to the wholesale supplier) ──
+          qboVendorId: o.retailQbo.qboVendorId || null,
+          qboBillId: o.retailQbo.qboBillId || null,
+          qboBillDocNumber: o.retailQbo.qboBillDocNumber || null,
+          qboBillTotal: o.retailQbo.qboBillTotal ?? null,
+          billUrl: o.retailQbo.billUrl || null,
+          billCreatedAt: o.retailQbo.billCreatedAt || null,
+          billSyncStatus: o.retailQbo.billSyncStatus || null,
+          billSyncedAt: o.retailQbo.billSyncedAt || null,
+          billSyncError: o.retailQbo.billSyncError || null,
           syncLog: (o.retailQbo.syncLog || []).map((s) => ({
             at: s.at || null,
             event: s.event || null,
@@ -3397,6 +3410,12 @@ export async function getCdoOrderDetail(id) {
         ? {
             label: `QBO invoice created${o.retailQbo.qboInvoiceDocNumber ? ` (#${o.retailQbo.qboInvoiceDocNumber})` : ""}`,
             at: o.retailQbo.qboCreatedAt,
+          }
+        : null,
+      o.retailQbo?.billCreatedAt
+        ? {
+            label: `Vendor bill created${o.retailQbo.qboBillDocNumber ? ` (#${o.retailQbo.qboBillDocNumber})` : ""}`,
+            at: o.retailQbo.billCreatedAt,
           }
         : null,
       o.shippedAt ? { label: "Shipped", at: o.shippedAt } : null,

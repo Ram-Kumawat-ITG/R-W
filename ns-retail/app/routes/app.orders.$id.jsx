@@ -10,6 +10,7 @@ import {
   sendRetailInvoiceForOrder,
   getRetailInvoicePdf,
 } from "../services/retailQbo/retailOrderInvoice.service";
+import { ensureRetailVendorBillForOrder } from "../services/retailQbo/retailVendorBill.service";
 import StatusBadge from "../components/cdo/StatusBadge";
 import { ShippingBadge, DeliveryBadge } from "../components/cdo/StatusBadges";
 import { formatCurrency, formatDate, formatDateTime, formatPercent } from "../utils/format";
@@ -75,6 +76,28 @@ export const action = async ({ request }) => {
         return { status: "error", message: "Retail QBO is not configured." };
       }
       return { status: "error", message: r.error || "Could not record the payment in QBO." };
+    }
+    if (op === "create-bill") {
+      const r = await ensureRetailVendorBillForOrder({ shop, shopifyOrderId, force: true });
+      if (r.ok && (r.billId || r.reason === "already_billed")) {
+        return { status: "success", message: `Vendor bill ${r.billId || ""} ready (unpaid).`.trim() };
+      }
+      if (r.reason === "bill_disabled") {
+        return { status: "error", message: "Vendor-bill creation is disabled (QBO_RETAIL_CREATE_VENDOR_BILL=false)." };
+      }
+      if (r.reason === "not_configured") {
+        return { status: "error", message: "Retail QBO is not configured." };
+      }
+      if (r.reason === "order_not_found") {
+        return { status: "error", message: "Order not found in this shop." };
+      }
+      if (r.reason === "no_line_items") {
+        return { status: "error", message: "This order has no line items to bill the vendor for." };
+      }
+      return {
+        status: "error",
+        message: r.error || "Vendor bill was not created — see QBO sync history below for the reason.",
+      };
     }
     if (op === "resync-shipping") {
       const r = await resyncInvoiceShippingForOrder({ shop, shopifyOrderId });
@@ -150,6 +173,19 @@ function QboStatusBadge({ status }) {
   const map = {
     created: { tone: "success", label: "Created" },
     shipping_synced: { tone: "success", label: "Created · shipping synced" },
+    creating: { tone: "info", label: "Creating…" },
+    pending: { tone: "neutral", label: "Pending" },
+    error: { tone: "critical", label: "Error" },
+  };
+  const m = map[status] || { tone: "neutral", label: status };
+  return <s-badge tone={m.tone}>{m.label}</s-badge>;
+}
+
+// QBO vendor-bill (A/P) sync status → Polaris badge tone.
+function QboBillStatusBadge({ status }) {
+  if (!status) return <s-badge tone="neutral">Not created</s-badge>;
+  const map = {
+    created: { tone: "success", label: "Created · unpaid" },
     creating: { tone: "info", label: "Creating…" },
     pending: { tone: "neutral", label: "Pending" },
     error: { tone: "critical", label: "Error" },
@@ -594,6 +630,48 @@ export default function OrderDetail() {
             </s-banner>
           ) : null}
 
+          {/* ── Vendor bill (A/P — dropship cost owed to Natural Solution Wholesale) ── */}
+          <s-divider />
+          <s-stack direction="block" gap="tight">
+            <s-stack direction="inline" gap="small-200" alignItems="center">
+              <s-text>Vendor bill</s-text>
+              <QboBillStatusBadge status={q?.billSyncStatus} />
+            </s-stack>
+            {!q?.qboBillId ? (
+              <s-paragraph tone="subdued">
+                No vendor bill yet. Paid dropship orders record an unpaid QBO bill against the
+                wholesale supplier automatically; for this order use “Create vendor bill” below.
+              </s-paragraph>
+            ) : (
+              <s-grid gap="base" gridTemplateColumns="repeat(3, minmax(0, 1fr))">
+                <s-stack direction="block" gap="none">
+                  <s-text tone="subdued">QBO bill ID</s-text>
+                  {q.billUrl ? (
+                    <s-link href={q.billUrl} target="_blank">
+                      {q.qboBillId} ↗
+                    </s-link>
+                  ) : (
+                    <s-text>{q.qboBillId}</s-text>
+                  )}
+                </s-stack>
+                <Row label="Bill number" value={q.qboBillDocNumber} />
+                <Row label="Vendor ID" value={q.qboVendorId} />
+                <Row
+                  label="Bill amount"
+                  value={q.qboBillTotal != null ? formatCurrency(q.qboBillTotal, cur) : "—"}
+                />
+                <Row label="Bill created" value={q.billCreatedAt ? formatDateTime(q.billCreatedAt) : "—"} />
+                <Row label="Last sync" value={q.billSyncedAt ? formatDateTime(q.billSyncedAt) : "—"} />
+              </s-grid>
+            )}
+          </s-stack>
+
+          {q?.billSyncError ? (
+            <s-banner tone="critical" heading="Last vendor-bill error">
+              <s-paragraph>{q.billSyncError}</s-paragraph>
+            </s-banner>
+          ) : null}
+
           <s-stack direction="inline" gap="base" alignItems="center">
             <s-button
               variant="primary"
@@ -606,6 +684,17 @@ export default function OrderDetail() {
               }
             >
               {q?.qboInvoiceId ? "Re-create / retry invoice" : "Create QBO invoice"}
+            </s-button>
+            <s-button
+              disabled={qboBusy}
+              onClick={() =>
+                qboFetcher.submit(
+                  { _action: "create-bill", shopifyOrderId: order.shopifyOrderId || "" },
+                  { method: "POST" },
+                )
+              }
+            >
+              {q?.qboBillId ? "Re-create / retry bill" : "Create vendor bill"}
             </s-button>
             {q?.qboInvoiceId ? (
               <>

@@ -14,7 +14,7 @@
 // SERVER-ONLY: reads process.env at module init. Import only from
 // services / webhook routes / loaders — never from a route's render path.
 
-import { readEnv, readBool } from "../../utils/env.utils";
+import { readEnv, readBool, readNumber } from "../../utils/env.utils";
 import { QBO_BASE_URLS, QBO_APP_URLS, QBO_OAUTH_TOKEN_URL } from "../qbo/qbo.constants";
 
 // Clamp to a known environment (don't throw at import — a missing/garbled
@@ -65,6 +65,39 @@ export const retailQboConfig = {
   // (Bank / Undeposited Funds); omit to let QBO use its default.
   recordPaymentOnPaid: readBool("QBO_RETAIL_RECORD_PAYMENT", true),
   depositAccountId: readEnv("QBO_RETAIL_DEPOSIT_ACCOUNT_ID"),
+
+  // ── Vendor Bill (A/P "money out") — dropship cost owed to the wholesale
+  //    supplier. In addition to the customer invoice (A/R), each PAID dropship
+  //    order records an UNPAID QBO Bill in this same retail company against the
+  //    "Natural Solution Wholesale" vendor, mirroring the wholesale invoice for
+  //    the same order. Default ON; set QBO_RETAIL_CREATE_VENDOR_BILL=false to
+  //    disable without touching the invoice flow.
+  createVendorBill: readBool("QBO_RETAIL_CREATE_VENDOR_BILL", true),
+  // The QBO Vendor the dropship bills post to. Prefer an explicit id; the
+  // existing QBO_RETAIL_ADMIN_VENDOR alias ("all patient bills are recorded as
+  // bills from this vendor") is accepted as a fallback. When NO id is set, the
+  // service find-or-creates the vendor by name/email below.
+  dropshipVendorId:
+    readEnv("QBO_RETAIL_DROPSHIP_VENDOR_ID") || readEnv("QBO_RETAIL_ADMIN_VENDOR"),
+  dropshipVendorName: readEnv("QBO_RETAIL_DROPSHIP_VENDOR_NAME", {
+    fallback: "Natural Solution Wholesale",
+  }),
+  dropshipVendorEmail: readEnv("QBO_RETAIL_DROPSHIP_VENDOR_EMAIL", {
+    fallback: "dropship@naturalsolutionsphc.com",
+  }),
+  // Expense / COGS account each bill line posts to. When unset, the service
+  // auto-resolves a "Cost of Goods Sold" account (else any Expense account).
+  dropshipExpenseAccountId: readEnv("QBO_RETAIL_DROPSHIP_EXPENSE_ACCOUNT_ID"),
+  // Optional explicit A/P account for the bill (QBO defaults the company's A/P
+  // when omitted). Reuses the same QBO_RETAIL_AP_ACCOUNT_ID as the payout Bills.
+  apAccountId: readEnv("QBO_RETAIL_AP_ACCOUNT_ID"),
+  // The wholesale dropship order/invoice prices each line at this fraction of
+  // the retail BASE price (½ today — see wholesale dropship.service
+  // buildDropshipLineItems). The bill mirrors that, so keep the two in sync.
+  wholesalePriceFactor: readNumber("QBO_RETAIL_WHOLESALE_PRICE_FACTOR", 0.5),
+  // Mirror the wholesale invoice's shipping line (retail shipping at full cost,
+  // per the wholesale draft order) onto the bill. Default ON.
+  billIncludesShipping: readBool("QBO_RETAIL_BILL_INCLUDE_SHIPPING", true),
 };
 
 // True when the four credentials needed to talk to the retail realm are set.

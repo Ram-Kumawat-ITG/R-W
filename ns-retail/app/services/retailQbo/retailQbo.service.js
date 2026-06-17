@@ -422,3 +422,246 @@ export async function getInvoicePdf(invoiceId) {
 export function invoiceWebUrl(invoiceId) {
   return `${retailQboConfig.appBaseUrl}/app/invoice?txnId=${invoiceId}`;
 }
+
+// ── Vendor Bills (A/P "money out" — dropship cost) ───────────────────
+//
+// The accounts-PAYABLE counterpart to the customer Invoice above, posted to
+// the SAME retail company. Each dropship order records what the retail store
+// owes the wholesale supplier ("Natural Solution Wholesale") as an UNPAID QBO
+// Bill, mirroring the wholesale invoice for the same order. Orchestrated by
+// retailVendorBill.service.js. The customer-invoice (A/R) path is untouched.
+
+// Vendor lookup helpers (mirror the CDO payout client's, but on the retail
+// realm). QBO returns ACTIVE entities by default; a deactivated vendor is
+// found via a second `Active = false` query. The GET /vendor/{id} read 610s on
+// an inactive vendor, so we always look up via query.
+async function queryOneVendor(whereClause) {
+  let res = await retailQbo.query(`SELECT * FROM Vendor WHERE ${whereClause}`);
+  let v = res?.QueryResponse?.Vendor?.[0];
+  if (v) return v;
+  res = await retailQbo.query(`SELECT * FROM Vendor WHERE ${whereClause} AND Active = false`);
+  return res?.QueryResponse?.Vendor?.[0] || null;
+}
+
+async function queryVendorByDisplayName(displayName) {
+  if (!displayName) return null;
+  return queryOneVendor(`DisplayName = '${escapeQuery(displayName)}'`);
+}
+
+// QBO QL can't filter Vendor by the complex PrimaryEmailAddr field, so fetch
+// and match client-side (active then inactive).
+async function queryVendorByEmail(email) {
+  if (!email) return null;
+  const target = String(email).toLowerCase();
+  const match = (list) =>
+    list.find((v) => (v.PrimaryEmailAddr?.Address || "").toLowerCase() === target);
+  let res = await retailQbo.query("SELECT * FROM Vendor MAXRESULTS 1000");
+  let v = match(res?.QueryResponse?.Vendor || []);
+  if (v) return v;
+  res = await retailQbo.query("SELECT * FROM Vendor WHERE Active = false MAXRESULTS 1000");
+  return match(res?.QueryResponse?.Vendor || []) || null;
+}
+
+// A Bill can't post to an inactive vendor — flip it back to Active via a sparse
+// update. Idempotent on an already-active vendor.
+async function reactivateVendor(vendor) {
+  const res = await retailQbo.update("/vendor", {
+    Id: String(vendor.Id),
+    SyncToken: vendor.SyncToken,
+    Active: true,
+    sparse: true,
+  });
+  return res?.Vendor || vendor;
+}
+
+// Module-memoized so we resolve the wholesale-supplier vendor once per process.
+let _dropshipVendorId = null;
+
+// Resolve the QBO Vendor id the dropship bills post to:
+//   1. configured id (QBO_RETAIL_DROPSHIP_VENDOR_ID / QBO_RETAIL_ADMIN_VENDOR) — verbatim
+//   2. adopt an existing vendor by email / DisplayName (incl. inactive)
+//   3. create it under the configured name + email
+// Returns the vendor id as a string.
+export async function resolveDropshipVendorId() {
+  if (_dropshipVendorId) return _dropshipVendorId;
+
+  if (retailQboConfig.dropshipVendorId) {
+    _dropshipVendorId = String(retailQboConfig.dropshipVendorId);
+    return _dropshipVendorId;
+  }
+
+  const name = retailQboConfig.dropshipVendorName;
+  const email = retailQboConfig.dropshipVendorEmail;
+
+  let vendor =
+    (await queryVendorByEmail(email)) || (await queryVendorByDisplayName(name));
+
+  if (!vendor) {
+    const payload = {
+      DisplayName: String(name).slice(0, 100),
+      ...(email ? { PrimaryEmailAddr: { Address: email } } : {}),
+    };
+    try {
+      const created = await retailQbo.post("/vendor", payload);
+      vendor = created?.Vendor || null;
+    } catch (err) {
+      const code = err?.body?.Fault?.Error?.[0]?.code;
+      if (code === "6240" || /duplicate/i.test(err?.message || "")) {
+        vendor = await queryVendorByDisplayName(name);
+      }
+      if (!vendor) throw err;
+    }
+  }
+
+  if (!vendor?.Id) {
+    throw new Error(`Retail QBO: failed to resolve the dropship vendor "${name}"`);
+  }
+  if (vendor.Active === false) vendor = await reactivateVendor(vendor);
+
+  _dropshipVendorId = String(vendor.Id);
+  log.info("dropship_vendor.resolved", { qboVendorId: _dropshipVendorId, name });
+  return _dropshipVendorId;
+}
+
+// Module-memoized expense account for the bill lines.
+let _dropshipExpenseAccountId = null;
+
+// Resolve the expense/COGS account each bill line posts to:
+//   1. QBO_RETAIL_DROPSHIP_EXPENSE_ACCOUNT_ID override (verbatim)
+//   2. first "Cost of Goods Sold" account in the chart of accounts
+//   3. first "Expense" account
+export async function resolveDropshipExpenseAccountId() {
+  if (_dropshipExpenseAccountId) return _dropshipExpenseAccountId;
+  if (retailQboConfig.dropshipExpenseAccountId) {
+    _dropshipExpenseAccountId = String(retailQboConfig.dropshipExpenseAccountId);
+    return _dropshipExpenseAccountId;
+  }
+
+  const cogs = await retailQbo.query(
+    "SELECT Id, Name FROM Account WHERE AccountType = 'Cost of Goods Sold' MAXRESULTS 1",
+  );
+  const cogsAcct = cogs?.QueryResponse?.Account?.[0];
+  if (cogsAcct?.Id) {
+    _dropshipExpenseAccountId = String(cogsAcct.Id);
+    return _dropshipExpenseAccountId;
+  }
+
+  const exp = await retailQbo.query(
+    "SELECT Id, Name FROM Account WHERE AccountType = 'Expense' MAXRESULTS 1",
+  );
+  const expAcct = exp?.QueryResponse?.Account?.[0];
+  if (expAcct?.Id) {
+    _dropshipExpenseAccountId = String(expAcct.Id);
+    return _dropshipExpenseAccountId;
+  }
+
+  throw new Error(
+    "Retail QBO: no Cost of Goods Sold / Expense account found for the dropship bill. " +
+      "Set QBO_RETAIL_DROPSHIP_EXPENSE_ACCOUNT_ID.",
+  );
+}
+
+// The retail order's shipping cost mirrored onto the bill (the wholesale draft
+// order copies retail's FIRST shipping line at full cost — match that).
+function firstShippingPrice(order) {
+  const lines = Array.isArray(order?.shippingLines) ? order.shippingLines : [];
+  if (lines.length) return round2(lines[0]?.price);
+  return round2(order?.pricing?.totalShipping);
+}
+
+// Build the QBO Bill payload from a cdo_orders snapshot, mirroring the wholesale
+// dropship invoice: one AccountBasedExpenseLine per product at the wholesale
+// price (BASE unit price × priceFactor, discounts ignored — matching the
+// wholesale ½-base formula) + an optional Shipping line at full retail cost.
+// Idempotent at the QBO layer via `requestid`. Returns the created Bill.
+export async function createBillForOrder({
+  order,
+  vendorId,
+  expenseAccountId,
+  apAccountId,
+  priceFactor = 0.5,
+  includeShipping = true,
+  requestId,
+}) {
+  if (!vendorId) throw new Error("createBillForOrder: vendorId is required");
+  if (!expenseAccountId) throw new Error("createBillForOrder: expenseAccountId is required");
+
+  const factor = Number.isFinite(Number(priceFactor)) ? Number(priceFactor) : 0.5;
+  const expenseRef = { value: String(expenseAccountId) };
+  const lines = [];
+
+  for (const li of order.lineItems || []) {
+    const qty = Number(li.quantity) || 0;
+    const unit = round2((Number(li.price) || 0) * factor);
+    const amount = round2(unit * qty);
+    if (!(amount > 0)) continue;
+    const titleParts = [li.title, li.variantTitle].filter(Boolean).join(" · ");
+    const desc = [
+      titleParts,
+      li.sku ? `SKU: ${li.sku}` : null,
+      `${qty} × ${unit.toFixed(2)} (wholesale)`,
+    ]
+      .filter(Boolean)
+      .join(" — ");
+    lines.push({
+      DetailType: "AccountBasedExpenseLineDetail",
+      Amount: amount,
+      ...(desc ? { Description: desc.slice(0, 4000) } : {}),
+      AccountBasedExpenseLineDetail: { AccountRef: expenseRef },
+    });
+  }
+
+  if (includeShipping) {
+    const shipping = firstShippingPrice(order);
+    if (shipping > 0) {
+      lines.push({
+        DetailType: "AccountBasedExpenseLineDetail",
+        Amount: shipping,
+        Description: "Shipping",
+        AccountBasedExpenseLineDetail: { AccountRef: expenseRef },
+      });
+    }
+  }
+
+  if (lines.length === 0) {
+    throw new Error("createBillForOrder: order has no billable lines");
+  }
+
+  const orderRef = order.orderName || order.shopifyOrderId || "";
+  const payload = {
+    VendorRef: { value: String(vendorId) },
+    Line: lines,
+    ...(apAccountId ? { APAccountRef: { value: String(apAccountId) } } : {}),
+    ...(order.placedAt ? { TxnDate: toQboDate(order.placedAt) } : {}),
+    // Vendor's reference for the bill — the retail order number for traceability.
+    ...(orderRef ? { DocNumber: String(orderRef).slice(0, 21) } : {}),
+    PrivateNote: `Dropship cost — retail order ${orderRef} → ${retailQboConfig.dropshipVendorName}`
+      .trim()
+      .slice(0, 4000),
+    ...(order.currency ? { CurrencyRef: { value: order.currency } } : {}),
+  };
+
+  const shortOrderId = String(order.shopifyOrderId || "").split("/").pop() || "x";
+  const res = await retailQbo.post("/bill", payload, undefined, {
+    requestId: (requestId || `retail-bill-${shortOrderId}`).slice(0, 50),
+  });
+  const bill = res?.Bill;
+  if (!bill?.Id) throw new Error("createBillForOrder: QBO did not return a Bill id");
+  log.info("bill.created", {
+    shopifyOrderId: order.shopifyOrderId,
+    billId: bill.Id,
+    docNumber: bill.DocNumber,
+    total: bill.TotalAmt,
+  });
+  return bill;
+}
+
+export async function getBill(billId) {
+  const res = await retailQbo.get(`/bill/${billId}`);
+  return res?.Bill || null;
+}
+
+// Deep link for the admin UI so operators can open the bill in QBO.
+export function billWebUrl(billId) {
+  return `${retailQboConfig.appBaseUrl}/app/bill?txnId=${billId}`;
+}

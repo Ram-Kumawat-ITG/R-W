@@ -125,16 +125,37 @@ const retailQboSchema = new mongoose.Schema(
     paymentSyncError: { type: String, default: null },
     // QBO invoice settlement state mirrored from QBO: open | paid
     invoiceStatus: { type: String, default: null },
+    // ── Vendor Bill (A/P "money out") ──
+    // In addition to the customer Invoice (A/R), each dropship order records a
+    // QBO Vendor Bill in the SAME retail company against the wholesale supplier
+    // ("Natural Solution Wholesale") for what the retail store owes for the
+    // dropship — mirroring the wholesale invoice for the same order (per-product
+    // lines at the wholesale price factor + shipping). Created UNPAID. Managed
+    // solely by services/retailQbo/retailVendorBill.service. This block is the
+    // Shopify Order ↔ Retail Invoice ↔ Retail Vendor Bill mapping.
+    qboVendorId: String, // QBO Vendor entity id (the wholesale supplier)
+    qboBillId: String, // QBO Bill entity id
+    qboBillDocNumber: String,
+    qboBillTotal: Number,
+    qboBillSyncToken: String,
+    billUrl: String, // deep link to the bill in QBO
+    billCreatedAt: Date,
+    // pending | creating | created | error
+    billSyncStatus: { type: String, default: null },
+    billSyncedAt: Date,
+    billSyncError: { type: String, default: null },
+    billLastAttemptAt: Date,
     // Transient in-flight guard so concurrent webhooks don't double-create the
-    // invoice (creating) or the payment (paymentCreating).
+    // invoice (creating), the payment (paymentCreating), or the bill (billCreating).
     creating: { type: Boolean, default: false },
     paymentCreating: { type: Boolean, default: false },
+    billCreating: { type: Boolean, default: false },
     syncLog: {
       type: [
         new mongoose.Schema(
           {
             at: { type: Date, default: Date.now },
-            event: String, // invoice_created | invoice_create_failed | shipping_synced | shipping_sync_failed
+            event: String, // invoice_created | invoice_create_failed | shipping_synced | shipping_sync_failed | bill_created | bill_create_failed
             ok: Boolean,
             message: String,
           },

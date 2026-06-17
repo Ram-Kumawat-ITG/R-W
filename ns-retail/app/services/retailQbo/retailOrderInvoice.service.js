@@ -26,6 +26,7 @@ import {
   createPaymentForInvoice,
   paymentWebUrl,
 } from "./retailQbo.service";
+import { ensureRetailVendorBillForOrder } from "./retailVendorBill.service";
 import { createLogger } from "../../utils/logger.utils";
 
 const log = createLogger("retail.order_invoice");
@@ -346,6 +347,34 @@ export async function ensureRetailInvoiceFromPayload({ shop, payload, trigger = 
       error: r.error,
     });
   }
+
+  // A/P side — record the UNPAID vendor bill for what the retail store owes the
+  // wholesale supplier for this dropship order. Fully INDEPENDENT of the
+  // invoice above and best-effort: a bill failure must never affect (or undo)
+  // the customer invoice or the webhook 200. Idempotent (claims on
+  // cdo_orders.retailQbo.qboBillId + QBO requestid), so create/paid/updated all
+  // retry a missed/failed create. No-ops cleanly when disabled / not configured.
+  try {
+    const b = await ensureRetailVendorBillForOrder({ shop, shopifyOrderId: orderGid });
+    if (b.ok && (b.billId || b.reason === "already_billed")) {
+      console.log(
+        `[retail-bill] (${trigger}) order ${orderGid} → vendor bill ${b.billId || "(existing)"}`,
+      );
+      log.info("auto_bill.ready", { trigger, shopifyOrderId: orderGid, billId: b.billId });
+    } else if (b.reason && !["bill_disabled", "not_configured"].includes(b.reason)) {
+      console.warn(
+        `[retail-bill] (${trigger}) order ${orderGid} NO vendor bill — ${b.reason}${
+          b.error ? `: ${b.error}` : ""
+        }`,
+      );
+      log.warn("auto_bill.not_created", { trigger, shopifyOrderId: orderGid, reason: b.reason, error: b.error });
+    }
+  } catch (err) {
+    // ensureRetailVendorBillForOrder is itself best-effort, but guard anyway so
+    // the invoice result is always returned.
+    log.error("auto_bill.threw", { trigger, shopifyOrderId: orderGid, err });
+  }
+
   return r;
 }
 
