@@ -723,6 +723,91 @@ passes (charge / failed-followup / sync-retry). Collection is owned solely by
     ACH retry, pause auto-charge/reminders) are intentionally absent — they
     don't apply to the auto-collected drop-ship method.
 
+### 5.7 Drop-ship fulfillment status mirror (Wholesale → Retail)
+
+When the Wholesale Admin **fulfills** a drop-ship order (and on every later
+shipment change — tracking added, carrier change, **delivered** — plus
+**cancellation**), that status is mirrored back onto the **linked retail
+Shopify order** so the retail customer's order reflects the real fulfillment
+state. This is the reverse of the retail→wholesale order sync (§ inventory /
+drop-ship intake): wholesale notifies, ns-retail applies.
+
+**The mapping.** `dropship_mappings` (written at retail-order intake) is the
+cross-store link: `retailOrderId` / `retailOrderGid` / `retailShop` ↔
+`wholesaleOrderId` / `wholesaleOrderGid`. The mirror also writes a
+`retailFulfillmentSync` audit block on that doc — `lastSignature`, `lastEvent`,
+`lastStatus`, `lastSyncedAt`, `lastError`/`lastErrorAt`, `attempts`.
+
+**Trigger (wholesale).** Both fulfillment choke-points
+(`handleFulfillmentUpdate` webhook + `syncFulfillmentsFromShopify` live-pull)
+and `handleOrderCancelled` call
+`services/sync/fulfillmentSync.notifyRetailOfDropshipChange({ localOrder, event })`
+right after the existing `pushShippingToInvoice`. It is **gated** on a
+`DropshipMapping` existing for the wholesale order (so only retail-triggered
+drop-ship orders are mirrored — ordinary wholesale orders are skipped), and
+**deduped** on a content `signature` of the fulfillment state (sorted
+`fulfillments[]` + ship date + order-level status, or `cancelled:<ts>`): an
+unchanged signature short-circuits, so re-delivered webhooks / repeated
+Order-Details views never re-POST a duplicate or conflicting update. The call
+is **best-effort and never throws** — a retail outage can't break wholesale
+fulfillment capture. It POSTs to `${NS_RETAIL_API_BASE}/api/sync/wholesale-fulfillment`
+with the shared `x-sync-secret` (`RETAIL_SYNC_SECRET`), gated by
+`isFulfillmentSyncEnabled()` (`NS_RETAIL_API_BASE` + secret set).
+
+**Apply (ns-retail).** `POST /api/sync/wholesale-fulfillment`
+(`app/api/sync/wholesale-fulfillment.js`, shared-secret auth, module-level
+dedup, fire-and-forget) → `services/sync/wholesaleFulfillment.applyWholesaleFulfillment`:
+
+1. Resolve the `cdo_orders` doc by `{ shop: retailShop, shopifyOrderId: retailOrderGid }`
+   and get an admin client via `unauthenticated.admin(retailShop)`.
+2. **Fulfillment event** — query the retail order's `fulfillmentOrders` +
+   `fulfillments`. If any fulfillment order is OPEN/IN_PROGRESS/SCHEDULED →
+   `fulfillmentCreate` over all open fulfillment orders with the carrier +
+   tracking (`notifyCustomer: true` → Shopify emails the retail customer the
+   shipping confirmation). If none are open but a fulfillment already exists →
+   `fulfillmentTrackingInfoUpdate` on the latest fulfillment, notifying the
+   customer **only when the tracking number actually changed** (so carrier-
+   driven status-only pushes like "delivered" don't re-email each sync).
+3. Record the resulting RETAIL fulfillment id + tracking onto `cdo_orders` and
+   sync the retail QBO invoice via the existing `recordFulfillmentAndSync` (the
+   retail store's own `fulfillments/*` webhook firing from our mutation is then
+   a harmless idempotent re-run). Every step appends to
+   `cdo_orders.retailQbo.syncLog` (`wholesale_fulfillment_synced` /
+   `wholesale_fulfillment_failed` / `wholesale_fulfillment_noop`).
+4. **Cancellation event** — the retail order is **tagged** `wholesale-cancelled`
+   (a safe, non-destructive signal logged to `syncLog` as `wholesale_cancelled`).
+   We deliberately do **NOT** auto-cancel or refund the (paid) retail order —
+   that's a manual money decision.
+
+Used Shopify Admin mutations (validated against the schema; the `*V2` forms are
+deprecated): `fulfillmentCreate`, `fulfillmentTrackingInfoUpdate`, `tagsAdd`.
+Required scopes on the retail store: `write_merchant_managed_fulfillment_orders`
+(+ assigned/third-party variants) and `write_orders`.
+
+**Delivered milestone + delivery date.** "Delivered" is the carrier
+`shipment_status` (set by Shopify's carrier integration, not by us). When the
+wholesale order's fulfillment first reaches `delivered`, `applyFulfillmentToOrder`
+stamps `fulfillments[].deliveredAt` (first-detection-wins — prefers the webhook's
+`updated_at`, else now) and `recomputeDeliveredAt` sets the order-level
+`ShopifyOrder.deliveredAt` once **every** active shipment is delivered. That
+flips the sync signature → a POST fires carrying per-shipment + order-level
+`deliveredAt` (+ a `delivered` flag). On the retail side, because carrier
+`shipment_status` **cannot** be set via the Admin API, a delivered/status-only
+change (tracking number unchanged) **skips the Shopify mutation entirely** —
+re-sending the same tracking would be a pointless customer email — and instead
+records `shipmentStatus: 'delivered'` + `deliveredAt` straight onto
+`cdo_orders.fulfillments[]` via `recordFulfillmentAndSync` (logged as
+`wholesale_delivered`). The retail Orders list + detail **Delivery status** badge
+and delivery date are *derived* (`app/utils/orderStatus.deriveDeliveredAt`, which
+now prefers the synced `deliveredAt` over `updatedAt`), so they reflect the
+wholesale delivery state + date without trusting a single stored field. Dedup:
+the signature short-circuits an unchanged delivered state, and `deliveredAt` is
+first-write-wins on both sides, so repeated syncs never move the recorded date.
+
+**Config.** Wholesale: `NS_RETAIL_API_BASE` (+ existing `RETAIL_SYNC_SECRET`).
+ns-retail: existing `RETAIL_SYNC_SECRET` (+ an installed offline session for the
+retail shop, as the discount-sync endpoint already requires).
+
 ---
 
 ## 6. Customer management & `customer_maps`

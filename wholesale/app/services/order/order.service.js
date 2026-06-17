@@ -26,6 +26,7 @@ import {
 } from '../../utils/shipping.constants'
 import { trackingConfig } from './tracking.config'
 import { isRetailCustomerEmail } from '../dropship/dropship.config'
+import { notifyRetailOfDropshipChange } from '../sync/fulfillmentSync.service'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('order.service')
@@ -589,6 +590,15 @@ export async function handleOrderCancelled({ shop, order, webhookId }) {
     `[orders] order doc set processingStatus=cancelled reason="${cancelReason}" cancelledAt=${shopifyCancelledAt.toISOString()}`,
   )
 
+  // Mirror the cancellation onto the linked retail Shopify order (drop-ship
+  // only; gated + deduped inside). Fired here — before the invoice/QBO work —
+  // so it runs even for orders that never carried an invoice. Best-effort.
+  try {
+    await notifyRetailOfDropshipChange({ localOrder, event: 'cancelled' })
+  } catch (err) {
+    log.warn('cancel.retail_sync_failed', { shopifyOrderId, err })
+  }
+
   // ── 3. Cancel the linked Invoice (if any) + void in QBO ───────
   if (!localOrder.invoiceRef) {
     console.log(`[orders] no Invoice linked — nothing to cancel in QBO`)
@@ -763,6 +773,31 @@ function recomputeShipDate(localOrder) {
   return false
 }
 
+// Recompute the order's official Delivery Date — set ONLY when every active
+// (non-cancelled) shipment has a `deliveredAt`; the value is the LATEST of them
+// (the moment the whole order became delivered). Null while any active shipment
+// is still in flight. Mirrors recomputeShipDate. Mutates localOrder; returns
+// true when the value changed (so callers know to persist + mirror to retail).
+function recomputeDeliveredAt(localOrder) {
+  const active = (localOrder.fulfillments || []).filter(
+    (f) => String(f.status || '').toLowerCase() !== 'cancelled',
+  )
+  let next = null
+  if (active.length) {
+    const times = active.map((f) =>
+      f.deliveredAt ? new Date(f.deliveredAt).getTime() : NaN,
+    )
+    if (times.every((t) => Number.isFinite(t))) next = new Date(Math.max(...times))
+  }
+  const prev = localOrder.deliveredAt ? new Date(localOrder.deliveredAt).getTime() : null
+  const nextMs = next ? next.getTime() : null
+  if (prev !== nextMs) {
+    localOrder.deliveredAt = next
+    return true
+  }
+  return false
+}
+
 // Apply ONE normalized fulfillment to a (mutable) ShopifyOrder doc — the
 // shared upsert used by BOTH the webhook path (handleFulfillmentUpdate) and
 // the live-pull path (syncFulfillmentsFromShopify). Resolves the carrier +
@@ -794,6 +829,13 @@ function applyFulfillmentToOrder(localOrder, n) {
   const fulfilledAt = n.fulfilledAt ? new Date(n.fulfilledAt) : undefined
   const estimatedDeliveryAt = n.estimatedDeliveryAt ? new Date(n.estimatedDeliveryAt) : undefined
 
+  // Delivery milestone: stamp deliveredAt the first time the carrier status is
+  // `delivered` (first-detection-wins — never overwritten on later re-syncs, so
+  // the recorded delivery date is stable). Prefer the caller-supplied
+  // observation time (the webhook's `updated_at`), else `now`.
+  const isDelivered = String(n.shipmentStatus || '').toLowerCase() === 'delivered'
+  const deliveredStamp = n.deliveredAt ? new Date(n.deliveredAt) : now
+
   if (existing) {
     existing.trackingNumber = n.trackingNumber
     existing.trackingCompany = n.trackingCompany
@@ -804,6 +846,7 @@ function applyFulfillmentToOrder(localOrder, n) {
     existing.status = n.status
     if (fulfilledAt) existing.fulfilledAt = fulfilledAt
     if (estimatedDeliveryAt) existing.estimatedDeliveryAt = estimatedDeliveryAt
+    if (isDelivered && !existing.deliveredAt) existing.deliveredAt = deliveredStamp
     if (changed) existing.updatedAt = now
   } else {
     localOrder.fulfillments.push({
@@ -817,6 +860,7 @@ function applyFulfillmentToOrder(localOrder, n) {
       status: n.status,
       fulfilledAt,
       estimatedDeliveryAt,
+      deliveredAt: isDelivered ? deliveredStamp : undefined,
       createdAt: now,
       updatedAt: now,
     })
@@ -892,12 +936,17 @@ export async function handleFulfillmentUpdate({ shop, fulfillment, webhookId, ev
     status: fulfillment.status || null,
     fulfilledAt: fulfillment.created_at || null,
     estimatedDeliveryAt: fulfillment.estimated_delivery_at || null,
+    // Best-available delivery-observation time — the fulfillment's last-updated
+    // timestamp, which Shopify bumps when the carrier reports `delivered`.
+    // applyFulfillmentToOrder only uses it when shipment_status is `delivered`.
+    deliveredAt: fulfillment.updated_at || null,
   }
   const { changed, isNew, carrierKey, trackingUrl } = applyFulfillmentToOrder(
     localOrder,
     normalized,
   )
   recomputeShipDate(localOrder)
+  recomputeDeliveredAt(localOrder)
   if (!changed) console.log(`[orders] fulfillment ${fulfillmentId} unchanged — no history row`)
 
   if (webhookId) {
@@ -947,6 +996,17 @@ export async function handleFulfillmentUpdate({ shop, fulfillment, webhookId, ev
   // Mirror carrier + tracking onto the customer-facing QBO invoice memo.
   if (changed) await pushShippingToInvoice(localOrder)
 
+  // Mirror the fulfillment status onto the linked retail Shopify order (only
+  // for drop-ship orders; gated + deduped inside). Best-effort — never let a
+  // retail-sync failure break tracking capture.
+  if (changed) {
+    try {
+      await notifyRetailOfDropshipChange({ localOrder, event: 'fulfillment' })
+    } catch (err) {
+      log.warn('fulfillment.retail_sync_failed', { shopifyOrderId, err })
+    }
+  }
+
   return localOrder
 }
 
@@ -984,6 +1044,7 @@ export async function syncFulfillmentsFromShopify({ shop, shopifyOrderId, admin 
     }
   }
   if (recomputeShipDate(localOrder)) anyChanged = true
+  if (recomputeDeliveredAt(localOrder)) anyChanged = true
 
   if (anyChanged) {
     await localOrder.save()
@@ -1003,6 +1064,16 @@ export async function syncFulfillmentsFromShopify({ shop, shopifyOrderId, admin 
   // differs, so this doesn't write on every view once converged.
   if ((localOrder.fulfillments || []).length) {
     await pushShippingToInvoice(localOrder)
+  }
+
+  // Mirror onto the linked retail Shopify order when this pull changed
+  // anything (drop-ship only; gated + deduped inside). Best-effort.
+  if (anyChanged) {
+    try {
+      await notifyRetailOfDropshipChange({ localOrder, event: 'fulfillment' })
+    } catch (err) {
+      log.warn('fulfillment.retail_sync_failed', { shopifyOrderId, err })
+    }
   }
   return localOrder.toObject()
 }

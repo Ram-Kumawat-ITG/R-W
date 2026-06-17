@@ -122,6 +122,10 @@ const orderSchema = new mongoose.Schema(
             status: String, // fulfillment.status (pending/open/success/cancelled)
             fulfilledAt: Date, // Shopify fulfillment created_at (the "Fulfillment Date")
             estimatedDeliveryAt: Date, // carrier estimate, when provided
+            // When this shipment's carrier status first flipped to `delivered`
+            // (first-detection-wins — not overwritten on later re-syncs). Used
+            // for the official delivery date + mirrored to the retail order.
+            deliveredAt: Date,
             createdAt: { type: Date, default: Date.now }, // when WE first saw it
             updatedAt: { type: Date, default: Date.now }, // when WE last updated it
           },
@@ -156,6 +160,13 @@ const orderSchema = new mongoose.Schema(
     // for partially-fulfilled orders). Fed to the QBO invoice's ShipDate and
     // shown on Order Details + the invoice panel + the tracking section.
     shippedAt: Date,
+
+    // Official Delivery Date — the LATEST per-shipment `deliveredAt` once EVERY
+    // active (non-cancelled) fulfillment has reached the carrier `delivered`
+    // status; null until the whole order is delivered. Recomputed on every
+    // fulfillment sync (mirrors `shippedAt`). Mirrored to the linked retail
+    // order for drop-ship orders (§5.7 retail fulfillment sync).
+    deliveredAt: Date,
 
     rawPayload: mongoose.Schema.Types.Mixed,
     receivedAt: { type: Date, default: Date.now },

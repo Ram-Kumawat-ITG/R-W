@@ -47,4 +47,9 @@ export default [
   route("/api/portal/payouts", "api/portal/payouts.js"),
   route("/api/portal/referrals", "api/portal/referrals.js"),
   route("/api/portal/discounts", "api/portal/discounts.js"),
+  // Inbound cross-repo sync: the WHOLESALE app POSTs here when a drop-ship
+  // wholesale order is fulfilled / shipped / delivered / cancelled, so we
+  // mirror that status (carrier + tracking + delivery) onto the linked retail
+  // Shopify order. Shared-secret auth (x-sync-secret = RETAIL_SYNC_SECRET).
+  route("/api/sync/wholesale-fulfillment", "api/sync/wholesale-fulfillment.js"),
 ];

@@ -65,6 +65,11 @@ const fulfillmentSchema = new mongoose.Schema(
     shipmentStatus: String, // carrier-driven shipment_status
     status: String, // fulfillment.status (pending/open/success/cancelled)
     fulfilledAt: Date,
+    // When this shipment was delivered. For drop-ship orders this is mirrored
+    // from the wholesale order's delivery date (§5.7); otherwise it's stamped
+    // when our own carrier webhook first reports `delivered`. First-write-wins.
+    // Preferred over `updatedAt` by deriveDeliveredAt for the order's delivery date.
+    deliveredAt: Date,
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now },
   },

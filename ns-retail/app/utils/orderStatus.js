@@ -122,10 +122,12 @@ export function deriveDeliveryStatus(order) {
   return lowestKey;
 }
 
-// The date the order was delivered — the latest carrier "delivered" event
-// across active fulfillments (a fulfillment's updatedAt reflects when its
-// shipmentStatus last changed, i.e. when it flipped to delivered). Returns null
-// until every active shipment is delivered.
+// The date the order was delivered — the latest "delivered" timestamp across
+// active fulfillments. Prefers the explicit `deliveredAt` (stamped at the
+// delivered transition / mirrored from the wholesale order for drop-ship
+// orders), falling back to `updatedAt` (when the shipmentStatus last changed,
+// i.e. when it flipped to delivered). Returns null until every active shipment
+// is delivered.
 export function deriveDeliveredAt(order) {
   const active = activeFulfillments(order);
   if (active.length === 0) return null;
@@ -134,7 +136,10 @@ export function deriveDeliveredAt(order) {
   );
   if (delivered.length === 0 || delivered.length !== active.length) return null;
   const times = delivered
-    .map((f) => (f.updatedAt ? new Date(f.updatedAt).getTime() : NaN))
+    .map((f) => {
+      const src = f.deliveredAt || f.updatedAt;
+      return src ? new Date(src).getTime() : NaN;
+    })
     .filter((t) => Number.isFinite(t));
   return times.length ? new Date(Math.max(...times)) : null;
 }
