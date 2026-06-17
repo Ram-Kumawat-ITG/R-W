@@ -184,6 +184,47 @@ export async function customerUpdateTags(admin, { customerId, addTag, removeTag 
   return writeJson?.data?.customerUpdate?.customer?.tags || next
 }
 
+// Update personal info on the Shopify customer record (firstName,
+// lastName, phone). Mirrors the registration data after a practitioner
+// edits their profile — keeps Shopify and Mongo in sync.
+//
+// Notes:
+//   • Phone gets normalized to E.164 via toE164US to match Shopify's
+//     expected format. Empty string / null skips the field.
+//   • Email is intentionally NOT supported here: changing email creates
+//     all sorts of identity coupling problems (login, password reset
+//     flows, app-proxy lookups). Practitioners change email via
+//     Shopify's native customer account UI.
+export async function customerUpdatePersonalInfo(
+  admin,
+  { customerId, firstName, lastName, phone },
+) {
+  const input = { id: customerId }
+  if (typeof firstName === 'string' && firstName.trim()) input.firstName = firstName.trim()
+  if (typeof lastName === 'string' && lastName.trim()) input.lastName = lastName.trim()
+  if (typeof phone === 'string' && phone.trim()) {
+    const normalized = toE164US(phone)
+    if (normalized) input.phone = normalized
+  }
+  // Nothing to change → bail without an API call.
+  if (Object.keys(input).length === 1) return false
+
+  const res = await admin.graphql(
+    `#graphql
+    mutation CustomerUpdate($input: CustomerInput!) {
+      customerUpdate(input: $input) {
+        customer { id firstName lastName phone }
+        userErrors { field message }
+      }
+    }`,
+    { variables: { input } },
+  )
+  const json = await res.json()
+  const errs = json?.data?.customerUpdate?.userErrors
+  if (errs?.length) throw new Error(errs.map((e) => e.message).join('; '))
+  return json?.data?.customerUpdate?.customer || true
+}
+
 export async function customerUpdateNote(admin, { customerId, note }) {
   const res = await admin.graphql(
     `#graphql
@@ -217,9 +258,9 @@ export async function customerUpdateDefaultAddress(admin, { customerId, address 
 
   const res = await admin.graphql(
     `#graphql
-    mutation UpdateAddress($customerId: ID!, $addressId: ID!, $address: CustomerAddressInput!) {
-      customerAddressUpdate(customerId: $customerId, id: $addressId, address: $address) {
-        customerAddress { id }
+    mutation UpdateAddress($customerId: ID!, $addressId: ID!, $address: MailingAddressInput!) {
+      customerAddressUpdate(customerId: $customerId, addressId: $addressId, address: $address) {
+        address { id }
         userErrors { field message }
       }
     }`,

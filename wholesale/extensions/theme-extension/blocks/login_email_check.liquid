@@ -282,17 +282,28 @@
       return;
     }
 
-    // Approved / pending / unknown → send to Shopify passwordless login.
-    // Use the storefront /account/login route — Shopify auto-redirects to
-    // the new customer accounts OAuth flow with the correct redirect_uri
-    // and client_id. Hitting shopify.com/authentication/.../login directly
-    // produces "Invalid redirect_uri" because OAuth params are missing.
+    // Approved / pending / unknown → send to Shopify's customer-authentication
+    // endpoint, which kicks off the passwordless OTP flow.
+    //
+    // The right URL (per Shopify single-sign-on docs) is:
+    //   /customer_authentication/login?login_hint=<email>&return_to=<path>
+    //
+    // This path is RESERVED by Shopify on the storefront domain — themes
+    // CANNOT intercept or override it (unlike /account/login, which is a
+    // theme-customizable route and was the cause of the redirect loop
+    // on this merchant's theme — the previous code redirected to
+    // STOREFRONT_LOGIN_URL = /account/login, which routes back to the
+    // page hosting THIS block, hence the infinite bounce).
+    //
+    //   login_hint = customer email; pre-fills the OTP screen.
+    //   return_to  = relative path to land on after auth (/account = their account home).
+    //
+    // Docs: https://shopify.dev/docs/api/customer-authentication/single-sign-on
     showStatus('Account found — sending you to login...');
-    // Build the URL exactly as Shopify's docs show. STOREFRONT_LOGIN_URL may already
-    // contain query parameters (return_url, locale, etc.) — those must be preserved.
-    // Use '&' if a '?' already exists in the base URL, otherwise use '?'.
-    var sep = STOREFRONT_LOGIN_URL.indexOf('?') >= 0 ? '&' : '?';
-    var loginUrl = STOREFRONT_LOGIN_URL + sep + 'login_hint=' + encodeURIComponent(email);
+    var loginUrl =
+      '/customer_authentication/login' +
+      '?login_hint=' + encodeURIComponent(email) +
+      '&return_to=' + encodeURIComponent('/account');
     console.log('[ns-login] redirecting to:', loginUrl);
     window.location.href = loginUrl;
   });

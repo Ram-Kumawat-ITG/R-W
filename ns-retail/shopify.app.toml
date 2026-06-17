@@ -35,6 +35,14 @@ api_version = "2026-07"
   topics = [ "orders/cancelled" ]
   uri = "/webhooks/orders/cancelled"
 
+  [[webhooks.subscriptions]]
+  topics = [ "fulfillments/create" ]
+  uri = "/webhooks/fulfillments/create"
+
+  [[webhooks.subscriptions]]
+  topics = [ "fulfillments/update" ]
+  uri = "/webhooks/fulfillments/update"
+
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 # NOTE: orders/* webhooks deliver protected customer data — the app needs

@@ -245,6 +245,94 @@ export async function addBillingToCustomerVault({
   return billingId
 }
 
+// Update an EXISTING billing record on a Customer Vault in place (the
+// billing_id stays the same; only the payment method changes). Used by
+// the profile-update flow when a practitioner submits new card data via
+// the customer-account extension's plain text inputs.
+//
+// NMI action: `customer_vault=update_billing`.
+//
+// `paymentDetails` accepts the same shape as addBillingToCustomerVault:
+//   { paymentToken }                              ← Collect.js
+//   { cardNumber, cardExpiry: 'MMYY', cardCvv? } ← raw PAN (PCI scope!)
+//   { achRouting, achAccount, achAccountType }   ← echeck
+//
+// PCI WARNING: when called with raw card data the caller is sending the
+// PAN through this server. Make sure the caller has stripped raw card
+// fields from any persisted Mongo write and from any log line.
+export async function updateBillingInCustomerVault({
+  customerVaultId,
+  billingId,
+  profile,
+  paymentDetails,
+}) {
+  if (!customerVaultId) {
+    throw new Error('updateBillingInCustomerVault: customerVaultId is required')
+  }
+  if (!billingId) {
+    throw new Error('updateBillingInCustomerVault: billingId is required')
+  }
+
+  const params = {
+    customer_vault: 'update_billing',
+    customer_vault_id: String(customerVaultId),
+    billing_id: String(billingId),
+  }
+
+  if (profile) {
+    if (profile.firstName) params.first_name = profile.firstName
+    if (profile.lastName) params.last_name = profile.lastName
+    if (profile.companyName) params.company = profile.companyName
+    if (profile.phone) params.phone = profile.phone
+    if (profile.billingAddress) {
+      Object.assign(params, {
+        address1: profile.billingAddress.line1,
+        address2: profile.billingAddress.line2,
+        city: profile.billingAddress.city,
+        state: profile.billingAddress.state,
+        zip: profile.billingAddress.zip,
+        country: profile.billingAddress.country,
+      })
+    }
+  }
+
+  if (paymentDetails?.paymentToken) {
+    params.payment_token = paymentDetails.paymentToken
+  } else if (paymentDetails?.cardNumber) {
+    params.ccnumber = paymentDetails.cardNumber
+    params.ccexp = paymentDetails.cardExpiry
+    if (paymentDetails.cardCvv) params.cvv = paymentDetails.cardCvv
+  } else if (paymentDetails?.achAccount) {
+    params.payment = 'check'
+    params.checkname =
+      paymentDetails.checkName ||
+      `${profile?.firstName || ''} ${profile?.lastName || ''}`.trim()
+    params.checkaba = paymentDetails.achRouting
+    params.checkaccount = paymentDetails.achAccount
+    params.account_type = paymentDetails.achAccountType || 'checking'
+  } else {
+    throw new Error(
+      'updateBillingInCustomerVault: paymentDetails must include a card or ACH payment method',
+    )
+  }
+
+  log.info('vault.update_billing.request', {
+    customerVaultId,
+    billingId,
+    hasCard: Boolean(paymentDetails?.paymentToken || paymentDetails?.cardNumber),
+    hasAch: Boolean(paymentDetails?.achAccount),
+  })
+  const res = await nmiTransact(params, { sensitiveKeys: NMI_SENSITIVE_PARAMS })
+  if (res.response !== '1') {
+    const err = new Error(`NMI update_billing failed: ${res.responsetext || 'unknown'}`)
+    err.permanent = true
+    err.nmiResponse = res
+    throw err
+  }
+  log.info('vault.update_billing.success', { customerVaultId, billingId })
+  return billingId
+}
+
 // Delete a Customer Vault profile. Used as a compensating transaction when
 // a downstream step (e.g. Shopify customerCreate) fails AFTER the vault was
 // created — without this, the vault becomes an orphan and the customer
