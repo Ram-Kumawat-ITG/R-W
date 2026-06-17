@@ -3249,9 +3249,12 @@ export async function listCdoOrders({
             // list can show a "Paid" indicator that matches the payment.
             invoiceStatus: r.retailQbo.invoiceStatus || null,
             paymentStatus: r.retailQbo.paymentSyncStatus || null,
-            // Vendor Bill (A/P) summary — the dropship cost owed to the supplier.
+            // Vendor Bill (A/P) summary — the dropship cost owed to the supplier
+            // + its reconciliation (paid) state.
             billId: r.retailQbo.qboBillId || null,
             billStatus: r.retailQbo.billSyncStatus || null,
+            billPaymentStatus: r.retailQbo.billPaymentStatus || null,
+            billReconcileStatus: r.retailQbo.billReconcileStatus || null,
           }
         : null,
     })),
@@ -3381,6 +3384,19 @@ export async function getCdoOrderDetail(id) {
           billSyncStatus: o.retailQbo.billSyncStatus || null,
           billSyncedAt: o.retailQbo.billSyncedAt || null,
           billSyncError: o.retailQbo.billSyncError || null,
+          // ── Bill reconciliation (vendor bill marked Paid via a Retail QBO
+          //    BillPayment once the wholesale dropship invoice settles) ──
+          wholesaleInvoiceMongoId: o.retailQbo.wholesaleInvoiceMongoId || null,
+          wholesaleQboInvoiceId: o.retailQbo.wholesaleQboInvoiceId || null,
+          wholesaleQboPaymentId: o.retailQbo.wholesaleQboPaymentId || null,
+          qboBillPaymentId: o.retailQbo.qboBillPaymentId || null,
+          billPaymentUrl: o.retailQbo.billPaymentUrl || null,
+          billPaymentTotal: o.retailQbo.billPaymentTotal ?? null,
+          billPaymentAppliedAt: o.retailQbo.billPaymentAppliedAt || null,
+          billPaymentStatus: o.retailQbo.billPaymentStatus || null,
+          billReconcileStatus: o.retailQbo.billReconcileStatus || null,
+          billReconcileError: o.retailQbo.billReconcileError || null,
+          billReconciledAt: o.retailQbo.billReconciledAt || null,
           syncLog: (o.retailQbo.syncLog || []).map((s) => ({
             at: s.at || null,
             event: s.event || null,
@@ -3417,6 +3433,9 @@ export async function getCdoOrderDetail(id) {
             label: `Vendor bill created${o.retailQbo.qboBillDocNumber ? ` (#${o.retailQbo.qboBillDocNumber})` : ""}`,
             at: o.retailQbo.billCreatedAt,
           }
+        : null,
+      o.retailQbo?.billPaymentAppliedAt
+        ? { label: "Vendor bill paid (reconciled)", at: o.retailQbo.billPaymentAppliedAt }
         : null,
       o.shippedAt ? { label: "Shipped", at: o.shippedAt } : null,
       o.updatedAt ? { label: "Last updated", at: o.updatedAt } : null,

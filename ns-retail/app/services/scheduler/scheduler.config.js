@@ -24,6 +24,14 @@ export const schedulerConfig = {
   // Leave unset in production.
   payoutIntervalOverride: readEnv("CDO_PAYOUT_INTERVAL"),
 
+  // ── Vendor-bill reconciliation cadence ──
+  // Polls for retail vendor bills whose mapped WHOLESALE dropship invoice has
+  // been paid, and records the matching Retail QBO BillPayment. Production runs
+  // every 6h by default; dev/test uses CDO_BILL_RECONCILE_INTERVAL (e.g.
+  // "2 minutes") to track the wholesale dropship-payment CRON's fast cadence.
+  billReconcileCron: readEnv("CDO_BILL_RECONCILE_CRON", { fallback: "0 */6 * * *" }),
+  billReconcileIntervalOverride: readEnv("CDO_BILL_RECONCILE_INTERVAL"),
+
   // Hard kill switch — when true the scheduler never boots (entry.server
   // skips getAgenda()). Useful for one-off processes / migrations / tests.
   disabled: readBool("CDO_SCHEDULER_DISABLED", false),

@@ -145,17 +145,43 @@ const retailQboSchema = new mongoose.Schema(
     billSyncedAt: Date,
     billSyncError: { type: String, default: null },
     billLastAttemptAt: Date,
+    // ── Bill reconciliation (mark the vendor bill PAID when the wholesale
+    //    dropship invoice for the same order is paid) ──
+    // The reconciler (services/retailQbo/retailBillReconcile.service) watches
+    // the shared DB: when the WHOLESALE QBO dropship invoice mapped to this
+    // order (via dropship_mappings) settles, it records a Retail QBO
+    // BillPayment fully applying to the bill (→ Paid) and captures the full
+    // five-way mapping below. References are the Shopify-order ↔ retail-bill ↔
+    // wholesale-invoice ↔ wholesale-payment ↔ retail-bill-payment chain.
+    wholesaleInvoiceMongoId: String, // wholesale `invoices` _id (for traceability)
+    wholesaleQboInvoiceId: String, // QBO Invoice id in the WHOLESALE company
+    wholesaleQboPaymentId: String, // QBO Payment id in the WHOLESALE company
+    qboBillPaymentId: String, // QBO BillPayment id in THIS (retail) company
+    billPaymentUrl: String, // deep link to the bill payment in QBO
+    billPaymentTotal: Number,
+    billPaymentAppliedAt: Date,
+    // Vendor-bill payment state: unpaid | paid
+    billPaymentStatus: { type: String, default: null },
+    // Reconciliation processing state: pending | reconciling | paid | error
+    billReconcileStatus: { type: String, default: null },
+    billReconcileError: { type: String, default: null },
+    billReconciledAt: Date, // last reconciliation sync date (success OR attempt)
     // Transient in-flight guard so concurrent webhooks don't double-create the
-    // invoice (creating), the payment (paymentCreating), or the bill (billCreating).
+    // invoice (creating), the invoice payment (paymentCreating), the bill
+    // (billCreating), or the bill payment (billPaymentCreating).
     creating: { type: Boolean, default: false },
     paymentCreating: { type: Boolean, default: false },
     billCreating: { type: Boolean, default: false },
+    billPaymentCreating: { type: Boolean, default: false },
     syncLog: {
       type: [
         new mongoose.Schema(
           {
             at: { type: Date, default: Date.now },
-            event: String, // invoice_created | invoice_create_failed | shipping_synced | shipping_sync_failed | bill_created | bill_create_failed
+            // invoice_created | invoice_create_failed | shipping_synced |
+            // shipping_sync_failed | bill_created | bill_create_failed |
+            // bill_payment_created | bill_payment_failed | bill_reconcile_skipped
+            event: String,
             ok: Boolean,
             message: String,
           },

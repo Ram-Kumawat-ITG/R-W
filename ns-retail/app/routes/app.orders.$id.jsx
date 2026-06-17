@@ -11,6 +11,7 @@ import {
   getRetailInvoicePdf,
 } from "../services/retailQbo/retailOrderInvoice.service";
 import { ensureRetailVendorBillForOrder } from "../services/retailQbo/retailVendorBill.service";
+import { reconcileRetailVendorBillForOrder } from "../services/retailQbo/retailBillReconcile.service";
 import StatusBadge from "../components/cdo/StatusBadge";
 import { ShippingBadge, DeliveryBadge } from "../components/cdo/StatusBadges";
 import { formatCurrency, formatDate, formatDateTime, formatPercent } from "../utils/format";
@@ -98,6 +99,37 @@ export const action = async ({ request }) => {
         status: "error",
         message: r.error || "Vendor bill was not created — see QBO sync history below for the reason.",
       };
+    }
+    if (op === "reconcile-bill") {
+      const r = await reconcileRetailVendorBillForOrder({ shop, shopifyOrderId, force: true });
+      if (r.ok && (r.billPaymentId || r.reason === "bill_already_settled")) {
+        return { status: "success", message: "Vendor bill marked Paid in QBO (reconciled)." };
+      }
+      if (r.reason === "already_paid") {
+        return { status: "success", message: `Vendor bill already has a payment (${r.billPaymentId}).` };
+      }
+      if (r.reason === "no_bill") {
+        return { status: "error", message: "Create the vendor bill first, then reconcile it." };
+      }
+      if (r.reason === "no_mapping") {
+        return { status: "error", message: "No wholesale dropship mapping found for this order yet." };
+      }
+      if (r.reason === "wholesale_invoice_pending") {
+        return { status: "error", message: "The wholesale dropship invoice hasn't been created yet — try again later." };
+      }
+      if (r.reason === "wholesale_not_paid") {
+        return {
+          status: "error",
+          message: `The wholesale dropship invoice isn't paid yet (status: ${r.wholesaleStatus || "unknown"}) — the bill is marked Paid once it settles.`,
+        };
+      }
+      if (r.reason === "reconcile_disabled") {
+        return { status: "error", message: "Bill reconciliation is disabled (QBO_RETAIL_RECONCILE_VENDOR_BILL=false)." };
+      }
+      if (r.reason === "not_configured") {
+        return { status: "error", message: "Retail QBO is not configured." };
+      }
+      return { status: "error", message: r.error || "Could not reconcile the vendor bill." };
     }
     if (op === "resync-shipping") {
       const r = await resyncInvoiceShippingForOrder({ shop, shopifyOrderId });
@@ -192,6 +224,16 @@ function QboBillStatusBadge({ status }) {
   };
   const m = map[status] || { tone: "neutral", label: status };
   return <s-badge tone={m.tone}>{m.label}</s-badge>;
+}
+
+// Vendor-bill PAYMENT (reconciliation) status → Polaris badge tone. Reflects
+// whether the bill has been settled by a Retail QBO BillPayment once the
+// wholesale dropship invoice was paid.
+function BillPaymentBadge({ paymentStatus, reconcileStatus }) {
+  if (paymentStatus === "paid") return <s-badge tone="success">Paid in QBO</s-badge>;
+  if (reconcileStatus === "error") return <s-badge tone="critical">Reconcile error</s-badge>;
+  if (reconcileStatus === "reconciling") return <s-badge tone="info">Reconciling…</s-badge>;
+  return <s-badge tone="neutral">Unpaid — awaiting wholesale payment</s-badge>;
 }
 
 export default function OrderDetail() {
@@ -636,6 +678,12 @@ export default function OrderDetail() {
             <s-stack direction="inline" gap="small-200" alignItems="center">
               <s-text>Vendor bill</s-text>
               <QboBillStatusBadge status={q?.billSyncStatus} />
+              {q?.qboBillId ? (
+                <BillPaymentBadge
+                  paymentStatus={q?.billPaymentStatus}
+                  reconcileStatus={q?.billReconcileStatus}
+                />
+              ) : null}
             </s-stack>
             {!q?.qboBillId ? (
               <s-paragraph tone="subdued">
@@ -662,6 +710,38 @@ export default function OrderDetail() {
                 />
                 <Row label="Bill created" value={q.billCreatedAt ? formatDateTime(q.billCreatedAt) : "—"} />
                 <Row label="Last sync" value={q.billSyncedAt ? formatDateTime(q.billSyncedAt) : "—"} />
+                {/* ── Reconciliation: bill payment ↔ wholesale invoice/payment mapping ── */}
+                <s-stack direction="block" gap="none">
+                  <s-text tone="subdued">Bill payment</s-text>
+                  <BillPaymentBadge
+                    paymentStatus={q.billPaymentStatus}
+                    reconcileStatus={q.billReconcileStatus}
+                  />
+                </s-stack>
+                <s-stack direction="block" gap="none">
+                  <s-text tone="subdued">Bill payment ID</s-text>
+                  {q.qboBillPaymentId ? (
+                    q.billPaymentUrl ? (
+                      <s-link href={q.billPaymentUrl} target="_blank">
+                        {q.qboBillPaymentId} ↗
+                      </s-link>
+                    ) : (
+                      <s-text>{q.qboBillPaymentId}</s-text>
+                    )
+                  ) : (
+                    <s-text>—</s-text>
+                  )}
+                </s-stack>
+                <Row
+                  label="Bill paid amount"
+                  value={q.billPaymentTotal != null ? formatCurrency(q.billPaymentTotal, cur) : "—"}
+                />
+                <Row label="Wholesale invoice ID" value={q.wholesaleQboInvoiceId} />
+                <Row label="Wholesale payment ID" value={q.wholesaleQboPaymentId} />
+                <Row
+                  label="Bill reconciled"
+                  value={q.billReconciledAt ? formatDateTime(q.billReconciledAt) : "—"}
+                />
               </s-grid>
             )}
           </s-stack>
@@ -669,6 +749,12 @@ export default function OrderDetail() {
           {q?.billSyncError ? (
             <s-banner tone="critical" heading="Last vendor-bill error">
               <s-paragraph>{q.billSyncError}</s-paragraph>
+            </s-banner>
+          ) : null}
+
+          {q?.billReconcileError ? (
+            <s-banner tone="critical" heading="Last bill-reconciliation error">
+              <s-paragraph>{q.billReconcileError}</s-paragraph>
             </s-banner>
           ) : null}
 
@@ -696,6 +782,19 @@ export default function OrderDetail() {
             >
               {q?.qboBillId ? "Re-create / retry bill" : "Create vendor bill"}
             </s-button>
+            {q?.qboBillId && !q?.qboBillPaymentId ? (
+              <s-button
+                disabled={qboBusy}
+                onClick={() =>
+                  qboFetcher.submit(
+                    { _action: "reconcile-bill", shopifyOrderId: order.shopifyOrderId || "" },
+                    { method: "POST" },
+                  )
+                }
+              >
+                Reconcile bill (mark paid)
+              </s-button>
+            ) : null}
             {q?.qboInvoiceId ? (
               <>
                 <s-button disabled={pdfLoading} onClick={onViewPdf}>

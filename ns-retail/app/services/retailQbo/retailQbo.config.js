@@ -91,6 +91,16 @@ export const retailQboConfig = {
   // Optional explicit A/P account for the bill (QBO defaults the company's A/P
   // when omitted). Reuses the same QBO_RETAIL_AP_ACCOUNT_ID as the payout Bills.
   apAccountId: readEnv("QBO_RETAIL_AP_ACCOUNT_ID"),
+
+  // ── Bill reconciliation (mark the vendor bill PAID once the wholesale
+  //    dropship invoice is paid) ──
+  // When ON (default), the reconciler records a Retail QBO BillPayment that
+  // fully applies to the vendor bill, drawn from this bank/clearing account
+  // (QBO_RETAIL_PAYMENT_ACCOUNT_ID — same account the payout BillPayments use).
+  // Required for the BillPayment; if unset the reconcile errors with a clear
+  // reason rather than posting a malformed payment.
+  reconcileVendorBill: readBool("QBO_RETAIL_RECONCILE_VENDOR_BILL", true),
+  paymentAccountId: readEnv("QBO_RETAIL_PAYMENT_ACCOUNT_ID"),
   // The wholesale dropship order/invoice prices each line at this fraction of
   // the retail BASE price (½ today — see wholesale dropship.service
   // buildDropshipLineItems). The bill mirrors that, so keep the two in sync.

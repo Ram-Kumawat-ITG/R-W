@@ -661,7 +661,68 @@ export async function getBill(billId) {
   return res?.Bill || null;
 }
 
+// Record a BillPayment that fully applies to one vendor Bill, so QBO shows the
+// bill Paid (Balance → 0) — the A/P counterpart to createPaymentForInvoice.
+// Drawn from the configured bank/clearing account (PayType "Check" is QBO's
+// representation of a bank-account disbursement; this RECORDS the payment in
+// the ledger — it does not itself move money). `amount` should equal the bill's
+// current Balance. Idempotent at the QBO layer via `requestid`. Returns the
+// created BillPayment.
+export async function createBillPaymentForBill({
+  vendorId,
+  billId,
+  amount,
+  txnDate,
+  currency,
+  privateNote,
+  requestId,
+}) {
+  if (!vendorId) throw new Error("createBillPaymentForBill: vendorId is required");
+  if (!billId) throw new Error("createBillPaymentForBill: billId is required");
+  if (!retailQboConfig.paymentAccountId) {
+    throw new Error(
+      "createBillPaymentForBill: QBO_RETAIL_PAYMENT_ACCOUNT_ID is not set — " +
+        "cannot record the bill payment without a bank/clearing account.",
+    );
+  }
+  const total = round2(amount);
+  if (!(total > 0)) {
+    throw new Error(`createBillPaymentForBill: amount must be > 0 (got ${amount})`);
+  }
+
+  const payload = {
+    VendorRef: { value: String(vendorId) },
+    TotalAmt: total,
+    PayType: "Check",
+    CheckPayment: { BankAccountRef: { value: String(retailQboConfig.paymentAccountId) } },
+    ...(txnDate ? { TxnDate: toQboDate(txnDate) } : {}),
+    ...(currency ? { CurrencyRef: { value: currency } } : {}),
+    ...(privateNote ? { PrivateNote: String(privateNote).slice(0, 4000) } : {}),
+    Line: [
+      {
+        Amount: total,
+        LinkedTxn: [{ TxnId: String(billId), TxnType: "Bill" }],
+      },
+    ],
+  };
+
+  const res = await retailQbo.post("/billpayment", payload, undefined, {
+    requestId: (requestId || `retail-billpay-${billId}`).slice(0, 50),
+  });
+  const payment = res?.BillPayment;
+  if (!payment?.Id) {
+    throw new Error("createBillPaymentForBill: QBO did not return a BillPayment id");
+  }
+  log.info("billpayment.created", { vendorId, billId, billPaymentId: payment.Id, total });
+  return payment;
+}
+
 // Deep link for the admin UI so operators can open the bill in QBO.
 export function billWebUrl(billId) {
   return `${retailQboConfig.appBaseUrl}/app/bill?txnId=${billId}`;
+}
+
+// Deep link to a bill payment in QBO.
+export function billPaymentWebUrl(billPaymentId) {
+  return `${retailQboConfig.appBaseUrl}/app/billpayment?txnId=${billPaymentId}`;
 }

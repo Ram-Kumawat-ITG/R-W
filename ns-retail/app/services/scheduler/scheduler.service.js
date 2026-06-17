@@ -116,6 +116,38 @@ async function ensureRecurring(agenda) {
       cron: payoutConfig.settlementCron,
     });
   }
+
+  // ── Vendor-bill reconciliation job (mark retail bill paid once the mapped
+  //    wholesale dropship invoice settles) ── Runs regardless of payout cadence
+  //    so paid wholesale invoices always get reconciled. Dev override mirrors
+  //    the payout/settlement interval pattern.
+  if (schedulerConfig.billReconcileIntervalOverride) {
+    await agenda.cancel({ name: JOB_NAMES.PROCESS_BILL_RECONCILIATION });
+    await agenda.every(
+      schedulerConfig.billReconcileIntervalOverride,
+      JOB_NAMES.PROCESS_BILL_RECONCILIATION,
+      { tick: "dev" },
+    );
+    log.info("scheduler.bill_reconcile_registered", {
+      mode: "dev-interval",
+      interval: schedulerConfig.billReconcileIntervalOverride,
+    });
+    console.log(
+      `\n[scheduler] DEV MODE — reconcile-vendor-bills running every ${schedulerConfig.billReconcileIntervalOverride}\n`,
+    );
+  } else {
+    await agenda.every(
+      schedulerConfig.billReconcileCron,
+      JOB_NAMES.PROCESS_BILL_RECONCILIATION,
+      { tick: "scheduled" },
+      { timezone: schedulerConfig.scheduleTimezone },
+    );
+    log.info("scheduler.bill_reconcile_registered", {
+      mode: "cron",
+      timezone: schedulerConfig.scheduleTimezone,
+      cron: schedulerConfig.billReconcileCron,
+    });
+  }
 }
 
 export async function getAgenda() {
