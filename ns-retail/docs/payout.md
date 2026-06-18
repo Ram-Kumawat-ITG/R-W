@@ -102,6 +102,36 @@ Two principles drive the design:
 
 **Eligibility for a payout** (`getEligibleCommissions`): `status = "approved"` **AND** `payoutId = null` **AND** `earnedAt <= periodEnd`. The per-practitioner sum must be `>= cdo_settings.minimumPayoutAmount`.
 
+### 4.1 Commission amount — per-vendor, per-line (versioned + snapshotted)
+
+Commission is **vendor-driven**, configured per Shopify **product vendor** on the
+Settings → **Commission Configuration** tab and stored on
+`cdo_settings.vendorCommissions[] = { vendor, commissionPercent (fraction), updatedAt, updatedBy }`.
+
+- **Calc** (`computeOrderCommission`): for each order line,
+  `lineRevenue = price×qty − totalDiscount` and `lineCommission = lineRevenue × vendorRate`,
+  where `vendorRate` is the configured fraction for the line's `vendor` (matched
+  case-insensitively) — **0% when that vendor isn't configured** (commission is purely
+  vendor-driven; the practitioner code rate / `defaultCommissionRate` no longer set the amount).
+  `order.commissionAmount = Σ lineCommission`. The order's line items capture
+  `lineItems[].vendor` (from the Shopify `orders/create` payload) at ingest.
+- **Snapshot + immutability** (the core guarantee): commission is computed and snapshotted
+  **exactly once, at first ingest** (order creation) into `cdo_orders.commissionSnapshot =
+  { configVersion, vendorRates[], lines[{vendor,revenue,rate,amount}], effectiveRate, computedAt }`.
+  `ingestShopifyOrder` skips recomputation when the order already exists, so re-ingests
+  (`orders/updated`, `orders/paid`, replays) **never** alter an existing order's commission.
+  Config edits bump `cdo_settings.commissionConfigVersion` and apply **only to future orders**;
+  existing orders + their `cdo_commissions` are unaffected. The `cdo_commission` record's `rate`
+  is the snapshot's blended `effectiveRate` (= commissionAmount ÷ Σ line revenue).
+- **Audit**: every vendor-rate change (set/remove) appends a row to
+  **`cdo_commission_config_history`** (`vendor, action, previousPercent, newPercent, version,
+  changedBy, changedAt`), surfaced as "Recent changes" on the Commission Configuration tab.
+- **Settings UI**: `/app/cdo-program/settings` is now a layout with sub-tabs (extensible via
+  `SettingsTabs`) — **Global Configuration** (index, the program singleton) and **Commission
+  Configuration** (lists Shopify product vendors via the `productVendors` Admin GraphQL query +
+  a per-vendor "Commission Setup" modal). ⚠️ Until vendors are configured, attributed orders
+  accrue $0 — the tab warns about this.
+
 ---
 
 ## 5. QBO Integration Flow
@@ -473,7 +503,10 @@ wholesale_applications (practitioner)        cdo_qbo_tokens (singleton/realm)
 `realmId (unique), accessToken, accessTokenExpiresAt, refreshToken, refreshTokenExpiresAt, tokenType`
 
 **`cdo_settings`** — program singleton.
-`defaultCommissionRate, currency, payoutSchedule, minimumPayoutAmount, autoApproveCommissions, …`
+`defaultCommissionRate, currency, payoutSchedule, minimumPayoutAmount, autoApproveCommissions, cookieWindowDays, vendorCommissions[] (per-vendor rates), commissionConfigVersion`
+
+**`cdo_commission_config_history`** — append-only audit of per-vendor commission-rate changes
+(`vendor, action: set|remove, previousPercent, newPercent, version, changedBy, changedAt`). See §4.1.
 
 ---
 
@@ -758,11 +791,12 @@ customer account** as a full-page UI extension. Read aggregations over the
 > practitioner detail page (`app.cdo-program.customers.$id._index.jsx`, action in
 > `…$id.jsx`) supports **Add referral code** + **Pause/Resume** + Copy; code
 > **edit / delete / set-primary were removed**. **Add** (`createPractitionerCode`,
-> `_action: "create-code"`) takes a required Code and **optional** Discount % and
-> Commission % (blank discount → 0% / attribution-only, blank commission →
-> inherits the program default); when a discount is set it also creates the
+> `_action: "create-code"`) takes a required Code and an **optional** Discount %
+> (blank → 0% / attribution-only); when a discount is set it also creates the
 > backing Shopify discount on the retail store (best-effort — a discount failure
-> logs but doesn't block the code row). **Pause/Resume**
+> logs but doesn't block the code row). There is **no practitioner-level
+> commission field** — commission is configured per product vendor (§4.1), so the
+> code's commission rate is always null and never drives the amount. **Pause/Resume**
 > (`setPractitionerCodeStatus`, `_action: "set-code-status"`), like the portal's
 > `setReferralCodeStatus`, calls the shared `cdo.discount.service.setShopifyDiscountActive`
 > to **deactivate/reactivate the backing Shopify discount** (not just flip the DB

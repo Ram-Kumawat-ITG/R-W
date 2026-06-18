@@ -56,16 +56,17 @@ export const action = async ({ request, params }) => {
 
   try {
     switch (op) {
-      // Create a referral code (admin). Discount % + Commission % are OPTIONAL
-      // (blank discount → 0% / attribution-only; blank commission → inherits the
-      // program default). When a discount is set, the service also creates the
-      // backing Shopify discount on this (retail) store.
+      // Create a referral code (admin). Discount % is OPTIONAL (blank → 0% /
+      // attribution-only; a discount also creates the backing Shopify discount
+      // on this retail store). NO commission field — commission is configured
+      // per product vendor (Settings → Commission Configuration), so codes are
+      // always created without a practitioner-level commission rate (inherits
+      // null; vendor config drives the amount).
       case "create-code": {
         const created = await createPractitionerCode({
           practitionerId: params.id,
           code: formData.get("code"),
           discountPercent: parseFractionField(formData.get("discountPercent")),
-          commissionRate: parseFractionField(formData.get("commissionRate")),
           actor,
           shop: session?.shop,
         });

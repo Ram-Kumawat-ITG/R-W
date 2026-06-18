@@ -29,6 +29,7 @@ import CdoPayout from "../../models/cdoPayout.server";
 import CdoReferral from "../../models/cdoReferral.server";
 import CdoTransaction from "../../models/cdoTransaction.server";
 import CdoSetting from "../../models/cdoSetting.server";
+import CdoCommissionConfigHistory from "../../models/cdoCommissionConfigHistory.server";
 import CdoPractitionerCode from "../../models/cdoPractitionerCode.server";
 import CdoPractitionerHold from "../../models/cdoPractitionerHold.server";
 import CdoPayoutBatch from "../../models/cdoPayoutBatch.server";
@@ -237,8 +238,238 @@ export async function getSettings() {
     minimumPayoutAmount: doc?.minimumPayoutAmount ?? 50,
     autoApproveCommissions: doc?.autoApproveCommissions ?? false,
     cookieWindowDays: doc?.cookieWindowDays ?? 30,
+    vendorCommissions: Array.isArray(doc?.vendorCommissions)
+      ? doc.vendorCommissions
+      : [],
+    commissionConfigVersion: doc?.commissionConfigVersion ?? 1,
     configured: Boolean(doc),
   };
+}
+
+// ── Per-vendor commission configuration ──────────────────────────────
+//
+// Commission is vendor-driven: each order line earns
+// `lineRevenue × vendorRate(line.vendor)`, where vendorRate is the configured
+// fraction for that vendor (0 when the vendor isn't configured). The config is
+// versioned (cdo_settings.commissionConfigVersion) and snapshotted onto every
+// order at ingest, so edits here apply ONLY to future orders.
+
+// Normalize a vendor key for case/space-insensitive matching (the Shopify
+// vendor string is the identity; we store the original casing but match loosely
+// so "Acme" and "acme " resolve to the same config).
+function vendorKey(v) {
+  return String(v || "").trim().toLowerCase();
+}
+
+// Saved vendor → fractional rate map (+ version) for the calc + UI.
+export async function getVendorCommissions() {
+  const settings = await getSettings();
+  const rows = settings.vendorCommissions.map((v) => ({
+    vendor: v.vendor,
+    commissionPercent: Number(v.commissionPercent) || 0,
+    updatedAt: v.updatedAt || null,
+    updatedBy: v.updatedBy || null,
+  }));
+  return { version: settings.commissionConfigVersion, vendors: rows };
+}
+
+// Build a vendorKey → fraction lookup from a vendorCommissions array.
+function buildVendorRateMap(vendorCommissions) {
+  const map = new Map();
+  for (const v of vendorCommissions || []) {
+    map.set(vendorKey(v.vendor), Number(v.commissionPercent) || 0);
+  }
+  return map;
+}
+
+// Upsert one vendor's commission rate. `commissionPercent` is a FRACTION
+// (0.10 = 10%). Bumps commissionConfigVersion + appends a history row. Idempotent
+// on value (still bumps version + logs so the audit trail is complete).
+export async function setVendorCommission({ vendor, commissionPercent, actor }) {
+  const name = String(vendor || "").trim();
+  if (!name) throw new Error("Vendor is required");
+  const rate = normalizeFraction(commissionPercent, "Commission percent");
+  if (rate == null) throw new Error("Commission percent is required");
+  await connectDB();
+
+  const doc =
+    (await CdoSetting.findOne({ singletonKey: "cdo-program" })) ||
+    new CdoSetting({ singletonKey: "cdo-program" });
+
+  const list = Array.isArray(doc.vendorCommissions) ? doc.vendorCommissions : [];
+  const idx = list.findIndex((v) => vendorKey(v.vendor) === vendorKey(name));
+  const previousPercent = idx >= 0 ? Number(list[idx].commissionPercent) || 0 : null;
+
+  if (idx >= 0) {
+    list[idx].vendor = name;
+    list[idx].commissionPercent = rate;
+    list[idx].updatedAt = new Date();
+    list[idx].updatedBy = actor || "system";
+  } else {
+    list.push({
+      vendor: name,
+      commissionPercent: rate,
+      updatedAt: new Date(),
+      updatedBy: actor || "system",
+    });
+  }
+  doc.vendorCommissions = list;
+  doc.commissionConfigVersion = (doc.commissionConfigVersion || 1) + 1;
+  doc.markModified("vendorCommissions");
+  await doc.save();
+
+  await CdoCommissionConfigHistory.create({
+    shop: doc.shop || null,
+    vendor: name,
+    action: "set",
+    previousPercent,
+    newPercent: rate,
+    version: doc.commissionConfigVersion,
+    changedBy: actor || "system",
+    changedAt: new Date(),
+  });
+
+  return { vendor: name, commissionPercent: rate, version: doc.commissionConfigVersion };
+}
+
+// Remove a vendor's commission config (its products revert to 0% commission).
+// Bumps version + logs. No-op (no version bump) if the vendor wasn't configured.
+export async function removeVendorCommission({ vendor, actor }) {
+  const name = String(vendor || "").trim();
+  if (!name) throw new Error("Vendor is required");
+  await connectDB();
+
+  const doc = await CdoSetting.findOne({ singletonKey: "cdo-program" });
+  if (!doc) return { removed: false };
+  const list = Array.isArray(doc.vendorCommissions) ? doc.vendorCommissions : [];
+  const idx = list.findIndex((v) => vendorKey(v.vendor) === vendorKey(name));
+  if (idx < 0) return { removed: false };
+
+  const previousPercent = Number(list[idx].commissionPercent) || 0;
+  list.splice(idx, 1);
+  doc.vendorCommissions = list;
+  doc.commissionConfigVersion = (doc.commissionConfigVersion || 1) + 1;
+  doc.markModified("vendorCommissions");
+  await doc.save();
+
+  await CdoCommissionConfigHistory.create({
+    shop: doc.shop || null,
+    vendor: name,
+    action: "remove",
+    previousPercent,
+    newPercent: null,
+    version: doc.commissionConfigVersion,
+    changedBy: actor || "system",
+    changedAt: new Date(),
+  });
+
+  return { removed: true, version: doc.commissionConfigVersion };
+}
+
+// Recent commission-config changes for the audit panel.
+export async function getCommissionConfigHistory({ vendor, limit = 25 } = {}) {
+  await connectDB();
+  const match = {};
+  if (vendor) match.vendor = vendor;
+  const rows = await CdoCommissionConfigHistory.find(match)
+    .sort({ changedAt: -1 })
+    .limit(Math.min(Math.max(parseInt(limit, 10) || 25, 1), 200))
+    .lean();
+  return rows.map((r) => ({
+    id: String(r._id),
+    vendor: r.vendor,
+    action: r.action,
+    previousPercent: r.previousPercent,
+    newPercent: r.newPercent,
+    version: r.version,
+    changedBy: r.changedBy || "system",
+    changedAt: r.changedAt || null,
+  }));
+}
+
+// Fetch ALL Shopify product vendors via Admin GraphQL (paginated). Returns a
+// sorted array of vendor strings. `admin` is the authenticated admin client
+// from authenticate.admin(request). Needs read_products (granted). Best-effort:
+// returns [] on failure so the settings page still renders the saved configs.
+const QUERY_PRODUCT_VENDORS = `#graphql
+  query ProductVendors($first: Int!, $after: String) {
+    productVendors(first: $first, after: $after) {
+      edges { node }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+`;
+
+export async function fetchProductVendors(admin) {
+  if (!admin?.graphql) return [];
+  const vendors = [];
+  let after = null;
+  try {
+    for (let page = 0; page < 50; page++) {
+      const res = await admin.graphql(QUERY_PRODUCT_VENDORS, {
+        variables: { first: 250, after },
+      });
+      const body = await res.json();
+      const conn = body?.data?.productVendors;
+      if (!conn) break;
+      for (const edge of conn.edges || []) {
+        if (edge?.node) vendors.push(String(edge.node));
+      }
+      if (!conn.pageInfo?.hasNextPage) break;
+      after = conn.pageInfo.endCursor;
+    }
+  } catch (e) {
+    console.error("[cdo] fetchProductVendors failed:", e?.message || e);
+  }
+  // Drop blanks + dedupe (case-insensitive), keep first-seen casing, sort.
+  const seen = new Set();
+  const out = [];
+  for (const v of vendors) {
+    const t = v.trim();
+    if (!t || seen.has(t.toLowerCase())) continue;
+    seen.add(t.toLowerCase());
+    out.push(t);
+  }
+  return out.sort((a, b) => a.localeCompare(b));
+}
+
+// Compute an order's commission per line from the per-vendor config, and build
+// the immutable snapshot persisted on the order. Pure (no DB). A line whose
+// vendor isn't configured earns 0%. Line revenue = price×qty − totalDiscount.
+//   vendorCommissions — the cdo_settings.vendorCommissions array (live, at ingest)
+//   configVersion     — cdo_settings.commissionConfigVersion (tags the snapshot)
+function computeOrderCommission(doc, { vendorCommissions, configVersion } = {}) {
+  const rateMap = buildVendorRateMap(vendorCommissions);
+  const lines = (doc.lineItems || []).map((li) => {
+    const revenue = roundMoney(
+      (Number(li.price) || 0) * (Number(li.quantity) || 0) -
+        (Number(li.totalDiscount) || 0),
+    );
+    const rate = rateMap.get(vendorKey(li.vendor)) || 0;
+    return {
+      vendor: li.vendor || null,
+      revenue,
+      rate,
+      amount: roundMoney(revenue * rate),
+    };
+  });
+  const commissionAmount = roundMoney(
+    lines.reduce((s, l) => s + (Number(l.amount) || 0), 0),
+  );
+  const totalRevenue = lines.reduce((s, l) => s + (Number(l.revenue) || 0), 0);
+  const effectiveRate =
+    totalRevenue > 0 ? Number((commissionAmount / totalRevenue).toFixed(4)) : 0;
+  const snapshot = {
+    configVersion: configVersion ?? null,
+    vendorRates: (vendorCommissions || []).map((v) => ({
+      vendor: v.vendor,
+      rate: Number(v.commissionPercent) || 0,
+    })),
+    lines,
+    effectiveRate,
+    computedAt: new Date(),
+  };
+  return { commissionAmount, snapshot };
 }
 
 // Dashboard KPIs + supporting lists. Computed in parallel; safe against
@@ -1417,12 +1648,18 @@ async function createCommissionForOrder(order, settings) {
   if (existing) return { created: false, commission: existing };
 
   const autoApprove = settings.autoApproveCommissions === true;
+  // Prefer the order's blended effective rate from the vendor-driven commission
+  // snapshot; fall back to the legacy referral rate / derived rate for orders
+  // ingested before per-vendor commissions existed.
+  const effectiveRate = order.commissionSnapshot?.effectiveRate;
   const snapshotRate = order.referral?.commissionRate;
-  const rate = Number.isFinite(snapshotRate)
-    ? snapshotRate
-    : Number(order.amount) > 0
-      ? Number((amount / Number(order.amount)).toFixed(4))
-      : settings.defaultCommissionRate;
+  const rate = Number.isFinite(effectiveRate)
+    ? effectiveRate
+    : Number.isFinite(snapshotRate)
+      ? snapshotRate
+      : Number(order.amount) > 0
+        ? Number((amount / Number(order.amount)).toFixed(4))
+        : settings.defaultCommissionRate;
   const earnedAt = order.placedAt || order.createdAt || new Date();
 
   const commission = await CdoCommission.create({
@@ -2271,6 +2508,8 @@ function mapShopifyOrderToDoc(payload, { referral, attribution, shop }) {
       sku: li.sku || null,
       title: li.title || null,
       variantTitle: li.variant_title || null,
+      // Product vendor — drives per-line commission (see computeOrderCommission).
+      vendor: li.vendor || null,
       quantity: Number(li.quantity) || 0,
       price: money(li.price),
       totalDiscount: money(li.total_discount),
@@ -2472,21 +2711,49 @@ export async function ingestShopifyOrder({ shop, payload, rawCode, attributionSo
 
   const doc = mapShopifyOrderToDoc(payload, { referral, attribution, shop });
 
-  // Commission base = order subtotal (product revenue, excl. tax/shipping).
-  if (attributed) {
-    const rate = Number.isFinite(referral.commissionRate) ? referral.commissionRate : 0;
-    doc.commissionAmount = roundMoney((doc.pricing.subtotal || 0) * rate);
-  } else {
-    doc.commissionAmount = 0;
+  // Commission is per-line + VENDOR-DRIVEN: each line earns
+  // lineRevenue × the line's product-vendor rate (0% for unconfigured vendors).
+  // It is SNAPSHOTTED EXACTLY ONCE — at first ingest (order creation). This
+  // handler re-runs on orders/updated, orders/paid, and webhook replays, so we
+  // must NOT recompute on re-ingest: a vendor-config change made after an order
+  // exists must never alter that order or its commission. So we compute (and
+  // snapshot the live config + version) only when the order is NEW to
+  // cdo_orders; on re-ingest we leave commissionAmount/commissionSnapshot OUT of
+  // the $set entirely, preserving the frozen originals (legacy pre-feature
+  // orders keep their stored amount too).
+  const existing = await CdoOrder.findOne({ shop, shopifyOrderId })
+    .select("_id commissionAmount commissionSnapshot")
+    .lean();
+
+  if (!existing) {
+    if (attributed) {
+      const cfg = await getVendorCommissions();
+      const { commissionAmount, snapshot } = computeOrderCommission(doc, {
+        vendorCommissions: cfg.vendors,
+        configVersion: cfg.version,
+      });
+      doc.commissionAmount = commissionAmount;
+      doc.commissionSnapshot = snapshot;
+    } else {
+      doc.commissionAmount = 0;
+      doc.commissionSnapshot = null;
+    }
   }
 
-  // Validation — never persist a negative / non-finite money figure.
-  if (!(doc.amount >= 0) || !(doc.commissionAmount >= 0)) {
+  // Validation — never persist a negative / non-finite money figure. Only check
+  // commissionAmount when we actually set it (new order); on re-ingest it's
+  // absent from `doc`, so the frozen value is left untouched.
+  if (!(doc.amount >= 0)) {
     console.error(
-      `[cdo.ingest] order ${orderId} has invalid amounts (amount=${doc.amount}, commission=${doc.commissionAmount}) — coercing to 0`,
+      `[cdo.ingest] order ${orderId} has invalid amount (${doc.amount}) — coercing to 0`,
     );
-    if (!(doc.amount >= 0)) doc.amount = 0;
-    if (!(doc.commissionAmount >= 0)) doc.commissionAmount = 0;
+    doc.amount = 0;
+  }
+  if (doc.commissionAmount !== undefined && !(doc.commissionAmount >= 0)) {
+    console.error(
+      `[cdo.ingest] order ${orderId} has invalid commission (${doc.commissionAmount}) — coercing to 0`,
+    );
+    doc.commissionAmount = 0;
   }
 
   const order = await CdoOrder.findOneAndUpdate(

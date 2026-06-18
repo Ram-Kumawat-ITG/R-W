@@ -147,13 +147,6 @@ export default function CdoCustomerDetails() {
     ? `https://nsdirectorder.com/${encodeURIComponent(primaryCode.code.toLowerCase())}`
     : null;
 
-  // Effective commission rate — primary code's override, else the
-  // program default. Shown in the Profile card so admins know what
-  // future orders will earn this practitioner.
-  const effectiveCommissionRate =
-    primaryCode?.commissionRate != null
-      ? primaryCode.commissionRate
-      : settings.defaultCommissionRate;
 
   const onCopyReferralLink = async () => {
     if (!referralLink) return;
@@ -366,15 +359,6 @@ export default function CdoCustomerDetails() {
             value={formatDateTime(profile.submittedAt)}
           />
           <DetailRow
-            label="Effective commission rate"
-            value={formatPercent(effectiveCommissionRate)}
-            hint={
-              primaryCode?.commissionRate != null
-                ? "Override on primary code"
-                : "Program default (cdo_settings.defaultCommissionRate)"
-            }
-          />
-          <DetailRow
             label="Primary discount"
             value={
               primaryCode
@@ -445,7 +429,6 @@ export default function CdoCustomerDetails() {
               <s-table-header-row>
                 <s-table-header>Code</s-table-header>
                 <s-table-header>Discount</s-table-header>
-                <s-table-header>Commission</s-table-header>
                 <s-table-header>Status</s-table-header>
                 <s-table-header>Created</s-table-header>
                 <s-table-header>Referral link</s-table-header>
@@ -462,11 +445,6 @@ export default function CdoCustomerDetails() {
                     </s-table-cell>
                     <s-table-cell>
                       {formatPercent(c.discountPercent)}
-                    </s-table-cell>
-                    <s-table-cell>
-                      {c.commissionRate != null
-                        ? formatPercent(c.commissionRate)
-                        : `${formatPercent(settings.defaultCommissionRate)} (default)`}
                     </s-table-cell>
                     <s-table-cell>
                       <s-badge
@@ -529,7 +507,6 @@ export default function CdoCustomerDetails() {
           setShowCreateModal(false);
         }}
         fetcher={codeFetcher}
-        defaultCommissionRate={settings.defaultCommissionRate}
       />
     </>
   );
@@ -553,26 +530,24 @@ function DetailRow({ label, value, hint, actions }) {
   );
 }
 
-// Admin "Add referral code" modal. Code is required; Discount % and
-// Commission % are BOTH optional — blank discount means a 0% (attribution-only)
-// code with no storefront discount, blank commission inherits the program
-// default. When a discount is set, the layout action's createPractitionerCode
-// also creates the backing Shopify discount on the retail store.
+// Admin "Add referral code" modal. Code is required; Discount % is optional
+// (blank = a 0% / attribution-only code with no storefront discount; a discount
+// creates the backing Shopify discount on the retail store). There is NO
+// commission field — commission is configured per product VENDOR (Settings →
+// Commission Configuration), never per practitioner.
 // eslint-disable-next-line react/display-name
 const CreateCodeModal = forwardRef(function CreateCodeModal(
-  { open, onClose, fetcher, defaultCommissionRate },
+  { open, onClose, fetcher },
   ref,
 ) {
   const [code, setCode] = useState("");
   const [discountPercent, setDiscountPercent] = useState("");
-  const [commissionRate, setCommissionRate] = useState("");
 
   // Reset on open so a previous draft doesn't leak into the next create.
   useEffect(() => {
     if (open) {
       setCode("");
       setDiscountPercent("");
-      setCommissionRate("");
     }
   }, [open]);
 
@@ -582,9 +557,8 @@ const CreateCodeModal = forwardRef(function CreateCodeModal(
         _action: "create-code",
         code,
         // Optional — send "" when blank so the action's parseFractionField
-        // resolves them to null (discount → 0%, commission → inherit default).
+        // resolves it to null (discount → 0%, attribution only).
         discountPercent: discountPercent === "" ? "" : String(discountPercent),
-        commissionRate: commissionRate === "" ? "" : String(commissionRate),
       },
       { method: "POST" },
     );
@@ -618,16 +592,6 @@ const CreateCodeModal = forwardRef(function CreateCodeModal(
           value={discountPercent}
           onChange={(e) => setDiscountPercent(e.currentTarget.value)}
           details="Optional. Customer-facing discount at checkout — creates a matching Shopify discount. Blank = no discount (attribution only)."
-        />
-        <s-text-field
-          label="Commission %"
-          type="number"
-          min="0"
-          max="100"
-          step="0.01"
-          value={commissionRate}
-          onChange={(e) => setCommissionRate(e.currentTarget.value)}
-          details={`Optional. Practitioner share. Blank inherits the program default (${(defaultCommissionRate * 100).toFixed(0)}%).`}
         />
       </s-stack>
       <s-button
