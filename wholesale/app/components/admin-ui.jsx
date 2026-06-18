@@ -152,6 +152,9 @@ export function OutcomeBadge({ outcome }) {
 // Tone per Shopify shipment_status / fulfillment.status value. Unknown
 // values fall through to a default-tone badge with the friendly label.
 const SHIPMENT_STATUS_TONE_MAP = {
+  // synthetic order-level rollup keys (deriveDeliveryStatus)
+  not_shipped: "default",
+  shipped: "info",
   // carrier shipment_status
   label_printed: "default",
   label_purchased: "default",

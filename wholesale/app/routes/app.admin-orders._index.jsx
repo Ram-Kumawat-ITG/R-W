@@ -10,7 +10,11 @@ import { authenticate } from "../shopify.server";
 import connectDB from "../services/APIService/mongo.service";
 import ShopifyOrder from "../models/order.server";
 import { RETAIL_CUSTOMER_EMAIL } from "../services/dropship/dropship.config";
-import { carrierDisplayName } from "../utils/shipping.constants";
+import {
+  carrierDisplayName,
+  deriveDeliveryStatus,
+} from "../utils/shipping.constants";
+import { ShipmentStatusBadge } from "../components/admin-ui";
 import { formatAmount } from "../utils/format.utils";
 
 // Admin Orders — orders placed by the retail drop-ship customer
@@ -86,7 +90,7 @@ export const loader = async ({ request }) => {
     .select(
       "shopifyOrderId shopifyOrderNumber shopifyOrderName customerEmail " +
         "currency totalAmount financialStatus fulfillmentStatus processingStatus " +
-        "fulfillments receivedAt",
+        "fulfillments deliveredAt receivedAt",
     )
     .lean();
 
@@ -129,6 +133,9 @@ export const loader = async ({ request }) => {
         financialStatus: r.financialStatus || null,
         fulfillmentStatus: r.fulfillmentStatus || null,
         processingStatus: r.processingStatus || null,
+        // Order-level carrier delivery status, rolled up from fulfillments[].
+        deliveryStatus: deriveDeliveryStatus(fulfillments),
+        deliveredAt: r.deliveredAt ? new Date(r.deliveredAt).toISOString() : null,
         receivedAt: r.receivedAt ? new Date(r.receivedAt).toISOString() : null,
         trackingCount,
         firstTracking: firstTracked
@@ -323,6 +330,7 @@ export default function AdminOrdersList() {
               <s-table-header>Total</s-table-header>
               <s-table-header>Payment</s-table-header>
               <s-table-header>Fulfillment</s-table-header>
+              <s-table-header>Delivery status</s-table-header>
               <s-table-header>Tracking</s-table-header>
               <s-table-header>Order date</s-table-header>
               <s-table-header>Actions</s-table-header>
@@ -351,6 +359,16 @@ export default function AdminOrdersList() {
                     </s-table-cell>
                     <s-table-cell>
                       <FulfillmentBadge status={r.fulfillmentStatus} />
+                    </s-table-cell>
+                    <s-table-cell>
+                      <s-stack direction="block" gap="none">
+                        <ShipmentStatusBadge status={r.deliveryStatus} />
+                        {r.deliveryStatus === "delivered" && r.deliveredAt ? (
+                          <s-text tone="subdued">
+                            {new Date(r.deliveredAt).toLocaleDateString()}
+                          </s-text>
+                        ) : null}
+                      </s-stack>
                     </s-table-cell>
                     <s-table-cell>
                       {r.trackingCount > 0 ? (
