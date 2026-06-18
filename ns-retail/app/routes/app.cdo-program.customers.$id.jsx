@@ -4,9 +4,7 @@ import {
   getPractitionerProfile,
   getPractitionerHold,
   createPractitionerCode,
-  updatePractitionerCode,
-  deletePractitionerCode,
-  setPrimaryPractitionerCode,
+  setPractitionerCodeStatus,
 } from "../services/cdo/cdo.service";
 import CustomerTabs from "../components/cdo/CustomerTabs";
 import StatusBadge from "../components/cdo/StatusBadge";
@@ -19,10 +17,12 @@ import { formatDateTime } from "../utils/format";
 //     the sub-tab bar.
 //   - Child routes (_index, commissions, downline, network, sales,
 //     payments, transactions, settings) render into the <Outlet />.
-//   - This file owns the `action` IMPLEMENTATION for referral-code CRUD
-//     used by the Details tab — co-located here so a single form
-//     submission can dispatch to any of the create / update / delete /
-//     set-primary code operations via an `_action` field.
+//   - This file owns the `action` IMPLEMENTATION for referral-code
+//     pause/resume used by the Details tab — co-located here so the form
+//     submission can dispatch the `set-code-status` operation via an
+//     `_action` field. (Code create / edit / delete / set-primary were
+//     removed from this page — codes are created by practitioners in the
+//     Practitioner Portal; this page is pause/resume oversight only.)
 //
 // NOTE on routing: React Router runs a submission's action on the LEAF
 // matched route. For the URL `/app/cdo-program/customers/:id` the leaf is
@@ -56,15 +56,18 @@ export const action = async ({ request, params }) => {
 
   try {
     switch (op) {
+      // Create a referral code (admin). Discount % + Commission % are OPTIONAL
+      // (blank discount → 0% / attribution-only; blank commission → inherits the
+      // program default). When a discount is set, the service also creates the
+      // backing Shopify discount on this (retail) store.
       case "create-code": {
         const created = await createPractitionerCode({
           practitionerId: params.id,
           code: formData.get("code"),
           discountPercent: parseFractionField(formData.get("discountPercent")),
           commissionRate: parseFractionField(formData.get("commissionRate")),
-          isPrimary: formData.get("isPrimary") === "true",
-          note: formData.get("note"),
           actor,
+          shop: session?.shop,
         });
         return {
           status: "success",
@@ -72,49 +75,28 @@ export const action = async ({ request, params }) => {
           message: `Code ${created.code} created`,
         };
       }
-      case "update-code": {
-        const updates = {
+      // Pause / resume — flips the DB status AND deactivates/reactivates the
+      // backing Shopify discount (cdo.service delegates to cdo.discount.service),
+      // so a paused code genuinely stops applying on the storefront. Referral
+      // tracking + earned commissions are untouched (immutable history).
+      case "set-code-status": {
+        const status = String(formData.get("status") || "").trim();
+        const updated = await setPractitionerCodeStatus({
           practitionerId: params.id,
           codeId: formData.get("codeId"),
+          status,
           actor,
-        };
-        // Only forward fields the form actually carried so we don't
-        // accidentally null a field the admin didn't touch.
-        if (formData.has("code")) updates.code = formData.get("code");
-        if (formData.has("discountPercent"))
-          updates.discountPercent = parseFractionField(formData.get("discountPercent"));
-        if (formData.has("commissionRate"))
-          updates.commissionRate = parseFractionField(formData.get("commissionRate"));
-        if (formData.has("status")) updates.status = formData.get("status");
-        if (formData.has("note")) updates.note = formData.get("note");
-        const updated = await updatePractitionerCode(updates);
-        return {
-          status: "success",
-          op,
-          message: `Code ${updated.code} updated`,
-        };
-      }
-      case "delete-code": {
-        await deletePractitionerCode({
-          practitionerId: params.id,
-          codeId: formData.get("codeId"),
+          // The backing Shopify discount lives on THIS (retail) store — pass
+          // the logged-in shop so the toggle targets the right Admin API.
+          shop: session?.shop,
         });
         return {
           status: "success",
           op,
-          message: "Referral code deleted",
-        };
-      }
-      case "set-primary-code": {
-        const primary = await setPrimaryPractitionerCode({
-          practitionerId: params.id,
-          codeId: formData.get("codeId"),
-          actor,
-        });
-        return {
-          status: "success",
-          op,
-          message: `Primary code set to ${primary.code}`,
+          message:
+            status === "paused"
+              ? `Code ${updated.code} paused`
+              : `Code ${updated.code} resumed`,
         };
       }
       default:
@@ -134,16 +116,17 @@ export const action = async ({ request, params }) => {
   }
 };
 
-// The form fields surface percentage VALUES (e.g. "10" for 10%).
-// `cdo_practitioner_codes` stores fractions (0.10). Convert here so
-// service-layer normalisers only deal with one representation.
+// The Discount % / Commission % form fields surface percentage VALUES (e.g.
+// "20" for 20%); `cdo_practitioner_codes` stores fractions (0.20). Convert
+// here so the service-layer normalisers only deal with one representation.
+// Blank → null (optional: blank discount → 0%, blank commission → inherit).
 function parseFractionField(raw) {
   if (raw == null || raw === "") return null;
   const n = Number(raw);
   if (!Number.isFinite(n)) return null;
   // Heuristic: values > 1 are interpreted as percentages, ≤ 1 as
   // pre-converted fractions. Keeps the API forgiving — admins typing
-  // "0.1" or "10" both land at 0.10.
+  // "0.2" or "20" both land at 0.20.
   return n > 1 ? n / 100 : n;
 }
 

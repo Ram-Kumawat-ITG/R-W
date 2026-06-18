@@ -461,12 +461,7 @@ export function ReferralsSection({ onAuthError }) {
     {
       key: 'code',
       label: 'Code',
-      render: (r) => (
-        <s-stack direction="inline" gap="small-300" alignItems="center">
-          <s-text type="strong">{r.code}</s-text>
-          {r.isPrimary ? <s-badge tone="info">Primary</s-badge> : null}
-        </s-stack>
-      ),
+      render: (r) => <s-text type="strong">{r.code}</s-text>,
     },
     { key: 'status', label: 'Status', render: (r) => <StatusBadge value={r.status} /> },
     { key: 'discountPercent', label: 'Discount', render: (r) => <s-text>{formatPercent(r.discountPercent)}</s-text> },

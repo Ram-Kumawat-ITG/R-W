@@ -38,6 +38,10 @@ import {
   createBillPayment,
   billWebUrl,
 } from "../qbo/qbo.service";
+import {
+  createShopifyDiscount,
+  setShopifyDiscountActive,
+} from "./cdo.discount.service";
 import { schedulerConfig } from "../scheduler/scheduler.config";
 import { payoutConfig } from "../payout/payout.config";
 import { getPayoutProvider } from "../payout/provider";
@@ -514,6 +518,10 @@ export async function listPractitionerCodes(practitionerId) {
     commissionRate: r.commissionRate, // null = "inherit from settings"
     status: r.status || "active",
     note: r.note || "",
+    // Shareable storefront discount URL (https://<retail-shop>/discount/<code>),
+    // populated when the backing Shopify discount was created. null for
+    // 0%/attribution-only or legacy codes that have no discount object.
+    referralUrl: r.shopifyDiscountUrl || null,
     createdAt: r.createdAt || null,
     updatedAt: r.updatedAt || null,
     createdBy: r.createdBy || null,
@@ -558,6 +566,10 @@ function normalizeFraction(raw, label) {
   return Number(n.toFixed(4));
 }
 
+// `shop` is the RETAIL store (session.shop) where the backing Shopify discount
+// is created — distinct from the code's stored `shop` (which follows the owning
+// practitioner / wholesale application). Pass it from the admin action so the
+// discount lands on the storefront the app is installed on.
 export async function createPractitionerCode({
   practitionerId,
   code,
@@ -566,6 +578,7 @@ export async function createPractitionerCode({
   isPrimary,
   note,
   actor,
+  shop: discountShop,
 }) {
   const profile = await getPractitionerProfile(practitionerId);
   if (!profile) throw new Error("Practitioner not found");
@@ -622,6 +635,34 @@ export async function createPractitionerCode({
     createdBy: actor || "system",
     updatedBy: actor || "system",
   });
+
+  // When a discount % was set, create the backing Shopify discount on the
+  // retail storefront so the shareable link actually applies a discount and
+  // the pause/resume toggle has something to deactivate/reactivate. Discount %
+  // is optional — a 0% code is attribution-only (no storefront discount), so
+  // we skip the Shopify write entirely in that case. Best-effort: a discount
+  // failure logs but never blocks code creation (an admin can re-trigger
+  // later); the code row simply keeps a null shopifyDiscountUrl, and pause/
+  // resume safely no-ops the Shopify side for it.
+  const retailShop = discountShop || shop;
+  if (discount > 0 && retailShop) {
+    const disc = await createShopifyDiscount({
+      shop: retailShop,
+      code: doc.code,
+      discountPercent: discount,
+      practitionerName: profile.name,
+    });
+    if (disc.ok && (disc.shopifyDiscountId || disc.shopifyDiscountUrl)) {
+      doc.shopifyDiscountId = disc.shopifyDiscountId || null;
+      doc.shopifyDiscountUrl = disc.shopifyDiscountUrl || null;
+      await doc.save();
+    } else if (!disc.ok) {
+      console.warn(
+        `[cdo] code ${doc.code} created, but Shopify discount creation failed: ${disc.error}`,
+      );
+    }
+  }
+
   return doc.toObject();
 }
 
@@ -679,6 +720,77 @@ export async function updatePractitionerCode({
   if (note !== undefined) {
     existing.note = note ? String(note).slice(0, 500) : "";
   }
+  existing.updatedBy = actor || "system";
+  await existing.save();
+  return existing.toObject();
+}
+
+// Pause or resume a practitioner's referral code from the CDO admin.
+//
+// This is the admin-side mirror of the Practitioner Portal's
+// setReferralCodeStatus (cdo.portal.service.js): it does NOT merely flip the
+// DB status — it deactivates / reactivates the backing Shopify discount via
+// the shared cdo.discount.service so the code genuinely stops (or resumes)
+// applying on the storefront. The Shopify toggle runs FIRST so the DB status
+// and the storefront never disagree (if the store update fails, the DB is left
+// untouched and the caller surfaces the error).
+//
+// Pausing also stops new attributions/validations (validateReferralCode +
+// the portal/checkout lookups all require status === "active"); existing
+// cdo_referrals / cdo_commissions are immutable history and are untouched, so
+// referral tracking + earned commissions are preserved.
+//
+// Legacy admin-created codes that never had a Shopify discount object
+// (shopifyDiscountId unset) simply skip the Shopify call — there's no
+// storefront discount to toggle, and the DB status gate still stops attribution.
+export async function setPractitionerCodeStatus({
+  practitionerId,
+  codeId,
+  status,
+  actor,
+  shop,
+}) {
+  if (!isValidObjectId(practitionerId)) {
+    throw new Error("Invalid practitioner id");
+  }
+  if (!isValidObjectId(codeId)) throw new Error("Invalid code id");
+  if (status !== "active" && status !== "paused") {
+    throw new Error(`Invalid status: ${status}`);
+  }
+  await connectDB();
+
+  const existing = await CdoPractitionerCode.findOne({
+    _id: codeId,
+    practitionerId,
+  });
+  if (!existing) throw new Error("Referral code not found");
+  if (existing.status === "archived") {
+    throw new Error("Archived codes can't be paused or resumed");
+  }
+
+  // Idempotent — already in the requested state.
+  if (existing.status === status) return existing.toObject();
+
+  // Toggle the backing Shopify discount before flipping the DB status.
+  // The discount lives on the RETAIL store (where the admin is logged in and
+  // where the app has an offline session) — prefer the caller-supplied `shop`
+  // (session.shop) over the code's stored `shop`, which for wholesale-created
+  // codes can be the wholesale shop (no ns-retail session there).
+  if (existing.shopifyDiscountId) {
+    const r = await setShopifyDiscountActive({
+      shop: shop || existing.shop,
+      discountId: existing.shopifyDiscountId,
+      active: status === "active",
+    });
+    if (!r.ok) {
+      throw new Error(
+        r.error ||
+          "Could not update the discount on the store. Please try again.",
+      );
+    }
+  }
+
+  existing.status = status;
   existing.updatedBy = actor || "system";
   await existing.save();
   return existing.toObject();

@@ -753,6 +753,26 @@ customer account** as a full-page UI extension. Read aggregations over the
 > the app's access scopes alongside `read_discounts`). The Shopify discount
 > writes live in `app/services/cdo/cdo.discount.service.js`, shared with the
 > wholesale-registration `/api/cdo-internal/create-shopify-discount` endpoint.
+>
+> **Admin CDO page: create + pause/resume (2026-06-18).** The CDO Program admin's
+> practitioner detail page (`app.cdo-program.customers.$id._index.jsx`, action in
+> `…$id.jsx`) supports **Add referral code** + **Pause/Resume** + Copy; code
+> **edit / delete / set-primary were removed**. **Add** (`createPractitionerCode`,
+> `_action: "create-code"`) takes a required Code and **optional** Discount % and
+> Commission % (blank discount → 0% / attribution-only, blank commission →
+> inherits the program default); when a discount is set it also creates the
+> backing Shopify discount on the retail store (best-effort — a discount failure
+> logs but doesn't block the code row). **Pause/Resume**
+> (`setPractitionerCodeStatus`, `_action: "set-code-status"`), like the portal's
+> `setReferralCodeStatus`, calls the shared `cdo.discount.service.setShopifyDiscountActive`
+> to **deactivate/reactivate the backing Shopify discount** (not just flip the DB
+> status) before saving — so a paused code genuinely stops applying on the
+> storefront. Both create + toggle pass the retail `shop` (session.shop) so the
+> Admin API targets the store the discount lives on (a code's stored `shop` may
+> be the wholesale shop). Referral tracking + earned commissions are untouched
+> (immutable history; the status gate only affects NEW attributions). Codes
+> without a `shopifyDiscountId` (0%/attribution-only or legacy) skip the Shopify
+> call.
 
 **Pieces:**
 
