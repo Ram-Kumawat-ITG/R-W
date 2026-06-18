@@ -1,5 +1,8 @@
-// Practitioner Portal service — all read-only aggregation/query logic for
-// the practitioner dashboard (Customer Account UI extension, full-page).
+// Practitioner Portal service — aggregation/query logic for the practitioner
+// dashboard (Customer Account UI extension, full-page), PLUS the practitioner
+// self-service WRITES (referral code create / pause / resume). The read paths
+// are the bulk of this file; the write paths live in the "Referral code
+// self-service" section at the bottom.
 //
 // PROJECT LAW: API handlers under app/api/portal/ are thin — they auth,
 // validate, call one of these functions, and shape the response. All
@@ -22,6 +25,10 @@ import CdoOrder from "../../models/cdoOrder.server";
 import CdoCommission from "../../models/cdoCommission.server";
 import CdoPayout from "../../models/cdoPayout.server";
 import CdoReferral from "../../models/cdoReferral.server";
+import {
+  createShopifyDiscount,
+  setShopifyDiscountActive,
+} from "./cdo.discount.service";
 
 // Revenue expression shared by aggregations: prefer pricing.total, fall
 // back to the flat `amount`, then 0. ns-retail writes both on most docs.
@@ -744,4 +751,295 @@ export async function getDiscounts(practitionerId) {
       expiresAt: null,
     })),
   };
+}
+
+// ── Referral code self-service (practitioner WRITE paths) ────────────────────
+//
+// The portal lets a practitioner create their own referral codes + links and
+// pause/resume them. These are the ONLY write paths in the portal. Every query
+// is still scoped by the trusted `practitionerId` (the guard's tenant key) —
+// identity is never taken from the request body. Each created code is backed
+// by a real Shopify discount (created via cdo.discount.service) so the
+// generated link works at checkout.
+
+// The discount tiers offered in the portal dropdown (integer percents). Kept in
+// sync with the extension's own DISCOUNT_PERCENTS (extensions can't import
+// server modules) — update both if this list changes.
+export const PORTAL_DISCOUNT_PERCENTS = [10, 15, 20, 25, 30, 35];
+
+// 3–40 chars, lowercase alphanumeric + hyphen/underscore, starting alphanumeric.
+const CODE_RE = /^[a-z0-9][a-z0-9_-]{2,39}$/;
+
+// Strip the protocol off a session token `dest` (e.g. "https://x.myshopify.com"
+// → "x.myshopify.com") so it can drive unauthenticated.admin / discount URLs.
+export function normalizeShopDomain(dest) {
+  let domain = String(dest || "");
+  try {
+    if (/^https?:\/\//i.test(domain)) domain = new URL(domain).host;
+  } catch {
+    /* use as-is */
+  }
+  return domain;
+}
+
+// Typed error the thin route handler maps to an HTTP status:
+//   INVALID         → 400   (bad code/percent/id)
+//   CONFLICT        → 409   (code taken / tier already active)
+//   DISCOUNT_FAILED → 502   (Shopify discount write failed)
+function portalError(code, message) {
+  const e = new Error(message);
+  e.code = code;
+  return e;
+}
+
+// Shape a CdoPractitionerCode doc into the row the dashboard renders (matching
+// getReferralCodes()'s row shape). Usage stats are zeroed — the frontend
+// reloads the full list (with aggregated stats) right after a mutation.
+function shapeCodeRow(c) {
+  return {
+    id: String(c._id),
+    code: c.code,
+    isPrimary: !!c.isPrimary,
+    status: c.status || null,
+    discountPercent: c.discountPercent || 0,
+    commissionRate: c.commissionRate ?? null,
+    referrals: 0,
+    orders: 0,
+    revenue: 0,
+    commission: 0,
+    referralUrl: c.shopifyDiscountUrl || null,
+  };
+}
+
+/**
+ * Create a practitioner-owned referral code + its Shopify discount link.
+ *
+ * Rules enforced (server-side is authoritative):
+ *   - code: valid format AND unique store-wide (catalogue + Shopify).
+ *   - discountPercent: one of PORTAL_DISCOUNT_PERCENTS.
+ *   - at most ONE active code per discount tier for this practitioner.
+ *
+ * The DB row is the atomic claim (unique {shop, code} index); if the Shopify
+ * discount can't be created (real failure OR the code already exists on
+ * Shopify) the row is rolled back so a code never lingers without a live link.
+ *
+ * @param {string} practitionerId            trusted tenant key (from the guard)
+ * @param {{ code: string, discountPercent: number }} input  discountPercent = integer percent
+ * @param {{ shop: string, application: object }} ctx
+ * @returns {Promise<object>} the new code row (getReferralCodes row shape)
+ * @throws {Error & { code: 'INVALID'|'CONFLICT'|'DISCOUNT_FAILED' }}
+ */
+export async function createReferralCode(
+  practitionerId,
+  { code, discountPercent } = {},
+  { shop, application } = {},
+) {
+  const raw = String(code || "").trim().toLowerCase();
+  if (!CODE_RE.test(raw)) {
+    throw portalError(
+      "INVALID",
+      "Code must be 3–40 characters using lowercase letters, numbers, hyphens or underscores, and start with a letter or number.",
+    );
+  }
+
+  const pct = Number(discountPercent);
+  if (!PORTAL_DISCOUNT_PERCENTS.includes(pct)) {
+    throw portalError(
+      "INVALID",
+      `Discount must be one of: ${PORTAL_DISCOUNT_PERCENTS.map((p) => `${p}%`).join(", ")}.`,
+    );
+  }
+  const fraction = pct / 100;
+
+  // Rule A — one ACTIVE code per discount tier (paused/archived don't count, so
+  // a tier frees up when its code is paused).
+  const tierClash = await CdoPractitionerCode.findOne({
+    practitionerId,
+    status: "active",
+    discountPercent: fraction,
+  })
+    .select("code")
+    .lean();
+  if (tierClash) {
+    throw portalError(
+      "CONFLICT",
+      `You already have an active code at ${pct}% (${tierClash.code}). Pause it first to create another at this discount.`,
+    );
+  }
+
+  // Rule B — store-wide code uniqueness (our catalogue; Shopify is checked at
+  // discount-create time below). Case-insensitive exact match.
+  const codeClash = await CdoPractitionerCode.findOne({
+    code: { $regex: `^${escapeRegex(raw)}$`, $options: "i" },
+  })
+    .select("_id")
+    .lean();
+  if (codeClash) {
+    throw portalError("CONFLICT", `The code "${raw}" is already taken. Choose another.`);
+  }
+
+  const fullName =
+    [application?.firstName, application?.lastName].filter(Boolean).join(" ").trim() ||
+    application?.businessName ||
+    null;
+
+  // Claim the row — the unique {shop, code} index is the race net.
+  let created;
+  try {
+    created = await CdoPractitionerCode.create({
+      shop: shop || null,
+      practitionerId,
+      practitionerSource: "wholesale",
+      practitionerEmail: application?.email || null,
+      practitionerName: fullName,
+      code: raw,
+      isPrimary: false,
+      discountPercent: fraction,
+      commissionRate: null,
+      status: "active",
+      createdBy: "portal-self-service",
+      updatedBy: "portal-self-service",
+    });
+  } catch (err) {
+    if (err?.code === 11000) {
+      throw portalError("CONFLICT", `The code "${raw}" is already taken. Choose another.`);
+    }
+    throw err;
+  }
+
+  // Create the Shopify discount. Roll back the row on any failure so we never
+  // leave a code with a dead/absent storefront link.
+  const disc = await createShopifyDiscount({
+    shop,
+    code: raw,
+    discountPercent: fraction,
+    practitionerName: fullName,
+  });
+
+  if (!disc.ok || disc.duplicate) {
+    await CdoPractitionerCode.deleteOne({ _id: created._id });
+    if (disc.duplicate) {
+      // The code exists on Shopify but not in our catalogue — a foreign/manual
+      // discount. Treat as taken rather than silently adopting it.
+      throw portalError("CONFLICT", `The code "${raw}" is already taken. Choose another.`);
+    }
+    log.error("create_referral.discount_failed", {
+      practitionerId,
+      code: raw,
+      err: disc.error,
+    });
+    throw portalError(
+      "DISCOUNT_FAILED",
+      "We couldn't create the discount on the store. Please try again.",
+    );
+  }
+
+  await CdoPractitionerCode.updateOne(
+    { _id: created._id },
+    {
+      $set: {
+        shopifyDiscountId: disc.shopifyDiscountId || null,
+        shopifyDiscountUrl: disc.shopifyDiscountUrl || null,
+      },
+    },
+  );
+  created.shopifyDiscountId = disc.shopifyDiscountId || null;
+  created.shopifyDiscountUrl = disc.shopifyDiscountUrl || null;
+
+  log.info("create_referral.ok", {
+    practitionerId,
+    code: raw,
+    discountPercent: fraction,
+  });
+  return shapeCodeRow(created);
+}
+
+/**
+ * Pause or resume a practitioner's referral code. Pausing deactivates the
+ * Shopify discount (the link stops applying) and frees its discount tier for
+ * re-use; resuming reactivates it. The Shopify toggle runs FIRST so the DB
+ * status and the storefront never disagree — if the store update fails the DB
+ * is left unchanged and the caller gets a 502.
+ *
+ * @param {string} practitionerId        trusted tenant key (from the guard)
+ * @param {{ codeId: string, status: 'active'|'paused' }} input
+ * @param {{ shop: string }} ctx
+ * @returns {Promise<object>} the updated code row
+ * @throws {Error & { code: 'INVALID'|'CONFLICT'|'DISCOUNT_FAILED' }}
+ */
+export async function setReferralCodeStatus(
+  practitionerId,
+  { codeId, status } = {},
+  { shop } = {},
+) {
+  if (status !== "active" && status !== "paused") {
+    throw portalError("INVALID", "Invalid status.");
+  }
+  if (!codeId) throw portalError("INVALID", "A code id is required.");
+
+  // Tenant-scoped — a practitioner can only ever touch their OWN code.
+  let doc;
+  try {
+    doc = await CdoPractitionerCode.findOne({ _id: codeId, practitionerId });
+  } catch {
+    // Malformed ObjectId etc. → treat as not found.
+    doc = null;
+  }
+  if (!doc) throw portalError("INVALID", "Referral code not found.");
+  if (doc.status === "archived") {
+    throw portalError("INVALID", "Archived codes can't be changed.");
+  }
+
+  // Idempotent — already in the requested state.
+  if (doc.status === status) return shapeCodeRow(doc);
+
+  // Resuming must not produce a second active code at the same discount tier.
+  if (status === "active") {
+    const clash = await CdoPractitionerCode.findOne({
+      practitionerId,
+      status: "active",
+      discountPercent: doc.discountPercent,
+      _id: { $ne: doc._id },
+    })
+      .select("code")
+      .lean();
+    if (clash) {
+      const pct = Math.round((doc.discountPercent || 0) * 100);
+      throw portalError(
+        "CONFLICT",
+        `You already have an active code at ${pct}% (${clash.code}). Pause it first.`,
+      );
+    }
+  }
+
+  // Toggle the storefront discount before flipping the DB status.
+  if (doc.shopifyDiscountId) {
+    const r = await setShopifyDiscountActive({
+      shop: shop || doc.shop,
+      discountId: doc.shopifyDiscountId,
+      active: status === "active",
+    });
+    if (!r.ok) {
+      log.error("set_status.discount_failed", {
+        practitionerId,
+        codeId: String(doc._id),
+        status,
+        err: r.error,
+      });
+      throw portalError(
+        "DISCOUNT_FAILED",
+        "We couldn't update the discount on the store. Please try again.",
+      );
+    }
+  }
+
+  doc.status = status;
+  doc.updatedBy = "portal-self-service";
+  await doc.save();
+  log.info("set_status.ok", {
+    practitionerId,
+    codeId: String(doc._id),
+    status,
+  });
+  return shapeCodeRow(doc);
 }

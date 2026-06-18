@@ -724,18 +724,44 @@ Shopify "partial"/"restocked"). Kept in sync automatically by the subscribed
 ## 18. Practitioner Portal (Customer Account UI extension)
 
 Self-service dashboard for CDO practitioners, rendered **inside the Shopify
-customer account** as a full-page UI extension. Read-only over the `cdo_*`
-collections this app owns. Moved here from the wholesale workspace on
-**2026-06-08** (single-owner architecture — the data and the portal now live in
-the same app).
+customer account** as a full-page UI extension. Read aggregations over the
+`cdo_*` collections this app owns, plus the referral self-service **write** path
+(see below). Moved here from the wholesale workspace on **2026-06-08**
+(single-owner architecture — the data and the portal now live in the same app).
+
+> **Referral self-service (write path) — added 2026-06-18.** Practitioners can
+> now **create their own referral codes + links** and **pause/resume** them from
+> the Referrals tab (previously the portal was strictly read-only). New endpoint
+> `POST /api/portal/referrals` with `{ op: 'create' | 'pause' | 'resume', ... }`,
+> guarded by a new `portalMutation` wrapper (same JWT/tenant gate as the GET
+> loaders; the CORS preflight now allows `POST`). Rules (enforced server-side in
+> `cdo.portal.service.createReferralCode` / `setReferralCodeStatus`):
+> - **Code**: 3–40 chars, lowercase `[a-z0-9_-]` (starts alphanumeric), and
+>   **unique store-wide** — checked against `cdo_practitioner_codes` AND Shopify
+>   (a code that already exists on Shopify → conflict, not silent adoption).
+> - **Discount**: one of **10/15/20/25/30/35 %**, stored as a fraction.
+> - **One ACTIVE code per discount tier** per practitioner — pausing a code frees
+>   its tier for re-creation; resuming into an occupied tier is rejected.
+>
+> Each created code is backed by a real Shopify **basic code** percentage
+> discount (`https://<retail-shop>/discount/<code>`). The DB row is the atomic
+> claim (unique `{shop, code}` index); the row is **rolled back** if the Shopify
+> discount can't be created, so a code never lingers without a live link. Pausing
+> runs `discountCodeDeactivate` (link stops applying) and resuming
+> `discountCodeActivate`, before the DB status flips, so the catalogue and the
+> storefront never disagree. **Requires the `write_discounts` scope** (added to
+> the app's access scopes alongside `read_discounts`). The Shopify discount
+> writes live in `app/services/cdo/cdo.discount.service.js`, shared with the
+> wholesale-registration `/api/cdo-internal/create-shopify-discount` endpoint.
 
 **Pieces:**
 
 | Piece | Path |
 |---|---|
 | Extension (Preact + Polaris web components, full page) | `extensions/practitioner-portal-account/` (`customer-account.page.render` target, `network_access = true`, api_version `2025-10`) |
-| Backend service (all read-only aggregations) | `app/services/cdo/cdo.portal.service.js` |
-| API handlers (thin) + shared guard | `app/api/portal/{_guard,me,summary,revenue,customers,commissions,payouts,referrals,discounts}.js`, registered in `app/routes.js` |
+| Backend service (aggregations + referral self-service writes) | `app/services/cdo/cdo.portal.service.js` |
+| Shopify discount writes (create / activate / deactivate) | `app/services/cdo/cdo.discount.service.js` |
+| API handlers (thin) + shared guard (`portalLoader` GET / `portalMutation` POST) | `app/api/portal/{_guard,me,summary,revenue,customers,commissions,payouts,referrals,discounts}.js`, registered in `app/routes.js` |
 | Response helpers | `app/services/APIService/api.service.js` |
 | Models reused (the real ones) | `cdoOrder` · `cdoCommission` · `cdoPayout` · `cdoReferral` · `cdoPractitionerCode` · `wholesaleApplication` |
 
@@ -758,7 +784,8 @@ Either gate failing → `403`. Every aggregation in `cdo.portal.service.js` is
 scoped by `{ practitionerId }`. Auth failures map to `401` (not signed in / no
 `sub`) and `403` (signed in but not authorized — missing tags or not an approved
 practitioner). A null-origin Web Worker + the Authorization header make the
-fetch non-simple, so `portalAction` answers the CORS `OPTIONS` preflight and the
+fetch non-simple, so the guard wrappers (`portalLoader` GET / `portalMutation`
+POST) answer the CORS `OPTIONS` preflight (now allowing `GET, POST`) and the
 library `cors` helper stamps success responses. **Frontend:** the extension
 calls `me` before rendering and shows a "sign in" (`401`) or "Access restricted"
 (`403`) screen instead of the dashboard — but the backend tag gate on every
@@ -782,15 +809,19 @@ extension; the page-level gate + backend `403` are what prevent access.*
 > request; nothing is read from a MongoDB mirror). Without the email bridge, every ns-retail
 > login 403s ("Access restricted") — the regression seen right after the move.
 
-**Endpoints** (all GET, served at `${api_base_url}/api/portal/*`): `me`,
-`summary`, `revenue` (month/last/year/lifetime + range), `customers` (referred
-patients), `commissions` (+ `pendingOnly`), `payouts` (with per-payout
-commission breakdown), `referrals` (codes + usage), `discounts` (derived from
-codes). Pagination + search + date-range filters where applicable.
+**Endpoints** (served at `${api_base_url}/api/portal/*`): `me`, `summary`,
+`revenue` (month/last/year/lifetime + range), `customers` (referred patients),
+`commissions` (+ `pendingOnly`), `payouts` (with per-payout commission
+breakdown), `referrals` (GET codes + usage; **POST** create / pause / resume —
+see the self-service write path above), `discounts` (derived from codes). All
+GET except the `referrals` POST. Pagination + search + date-range filters where
+applicable.
 
 **Prerequisites (Partner dashboard, ns-retail app):** customer accounts
 enabled + protected customer data access (for the `sub` claim) + the
-`read_customers` scope (for the cross-store email bridge above). The
+`read_customers` scope (for the cross-store email bridge above) + the
+`read_discounts,write_discounts` scopes (for referral self-service — creating /
+activating / deactivating the storefront discount). The
 practitioner must have a **customer account on the ns-retail store using the
 same email** as their approved wholesale application — that email is the bridge
 key. **Merchant step after deploy:** add the page to the customer-account
@@ -803,8 +834,9 @@ wins over the merchant-set setting when non-empty); leave it `''` for production
 builds.
 
 **Out of scope (here):** commission/payout *generation* (owned by the CDO
-engine, §4/§7), live Shopify Discount API objects, charts, and CSV export (the
-sandboxed Web Worker has no DOM/Blob).
+engine, §4/§7), charts, and CSV export (the sandboxed Web Worker has no
+DOM/Blob). *(Live Shopify Discount API objects were previously out of scope but
+are now created/toggled by the referral self-service write path above.)*
 
 ## 19. Retail order QBO invoicing (`QBO_RETAIL_*`) — IMPLEMENTED
 

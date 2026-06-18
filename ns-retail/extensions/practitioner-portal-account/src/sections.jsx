@@ -9,7 +9,13 @@ import {
   Table,
   Pagination,
 } from './ui.jsx'
+import { apiPost, ApiError } from './api.js'
 import { formatMoney, formatDate, formatPercent, formatNumber, titleCase } from './format.js'
+
+// Discount tiers offered when a practitioner creates a code. Kept in sync with
+// the backend's PORTAL_DISCOUNT_PERCENTS (extensions can't import server
+// modules) — update both if this list changes.
+const DISCOUNT_PERCENTS = [10, 15, 20, 25, 30, 35]
 
 function SectionShell({ heading, description, children }) {
   return (
@@ -376,6 +382,81 @@ export function PayoutsSection({ onAuthError }) {
 export function ReferralsSection({ onAuthError }) {
   const { data, loading, error, reload } = useResource('referrals', null, onAuthError)
   const rows = data?.rows || []
+
+  // Create-form state.
+  const [code, setCode] = useState('')
+  const [percent, setPercent] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+  const [formError, setFormError] = useState('')
+  const [notice, setNotice] = useState('')
+  // Id of the code whose Pause/Resume is mid-flight (disables just that row).
+  const [busyId, setBusyId] = useState(null)
+
+  // Rule A (client-side mirror): a discount tier already used by an ACTIVE code
+  // can't be re-used, so drop it from the dropdown. Pausing a code frees its
+  // tier. The server still enforces this authoritatively.
+  const usedActiveTiers = new Set(
+    rows
+      .filter((r) => r.status === 'active')
+      .map((r) => Math.round((r.discountPercent || 0) * 100)),
+  )
+  const availablePercents = DISCOUNT_PERCENTS.filter((p) => !usedActiveTiers.has(p))
+
+  // Map an ApiError to either the auth-shell switch (401/403) or an inline msg.
+  const handleApiError = (err, fallback) => {
+    if (err instanceof ApiError && (err.httpStatus === 401 || err.httpStatus === 403)) {
+      onAuthError?.(err)
+      return
+    }
+    setFormError(err?.message || fallback)
+  }
+
+  const handleCreate = async () => {
+    setFormError('')
+    setNotice('')
+    const trimmed = code.trim()
+    if (!trimmed) {
+      setFormError('Enter a referral code.')
+      return
+    }
+    if (!percent) {
+      setFormError('Choose a discount percentage.')
+      return
+    }
+    setSubmitting(true)
+    try {
+      await apiPost('referrals', {
+        op: 'create',
+        code: trimmed,
+        discountPercent: Number(percent),
+      })
+      setCode('')
+      setPercent('')
+      setNotice(`Referral code “${trimmed.toLowerCase()}” created.`)
+      reload()
+    } catch (err) {
+      handleApiError(err, 'Could not create the referral code.')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const handleToggle = async (row) => {
+    setFormError('')
+    setNotice('')
+    const op = row.status === 'active' ? 'pause' : 'resume'
+    setBusyId(row.id)
+    try {
+      await apiPost('referrals', { op, codeId: row.id })
+      setNotice(op === 'pause' ? `Paused “${row.code}”.` : `Resumed “${row.code}”.`)
+      reload()
+    } catch (err) {
+      handleApiError(err, 'Could not update the referral code.')
+    } finally {
+      setBusyId(null)
+    }
+  }
+
   const columns = [
     {
       key: 'code',
@@ -410,16 +491,83 @@ export function ReferralsSection({ onAuthError }) {
           <s-text color="subdued">Not generated yet</s-text>
         ),
     },
+    // Pause (active) / Resume (paused). Archived codes can't be toggled.
+    {
+      key: 'actions',
+      label: '',
+      render: (r) =>
+        r.status === 'archived' ? (
+          <s-text color="subdued">—</s-text>
+        ) : (
+          <s-button disabled={busyId === r.id} onClick={() => handleToggle(r)}>
+            {r.status === 'active' ? 'Pause' : 'Resume'}
+          </s-button>
+        ),
+    },
   ]
 
   return (
-    <SectionShell heading="Referral management" description="Your codes and how each performs.">
+    <SectionShell heading="Referral management" description="Create, share, and manage your referral codes.">
+      {/* Create a new code + auto-generated link */}
+      <s-box border="base subdued" borderRadius="base" padding="base">
+        <s-stack direction="block" gap="base">
+          <s-heading>Create a referral code</s-heading>
+          <s-text color="subdued">
+            Choose a code and a discount — we generate the shareable link automatically.
+            Codes are unique store-wide; lowercase letters, numbers, “-” or “_”.
+          </s-text>
+
+          {formError ? <ErrorBanner message={formError} /> : null}
+          {notice ? (
+            <s-banner tone="info" heading="Done">
+              <s-text>{notice}</s-text>
+            </s-banner>
+          ) : null}
+
+          {availablePercents.length === 0 ? (
+            <s-text color="subdued">
+              You have an active code for every discount tier. Pause one below to free up a tier.
+            </s-text>
+          ) : (
+            <s-stack direction="block" gap="base">
+              <s-grid gridTemplateColumns="2fr 1fr" gap="base">
+                <s-text-field
+                  label="Referral code"
+                  placeholder="e.g. jane_clinic"
+                  value={code}
+                  onInput={(e) => setCode(e.target.value)}
+                />
+                <s-select
+                  label="Discount"
+                  value={percent}
+                  onChange={(e) => setPercent(e.currentTarget.value)}
+                >
+                  <s-option value="">Select…</s-option>
+                  {availablePercents.map((p) => (
+                    <s-option key={p} value={String(p)}>
+                      {p}%
+                    </s-option>
+                  ))}
+                </s-select>
+              </s-grid>
+              <s-button
+                onClick={handleCreate}
+                disabled={submitting || !code.trim() || !percent}
+              >
+                {submitting ? 'Creating…' : 'Create code'}
+              </s-button>
+            </s-stack>
+          )}
+        </s-stack>
+      </s-box>
+
+      {/* Existing codes */}
       {error ? (
         <ErrorBanner message={error} onRetry={reload} />
       ) : loading && rows.length === 0 ? (
         <Loading />
       ) : (
-        <Table columns={columns} rows={rows} empty="No referral codes." />
+        <Table columns={columns} rows={rows} empty="No referral codes yet — create one above." />
       )}
     </SectionShell>
   )

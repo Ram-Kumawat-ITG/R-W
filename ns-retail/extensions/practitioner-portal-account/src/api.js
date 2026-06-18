@@ -74,3 +74,46 @@ export async function apiGet(path, params) {
   }
   return body?.result ?? null
 }
+
+// POST a JSON body to a portal endpoint (the portal's only write path today is
+// the referral self-service: create / pause / resume). Same Bearer-token auth
+// as apiGet; the Authorization header + JSON content-type make this a
+// "non-simple" request, so the browser sends a CORS preflight first (answered
+// by the backend's portalMutation guard). Returns the response `result`.
+export async function apiPost(path, payload) {
+  const url = buildUrl(path)
+
+  let token
+  try {
+    token = await shopify.sessionToken.get()
+  } catch {
+    throw new ApiError(401, 'Could not authenticate your session. Please sign in again.')
+  }
+
+  let res
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload || {}),
+    })
+  } catch (err) {
+    throw new ApiError(0, 'Network error. Please try again.', { err: String(err) })
+  }
+
+  let body = null
+  try {
+    body = await res.json()
+  } catch {
+    // non-JSON response
+  }
+
+  if (!res.ok) {
+    throw new ApiError(res.status, body?.message || `Request failed (${res.status})`, body)
+  }
+  return body?.result ?? null
+}
