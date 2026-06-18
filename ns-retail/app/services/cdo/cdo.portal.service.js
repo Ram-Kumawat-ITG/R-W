@@ -350,31 +350,72 @@ export async function getRevenue(practitionerId, { from, to } = {}) {
 
 // ── Commissions ──────────────────────────────────────────────────────────────
 
-// Bucket commissions into the four states the dashboard cares about:
-//   paid           → payoutStatus === 'paid'
-//   pending        → status === 'pending' (not yet earned/approved for payout)
-//   awaitingPayout → earned (status 'paid') but payout not completed
-//   failed         → payoutStatus === 'failed' (subset, surfaced separately)
+// Bucket commissions into the states the dashboard cares about, following the
+// real CDO lifecycle (two dimensions: accrual `status` ∈ pending/approved/paid/
+// reversed, and payout-pipeline `payoutStatus` ∈ pending/processing/paid/failed/
+// skipped/cancelled). The buckets partition every NON-reversed commission into
+// exactly one of paid / pending / awaitingPayout, so the summary cards
+// reconcile: total = paid + awaitingPayout + pending.
+//
+//   paid           → payoutStatus === 'paid'   (money actually sent — authoritative)
+//   pending        → not paid AND status === 'pending'
+//                    (accrued, not yet approved/cleared for payout)
+//   awaitingPayout → not paid AND approved-and-earned but not yet paid out
+//                    (the approved → processing/failed/skipped queue). This is
+//                    the bucket the old logic missed — it only counted
+//                    status==='paid' commissions, so approved-but-unpaid
+//                    commissions fell through every bucket.
+//   reversed       → status 'reversed' / payoutStatus 'cancelled' (clawed back;
+//                    EXCLUDED from "total earned").
+//   failed         → payoutStatus === 'failed' (informational subset of awaiting).
 async function commissionTotals(practitionerId) {
+  const NOT_PAID = { $ne: ["$payoutStatus", "paid"] };
+  const NOT_REVERSED = {
+    $and: [
+      { $ne: ["$status", "reversed"] },
+      { $ne: ["$payoutStatus", "cancelled"] },
+    ],
+  };
+
   const rows = await CdoCommission.aggregate([
     { $match: { practitionerId } },
     {
       $group: {
         _id: null,
-        total: { $sum: "$amount" },
         paid: {
           $sum: { $cond: [{ $eq: ["$payoutStatus", "paid"] }, "$amount", 0] },
         },
         pending: {
-          $sum: { $cond: [{ $eq: ["$status", "pending"] }, "$amount", 0] },
+          $sum: {
+            $cond: [
+              { $and: [NOT_PAID, { $eq: ["$status", "pending"] }] },
+              "$amount",
+              0,
+            ],
+          },
         },
         awaitingPayout: {
           $sum: {
             $cond: [
               {
                 $and: [
-                  { $eq: ["$status", "paid"] },
-                  { $ne: ["$payoutStatus", "paid"] },
+                  NOT_PAID,
+                  { $ne: ["$status", "pending"] },
+                  NOT_REVERSED,
+                ],
+              },
+              "$amount",
+              0,
+            ],
+          },
+        },
+        reversed: {
+          $sum: {
+            $cond: [
+              {
+                $or: [
+                  { $eq: ["$status", "reversed"] },
+                  { $eq: ["$payoutStatus", "cancelled"] },
                 ],
               },
               "$amount",
@@ -390,11 +431,17 @@ async function commissionTotals(practitionerId) {
     },
   ]);
   const r = rows[0] || {};
+  const paid = round2(r.paid);
+  const pending = round2(r.pending);
+  const awaitingPayout = round2(r.awaitingPayout);
   return {
-    total: round2(r.total),
-    paid: round2(r.paid),
-    pending: round2(r.pending),
-    awaitingPayout: round2(r.awaitingPayout),
+    // "Total earned" excludes reversed/cancelled clawbacks, so the cards
+    // reconcile exactly: total = paid + awaitingPayout + pending.
+    total: round2(paid + awaitingPayout + pending),
+    paid,
+    pending,
+    awaitingPayout,
+    reversed: round2(r.reversed),
     failed: round2(r.failed),
     count: r.count || 0,
   };

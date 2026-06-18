@@ -58,17 +58,15 @@ export function OverviewSection({ onAuthError }) {
       <s-stack direction="block" gap="base">
         <s-heading>Revenue breakdown</s-heading>
         <s-grid gridTemplateColumns="1fr 1fr" gap="base">
-          <s-text-field
+          <s-date-field
             label="From"
-            type="date"
             value={range.from}
-            onChange={(e) => setRange((p) => ({ ...p, from: e.target.value }))}
+            onChange={(e) => setRange((p) => ({ ...p, from: e.currentTarget.value }))}
           />
-          <s-text-field
+          <s-date-field
             label="To"
-            type="date"
             value={range.to}
-            onChange={(e) => setRange((p) => ({ ...p, to: e.target.value }))}
+            onChange={(e) => setRange((p) => ({ ...p, to: e.currentTarget.value }))}
           />
         </s-grid>
         {revenue.error ? (
@@ -193,21 +191,19 @@ export function CommissionsSection({ mode = 'all', onAuthError }) {
         ]}
       />
       <s-grid gridTemplateColumns="1fr 1fr" gap="base">
-        <s-text-field
+        <s-date-field
           label="From"
-          type="date"
           value={range.from}
           onChange={(e) => {
-            setRange((p) => ({ ...p, from: e.target.value }))
+            setRange((p) => ({ ...p, from: e.currentTarget.value }))
             setPage(1)
           }}
         />
-        <s-text-field
+        <s-date-field
           label="To"
-          type="date"
           value={range.to}
           onChange={(e) => {
-            setRange((p) => ({ ...p, to: e.target.value }))
+            setRange((p) => ({ ...p, to: e.currentTarget.value }))
             setPage(1)
           }}
         />
@@ -335,21 +331,19 @@ export function PayoutsSection({ onAuthError }) {
           <s-option value="">All</s-option>
           <s-option value="paid">Paid</s-option>
         </s-select>
-        <s-text-field
+        <s-date-field
           label="From"
-          type="date"
           value={range.from}
           onChange={(e) => {
-            setRange((p) => ({ ...p, from: e.target.value }))
+            setRange((p) => ({ ...p, from: e.currentTarget.value }))
             setPage(1)
           }}
         />
-        <s-text-field
+        <s-date-field
           label="To"
-          type="date"
           value={range.to}
           onChange={(e) => {
-            setRange((p) => ({ ...p, to: e.target.value }))
+            setRange((p) => ({ ...p, to: e.currentTarget.value }))
             setPage(1)
           }}
         />
