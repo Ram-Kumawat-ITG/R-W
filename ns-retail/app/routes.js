@@ -47,6 +47,14 @@ export default [
   route("/api/portal/payouts", "api/portal/payouts.js"),
   route("/api/portal/referrals", "api/portal/referrals.js"),
   route("/api/portal/discounts", "api/portal/discounts.js"),
+  // Shopify Carrier Service callback — receives the cart origin + destination
+  // + items at checkout, fetches live rates from USPS + UPS (or falls back
+  // to STATIC_CARRIER_RATES placeholder when credentials are unset), and
+  // returns rates to Shopify with per-quantity markup.
+  // 1:1 with wholesale/app/api/shipping/rates.js — keep them in sync.
+  // Each store has its own carrier service registered via the
+  // `carrierServiceCreate` Admin GraphQL mutation pointing at this URL.
+  route("/api/shipping/rates", "api/shipping/rates.js"),
   // Inbound cross-repo sync: the WHOLESALE app POSTs here when a drop-ship
   // wholesale order is fulfilled / shipped / delivered / cancelled, so we
   // mirror that status (carrier + tracking + delivery) onto the linked retail
