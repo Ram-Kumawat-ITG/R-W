@@ -3352,10 +3352,31 @@ export async function listPayoutBatches({ limit = 0 } = {}) {
     completedAt: b.completedAt || null,
     totalCommissions: b.totalCommissions || 0,
     totalAmount: b.totalAmount || 0,
-    successCount: b.successCount || 0,
-    failedCount: b.failedCount || 0,
-    skippedCount: b.skippedCount || 0,
+    ...batchOutcomeCounts(b),
   }));
+}
+
+// Per-batch outcome counts for the breakdown column. `processing` is DERIVED
+// as the remainder (commissions batched into a payout but not yet paid/failed/
+// skipped — i.e. awaiting admin approval or awaiting bank settlement). Deriving
+// it makes the breakdown always reconcile with totalCommissions, and works for
+// existing batches too (the approval-gated run path records totalCommissions
+// but no items/paid-failed-skipped counts, which is why those rows showed
+// 0 / 0 / 0 against a non-zero commission count).
+function batchOutcomeCounts(b) {
+  const successCount = b.successCount || 0;
+  const failedCount = b.failedCount || 0;
+  const skippedCount = b.skippedCount || 0;
+  const total = b.totalCommissions || 0;
+  return {
+    successCount,
+    failedCount,
+    skippedCount,
+    processingCount: Math.max(
+      0,
+      total - successCount - failedCount - skippedCount,
+    ),
+  };
 }
 
 // Full batch detail (rollup + per-commission items) for the detail page.
@@ -3389,9 +3410,7 @@ export async function getPayoutBatch(id) {
     completedAt: b.completedAt || null,
     totalCommissions: b.totalCommissions || 0,
     totalAmount: b.totalAmount || 0,
-    successCount: b.successCount || 0,
-    failedCount: b.failedCount || 0,
-    skippedCount: b.skippedCount || 0,
+    ...batchOutcomeCounts(b),
     error: b.error || null,
     practitionerPayouts: (b.practitionerPayouts || []).map((p) => {
       const doc = p.payoutId ? payoutById.get(String(p.payoutId)) : null;

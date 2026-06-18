@@ -130,6 +130,7 @@ export default function CdoPayoutBatchDetail() {
           <Row label="Paid" value={batch.successCount} />
           <Row label="Failed" value={batch.failedCount} />
           <Row label="Skipped" value={batch.skippedCount} />
+          <Row label="Processing" value={batch.processingCount} />
         </s-stack>
       </s-section>
 

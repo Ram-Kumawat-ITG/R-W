@@ -40,13 +40,17 @@ export default function CdoPayoutBatches() {
       render: (r) => formatCurrency(r.totalAmount, "USD"),
     },
     {
+      // Processing = batched into a payout but not yet settled (awaiting admin
+      // approval or bank settlement). Surfaced so the breakdown reconciles with
+      // the Commissions count instead of showing 0 / 0 / 0 for in-flight runs.
       key: "counts",
-      header: "Paid / Failed / Skipped",
+      header: "Paid / Failed / Skipped / Processing",
       render: (r) => (
         <s-stack direction="inline" gap="small-200">
           <s-badge tone="success">{r.successCount}</s-badge>
           <s-badge tone={r.failedCount ? "critical" : "neutral"}>{r.failedCount}</s-badge>
           <s-badge tone="neutral">{r.skippedCount}</s-badge>
+          <s-badge tone={r.processingCount ? "info" : "neutral"}>{r.processingCount}</s-badge>
         </s-stack>
       ),
     },

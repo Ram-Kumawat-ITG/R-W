@@ -8,15 +8,11 @@ import { CDO_BASE } from "./CdoTabs";
 const SETTINGS_BASE = `${CDO_BASE}/settings`;
 
 export const SETTINGS_TABS = [
-  { label: "Global Configuration", path: SETTINGS_BASE },
   { label: "Commission Configuration", path: `${SETTINGS_BASE}/commission` },
 ];
 
 function isActive(pathname, tabPath) {
   const clean = pathname.replace(/\/$/, "");
-  // The index tab (/settings) must match EXACTLY, otherwise it would also stay
-  // active on /settings/commission.
-  if (tabPath === SETTINGS_BASE) return clean === SETTINGS_BASE;
   return clean === tabPath || clean.startsWith(`${tabPath}/`);
 }
 

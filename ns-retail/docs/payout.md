@@ -126,11 +126,12 @@ Settings → **Commission Configuration** tab and stored on
 - **Audit**: every vendor-rate change (set/remove) appends a row to
   **`cdo_commission_config_history`** (`vendor, action, previousPercent, newPercent, version,
   changedBy, changedAt`), surfaced as "Recent changes" on the Commission Configuration tab.
-- **Settings UI**: `/app/cdo-program/settings` is now a layout with sub-tabs (extensible via
-  `SettingsTabs`) — **Global Configuration** (index, the program singleton) and **Commission
-  Configuration** (lists Shopify product vendors via the `productVendors` Admin GraphQL query +
-  a per-vendor "Commission Setup" modal). ⚠️ Until vendors are configured, attributed orders
-  accrue $0 — the tab warns about this.
+- **Settings UI**: `/app/cdo-program/settings` is a layout with sub-tabs (extensible via
+  `SettingsTabs`). The only tab is **Commission Configuration** (lists Shopify product vendors
+  via the `productVendors` Admin GraphQL query + a per-vendor "Commission Setup" modal); the
+  settings index redirects there. ⚠️ Until vendors are configured, attributed orders accrue $0 —
+  the tab warns about this. (A read-only Global Configuration tab over the `cdo_settings`
+  singleton was removed; the singleton is still tuned directly per §14.)
 
 ---
 
