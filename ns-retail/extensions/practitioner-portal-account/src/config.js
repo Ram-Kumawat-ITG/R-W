@@ -17,4 +17,4 @@
 //     configured `api_base_url` setting is used. A non-empty value here ships
 //     into the bundle and would override the live setting.
 // ─────────────────────────────────────────────────────────────────────────────
-export const DEV_API_BASE_URL = 'https://soon-camel-pie-encourages.trycloudflare.com'
+export const DEV_API_BASE_URL = 'https://unconsoled-internationally-stephani.ngrok-free.dev'

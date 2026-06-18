@@ -259,10 +259,23 @@ export async function getDashboardMetrics() {
   ] = await Promise.all([
     CdoOrder.find(ATTRIBUTED_ORDER_FILTER).select("amount commissionAmount placedAt createdAt").lean(),
     CdoCommission.find({}).select("amount status").lean(),
-    // "Pending payouts" = open (not-yet-settled) payouts. NOTE: there is no
-    // "pending" payout status — the open set is awaiting_approval/approved/
-    // processing. (The old "pending" filter silently matched nothing.)
-    CdoPayout.find({ status: { $in: ["awaiting_approval", "approved", "processing"] } })
+    // "Pending payouts" = every OPEN (non-terminal) payout — i.e. in flight,
+    // not yet paid/failed/rejected/cancelled. The lifecycle is
+    // draft → awaiting_approval → approved → processing → awaiting_settlement →
+    // paid, so the open set must include `awaiting_settlement` (funds submitted,
+    // awaiting bank confirmation) and `draft` — omitting `awaiting_settlement`
+    // made this read $0 even with disbursements in flight.
+    CdoPayout.find({
+      status: {
+        $in: [
+          "draft",
+          "awaiting_approval",
+          "approved",
+          "processing",
+          "awaiting_settlement",
+        ],
+      },
+    })
       .select("amount")
       .lean(),
     CdoPayout.find({ status: "paid" }).select("amount").lean(),
