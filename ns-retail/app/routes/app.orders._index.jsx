@@ -21,6 +21,44 @@ const FILTER_KEYS = [
   "dateTo",
 ];
 
+// Human-readable label per filter key (matches the form control labels) — used
+// to render the active-filter chips.
+const FILTER_LABELS = {
+  orderNumber: "Order number",
+  customer: "Customer",
+  practitioner: "Practitioner",
+  referralCode: "Referral code",
+  status: "Order status",
+  financialStatus: "Payment status",
+  commissionStatus: "Commission status",
+  dateFrom: "From date",
+  dateTo: "To date",
+};
+
+// For select-backed filters, map the stored value → its display label so a chip
+// reads "Payment status: Partially paid" (not "partially_paid"). Text/date
+// fields fall back to the raw value.
+const OPTION_LABELS = {
+  status: {
+    pending: "Pending",
+    approved: "Approved",
+    paid: "Paid",
+    cancelled: "Cancelled",
+  },
+  financialStatus: {
+    paid: "Paid",
+    pending: "Pending",
+    partially_paid: "Partially paid",
+    refunded: "Refunded",
+    partially_refunded: "Partially refunded",
+    voided: "Voided",
+  },
+  commissionStatus: {
+    attributed: "Attributed",
+    unattributed: "Unattributed",
+  },
+};
+
 // Project the active (URL) filters into a full draft shape (every key present,
 // defaulting to "").
 function pickFilters(filters) {
@@ -108,6 +146,25 @@ export default function OrdersList() {
     draftRef.current = { ...EMPTY_DRAFT };
     setDraft({ ...EMPTY_DRAFT });
     navigate("?");
+  };
+
+  // Active-filter chips — one per applied (URL) filter, label resolved from the
+  // select option map where available. Removing a chip re-navigates with that
+  // one filter dropped (the others, sort + dir preserved; page reset to 1).
+  const activeChips = FILTER_KEYS.filter((k) => filters?.[k]).map((k) => {
+    const v = filters[k];
+    const display = OPTION_LABELS[k]?.[v] ?? v;
+    return { key: k, text: `${FILTER_LABELS[k] || k}: ${display}` };
+  });
+
+  const removeChip = (key) => {
+    draftRef.current = { ...draftRef.current, [key]: "" };
+    setDraft((d) => ({ ...d, [key]: "" }));
+    const next = {};
+    for (const k of FILTER_KEYS) {
+      if (k !== key && filters?.[k]) next[k] = filters[k];
+    }
+    goto({ ...next, sort, dir, page: "1" });
   };
 
   const setSort = (field) => {
@@ -204,12 +261,33 @@ export default function OrdersList() {
             <s-date-field label="From date" {...bind("dateFrom")} />
             <s-date-field label="To date" {...bind("dateTo")} />
           </s-grid>
-          <s-stack direction="inline" gap="base">
+          <s-stack direction="inline" gap="base" alignItems="center" wrap>
             <s-button variant="primary" onClick={applyFilters} {...(loading ? { loading: true } : {})}>
               Apply filters
             </s-button>
             <s-button variant="tertiary" onClick={resetFilters}>Reset</s-button>
+            {activeChips.length > 0 && (
+              <s-text tone="subdued">
+                {activeChips.length} filter{activeChips.length === 1 ? "" : "s"} applied
+              </s-text>
+            )}
           </s-stack>
+
+          {activeChips.length > 0 && (
+            <s-stack direction="inline" gap="small-200" alignItems="center" wrap>
+              {activeChips.map((c) => (
+                <s-clickable-chip
+                  key={c.key}
+                  removable
+                  accessibilityLabel={`Remove filter ${c.text}`}
+                  onClick={() => removeChip(c.key)}
+                  onRemove={() => removeChip(c.key)}
+                >
+                  {c.text}
+                </s-clickable-chip>
+              ))}
+            </s-stack>
+          )}
         </s-stack>
       </s-section>
 
