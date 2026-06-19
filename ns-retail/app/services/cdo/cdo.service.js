@@ -2168,7 +2168,84 @@ async function finalizeSettledPayout(payout, { actor, source } = {}) {
   payout.status = "paid";
   payout.paidAt = settledAt;
   await payout.save();
+
+  // Reflect the settled outcome back onto the batch snapshot(s) that processed
+  // this payout (run-time items were recorded as "processing" because ACH is
+  // async). Without this the batch view stays stuck on "Processing".
+  await reflectPayoutOnBatches(payout, {
+    itemStatus: "paid",
+    txnRef: payout.providerTransferId || payout.qboBillPaymentId || null,
+    payoutDate: settledAt,
+  });
   return payout.toObject();
+}
+
+// Reflect a payout's TERMINAL outcome back onto the payout-batch snapshot(s)
+// that processed it. Batch items are recorded at RUN time as "processing"
+// (ACH settles asynchronously, later, via the settlement CRON — a different
+// tick/process than the run), so without this the batch's per-commission
+// outcome + Paid/Failed/Skipped counts would stay frozen on "processing" even
+// after the payout settled or returned. Updates the matching items + recomputes
+// the stored counts. Best-effort — never throws into the settlement path.
+async function reflectPayoutOnBatches(payout, { itemStatus, txnRef = null, payoutDate = null } = {}) {
+  try {
+    const batches = await CdoPayoutBatch.find({ "items.payoutId": payout._id });
+    for (const batch of batches) {
+      let touched = false;
+      for (const it of batch.items || []) {
+        if (String(it.payoutId) === String(payout._id) && it.status !== itemStatus) {
+          it.status = itemStatus;
+          if (txnRef) it.txnRef = txnRef;
+          if (payoutDate) it.payoutDate = payoutDate;
+          if (itemStatus === "paid") it.failureReason = null;
+          touched = true;
+        }
+      }
+      if (!touched) continue;
+      batch.successCount = batch.items.filter((i) => i.status === "paid").length;
+      batch.failedCount = batch.items.filter((i) => i.status === "failed").length;
+      batch.skippedCount = batch.items.filter((i) => i.status === "skipped").length;
+      // A late return can introduce failures into a previously clean batch.
+      if (["completed", "completed_with_errors"].includes(batch.status)) {
+        batch.status = batch.failedCount > 0 ? "completed_with_errors" : "completed";
+      }
+      batch.markModified("items");
+      await batch.save();
+    }
+  } catch (err) {
+    log.warn("payout.batch_reflect_failed", {
+      payoutId: String(payout._id),
+      err: err?.message || String(err),
+    });
+  }
+}
+
+// Advance any provider-side transfers that require an explicit processing
+// trigger before they can settle, so the settlement loop is fully automated
+// with NO manual dashboard step. On real rails (production ACH) the provider's
+// processPendingTransfers is a no-op — the banking network settles on its own.
+// In TEST/sandbox it triggers the provider's batch processing (Dwolla Sandbox's
+// `/sandbox/process-bank-transfers`). Best-effort + provider-optional: never
+// throws into the settlement CRON. Called once per settlement tick BEFORE the
+// per-payout poll, so the subsequent checkPayoutSettlement sees `processed`.
+export async function advancePendingPayoutTransfers() {
+  const provider = getPayoutProvider();
+  if (typeof provider.processPendingTransfers !== "function") {
+    return { advanced: false, skipped: true };
+  }
+  try {
+    const res = (await provider.processPendingTransfers()) || { advanced: false };
+    if (res.advanced) {
+      log.info("payout.provider_transfers_advanced", { provider: provider.name });
+    }
+    return res;
+  } catch (err) {
+    log.warn("payout.advance_pending_failed", {
+      provider: provider.name,
+      err: err?.message || String(err),
+    });
+    return { advanced: false, error: err?.message || String(err) };
+  }
 }
 
 // Poll the provider for one in-flight payout and apply the outcome. Safe to
@@ -2235,6 +2312,7 @@ export async function checkPayoutSettlement(payoutId, { actor = "system", source
     );
     pushPayoutRemark(payout, { kind: "returned", message: payout.lastError, actor, source });
     await payout.save();
+    await reflectPayoutOnBatches(payout, { itemStatus: "failed" });
     await alertPayoutFailure(payout, new Error(payout.lastError));
     log.warn("payout.returned", {
       payoutId: String(payout._id),
