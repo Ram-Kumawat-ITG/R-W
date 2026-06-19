@@ -695,6 +695,57 @@ payment), but the money record waits for payment:
 
 > **Scopes:** receiving `orders/*` requires `read_orders` and Shopify **protected customer data** approval. `shopify.app.toml` subscribes `orders/create`, `orders/paid`, `orders/updated`, `orders/cancelled`; production stores must be approved before delivery starts.
 
+### 15.1 Permanent patient↔practitioner binding + multi-point enforcement
+
+Once a patient (keyed by **email and/or Shopify customer id**) is attributed to a
+practitioner, that relationship is **permanent**: the patient may afterwards only
+use referral codes belonging to the **same** practitioner. The binding compares
+the **practitioner, not the code**, so a practitioner can rotate / re-issue codes
+and the patient may use any of them without breaking the relationship — but a
+**different** practitioner's code is always rejected.
+
+**Shared helpers** ([cdo.service.js](../app/services/cdo/cdo.service.js)):
+- `resolvePatientPractitioner({ email, customerId })` → the bound practitioner,
+  from `cdo_applications.referral.practitionerId` (primary, by email **or**
+  customerId) then `cdo_referrals` (fallback — earliest row by `referredEmail`
+  wins; the first attribution is the permanent one). `null` if no binding yet.
+- `checkPatientBinding({ email, customerId, practitionerId })` → `{ ok }`:
+  `ok:true` when there's **no binding yet** (first attribution) or the candidate
+  code's practitioner **matches** the bound one; `ok:false reason:"bound_other"`
+  when it's a different practitioner.
+
+**Four enforcement points** (every place a code can attach to a patient):
+1. **Registration** — `POST /api/signup-form` runs `checkPatientBinding` after
+   verifying the code; a different practitioner's code is rejected `409` ("You are
+   already associated with another practitioner"). Same-practitioner codes pass.
+2. **Order / referral-link attribution (server)** — `resolveOrderReferral`'s
+   catalogue-fallback path guards on the binding, so a foreign code carried on an
+   order can't re-attribute an already-bound patient (the order is left
+   unattributed rather than crediting another practitioner). This is the
+   **backstop** that holds even when the checkout extension can't run.
+3. **Checkout validation** — `POST /api/cdo/checkout-validate-code`
+   (`{ code, email?, customerId? }`) returns a specific `result.message`:
+   **"Invalid Referral Code"** (`not_found` — unknown/inactive code),
+   **"Practitioner does not exist"** (`practitioner_missing` — code's practitioner
+   no longer eligible), or **"You are already associated with another
+   practitioner"** (`bound_other`). The binding check is identity-gated and
+   skipped for a guest with no identity; code-validity checks always run.
+4. **Checkout BLOCK (extension)** — the [`checkout-ui-code`](../extensions/checkout-ui-code/src/Checkout.jsx)
+   extension declares the **`block_progress`** capability and registers a
+   `useBuyerJourneyIntercept`. While any referral validation is unresolved the
+   buyer **cannot advance** — including past the final **Pay** step, so the order
+   is never created. The single render-derived gate (`referralBlock`) blocks on:
+   an external/applied code still being validated; an invalid applied code that
+   couldn't be auto-removed (a known-bad Shopify discount stuck on the order); or
+   an invalid manually-entered code. A code that validates as valid clears the
+   gate; an invalid code is removed (clearing the `cdo_practitioner_code` cart
+   attribute) and, if removal fails, hard-blocks with a **Remove code** action.
+   If the merchant disallows `block_progress`, Shopify downgrades block→allow and
+   the extension degrades to a visible critical banner (the server backstop, #2,
+   still enforces). **Limitation:** a fully guest checkout (no PCD email, not
+   logged in) can't have its *binding* enforced at the extension — only validity —
+   but order ingest (#2) re-enforces server-side.
+
 ---
 
 ## 16. Reporting + analytics
