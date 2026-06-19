@@ -11,6 +11,7 @@ import { listNmiCustomerVaults } from "../services/nmi/nmi.service";
 // helpers are split out (avoids dragging process.env into the client
 // bundle via nmi.config.js).
 import { fromNmiDate } from "../services/nmi/nmi.utils";
+import { AdvancedFilters } from "../components/admin-ui";
 
 const PAGE_SIZE = 50;
 
@@ -46,6 +47,23 @@ const STATUS_FILTERS = [
   { id: "card", label: "Card on file" },
   { id: "ach", label: "ACH on file" },
 ];
+
+// Config for the shared <AdvancedFilters> card.
+const FILTER_FIELDS = [
+  {
+    key: "q",
+    label: "Search",
+    type: "text",
+    placeholder: "Name, email, phone, or vault id",
+  },
+  {
+    key: "status",
+    label: "Payment on file",
+    type: "select",
+    options: STATUS_FILTERS.map((s) => ({ value: s.id, label: s.label })),
+  },
+];
+const FILTER_DEFAULTS = { status: "all" };
 
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
@@ -157,7 +175,6 @@ export default function NmiCustomers() {
   const navigation = useNavigation();
   const revalidator = useRevalidator();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [searchInput, setSearchInput] = useState(q);
   const [showDebug, setShowDebug] = useState(false);
 
   const tableLoading = navigation.state === "loading";
@@ -166,6 +183,7 @@ export default function NmiCustomers() {
   const firstShown = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const lastShown = Math.min(page * pageSize, total);
 
+  // Pagination only — filter navigation is owned by <AdvancedFilters>.
   const updateParams = (next) => {
     const merged = new URLSearchParams(searchParams);
     for (const [k, v] of Object.entries(next)) {
@@ -176,63 +194,18 @@ export default function NmiCustomers() {
     setSearchParams(merged);
   };
 
-  const onStatusChip = (id) =>
-    updateParams({ status: id === "all" ? null : id });
-  const onSearchSubmit = (e) => {
-    e?.preventDefault?.();
-    updateParams({ q: searchInput.trim() || null });
-  };
-  const onSearchClear = () => {
-    setSearchInput("");
-    updateParams({ q: null });
-  };
-
   return (
-    <s-section heading={`Customer vault (${total})`}>
-      <s-stack direction="block" gap="base">
-        <form onSubmit={onSearchSubmit}>
-          <s-stack direction="inline" gap="small-200" alignItems="end">
-            <s-search-field
-              label="Search"
-              labelAccessibilityVisibility="exclusive"
-              placeholder="Search by name, email, phone, or vault id"
-              value={searchInput}
-              onInput={(e) => setSearchInput(e?.currentTarget?.value ?? "")}
-            />
-            <s-button variant="primary" type="submit">
-              Search
-            </s-button>
-            {q && (
-              <s-button variant="tertiary" onClick={onSearchClear}>
-                Clear
-              </s-button>
-            )}
-            <s-button
-              variant="secondary"
-              onClick={() => revalidator.revalidate()}
-              {...(refreshing ? { loading: true } : {})}
-            >
-              Refresh
-            </s-button>
-          </s-stack>
-        </form>
-
-        <s-stack direction="inline" gap="small-200">
-          {STATUS_FILTERS.map((f) => {
-            const active = status === f.id;
-            return (
-              <s-clickable-chip
-                key={f.id}
-                color={active ? "strong" : "base"}
-                accessibilityLabel={`Filter by ${f.label}`}
-                onClick={() => onStatusChip(f.id)}
-              >
-                {f.label}
-              </s-clickable-chip>
-            );
-          })}
-        </s-stack>
-
+    <>
+      <AdvancedFilters
+        fields={FILTER_FIELDS}
+        values={{ q, status }}
+        defaults={FILTER_DEFAULTS}
+        onRefresh={() => revalidator.revalidate()}
+        refreshing={refreshing}
+        applying={tableLoading}
+      />
+      <s-section heading={`Customer vault (${total})`}>
+        <s-stack direction="block" gap="base">
         {error && (
           <s-banner tone="critical" heading="Could not load customers">
             <s-paragraph>{error}</s-paragraph>
@@ -438,7 +411,8 @@ export default function NmiCustomers() {
             </s-stack>
           </s-box>
         )}
-      </s-stack>
-    </s-section>
+        </s-stack>
+      </s-section>
+    </>
   );
 }

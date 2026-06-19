@@ -1,4 +1,3 @@
-import { useState } from "react";
 import {
   useLoaderData,
   useNavigation,
@@ -12,6 +11,7 @@ import {
 } from "../services/qbo/qbo.service";
 import { escapeQboQuery } from "../services/qbo/qbo.utils";
 import { formatAmount } from "../utils/format.utils";
+import { AdvancedFilters } from "../components/admin-ui";
 
 const PAGE_SIZE = 50;
 
@@ -22,6 +22,24 @@ const STATUS_FILTERS = [
   { id: "active", label: "Active", where: "Active = true" },
   { id: "inactive", label: "Inactive", where: "Active = false" },
 ];
+
+// Config for the shared <AdvancedFilters> card. Options mirror STATUS_FILTERS
+// so the loader's where-clause mapping stays the single source of truth.
+const FILTER_FIELDS = [
+  {
+    key: "q",
+    label: "Search",
+    type: "text",
+    placeholder: "Name, company, or email",
+  },
+  {
+    key: "status",
+    label: "Status",
+    type: "select",
+    options: STATUS_FILTERS.map((s) => ({ value: s.id, label: s.label })),
+  },
+];
+const FILTER_DEFAULTS = { status: "all" };
 
 // Build a QBO QL WHERE predicate that matches the admin's free-text
 // search against name, email, and company name. Returns null when the
@@ -114,7 +132,6 @@ export default function QboCustomers() {
   const navigation = useNavigation();
   const revalidator = useRevalidator();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [searchInput, setSearchInput] = useState(q);
 
   const tableLoading = navigation.state === "loading";
   const refreshing = revalidator.state !== "idle";
@@ -122,6 +139,7 @@ export default function QboCustomers() {
   const firstShown = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const lastShown = Math.min(page * pageSize, total);
 
+  // Pagination only — filter navigation is owned by <AdvancedFilters>.
   const updateParams = (next) => {
     const merged = new URLSearchParams(searchParams);
     for (const [k, v] of Object.entries(next)) {
@@ -132,62 +150,18 @@ export default function QboCustomers() {
     setSearchParams(merged);
   };
 
-  const onStatusChip = (id) => updateParams({ status: id === "all" ? null : id });
-  const onSearchSubmit = (e) => {
-    e?.preventDefault?.();
-    updateParams({ q: searchInput.trim() || null });
-  };
-  const onSearchClear = () => {
-    setSearchInput("");
-    updateParams({ q: null });
-  };
-
   return (
-    <s-section heading={`Customers (${total})`}>
-      <s-stack direction="block" gap="base">
-        <form onSubmit={onSearchSubmit}>
-          <s-stack direction="inline" gap="small-200" alignItems="end">
-            <s-search-field
-              label="Search"
-              labelAccessibilityVisibility="exclusive"
-              placeholder="Search by name, company, or email"
-              value={searchInput}
-              onInput={(e) => setSearchInput(e?.currentTarget?.value ?? "")}
-            />
-            <s-button variant="primary" type="submit">
-              Search
-            </s-button>
-            {q && (
-              <s-button variant="tertiary" onClick={onSearchClear}>
-                Clear
-              </s-button>
-            )}
-            <s-button
-              variant="secondary"
-              onClick={() => revalidator.revalidate()}
-              {...(refreshing ? { loading: true } : {})}
-            >
-              Refresh
-            </s-button>
-          </s-stack>
-        </form>
-
-        <s-stack direction="inline" gap="small-200">
-          {STATUS_FILTERS.map((f) => {
-            const active = status === f.id;
-            return (
-              <s-clickable-chip
-                key={f.id}
-                color={active ? "strong" : "base"}
-                accessibilityLabel={`Filter by ${f.label}`}
-                onClick={() => onStatusChip(f.id)}
-              >
-                {f.label}
-              </s-clickable-chip>
-            );
-          })}
-        </s-stack>
-
+    <>
+      <AdvancedFilters
+        fields={FILTER_FIELDS}
+        values={{ q, status }}
+        defaults={FILTER_DEFAULTS}
+        onRefresh={() => revalidator.revalidate()}
+        refreshing={refreshing}
+        applying={tableLoading}
+      />
+      <s-section heading={`Customers (${total})`}>
+        <s-stack direction="block" gap="base">
         {error && (
           <s-banner tone="critical" heading="Could not load customers">
             <s-paragraph>{error}</s-paragraph>
@@ -285,7 +259,8 @@ export default function QboCustomers() {
             </s-stack>
           </s-stack>
         )}
-      </s-stack>
-    </s-section>
+        </s-stack>
+      </s-section>
+    </>
   );
 }

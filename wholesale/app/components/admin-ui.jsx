@@ -5,6 +5,8 @@
 // Styling rule (from CLAUDE.md): admin UI is Polaris-only — no `style={{}}`
 // and no CSS classes in this file or the routes that consume it.
 
+import { useRef, useState } from "react";
+import { useNavigate } from "react-router";
 import {
   PAYMENT_METHOD_LABEL,
   PAYMENT_METHOD_SHORT,
@@ -191,4 +193,213 @@ export function ShipmentStatusBadge({ status }) {
 export function PaymentMethodShortText({ method }) {
   if (!method) return <s-text tone="subdued">—</s-text>;
   return <s-text>{PAYMENT_METHOD_SHORT[method] || method}</s-text>;
+}
+
+// ── Advanced filter form ────────────────────────────────────────────
+//
+// A reusable, config-driven filter card shared by every admin list page
+// (Orders / QBO / NMI tabs) so they all present the same modern form:
+// a responsive grid of labelled controls + Apply / Reset (+ optional
+// Refresh) + a removable active-filter summary. Replaces the older
+// per-page chip rows.
+//
+// Each field is backed by a URL search param of the same `key`, so a
+// filtered view is shareable / bookmarkable. The component owns the
+// form's draft state and all filter navigation; the consuming page keeps
+// its own loader (reads the same param keys) and its own pagination.
+//
+//   fields:   [{ key, label, type, options?, placeholder? }]
+//             type ∈ "text" | "select" | "date" | "number" (default "text")
+//             select fields require `options: [{ value, label }]`.
+//   values:   the active filter values from the loader (object keyed by
+//             field key; absent/"" means "not applied").
+//   defaults: per-key value that represents "no filter" for that control
+//             (e.g. { status: "all", period: "30" }) — kept out of the
+//             URL and never shown as an active chip.
+//   onRefresh / refreshing: optional live-reload button (QBO/NMI tabs).
+//   applying: render the Apply button in its loading state.
+//
+// A control whose draft equals its default is dropped from the URL, so
+// the loader's own `param || default` fallbacks keep working unchanged.
+export function AdvancedFilters({
+  fields,
+  values,
+  defaults = {},
+  heading = "Filters",
+  description,
+  onRefresh,
+  refreshing = false,
+  applying = false,
+}) {
+  const navigate = useNavigate();
+
+  const defaultFor = (k) => (defaults[k] != null ? String(defaults[k]) : "");
+  const isDefault = (k, v) =>
+    v == null || v === "" || String(v) === defaultFor(k);
+
+  const buildInitial = () => {
+    const out = {};
+    for (const f of fields) {
+      const v = values?.[f.key];
+      out[f.key] = v != null && v !== "" ? String(v) : defaultFor(f.key);
+    }
+    return out;
+  };
+
+  // Local editable copy + a ref mirror so Apply reads the freshest values
+  // even for controls that commit on blur (fires just before the click).
+  const [draft, setDraft] = useState(buildInitial);
+  const draftRef = useRef(draft);
+
+  const set = (k) => (e) => {
+    const v = e?.currentTarget?.value ?? "";
+    draftRef.current = { ...draftRef.current, [k]: v };
+    setDraft((d) => ({ ...d, [k]: v }));
+  };
+  const bind = (k) => ({ value: draft[k], onInput: set(k), onChange: set(k) });
+
+  // Navigate with the given key→value object, dropping empties + defaults
+  // so the URL only carries the active filters (and `page` resets to 1 by
+  // omission).
+  const goNav = (next) => {
+    const params = new URLSearchParams();
+    for (const [k, v] of Object.entries(next)) {
+      if (isDefault(k, v)) continue;
+      params.set(k, String(v));
+    }
+    const qs = params.toString();
+    navigate(qs ? `?${qs}` : "?");
+  };
+
+  const apply = () => goNav(draftRef.current);
+  const reset = () => {
+    const cleared = {};
+    for (const f of fields) cleared[f.key] = defaultFor(f.key);
+    draftRef.current = cleared;
+    setDraft(cleared);
+    navigate("?");
+  };
+
+  // Active-filter chips — one per non-default field, label resolved from
+  // the select option list where available.
+  const activeChips = fields
+    .filter((f) => !isDefault(f.key, values?.[f.key]))
+    .map((f) => {
+      const v = values[f.key];
+      const label =
+        f.type === "select"
+          ? f.options?.find((o) => String(o.value) === String(v))?.label ?? v
+          : v;
+      return { key: f.key, text: `${f.label}: ${label}` };
+    });
+
+  const removeChip = (key) => {
+    draftRef.current = { ...draftRef.current, [key]: defaultFor(key) };
+    setDraft((d) => ({ ...d, [key]: defaultFor(key) }));
+    const next = {};
+    for (const f of fields) {
+      if (f.key === key) continue;
+      const v = values?.[f.key];
+      if (v != null && v !== "") next[f.key] = v;
+    }
+    goNav(next);
+  };
+
+  return (
+    <s-section heading={heading}>
+      <s-stack direction="block" gap="base">
+        {description && (
+          <s-paragraph tone="subdued">{description}</s-paragraph>
+        )}
+        {/* Responsive auto-fill grid: each control gets ≥220px and the row
+            re-flows to as many columns as fit — a tidy multi-column form on
+            desktop that stacks to one column on mobile. */}
+        <s-grid
+          gap="base"
+          gridTemplateColumns="repeat(auto-fill, minmax(220px, 1fr))"
+        >
+          {fields.map((f) => {
+            if (f.type === "select") {
+              return (
+                <s-select key={f.key} label={f.label} {...bind(f.key)}>
+                  {f.options.map((o) => (
+                    <s-option key={o.value} value={o.value}>
+                      {o.label}
+                    </s-option>
+                  ))}
+                </s-select>
+              );
+            }
+            if (f.type === "date") {
+              return (
+                <s-date-field key={f.key} label={f.label} {...bind(f.key)} />
+              );
+            }
+            if (f.type === "number") {
+              return (
+                <s-number-field
+                  key={f.key}
+                  label={f.label}
+                  placeholder={f.placeholder}
+                  {...bind(f.key)}
+                />
+              );
+            }
+            return (
+              <s-text-field
+                key={f.key}
+                label={f.label}
+                placeholder={f.placeholder}
+                {...bind(f.key)}
+              />
+            );
+          })}
+        </s-grid>
+
+        <s-stack direction="inline" gap="base" alignItems="center" wrap>
+          <s-button
+            variant="primary"
+            onClick={apply}
+            {...(applying ? { loading: true } : {})}
+          >
+            Apply filters
+          </s-button>
+          <s-button variant="tertiary" onClick={reset}>
+            Reset
+          </s-button>
+          {onRefresh && (
+            <s-button
+              variant="secondary"
+              onClick={onRefresh}
+              {...(refreshing ? { loading: true } : {})}
+            >
+              Refresh
+            </s-button>
+          )}
+          {activeChips.length > 0 && (
+            <s-text tone="subdued">
+              {activeChips.length} filter
+              {activeChips.length === 1 ? "" : "s"} applied
+            </s-text>
+          )}
+        </s-stack>
+
+        {activeChips.length > 0 && (
+          <s-stack direction="inline" gap="small-200" alignItems="center" wrap>
+            {activeChips.map((c) => (
+              <s-clickable-chip
+                key={c.key}
+                removable
+                accessibilityLabel={`Remove filter ${c.text}`}
+                onClick={() => removeChip(c.key)}
+                onRemove={() => removeChip(c.key)}
+              >
+                {c.text}
+              </s-clickable-chip>
+            ))}
+          </s-stack>
+        )}
+      </s-stack>
+    </s-section>
+  );
 }

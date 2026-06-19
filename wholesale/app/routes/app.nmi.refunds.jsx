@@ -1,4 +1,3 @@
-import { useState } from "react";
 import {
   useLoaderData,
   useNavigation,
@@ -10,6 +9,7 @@ import { listNmiTransactions } from "../services/nmi/nmi.service";
 // fromNmiDate lives in nmi.utils.js — see that file for why.
 import { fromNmiDate } from "../services/nmi/nmi.utils";
 import { formatAmount } from "../utils/format.utils";
+import { AdvancedFilters } from "../components/admin-ui";
 
 const PAGE_SIZE = 50;
 
@@ -25,19 +25,56 @@ const STATUS_FILTERS = [
   { id: "failed", label: "Declined" },
 ];
 
+// Config for the shared <AdvancedFilters> card. The status field's URL key is
+// `status` (the loader reads it into `statusFilter`).
+const FILTER_FIELDS = [
+  { key: "q", label: "Search", type: "text", placeholder: "Txn / customer / email / response" },
+  {
+    key: "status",
+    label: "Refund status",
+    type: "select",
+    options: STATUS_FILTERS.map((s) => ({ value: s.id, label: s.label })),
+  },
+  {
+    key: "period",
+    label: "Period",
+    type: "select",
+    options: PERIOD_OPTIONS.map((p) => ({ value: p.id, label: p.label })),
+  },
+  { key: "dateFrom", label: "From date", type: "date" },
+  { key: "dateTo", label: "To date", type: "date" },
+];
+const FILTER_DEFAULTS = { status: "all", period: "30" };
+
+const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+// Resolve the NMI fetch window. Explicit From/To dates win; else fall back to
+// the relative period (default 30 days). NMI has no pagination, so a bounded
+// window is mandatory.
+function resolveWindow({ dateFrom, dateTo, period }) {
+  if (YMD_RE.test(dateFrom) || YMD_RE.test(dateTo)) {
+    return {
+      start: YMD_RE.test(dateFrom) ? new Date(`${dateFrom}T00:00:00`) : new Date(0),
+      end: YMD_RE.test(dateTo) ? new Date(`${dateTo}T23:59:59`) : new Date(),
+    };
+  }
+  const days = PERIOD_OPTIONS.find((p) => p.id === period)?.days || 30;
+  const end = new Date();
+  const start = new Date(end);
+  start.setDate(start.getDate() - days);
+  return { start, end };
+}
+
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
   const url = new URL(request.url);
   const q = (url.searchParams.get("q") || "").trim();
   const period = url.searchParams.get("period") || "30";
   const statusFilter = url.searchParams.get("status") || "all";
+  const dateFrom = (url.searchParams.get("dateFrom") || "").trim();
+  const dateTo = (url.searchParams.get("dateTo") || "").trim();
   const page = Math.max(1, Number(url.searchParams.get("page") || 1));
 
-  const periodDays =
-    PERIOD_OPTIONS.find((p) => p.id === period)?.days || 30;
-  const end = new Date();
-  const start = new Date(end);
-  start.setDate(start.getDate() - periodDays);
+  const { start, end } = resolveWindow({ dateFrom, dateTo, period });
 
   try {
     // NMI lets us narrow to refunds server-side via action_type=refund.
@@ -111,6 +148,8 @@ export const loader = async ({ request }) => {
       q,
       period,
       statusFilter,
+      dateFrom,
+      dateTo,
       error: null,
     };
   } catch (e) {
@@ -123,6 +162,8 @@ export const loader = async ({ request }) => {
       q,
       period,
       statusFilter,
+      dateFrom,
+      dateTo,
       error: e?.message || "Failed to load NMI refunds",
     };
   }
@@ -166,12 +207,21 @@ function projectRefund({ tx, action, saleAction }) {
 }
 
 export default function NmiRefunds() {
-  const { rows, total, page, pageSize, q, period, statusFilter, error } =
-    useLoaderData();
+  const {
+    rows,
+    total,
+    page,
+    pageSize,
+    q,
+    period,
+    statusFilter,
+    dateFrom,
+    dateTo,
+    error,
+  } = useLoaderData();
   const navigation = useNavigation();
   const revalidator = useRevalidator();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [searchInput, setSearchInput] = useState(q);
 
   const tableLoading = navigation.state === "loading";
   const refreshing = revalidator.state !== "idle";
@@ -197,73 +247,18 @@ export default function NmiRefunds() {
     setSearchParams(merged);
   };
 
-  const onSearchSubmit = (e) => {
-    e?.preventDefault?.();
-    updateParams({ q: searchInput.trim() || null });
-  };
-  const onSearchClear = () => {
-    setSearchInput("");
-    updateParams({ q: null });
-  };
-
   return (
-    <s-section heading={`Refunds (${total})`}>
-      <s-stack direction="block" gap="base">
-        <form onSubmit={onSearchSubmit}>
-          <s-stack direction="inline" gap="small-200" alignItems="end">
-            <s-search-field
-              label="Search"
-              labelAccessibilityVisibility="exclusive"
-              placeholder="Search by txn id, customer, email, or response text"
-              value={searchInput}
-              onInput={(e) => setSearchInput(e?.currentTarget?.value ?? "")}
-            />
-            <s-button variant="primary" type="submit">
-              Search
-            </s-button>
-            {q && (
-              <s-button variant="tertiary" onClick={onSearchClear}>
-                Clear
-              </s-button>
-            )}
-            <s-button
-              variant="secondary"
-              onClick={() => revalidator.revalidate()}
-              {...(refreshing ? { loading: true } : {})}
-            >
-              Refresh
-            </s-button>
-          </s-stack>
-        </form>
-
-        <s-stack direction="inline" gap="small-200" wrap>
-          {PERIOD_OPTIONS.map((p) => (
-            <s-clickable-chip
-              key={p.id}
-              color={period === p.id ? "strong" : "base"}
-              accessibilityLabel={`Period: ${p.label}`}
-              onClick={() =>
-                updateParams({ period: p.id === "30" ? null : p.id })
-              }
-            >
-              {p.label}
-            </s-clickable-chip>
-          ))}
-          <s-text tone="subdued">·</s-text>
-          {STATUS_FILTERS.map((s) => (
-            <s-clickable-chip
-              key={s.id}
-              color={statusFilter === s.id ? "strong" : "base"}
-              accessibilityLabel={`Refund status: ${s.label}`}
-              onClick={() =>
-                updateParams({ status: s.id === "all" ? null : s.id })
-              }
-            >
-              {s.label}
-            </s-clickable-chip>
-          ))}
-        </s-stack>
-
+    <>
+      <AdvancedFilters
+        fields={FILTER_FIELDS}
+        values={{ q, status: statusFilter, period, dateFrom, dateTo }}
+        defaults={FILTER_DEFAULTS}
+        onRefresh={() => revalidator.revalidate()}
+        refreshing={refreshing}
+        applying={tableLoading}
+      />
+      <s-section heading={`Refunds (${total})`}>
+        <s-stack direction="block" gap="base">
         {/* Window-level summary tile — shows the total successful
             refund amount across the visible rows. Re-renders with the
             page since the loader's row count IS the filter count. */}
@@ -427,6 +422,7 @@ export default function NmiRefunds() {
           </s-stack>
         )}
       </s-stack>
-    </s-section>
+      </s-section>
+    </>
   );
 }

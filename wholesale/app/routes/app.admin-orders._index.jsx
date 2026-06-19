@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import {
   useLoaderData,
   useNavigate,
@@ -14,8 +14,8 @@ import {
   carrierDisplayName,
   deriveDeliveryStatus,
 } from "../utils/shipping.constants";
-import { ShipmentStatusBadge } from "../components/admin-ui";
-import { formatAmount } from "../utils/format.utils";
+import { ShipmentStatusBadge, AdvancedFilters } from "../components/admin-ui";
+import { formatAmount, parseDateOnly, startOfDay } from "../utils/format.utils";
 
 // Admin Orders — orders placed by the retail drop-ship customer
 // (DROPSHIP_RETAIL_CUSTOMER_EMAIL). These run on a separate flow from the
@@ -50,13 +50,48 @@ const FULFILLMENT_FILTER_BY_ID = new Map(
   FULFILLMENT_FILTERS.map((f) => [f.id, f]),
 );
 
+// Payment-status options (Shopify financialStatus, matched exactly).
+const PAYMENT_OPTIONS = [
+  { value: "all", label: "All" },
+  { value: "paid", label: "Paid" },
+  { value: "pending", label: "Pending" },
+  { value: "partially_paid", label: "Partially paid" },
+  { value: "refunded", label: "Refunded" },
+  { value: "partially_refunded", label: "Partially refunded" },
+  { value: "voided", label: "Voided" },
+];
+
+// Config for the shared <AdvancedFilters> card. Fulfillment options mirror
+// FULFILLMENT_FILTERS so the loader's $in mapping stays the source of truth.
+const FILTER_FIELDS = [
+  { key: "q", label: "Order number", type: "text", placeholder: "#1091" },
+  {
+    key: "fulfillment",
+    label: "Fulfillment",
+    type: "select",
+    options: FULFILLMENT_FILTERS.map((f) => ({ value: f.id, label: f.label })),
+  },
+  {
+    key: "payment",
+    label: "Payment status",
+    type: "select",
+    options: PAYMENT_OPTIONS,
+  },
+  { key: "dateFrom", label: "From date", type: "date" },
+  { key: "dateTo", label: "To date", type: "date" },
+];
+const FILTER_DEFAULTS = { fulfillment: "all", payment: "all" };
+
 export const loader = async ({ request }) => {
   const { session } = await authenticate.admin(request);
   await connectDB();
 
   const url = new URL(request.url);
   const fulfillment = url.searchParams.get("fulfillment") || "all";
+  const payment = url.searchParams.get("payment") || "all";
   const q = (url.searchParams.get("q") || "").trim();
+  const dateFrom = (url.searchParams.get("dateFrom") || "").trim();
+  const dateTo = (url.searchParams.get("dateTo") || "").trim();
   const page = Math.max(1, Number(url.searchParams.get("page") || 1));
 
   // Anchor the whole page on the retail drop-ship customer's email — the
@@ -71,6 +106,25 @@ export const loader = async ({ request }) => {
   const fulfillmentFilter = FULFILLMENT_FILTER_BY_ID.get(fulfillment);
   if (fulfillmentFilter?.match) {
     filter.fulfillmentStatus = { $in: fulfillmentFilter.match };
+  }
+
+  // Exact Shopify financial-status match.
+  if (payment && payment !== "all") {
+    filter.financialStatus = payment;
+  }
+
+  // Order-date range (receivedAt), inclusive on both ends.
+  const from = parseDateOnly(dateFrom);
+  const to = parseDateOnly(dateTo);
+  if (from || to) {
+    const range = {};
+    if (from) range.$gte = startOfDay(from);
+    if (to) {
+      const end = new Date(to);
+      end.setHours(23, 59, 59, 999);
+      range.$lte = end;
+    }
+    filter.receivedAt = range;
   }
 
   if (q) {
@@ -93,30 +147,6 @@ export const loader = async ({ request }) => {
         "fulfillments deliveredAt receivedAt",
     )
     .lean();
-
-  // Chip badge counts — one grouped aggregation on fulfillmentStatus, scoped
-  // to Admin Orders (and the active search) so the numbers track what's shown.
-  const countFilter = {
-    shop: session.shop,
-    customerEmail: RETAIL_CUSTOMER_EMAIL,
-  };
-  if (q) countFilter.$or = filter.$or;
-  const grouped = await ShopifyOrder.aggregate([
-    { $match: countFilter },
-    { $group: { _id: "$fulfillmentStatus", n: { $sum: 1 } } },
-  ]);
-  const countByFulfillment = { all: 0 };
-  for (const f of FULFILLMENT_FILTERS) {
-    if (f.id !== "all") countByFulfillment[f.id] = 0;
-  }
-  for (const g of grouped) {
-    countByFulfillment.all += g.n;
-    for (const f of FULFILLMENT_FILTERS) {
-      if (f.match && f.match.includes(g._id)) {
-        countByFulfillment[f.id] += g.n;
-      }
-    }
-  }
 
   return {
     rows: rows.map((r) => {
@@ -153,8 +183,10 @@ export const loader = async ({ request }) => {
     page,
     pageSize: PAGE_SIZE,
     fulfillment,
+    payment,
     q,
-    countByFulfillment,
+    dateFrom,
+    dateTo,
     customerEmail: RETAIL_CUSTOMER_EMAIL,
   };
 };
@@ -200,15 +232,16 @@ export default function AdminOrdersList() {
     page,
     pageSize,
     fulfillment,
+    payment,
     q,
-    countByFulfillment,
+    dateFrom,
+    dateTo,
     customerEmail,
   } = useLoaderData();
   const navigate = useNavigate();
   const navigation = useNavigation();
   const shopify = useAppBridge();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [searchInput, setSearchInput] = useState(q || "");
   const loadedToastShown = useRef(false);
 
   useEffect(() => {
@@ -221,7 +254,10 @@ export default function AdminOrdersList() {
 
   const tableLoading = navigation.state === "loading";
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const firstShown = total === 0 ? 0 : (page - 1) * pageSize + 1;
+  const lastShown = Math.min(page * pageSize, total);
 
+  // Pagination only — filter navigation is owned by <AdvancedFilters>.
   const updateParams = (next) => {
     const merged = new URLSearchParams(searchParams);
     for (const [k, v] of Object.entries(next)) {
@@ -232,69 +268,33 @@ export default function AdminOrdersList() {
     setSearchParams(merged);
   };
 
-  const onFulfillmentChip = (id) =>
-    updateParams({ fulfillment: id === "all" ? null : id });
-  const onSearchSubmit = (e) => {
-    e?.preventDefault?.();
-    updateParams({ q: searchInput.trim() || null });
-  };
-  const onSearchClear = () => {
-    setSearchInput("");
-    updateParams({ q: null });
-  };
-
-  const firstShown = total === 0 ? 0 : (page - 1) * pageSize + 1;
-  const lastShown = Math.min(page * pageSize, total);
+  const hasActiveFilter =
+    Boolean(q) ||
+    (fulfillment && fulfillment !== "all") ||
+    (payment && payment !== "all") ||
+    Boolean(dateFrom) ||
+    Boolean(dateTo);
 
   return (
     <s-page inlineSize="large" heading="Admin Orders">
+      <AdvancedFilters
+        fields={FILTER_FIELDS}
+        values={{ q, fulfillment, payment, dateFrom, dateTo }}
+        defaults={FILTER_DEFAULTS}
+        applying={tableLoading}
+        description={`Orders placed by the retail drop-ship customer${
+          customerEmail ? ` (${customerEmail})` : ""
+        }. Each new order gets an unpaid QBO invoice on creation; the drop-ship payment job collects it automatically against the card on file and marks it paid in QBO. They are handled separately from the wholesale payment flow.`}
+      />
       <s-section padding="none">
         <s-box padding="base">
-          <s-stack direction="block" gap="base">
-            <s-paragraph tone="subdued">
-              Orders placed by the retail drop-ship customer
-              {customerEmail ? ` (${customerEmail})` : ""}. Each new order gets
-              an unpaid QBO invoice on creation; the drop-ship payment job
-              collects it automatically against the card on file and marks it
-              paid in QBO. They are handled separately from the wholesale
-              payment flow.
-            </s-paragraph>
-            <form onSubmit={onSearchSubmit}>
-              <s-stack direction="inline" gap="small-200" alignItems="end">
-                <s-search-field
-                  label="Search"
-                  labelAccessibilityVisibility="exclusive"
-                  placeholder="Search by order # or name"
-                  value={searchInput}
-                  onInput={(e) => setSearchInput(e?.currentTarget?.value ?? "")}
-                />
-                <s-button variant="primary" type="submit">
-                  Search
-                </s-button>
-                {q && (
-                  <s-button variant="tertiary" onClick={onSearchClear}>
-                    Clear
-                  </s-button>
-                )}
-              </s-stack>
-            </form>
-            <s-stack direction="inline" gap="small-200">
-              {FULFILLMENT_FILTERS.map((f) => {
-                const active = fulfillment === f.id;
-                const n = countByFulfillment[f.id] ?? 0;
-                return (
-                  <s-clickable-chip
-                    key={f.id}
-                    color={active ? "strong" : "base"}
-                    accessibilityLabel={`Filter by ${f.label}`}
-                    onClick={() => onFulfillmentChip(f.id)}
-                  >
-                    {f.label} ({n})
-                  </s-clickable-chip>
-                );
-              })}
-            </s-stack>
-          </s-stack>
+          <s-text tone="subdued">
+            {total === 0
+              ? "No orders"
+              : `Showing ${firstShown}–${lastShown} of ${total} order${
+                  total === 1 ? "" : "s"
+                }`}
+          </s-text>
         </s-box>
 
         {rows.length === 0 ? (
@@ -305,22 +305,15 @@ export default function AdminOrdersList() {
               alignItems="center"
               justifyContent="center"
             >
-              <s-text>{q ? "🔍" : "📭"}</s-text>
+              <s-text>{hasActiveFilter ? "🔍" : "📭"}</s-text>
               <s-heading>
-                {q
-                  ? "No matches"
-                  : fulfillment === "all"
-                    ? "No admin orders yet"
-                    : "No admin orders in this status"}
+                {hasActiveFilter ? "No matching orders" : "No admin orders yet"}
               </s-heading>
               <s-paragraph tone="subdued">
-                {q
-                  ? `No admin orders match "${q}". Try a different keyword or clear the search.`
-                  : fulfillment === "all"
-                    ? "Orders placed by the retail drop-ship customer will appear here."
-                    : "Try changing the fulfillment filter."}
+                {hasActiveFilter
+                  ? "No admin orders match the current filters. Try broadening or clearing them."
+                  : "Orders placed by the retail drop-ship customer will appear here."}
               </s-paragraph>
-              {q && <s-button onClick={onSearchClear}>Clear search</s-button>}
             </s-stack>
           </s-box>
         ) : (

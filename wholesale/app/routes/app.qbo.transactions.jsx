@@ -1,4 +1,3 @@
-import { useState } from "react";
 import {
   useLoaderData,
   useNavigation,
@@ -12,6 +11,7 @@ import {
 } from "../services/qbo/qbo.service";
 import { escapeQboQuery } from "../services/qbo/qbo.utils";
 import { formatAmount, fmtDueDate } from "../utils/format.utils";
+import { AdvancedFilters } from "../components/admin-ui";
 
 const PAGE_SIZE = 50;
 
@@ -25,6 +25,20 @@ const DATE_FILTERS = [
   { id: "ytd", label: "Year to date" },
 ];
 
+// Config for the shared <AdvancedFilters> card.
+const FILTER_FIELDS = [
+  { key: "q", label: "Reference number", type: "text", placeholder: "Cheque / ref #" },
+  {
+    key: "range",
+    label: "Date range",
+    type: "select",
+    options: DATE_FILTERS.map((d) => ({ value: d.id, label: d.label })),
+  },
+  { key: "dateFrom", label: "From date", type: "date" },
+  { key: "dateTo", label: "To date", type: "date" },
+];
+const FILTER_DEFAULTS = { range: "all" };
+
 function buildDateWhere(filterId, now) {
   if (!filterId || filterId === "all") return null;
   if (filterId === "ytd") {
@@ -35,6 +49,18 @@ function buildDateWhere(filterId, now) {
   cutoff.setDate(cutoff.getDate() - days);
   const ymd = `${cutoff.getFullYear()}-${String(cutoff.getMonth() + 1).padStart(2, "0")}-${String(cutoff.getDate()).padStart(2, "0")}`;
   return `TxnDate >= '${ymd}'`;
+}
+
+const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+// Explicit From/To range on TxnDate. Each bound applied only when a
+// well-formed YYYY-MM-DD (the s-date-field always emits that; the regex
+// guards hand-edited URLs). Null when neither bound is set, so the caller
+// falls back to the relative `range`.
+function buildExplicitDateWhere(from, to) {
+  const parts = [];
+  if (YMD_RE.test(from)) parts.push(`TxnDate >= '${from}'`);
+  if (YMD_RE.test(to)) parts.push(`TxnDate <= '${to}'`);
+  return parts.length ? parts.join(" AND ") : null;
 }
 
 function buildSearchWhere(q) {
@@ -61,10 +87,16 @@ export const loader = async ({ request }) => {
   const url = new URL(request.url);
   const q = (url.searchParams.get("q") || "").trim();
   const range = url.searchParams.get("range") || "all";
+  const dateFrom = (url.searchParams.get("dateFrom") || "").trim();
+  const dateTo = (url.searchParams.get("dateTo") || "").trim();
   const page = Math.max(1, Number(url.searchParams.get("page") || 1));
   const startPosition = (page - 1) * PAGE_SIZE + 1;
 
-  const where = combineWhere(buildDateWhere(range, new Date()), buildSearchWhere(q));
+  const explicitDate = buildExplicitDateWhere(dateFrom, dateTo);
+  const where = combineWhere(
+    explicitDate || buildDateWhere(range, new Date()),
+    buildSearchWhere(q),
+  );
 
   try {
     const [pageRes, total] = await Promise.all([
@@ -79,6 +111,8 @@ export const loader = async ({ request }) => {
       pageSize: PAGE_SIZE,
       q,
       range,
+      dateFrom,
+      dateTo,
       error: null,
     };
   } catch (e) {
@@ -90,6 +124,8 @@ export const loader = async ({ request }) => {
       pageSize: PAGE_SIZE,
       q,
       range,
+      dateFrom,
+      dateTo,
       error: e?.message || "Failed to load QBO transactions",
     };
   }
@@ -126,11 +162,11 @@ function projectPayment(p) {
 }
 
 export default function QboTransactions() {
-  const { rows, total, page, pageSize, q, range, error } = useLoaderData();
+  const { rows, total, page, pageSize, q, range, dateFrom, dateTo, error } =
+    useLoaderData();
   const navigation = useNavigation();
   const revalidator = useRevalidator();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [searchInput, setSearchInput] = useState(q);
 
   const tableLoading = navigation.state === "loading";
   const refreshing = revalidator.state !== "idle";
@@ -148,62 +184,18 @@ export default function QboTransactions() {
     setSearchParams(merged);
   };
 
-  const onRangeChip = (id) => updateParams({ range: id === "all" ? null : id });
-  const onSearchSubmit = (e) => {
-    e?.preventDefault?.();
-    updateParams({ q: searchInput.trim() || null });
-  };
-  const onSearchClear = () => {
-    setSearchInput("");
-    updateParams({ q: null });
-  };
-
   return (
-    <s-section heading={`Transactions (${total})`}>
-      <s-stack direction="block" gap="base">
-        <form onSubmit={onSearchSubmit}>
-          <s-stack direction="inline" gap="small-200" alignItems="end">
-            <s-search-field
-              label="Search"
-              labelAccessibilityVisibility="exclusive"
-              placeholder="Search by reference number"
-              value={searchInput}
-              onInput={(e) => setSearchInput(e?.currentTarget?.value ?? "")}
-            />
-            <s-button variant="primary" type="submit">
-              Search
-            </s-button>
-            {q && (
-              <s-button variant="tertiary" onClick={onSearchClear}>
-                Clear
-              </s-button>
-            )}
-            <s-button
-              variant="secondary"
-              onClick={() => revalidator.revalidate()}
-              {...(refreshing ? { loading: true } : {})}
-            >
-              Refresh
-            </s-button>
-          </s-stack>
-        </form>
-
-        <s-stack direction="inline" gap="small-200">
-          {DATE_FILTERS.map((f) => {
-            const active = range === f.id;
-            return (
-              <s-clickable-chip
-                key={f.id}
-                color={active ? "strong" : "base"}
-                accessibilityLabel={`Filter by ${f.label}`}
-                onClick={() => onRangeChip(f.id)}
-              >
-                {f.label}
-              </s-clickable-chip>
-            );
-          })}
-        </s-stack>
-
+    <>
+      <AdvancedFilters
+        fields={FILTER_FIELDS}
+        values={{ q, range, dateFrom, dateTo }}
+        defaults={FILTER_DEFAULTS}
+        onRefresh={() => revalidator.revalidate()}
+        refreshing={refreshing}
+        applying={tableLoading}
+      />
+      <s-section heading={`Transactions (${total})`}>
+        <s-stack direction="block" gap="base">
         {error && (
           <s-banner tone="critical" heading="Could not load transactions">
             <s-paragraph>{error}</s-paragraph>
@@ -311,7 +303,8 @@ export default function QboTransactions() {
             </s-stack>
           </s-stack>
         )}
-      </s-stack>
-    </s-section>
+        </s-stack>
+      </s-section>
+    </>
   );
 }
