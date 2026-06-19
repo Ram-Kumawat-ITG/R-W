@@ -18,6 +18,10 @@
 
 import connectDB from "../../db/mongo.server";
 import CdoPractitionerCode from "../../models/cdoPractitionerCode.server";
+import {
+  resolvePractitionerReferral,
+  checkPatientBinding,
+} from "../../services/cdo/cdo.service";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -84,6 +88,13 @@ export async function action({ request }) {
   if (!raw) {
     return json(400, { status: "error", message: "Code is required" });
   }
+  // Buyer identity — used to enforce the permanent patient↔practitioner
+  // binding. Either is sufficient; both are best-effort. A guest checkout
+  // without PCD level-2 email access sends neither, in which case the
+  // checkout-time binding check is skipped (order ingest still attributes
+  // server-side to the already-bound practitioner).
+  const email = String(body?.email || "").trim().toLowerCase();
+  const customerId = String(body?.customerId || "").trim();
 
   try {
     await connectDB();
@@ -92,15 +103,57 @@ export async function action({ request }) {
       code: { $regex: `^${escaped}$`, $options: "i" },
       status: "active",
     })
-      .select("code practitionerName practitionerEmail discountPercent")
+      .select("code practitionerId")
       .lean();
 
+    // Unknown / inactive code.
     if (!doc) {
       return json(200, {
         status: "success",
-        message: "Code not found",
-        result: { valid: false },
+        message: "Invalid Referral Code",
+        result: {
+          valid: false,
+          reason: "not_found",
+          message: "Invalid Referral Code",
+        },
       });
+    }
+
+    // Code exists, but confirm it still resolves to an ELIGIBLE practitioner
+    // (approved + reselling). resolvePractitionerReferral returns null when
+    // the owning practitioner record is gone or no longer qualifies.
+    const referral = await resolvePractitionerReferral(doc.code);
+    if (!referral) {
+      return json(200, {
+        status: "success",
+        message: "Practitioner does not exist",
+        result: {
+          valid: false,
+          reason: "practitioner_missing",
+          message: "Practitioner does not exist",
+        },
+      });
+    }
+
+    // Permanent-binding enforcement: a patient already associated with a
+    // practitioner may only use codes belonging to that same practitioner.
+    if (email || customerId) {
+      const verdict = await checkPatientBinding({
+        email,
+        customerId,
+        practitionerId: referral.practitionerId,
+      });
+      if (!verdict.ok) {
+        return json(200, {
+          status: "success",
+          message: "You are already associated with another practitioner",
+          result: {
+            valid: false,
+            reason: "bound_other",
+            message: "You are already associated with another practitioner",
+          },
+        });
+      }
     }
 
     return json(200, {
@@ -108,9 +161,12 @@ export async function action({ request }) {
       message: "Code valid",
       result: {
         valid: true,
-        code: doc.code,
-        practitionerName: doc.practitionerName || null,
-        discountPercent: typeof doc.discountPercent === "number" ? doc.discountPercent : 0,
+        code: referral.code,
+        practitionerName: referral.practitionerName || null,
+        discountPercent:
+          typeof referral.discountPercent === "number"
+            ? referral.discountPercent
+            : 0,
       },
     });
   } catch (err) {

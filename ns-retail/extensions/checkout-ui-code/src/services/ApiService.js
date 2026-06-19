@@ -71,9 +71,17 @@ async function jsonPost(path, body) {
 
 const ApiService = {
   // POST /api/cdo/checkout-validate-code
-  // Returns { valid: boolean, code?, practitionerName?, discountPercent? }
-  async verifyCode(code) {
-    const data = await jsonPost('/api/cdo/checkout-validate-code', { code });
+  // `identity` carries the buyer's email + Shopify customer id so the backend
+  // can enforce the permanent patient↔practitioner binding (a patient may only
+  // use codes from the practitioner they're already associated with). Both are
+  // best-effort — omitted when not available (guest checkout / no PCD email).
+  // Returns { valid, reason?, message?, code?, practitionerName?, discountPercent? }
+  async verifyCode(code, identity = {}) {
+    const data = await jsonPost('/api/cdo/checkout-validate-code', {
+      code,
+      email: identity.email || undefined,
+      customerId: identity.customerId || undefined,
+    });
     return data?.result || { valid: false };
   },
 

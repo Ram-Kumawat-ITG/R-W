@@ -49,6 +49,17 @@ function Extension() {
     shopifyAny?.shop?.value?.myshopifyDomain ||
     "";
 
+  // Buyer email — used to enforce the permanent patient↔practitioner binding
+  // server-side. `buyerIdentity.email` needs PCD level-2 access; the
+  // logged-in customer's id (level 1) is the reliable fallback the backend
+  // also accepts. Both are passed best-effort; an empty identity just skips
+  // the checkout-time binding check (order ingest still enforces it).
+  const buyerEmail =
+    shopifyAny?.buyerIdentity?.email?.value ||
+    customer?.email ||
+    "";
+  const identity = { email: buyerEmail, customerId: customer?.id };
+
   // Read appMetafields REACTIVELY in render so this component re-renders
   // (and the effect below re-fires) when Shopify finishes loading the
   // shop metafield list. Both `customer` and `appMetafields` are async
@@ -146,7 +157,7 @@ function Extension() {
 
     let result;
     try {
-      result = await ApiService.verifyCode(code);
+      result = await ApiService.verifyCode(code, identity);
     } catch (err) {
       console.warn("[checkout-ui-code] auto-verify failed:", err);
       verifyState.value = "idle";
@@ -208,7 +219,7 @@ function Extension() {
     verifyState.value = "verifying";
     verifyMessage.value = null;
     try {
-      const result = await ApiService.verifyCode(code);
+      const result = await ApiService.verifyCode(code, identity);
       if (result?.valid) {
         verifyState.value = "verified";
         verifiedCode.value = result.code || code;
@@ -217,7 +228,10 @@ function Extension() {
           : "Verified";
       } else {
         verifyState.value = "invalid";
-        verifyMessage.value = "Code not found.";
+        // Surface the backend's specific reason — "Invalid Referral Code",
+        // "Practitioner does not exist", or "You are already associated with
+        // another practitioner" (permanent-binding block).
+        verifyMessage.value = result?.message || "Invalid Referral Code";
       }
     } catch (err) {
       console.warn("[checkout-ui-code] verify failed:", err);

@@ -1192,6 +1192,96 @@ export async function buildReferralSnapshot(rawCode, { when, shop } = {}) {
   };
 }
 
+// ── Permanent patient ↔ practitioner binding ─────────────────────────
+//
+// Once a patient (identified by email and/or Shopify customer id) is
+// attributed to a practitioner, that relationship is PERMANENT: the patient
+// may afterwards only use referral codes that belong to the SAME
+// practitioner. The binding is read from two places, in priority order:
+//   1. cdo_applications.referral.practitionerId — the registration /
+//      first-touch snapshot (the canonical mapping; one per customer).
+//   2. cdo_referrals.practitionerId (by referredEmail) — the referral
+//      lifecycle row, kept as a fallback for link / checkout-only
+//      attributions that never created an application.
+// A practitioner may rotate or hold several codes, so the binding is by
+// PRACTITIONER, not by code — different codes from the bound practitioner
+// are always allowed; only a different practitioner is blocked.
+export async function resolvePatientPractitioner({ email, customerId } = {}) {
+  const e = String(email || "").trim().toLowerCase();
+  const cid = String(customerId || "").trim();
+  if (!e && !cid) return null;
+  await connectDB();
+
+  // 1. PRIMARY — the customer's cdo_applications referral snapshot. Match on
+  //    email OR customerId (different ingest paths populate one or the other).
+  const or = [];
+  if (e) or.push({ email: e });
+  if (cid) or.push({ customerId: cid });
+  const app = await CdoApplication.findOne({
+    $or: or,
+    status: { $ne: "rejected" },
+    "referral.practitionerId": { $ne: null },
+  })
+    .select("referral email")
+    .lean();
+  if (app?.referral?.practitionerId) {
+    return {
+      practitionerId: String(app.referral.practitionerId),
+      practitionerName: app.referral.practitionerName || null,
+      practitionerEmail: (app.referral.practitionerEmail || "").toLowerCase() || null,
+      code: app.referral.code || null,
+      source: "cdo_application",
+    };
+  }
+
+  // 2. FALLBACK — earliest cdo_referrals row for this email wins (the FIRST
+  //    attribution is the permanent one).
+  const refEmail = e || app?.email;
+  if (refEmail) {
+    const ref = await CdoReferral.findOne({
+      referredEmail: refEmail,
+      practitionerId: { $ne: null },
+    })
+      .sort({ createdAt: 1 })
+      .select("practitionerId practitionerName practitionerEmail referralCode")
+      .lean();
+    if (ref?.practitionerId) {
+      return {
+        practitionerId: String(ref.practitionerId),
+        practitionerName: ref.practitionerName || null,
+        practitionerEmail: (ref.practitionerEmail || "").toLowerCase() || null,
+        code: ref.referralCode || null,
+        source: "cdo_referral",
+      };
+    }
+  }
+  return null;
+}
+
+// Decide whether a candidate code's practitioner is allowed for this patient,
+// honoring the permanent binding. `practitionerId` is the practitioner the
+// candidate code resolves to. Returns:
+//   { ok: true,  firstTime: true,  boundPractitionerId: null }      — no binding yet
+//   { ok: true,  firstTime: false, boundPractitionerId }            — same practitioner
+//   { ok: false, reason: "bound_other", boundPractitionerId, boundPractitionerName }
+export async function checkPatientBinding({ email, customerId, practitionerId } = {}) {
+  const binding = await resolvePatientPractitioner({ email, customerId });
+  if (!binding) return { ok: true, firstTime: true, boundPractitionerId: null };
+  if (String(binding.practitionerId) === String(practitionerId || "")) {
+    return {
+      ok: true,
+      firstTime: false,
+      boundPractitionerId: binding.practitionerId,
+    };
+  }
+  return {
+    ok: false,
+    reason: "bound_other",
+    boundPractitionerId: binding.practitionerId,
+    boundPractitionerName: binding.practitionerName,
+  };
+}
+
 // List customer applications, optionally scoped by applicant type. Used
 // by the (future) CDO customer-applications admin screens + by tests
 // validating the referral / non-referral seed scenarios.
@@ -2505,7 +2595,21 @@ async function resolveOrderReferral({ shop, payload, rawCode, codeSource }) {
   // 2. FALLBACK: validate a code carried on the order against the catalogue.
   if (rawCode) {
     const referral = await resolvePractitionerReferral(rawCode, { shop });
-    if (referral) return { referral, attributionSource: codeSource || null };
+    if (referral) {
+      // Permanent-binding guard. The cdo_applications case is handled in
+      // step 1; this also covers a patient who has a cdo_referrals binding
+      // but no application yet. If they're already bound to a DIFFERENT
+      // practitioner, a foreign code must NOT re-attribute the order — the
+      // relationship is permanent.
+      const binding = await resolvePatientPractitioner({ email, customerId: customerGid });
+      if (binding && String(binding.practitionerId) !== String(referral.practitionerId)) {
+        console.warn(
+          `[cdo.ingest] order ${payload?.id} carried code "${rawCode}" (practitioner ${referral.practitionerId}), but ${email || customerGid} is permanently bound to practitioner ${binding.practitionerId} — ignoring the foreign code, leaving order unattributed`,
+        );
+        return { referral: null, attributionSource: null };
+      }
+      return { referral, attributionSource: codeSource || null };
+    }
   }
 
   return { referral: null, attributionSource: null };
