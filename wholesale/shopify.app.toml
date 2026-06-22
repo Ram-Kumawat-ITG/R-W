@@ -68,7 +68,7 @@ api_version = "2026-07"
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 # NOTE: `read_customers` is protected customer data and requires Partners
 # dashboard approval before it can be requested. `read_orders` is unprotected.
-scopes = "write_draft_orders,read_draft_orders,read_orders,write_products,write_files,write_customers,read_inventory,write_inventory"
+scopes = "customer_read_customers,customer_read_orders,customer_write_orders,read_assigned_fulfillment_orders,read_cart_transforms,read_customers,read_discounts,read_files,read_gift_cards,read_inventory,read_locations,read_markets,read_product_listings,read_products,read_publications,read_shipping,read_third_party_fulfillment_orders,unauthenticated_read_checkouts,unauthenticated_read_customers,unauthenticated_read_product_inventory,unauthenticated_read_product_listings,write_cart_transforms,write_checkouts,write_customers,write_draft_orders,write_files,write_gift_cards,write_merchant_managed_fulfillment_orders,write_order_edits,write_orders,write_products,write_publications,write_shipping,write_third_party_fulfillment_orders"
 
 [auth]
 redirect_urls = [ "https://e630-182-70-242-149.ngrok-free.app/api/auth" ]

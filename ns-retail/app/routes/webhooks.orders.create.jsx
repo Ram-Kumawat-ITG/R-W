@@ -114,6 +114,12 @@ async function forwardToWholesaleDropship({ payload, retailShop }) {
     headers: {
       "Content-Type": "application/json",
       "x-sync-secret": syncSecret,
+      // ngrok free-tier serves an HTML interstitial ("You are about to
+      // visit…") with HTTP 200 on first POST unless this header is set.
+      // Without it the wholesale app never sees the request — Shopify
+      // CLI tunnels add this header automatically for embedded admin
+      // requests, but our server-to-server fetch must add it manually.
+      "ngrok-skip-browser-warning": "true",
     },
     body: JSON.stringify(payload),
   });

@@ -43,6 +43,40 @@ function buildRetailPayload(p, { includePrice = false } = {}) {
   };
 }
 
+// Pair wholesale + retail variant arrays by SKU. Both stores share SKUs
+// because the retail variant is created from the wholesale payload, so SKU
+// is the only stable cross-store identifier — positional indexing breaks
+// the moment either side reorders variants in Shopify admin, after which
+// every downstream write (IdMap, inventory snapshot, price snapshot) would
+// silently land on the wrong row.
+//
+// Variants on either side with no SKU, or with no matching SKU on the
+// other side, are skipped with a warn log so the sync proceeds for the
+// remaining variants instead of corrupting the mapping.
+function pairVariantsBySku(wholesaleVariants, retailVariants) {
+  const retailBySku = new Map();
+  for (const rv of retailVariants || []) {
+    if (rv?.sku) retailBySku.set(rv.sku, rv);
+  }
+  const pairs = [];
+  for (const wv of wholesaleVariants || []) {
+    if (!wv?.sku) {
+      log.warn("variant_pair.wholesale_no_sku", { wholesaleVariantId: wv?.id });
+      continue;
+    }
+    const rv = retailBySku.get(wv.sku);
+    if (!rv) {
+      log.warn("variant_pair.no_retail_match", {
+        wholesaleVariantId: wv.id,
+        sku: wv.sku,
+      });
+      continue;
+    }
+    pairs.push([wv, rv]);
+  }
+  return pairs;
+}
+
 // Set inventory levels on the retail store for each variant after product creation.
 // Uses the wholesale location_id (from the product or null) to resolve the retail location.
 async function setRetailInventoryForProduct(
@@ -57,13 +91,7 @@ async function setRetailInventoryForProduct(
     log.warn("set_retail_inventory.no_location");
     return;
   }
-  for (
-    let i = 0;
-    i < wholesaleVariants.length && i < retailVariants.length;
-    i++
-  ) {
-    const wv = wholesaleVariants[i];
-    const rv = retailVariants[i];
+  for (const [wv, rv] of pairVariantsBySku(wholesaleVariants, retailVariants)) {
     const qty = wv.inventory_quantity ?? 0;
     if (!rv.inventory_item_id) continue;
     try {
@@ -82,15 +110,19 @@ async function setRetailInventoryForProduct(
   }
 }
 
+// Parse a Shopify REST variant price string ("9.99") into a Number, or
+// null if the field is missing/blank. Shopify always serializes price as
+// a string; using Number() gives `0` for "" which would be misleading,
+// so empty/null/undefined explicitly maps to null.
+function variantPriceToNumber(raw) {
+  if (raw === null || raw === undefined || raw === "") return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
 // Store variant + inventory item mappings after a create or update.
 async function upsertVariantMappings(wholesaleVariants, retailVariants) {
-  for (
-    let i = 0;
-    i < wholesaleVariants.length && i < retailVariants.length;
-    i++
-  ) {
-    const wv = wholesaleVariants[i];
-    const rv = retailVariants[i];
+  for (const [wv, rv] of pairVariantsBySku(wholesaleVariants, retailVariants)) {
     await IdMap.updateOne(
       { entityType: "productVariant", wholesaleId: String(wv.id) },
       {
@@ -99,6 +131,12 @@ async function upsertVariantMappings(wholesaleVariants, retailVariants) {
           wholesaleId: String(wv.id),
           retailId: String(rv.id),
           wholesaleInventoryItemId: String(wv.inventory_item_id),
+          // Price snapshots — captured from BOTH stores' variant payloads
+          // at sync time. Schema field docs: services/sync/idMap.model.js.
+          wholesalePrice: variantPriceToNumber(wv.price),
+          retailPrice: variantPriceToNumber(rv.price),
+          wholesaleCompareAtPrice: variantPriceToNumber(wv.compare_at_price),
+          retailCompareAtPrice: variantPriceToNumber(rv.compare_at_price),
         },
       },
       { upsert: true },
