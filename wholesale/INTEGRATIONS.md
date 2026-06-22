@@ -698,9 +698,9 @@ passes (charge / failed-followup / sync-retry). Collection is owned solely by
     `SORT_FIELDS`, the chosen sort preserved across filter changes by the
     `AdvancedFilters` `extraParams` prop — and pagination. Columns: **Order**
     (number + date stacked), **Total**, **Payment** (Shopify financial status),
-    **Fulfillment**, **Delivery status**, **QBO Invoice**, **Vendor Bill**, and
-    **Actions** (mirroring the ns-retail "practitioner" Order List's cell
-    layout). **Fulfillment** stacks the ship date (`shippedAt`, subdued, on top)
+    **Fulfillment**, **Delivery status**, **QBO Invoice**, **Vendor Bill**,
+    **Remarks**, and **Actions** (mirroring the ns-retail "practitioner" Order
+    List's cell layout). **Fulfillment** stacks the ship date (`shippedAt`, subdued, on top)
     → fulfillment badge → carrier tracking link(s); **Delivery status** stacks
     the delivered date (`deliveredAt`, on top) → delivery badge. Tracking has
     no standalone column — it lists one clickable carrier link per shipment
@@ -731,6 +731,14 @@ passes (charge / failed-followup / sync-retry). Collection is owned solely by
     the read; wholesale never writes it (single-owner discipline — the symmetric
     pattern to ns-retail read-only-mirroring the wholesale `invoices` /
     `dropship_mappings` collections). Renders "—" when no linked bill exists.
+    The **Remarks** column shows the linked invoice's latest `remarks[]` entry
+    (the drop-ship collection / admin-action note — e.g. a "Duplicate
+    transaction" collection error) + a "+N more" pointer to the detail page,
+    plus a critical "Collection failed — $X · N/M attempts" header when the
+    invoice `paymentStatus` is `failed`. Mirrors the wholesale Orders list's
+    `RemarksCell` (no cheque/ACH "Payment Due" cue — drop-ship uses
+    `paymentMethod: 'dropship'`); the invoice join selects `remarks` + the
+    amount/attempt fields and each row projects a `remarks` summary.
   - `app.admin-orders.$id.jsx` — full detail (order info, customer info, tags,
     line items + quantities/pricing, shipping + billing addresses, shipping
     method, fulfillment + tracking numbers/URLs, order note + note attributes,

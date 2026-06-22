@@ -175,7 +175,10 @@ export const loader = async ({ request }) => {
   const invoiceById = new Map();
   if (invoiceIds.length) {
     const invoices = await Invoice.find({ _id: { $in: invoiceIds } })
-      .select("qboInvoiceId qboDocNumber paymentStatus")
+      .select(
+        "qboInvoiceId qboDocNumber paymentStatus paymentMethod amountDue " +
+          "amountPaid attemptCount maxAttempts remarks",
+      )
       .lean();
     for (const inv of invoices) invoiceById.set(inv._id.toString(), inv);
   }
@@ -303,6 +306,28 @@ export const loader = async ({ request }) => {
         // Linked ns-retail Vendor Bill (A/P) — amount + status for the Vendor
         // Bill column. Null when the order has no linked retail bill yet.
         vendorBill: vendorBillByOrderId.get(String(r.shopifyOrderId)) || null,
+        // Invoice remarks for the Remarks column — the latest drop-ship
+        // collection / admin note + total count (full timeline on the detail
+        // page). Mirrors the wholesale Orders list's Remarks column.
+        remarks: (() => {
+          const inv = r.invoiceRef
+            ? invoiceById.get(r.invoiceRef.toString())
+            : null;
+          if (!inv) return null;
+          const list = Array.isArray(inv.remarks) ? inv.remarks : [];
+          const last = list.length ? list[list.length - 1] : null;
+          return {
+            paymentStatus: inv.paymentStatus || null,
+            amountDue: inv.amountDue ?? null,
+            amountPaid: inv.amountPaid ?? null,
+            attemptCount: inv.attemptCount ?? null,
+            maxAttempts: inv.maxAttempts ?? null,
+            latest: last
+              ? { message: last.message || null, createdAt: last.createdAt || null }
+              : null,
+            count: list.length,
+          };
+        })(),
       };
     }),
     total,
@@ -429,6 +454,51 @@ function VendorBillCell({ bill, currency }) {
         <s-link href={bill.billUrl} target="_blank">
           Open in QBO{bill.docNumber ? ` ${bill.docNumber}` : ""} ↗
         </s-link>
+      )}
+    </s-stack>
+  );
+}
+
+// Remarks cell — the latest drop-ship collection / admin note from the
+// invoice's remarks[] timeline + a "+N more" pointer to the detail page.
+// Surfaces a "Collection failed" header (with the outstanding balance +
+// attempt count) when the drop-ship charge has exhausted its retries — so the
+// duplicate-transaction / decline errors are visible at a glance. Renders "—"
+// when there's nothing to show. Mirrors the wholesale Orders list's Remarks
+// column (drop-ship invoices have no cheque/ACH "Payment Due" state).
+function RemarksCell({ remarks, currency }) {
+  if (!remarks) return <s-text tone="subdued">—</s-text>;
+  const latest = remarks.latest;
+  const moreCount = Math.max(0, (remarks.count || 0) - 1);
+  const failed = remarks.paymentStatus === "failed";
+  const outstanding = Number(
+    ((remarks.amountDue ?? 0) - (remarks.amountPaid ?? 0)).toFixed(2),
+  );
+  if (!failed && !latest) return <s-text tone="subdued">—</s-text>;
+  return (
+    <s-stack direction="block" gap="none">
+      {failed && (
+        <>
+          <s-text tone="critical">
+            <strong>Collection failed — {formatAmount(outstanding, currency)}</strong>
+          </s-text>
+          {remarks.attemptCount != null && remarks.maxAttempts != null && (
+            <s-text tone="critical">
+              {remarks.attemptCount}/{remarks.maxAttempts} attempts
+            </s-text>
+          )}
+        </>
+      )}
+      {latest && (
+        <s-text tone="subdued">
+          {latest.message}
+          {latest.createdAt
+            ? ` · ${new Date(latest.createdAt).toLocaleDateString()}`
+            : ""}
+        </s-text>
+      )}
+      {moreCount > 0 && (
+        <s-text tone="subdued">+{moreCount} more (see Order)</s-text>
       )}
     </s-stack>
   );
@@ -619,6 +689,7 @@ export default function AdminOrdersList() {
               <s-table-header>Delivery status</s-table-header>
               <s-table-header>QBO Invoice</s-table-header>
               <s-table-header>Vendor Bill</s-table-header>
+              <s-table-header>Remarks</s-table-header>
               <s-table-header>Actions</s-table-header>
             </s-table-header-row>
             <s-table-body>
@@ -680,6 +751,9 @@ export default function AdminOrdersList() {
                     </s-table-cell>
                     <s-table-cell>
                       <VendorBillCell bill={r.vendorBill} currency={r.currency} />
+                    </s-table-cell>
+                    <s-table-cell>
+                      <RemarksCell remarks={r.remarks} currency={r.currency} />
                     </s-table-cell>
                     <s-table-cell>
                       <s-button
