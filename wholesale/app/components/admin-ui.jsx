@@ -218,6 +218,9 @@ export function PaymentMethodShortText({ method }) {
 //             URL and never shown as an active chip.
 //   onRefresh / refreshing: optional live-reload button (QBO/NMI tabs).
 //   applying: render the Apply button in its loading state.
+//   extraParams: caller-owned URL params (e.g. { sort, dir }) preserved
+//     across every Apply / chip-removal so a chosen sort isn't lost when
+//     the filters change. Empties are skipped; Reset still clears them.
 //
 // A control whose draft equals its default is dropped from the URL, so
 // the loader's own `param || default` fallbacks keep working unchanged.
@@ -230,6 +233,7 @@ export function AdvancedFilters({
   onRefresh,
   refreshing = false,
   applying = false,
+  extraParams = {},
 }) {
   const navigate = useNavigate();
 
@@ -265,6 +269,12 @@ export function AdvancedFilters({
     const params = new URLSearchParams();
     for (const [k, v] of Object.entries(next)) {
       if (isDefault(k, v)) continue;
+      params.set(k, String(v));
+    }
+    // Preserve caller-owned params (e.g. sort/dir) so the chosen sort
+    // survives a filter change. Empties are skipped.
+    for (const [k, v] of Object.entries(extraParams)) {
+      if (v == null || v === "") continue;
       params.set(k, String(v));
     }
     const qs = params.toString();

@@ -3843,8 +3843,12 @@ export async function listCdoOrders({
             invoiceStatus: r.retailQbo.invoiceStatus || null,
             paymentStatus: r.retailQbo.paymentSyncStatus || null,
             // Vendor Bill (A/P) summary — the dropship cost owed to the supplier
-            // + its reconciliation (paid) state.
+            // + its reconciliation (paid) state. `billUrl` / `billDocNumber`
+            // power the list's "Vendor Bills" column (status badge + deep link).
             billId: r.retailQbo.qboBillId || null,
+            billDocNumber: r.retailQbo.qboBillDocNumber || null,
+            billTotal: r.retailQbo.qboBillTotal ?? null,
+            billUrl: r.retailQbo.billUrl || null,
             billStatus: r.retailQbo.billSyncStatus || null,
             billPaymentStatus: r.retailQbo.billPaymentStatus || null,
             billReconcileStatus: r.retailQbo.billReconcileStatus || null,

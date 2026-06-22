@@ -690,8 +690,31 @@ passes (charge / failed-followup / sync-retry). Collection is owned solely by
 - A dedicated **Admin Orders** nav item exposes two read-only routes:
   - `app.admin-orders._index.jsx` — list, anchored on
     `{ customerEmail: RETAIL_CUSTOMER_EMAIL }` (captures every such order
-    regardless of `processingStatus`, including legacy `admin_order` rows),
-    with fulfillment-status chips + search + pagination.
+    regardless of `processingStatus`, including legacy `admin_order` rows).
+    Built for parity with the ns-retail Order List: the shared
+    `AdvancedFilters` form (order number / fulfillment / payment / date range),
+    **clickable sortable headers** on **Order** (`receivedAt`) and **Total**
+    (`totalAmount`) — toggling desc → asc with a ▲/▼ arrow, whitelisted via
+    `SORT_FIELDS`, the chosen sort preserved across filter changes by the
+    `AdvancedFilters` `extraParams` prop — and pagination. Columns: **Order**
+    (number + date stacked), **Total**, **Payment** (Shopify financial status),
+    **Fulfillment**, **Delivery status**, **QBO Invoice**, and **Actions**
+    (the same column set + cell layout as the ns-retail "practitioner" Order
+    List). **Fulfillment** stacks the ship date (`shippedAt`, subdued, on top)
+    → fulfillment badge → carrier tracking link(s); **Delivery status** stacks
+    the delivered date (`deliveredAt`, on top) → delivery badge. Tracking has
+    no standalone column — it lists one clickable carrier link per shipment
+    (`tracking[]` = `{ company, url }`) inside the Fulfillment cell,
+    deep-linking to the carrier page (tracking number pre-filled in the URL
+    but not shown). The **QBO Invoice** column shows the linked drop-ship
+    invoice's
+    payment-status badge (the wholesale→retail collection state — distinct from
+    Shopify's customer-facing "Payment"), an in-app PDF **Preview** (reuses the
+    `/api/admin/orders/:id/qbo-invoice-pdf` endpoint), and an **Open in QBO
+    #<docNumber>** deep link; the loader joins the page's invoices in one query
+    (`qboInvoiceId` / `qboDocNumber` / `paymentStatus`) and builds the QBO web
+    URL server-side via `getInvoiceWebUrl`. Legacy `admin_order` rows (no
+    invoice) render "—".
   - `app.admin-orders.$id.jsx` — full detail (order info, customer info, tags,
     line items + quantities/pricing, shipping + billing addresses, shipping
     method, fulfillment + tracking numbers/URLs, order note + note attributes,
