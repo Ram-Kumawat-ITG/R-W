@@ -20,6 +20,17 @@ export const dropshipPaymentConfig = {
   // silently no-ops.
   vaultId: readEnv('DROPSHIP_NMI_VAULT_ID'),
 
+  // NOTE on NMI "Duplicate transaction" rejections: because every drop-ship
+  // invoice charges the SAME shared vault, two distinct orders of the same
+  // amount look identical to NMI's gateway-level duplicate check and the second
+  // is rejected with "Duplicate transaction REFID:…". We CANNOT fix this from
+  // code — this processor forbids the per-transaction `dup_seconds` override
+  // ("Overriding Duplicate Threshold is not allowed for this processor",
+  // code 300), so any attempt to pass it fails EVERY charge. The fix is
+  // operational: in the NMI control panel adjust "Duplicate Transaction
+  // Checking" for this MID — disable it, shorten the window, or set it to key
+  // on order id (we send a unique `orderid` per order in `chargeCustomerVault`).
+
   // Production cron — "once per month" per the requirement. Default 00:30 on
   // the 1st of each month (in `timezone`). Fully overridable via
   // DROPSHIP_PAYMENT_CRON without a code change. Independent of the wholesale

@@ -2445,6 +2445,31 @@ When unset, every invoice is skipped with a clear
 `no DROPSHIP_NMI_VAULT_ID configured` reason (recorded on a PaymentAttempt
 + a `cron_dropship_attempt` remark) — the job never silently no-ops.
 
+**NMI duplicate-transaction handling (shared-vault gotcha — GATEWAY CONFIG, not
+code).** Because every drop-ship invoice charges the SAME vault, two distinct
+orders that happen to cost the same amount look identical to NMI's gateway-level
+amount+card duplicate-transaction check, and the second sale is rejected with
+`Duplicate transaction REFID:…` (it surfaces as an errored
+`cron_dropship_attempt` remark). **This cannot be fixed from code on this
+processor.** NMI's only per-transaction lever is `dup_seconds`, and this
+processor forbids it both ways: `dup_seconds=0` (disable) →
+`Disabling Duplicate Check is not allowed for this processor` (code 300), and any
+positive `dup_seconds=N` (override the window) →
+`Overriding Duplicate Threshold is not allowed for this processor` (code 300).
+Sending `dup_seconds` at all therefore fails EVERY drop-ship charge (even
+unique-amount orders), so we deliberately **never send it** (see the comment in
+`chargeCustomerVault`). The resolution is operational: in the **NMI control
+panel** → *Settings → Transaction/Security Options → Duplicate Transaction
+Checking* for this MID, **disable it, shorten the window, or set it to key on
+order id**. We send a unique `orderid` per order
+(`invoice.shopifyOrderId || invoice._id`), so the order-id-keyed mode lets NMI
+distinguish distinct orders. Relaxing NMI's amount-based dup check is safe
+because a *same-invoice* double-charge is already impossible regardless:
+`chargeInvoice` flips the invoice to `in_progress` **before** the sale (PASS A
+only sweeps `pending`, and the admin "Collect payment now" excludes
+`in_progress`), and the claim-first unique `(shop, shopifyOrderId)` invoice index
+guarantees one invoice per order.
+
 **Code:** `services/dropship/dropshipPayment.service.collectDropshipPayments()`
 + `dropshipPayment.config.js`; thin Agenda wrapper
 `services/scheduler/jobs/processDropshipPayments.job.js` (concurrency:1).

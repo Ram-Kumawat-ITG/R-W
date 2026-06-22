@@ -399,6 +399,13 @@ export async function chargeCustomerVault({ customerVaultId, amount, currency, o
     order_description: invoiceNumber ? `Invoice ${invoiceNumber}` : undefined,
   }
   if (billingId) params.billing_id = String(billingId)
+  // NOTE: we intentionally do NOT send NMI's `dup_seconds`. Some processors
+  // (incl. this account's) reject it outright — "Overriding Duplicate Threshold
+  // is not allowed for this processor" (code 300), which would fail EVERY charge,
+  // not just true duplicates. NMI's duplicate-transaction window is controlled
+  // gateway-side; for the shared drop-ship vault, configure "Duplicate
+  // Transaction Checking" in the NMI control panel (disable it, shorten the
+  // window, or key it on order id — we send a unique `orderid` per order).
 
   console.log(
     `\n[NMI charge] vault=${customerVaultId}${billingId ? ` billing=${billingId}` : ''} ` +
