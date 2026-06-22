@@ -698,9 +698,9 @@ passes (charge / failed-followup / sync-retry). Collection is owned solely by
     `SORT_FIELDS`, the chosen sort preserved across filter changes by the
     `AdvancedFilters` `extraParams` prop — and pagination. Columns: **Order**
     (number + date stacked), **Total**, **Payment** (Shopify financial status),
-    **Fulfillment**, **Delivery status**, **QBO Invoice**, and **Actions**
-    (the same column set + cell layout as the ns-retail "practitioner" Order
-    List). **Fulfillment** stacks the ship date (`shippedAt`, subdued, on top)
+    **Fulfillment**, **Delivery status**, **QBO Invoice**, **Vendor Bill**, and
+    **Actions** (mirroring the ns-retail "practitioner" Order List's cell
+    layout). **Fulfillment** stacks the ship date (`shippedAt`, subdued, on top)
     → fulfillment badge → carrier tracking link(s); **Delivery status** stacks
     the delivered date (`deliveredAt`, on top) → delivery badge. Tracking has
     no standalone column — it lists one clickable carrier link per shipment
@@ -714,7 +714,23 @@ passes (charge / failed-followup / sync-retry). Collection is owned solely by
     #<docNumber>** deep link; the loader joins the page's invoices in one query
     (`qboInvoiceId` / `qboDocNumber` / `paymentStatus`) and builds the QBO web
     URL server-side via `getInvoiceWebUrl`. Legacy `admin_order` rows (no
-    invoice) render "—".
+    invoice) render "—". The **Vendor Bill** column surfaces the linked
+    **ns-retail Vendor Bill** (A/P — what the retail company owes Natural
+    Solution Wholesale for this drop-ship order; the wholesale app never creates
+    a vendor bill, only the dropship invoice). It shows the **bill amount**
+    (`qboBillTotal`) + a **status badge** (Paid once reconciled against the paid
+    wholesale invoice / Unpaid while `created` / Reconcile-error / Error) + an
+    **Open in QBO #<docNumber>** deep link. Sourced cross-repo on the shared
+    `natural-solutions` DB via a **two-hop join** (no N+1, no live API call):
+    wholesale `ShopifyOrder.shopifyOrderId` → `dropship_mappings.wholesaleOrderId`
+    → `mapping.retailOrderGid` → `cdo_orders.shopifyOrderId` (a GID) →
+    `retailQbo` bill fields. The bill data is read from `cdo_orders.retailQbo`
+    (ns-retail-owned, written there) — NOT the legacy `dropship_mappings.retailQboBillId`
+    (unwritten/`null`). A new READ-ONLY mirror model `models/retailCdoOrder.server.js`
+    (collection `cdo_orders`, `strict:false`, declares only the bill fields) does
+    the read; wholesale never writes it (single-owner discipline — the symmetric
+    pattern to ns-retail read-only-mirroring the wholesale `invoices` /
+    `dropship_mappings` collections). Renders "—" when no linked bill exists.
   - `app.admin-orders.$id.jsx` — full detail (order info, customer info, tags,
     line items + quantities/pricing, shipping + billing addresses, shipping
     method, fulfillment + tracking numbers/URLs, order note + note attributes,

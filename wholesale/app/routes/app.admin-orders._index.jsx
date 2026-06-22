@@ -11,6 +11,8 @@ import { authenticate } from "../shopify.server";
 import connectDB from "../services/APIService/mongo.service";
 import ShopifyOrder from "../models/order.server";
 import Invoice from "../models/invoice.server";
+import DropshipMapping from "../models/dropshipMapping.server";
+import RetailCdoOrder from "../models/retailCdoOrder.server";
 import { RETAIL_CUSTOMER_EMAIL } from "../services/dropship/dropship.config";
 import { getInvoiceWebUrl } from "../services/qbo/qbo.service";
 import {
@@ -178,6 +180,54 @@ export const loader = async ({ request }) => {
     for (const inv of invoices) invoiceById.set(inv._id.toString(), inv);
   }
 
+  // Vendor Bill (A/P) join — cross-repo, READ-ONLY. Each drop-ship Admin Order
+  // has a linked ns-retail order that carries the retail QBO **Vendor Bill**
+  // (what the retail company owes Natural Solution Wholesale for the dropship).
+  // Resolve it in two hops on the shared DB (no N+1, no live API call):
+  //   wholesale shopifyOrderId → dropship_mappings.wholesaleOrderId
+  //   → mapping.retailOrderGid → cdo_orders.shopifyOrderId → retailQbo bill fields.
+  // The bill is owned + written by ns-retail; the wholesale list only reads it.
+  const wsOrderIds = rows.map((r) => String(r.shopifyOrderId)).filter(Boolean);
+  const vendorBillByOrderId = new Map();
+  if (wsOrderIds.length) {
+    const maps = await DropshipMapping.find({
+      wholesaleOrderId: { $in: wsOrderIds },
+    })
+      .select("wholesaleOrderId retailOrderGid")
+      .lean();
+    const retailGidByWsId = new Map();
+    const retailGids = [];
+    for (const m of maps) {
+      if (m.wholesaleOrderId && m.retailOrderGid) {
+        retailGidByWsId.set(String(m.wholesaleOrderId), m.retailOrderGid);
+        retailGids.push(m.retailOrderGid);
+      }
+    }
+    if (retailGids.length) {
+      const cdoRows = await RetailCdoOrder.find({
+        shopifyOrderId: { $in: retailGids },
+      })
+        .select("shopifyOrderId retailQbo")
+        .lean();
+      const rqByGid = new Map();
+      for (const c of cdoRows) rqByGid.set(c.shopifyOrderId, c.retailQbo || null);
+      for (const [wsId, gid] of retailGidByWsId) {
+        const rq = rqByGid.get(gid);
+        if (rq?.qboBillId) {
+          vendorBillByOrderId.set(wsId, {
+            billId: rq.qboBillId,
+            docNumber: rq.qboBillDocNumber || null,
+            amount: rq.qboBillTotal ?? null,
+            billUrl: rq.billUrl || null,
+            syncStatus: rq.billSyncStatus || null,
+            paymentStatus: rq.billPaymentStatus || null,
+            reconcileStatus: rq.billReconcileStatus || null,
+          });
+        }
+      }
+    }
+  }
+
   return {
     rows: rows.map((r) => {
       const fulfillments = Array.isArray(r.fulfillments) ? r.fulfillments : [];
@@ -250,6 +300,9 @@ export const loader = async ({ request }) => {
             qboInvoiceUrl: getInvoiceWebUrl(inv.qboInvoiceId),
           };
         })(),
+        // Linked ns-retail Vendor Bill (A/P) — amount + status for the Vendor
+        // Bill column. Null when the order has no linked retail bill yet.
+        vendorBill: vendorBillByOrderId.get(String(r.shopifyOrderId)) || null,
       };
     }),
     total,
@@ -343,6 +396,40 @@ function QboInvoiceCell({ invoice, previewing, onPreview }) {
           </s-link>
         )}
       </s-stack>
+    </s-stack>
+  );
+}
+
+// Vendor Bill cell — the linked ns-retail Vendor Bill (A/P): what the retail
+// company owes Natural Solution Wholesale for this drop-ship order. Shows the
+// bill amount + a settlement-status badge (Paid once reconciled against the
+// paid wholesale invoice, else Unpaid / Error), plus a deep link into QBO.
+// Renders "—" for orders with no linked retail bill (e.g. legacy admin orders).
+function VendorBillCell({ bill, currency }) {
+  if (!bill?.billId) return <s-text tone="subdued">—</s-text>;
+  let badge;
+  if (bill.paymentStatus === "paid") {
+    badge = <s-badge tone="success">Paid</s-badge>;
+  } else if (bill.reconcileStatus === "error") {
+    badge = <s-badge tone="critical">Reconcile error</s-badge>;
+  } else if (bill.syncStatus === "error") {
+    badge = <s-badge tone="critical">Error</s-badge>;
+  } else if (bill.syncStatus === "created") {
+    badge = <s-badge tone="warning">Unpaid</s-badge>;
+  } else {
+    badge = <s-badge tone="default">{bill.syncStatus || "Pending"}</s-badge>;
+  }
+  return (
+    <s-stack direction="block" gap="small-200">
+      <s-text>
+        {bill.amount != null ? formatAmount(bill.amount, currency) : "—"}
+      </s-text>
+      {badge}
+      {bill.billUrl && (
+        <s-link href={bill.billUrl} target="_blank">
+          Open in QBO{bill.docNumber ? ` ${bill.docNumber}` : ""} ↗
+        </s-link>
+      )}
     </s-stack>
   );
 }
@@ -531,6 +618,7 @@ export default function AdminOrdersList() {
               <s-table-header>Fulfillment</s-table-header>
               <s-table-header>Delivery status</s-table-header>
               <s-table-header>QBO Invoice</s-table-header>
+              <s-table-header>Vendor Bill</s-table-header>
               <s-table-header>Actions</s-table-header>
             </s-table-header-row>
             <s-table-body>
@@ -589,6 +677,9 @@ export default function AdminOrdersList() {
                         previewing={previewingId === r.id}
                         onPreview={() => onPreviewInvoice(r.id)}
                       />
+                    </s-table-cell>
+                    <s-table-cell>
+                      <VendorBillCell bill={r.vendorBill} currency={r.currency} />
                     </s-table-cell>
                     <s-table-cell>
                       <s-button
