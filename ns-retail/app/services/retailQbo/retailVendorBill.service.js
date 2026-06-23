@@ -19,6 +19,7 @@
 
 import connectDB from "../../db/mongo.server";
 import CdoOrder from "../../models/cdoOrder.server";
+import SyncIdMap from "../../models/syncIdMap.server";
 import { isRetailQboConfigured, retailQboConfig } from "./retailQbo.config";
 import {
   resolveDropshipVendorId,
@@ -32,6 +33,42 @@ const log = createLogger("retail.vendor_bill");
 
 function errMsg(err) {
   return String(err?.message || err || "unknown error").slice(0, 1000);
+}
+
+// Build a Map(retailVariantId → wholesale unit price) for an order's lines by
+// reading the wholesale product sync's `sync_id_maps` snapshot. This is the
+// SAME source the wholesale dropship invoice prices from, so the bill (A/P)
+// matches the wholesale invoice (A/R). Single batched query; best-effort — a
+// lookup failure or a missing/zero snapshot just leaves that variant out of
+// the map, and createBillForOrder falls back to retail × wholesalePriceFactor.
+async function buildWholesalePriceMap(lineItems) {
+  const map = new Map();
+  const ids = [
+    ...new Set(
+      (lineItems || [])
+        .map((li) => li?.variantId)
+        .filter((v) => v != null && v !== "")
+        .map(String),
+    ),
+  ];
+  if (ids.length === 0) return map;
+  try {
+    const rows = await SyncIdMap.find({
+      entityType: "productVariant",
+      retailId: { $in: ids },
+    })
+      .select("retailId wholesalePrice")
+      .lean();
+    for (const r of rows) {
+      const wp = Number(r.wholesalePrice);
+      if (Number.isFinite(wp) && wp > 0) {
+        map.set(String(r.retailId), Math.round(wp * 100) / 100);
+      }
+    }
+  } catch (err) {
+    log.warn("wholesale_price_map_failed", { err: err?.message || err });
+  }
+  return map;
 }
 
 // Create the QBO Vendor Bill for a retail dropship order, once. Idempotent via
@@ -115,6 +152,12 @@ export async function ensureRetailVendorBillForOrder({ shop, shopifyOrderId, for
     const vendorId = await resolveDropshipVendorId();
     const expenseAccountId = await resolveDropshipExpenseAccountId();
 
+    // Resolve each line's actual WHOLESALE product price from sync_id_maps
+    // (written by the wholesale product sync) so the vendor bill matches the
+    // wholesale dropship invoice for the same order. Lines with no mapping
+    // fall back to retail × wholesalePriceFactor inside createBillForOrder.
+    const wholesalePriceByVariantId = await buildWholesalePriceMap(order.lineItems);
+
     // QBO caps requestid at 50 chars; key off the short numeric tail of the GID.
     const shortOrderId = String(shopifyOrderId).split("/").pop() || shopifyOrderId;
     const bill = await createBillForOrder({
@@ -123,6 +166,7 @@ export async function ensureRetailVendorBillForOrder({ shop, shopifyOrderId, for
       expenseAccountId,
       apAccountId: retailQboConfig.apAccountId,
       priceFactor: retailQboConfig.wholesalePriceFactor,
+      wholesalePriceByVariantId,
       includeShipping: retailQboConfig.billIncludesShipping,
       requestId: `retail-bill-${shortOrderId}`.slice(0, 50),
     });

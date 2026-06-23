@@ -570,16 +570,24 @@ function firstShippingPrice(order) {
 }
 
 // Build the QBO Bill payload from a cdo_orders snapshot, mirroring the wholesale
-// dropship invoice: one AccountBasedExpenseLine per product at the wholesale
-// price (BASE unit price × priceFactor, discounts ignored — matching the
-// wholesale ½-base formula) + an optional Shipping line at full retail cost.
+// dropship invoice: one AccountBasedExpenseLine per product at the actual
+// WHOLESALE product price + an optional Shipping line at full retail cost.
 // Idempotent at the QBO layer via `requestid`. Returns the created Bill.
+//
+// Per-line unit pricing precedence (keeps the bill in sync with the wholesale
+// invoice, which prices from the same source):
+//   1. wholesalePriceByVariantId — the actual wholesale Shopify variant price
+//      (sync_id_maps.wholesalePrice), keyed by the line's retail variant id.
+//   2. retail BASE unit price × priceFactor — graceful fallback when a
+//      variant's wholesale price snapshot isn't populated (legacy ½ behavior).
+// Discounts are ignored in both cases (matching the wholesale base formula).
 export async function createBillForOrder({
   order,
   vendorId,
   expenseAccountId,
   apAccountId,
   priceFactor = 0.5,
+  wholesalePriceByVariantId,
   includeShipping = true,
   requestId,
 }) {
@@ -587,12 +595,19 @@ export async function createBillForOrder({
   if (!expenseAccountId) throw new Error("createBillForOrder: expenseAccountId is required");
 
   const factor = Number.isFinite(Number(priceFactor)) ? Number(priceFactor) : 0.5;
+  const wsPrices =
+    wholesalePriceByVariantId instanceof Map ? wholesalePriceByVariantId : new Map();
   const expenseRef = { value: String(expenseAccountId) };
   const lines = [];
 
   for (const li of order.lineItems || []) {
     const qty = Number(li.quantity) || 0;
-    const unit = round2((Number(li.price) || 0) * factor);
+    // Prefer the actual wholesale product price; fall back to retail × factor.
+    const mapped = li.variantId != null ? wsPrices.get(String(li.variantId)) : undefined;
+    const unit =
+      Number.isFinite(mapped) && mapped > 0
+        ? round2(mapped)
+        : round2((Number(li.price) || 0) * factor);
     const amount = round2(unit * qty);
     if (!(amount > 0)) continue;
     const titleParts = [li.title, li.variantTitle].filter(Boolean).join(" · ");

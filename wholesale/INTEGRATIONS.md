@@ -681,6 +681,42 @@ just-created invoice if `orders/cancelled` overtook creation.
 passes (charge / failed-followup / sync-retry). Collection is owned solely by
 `process-dropship-payments` (§10.6), which sweeps `isDropship: true`.
 
+**Line-item pricing — the WHOLESALE product price (not ½-of-retail).** The
+drop-ship orchestrator (`services/dropship/dropship.service.js`) builds the
+parallel **wholesale Shopify order** that the invoice is generated from. Each
+retail order line is mapped to its wholesale variant via the product sync's
+`sync_id_maps` collection (`entityType:'productVariant'`, keyed by
+`retailId` = the retail variant id), and the wholesale **Draft Order** line is
+priced at the **actual wholesale product price**:
+
+- **Primary source:** `sync_id_maps.wholesalePrice` — the wholesale Shopify
+  variant's price, captured by the product sync (`services/sync/product.sync.js`
+  `upsertVariantMappings`) on every product create/update. `resolveWholesaleLines`
+  applies it as the Draft Order `priceOverride`; `shopifyLinesToQboLines` then
+  reads it straight onto the QBO invoice lines, so the Admin Order invoice shows
+  the true per-product wholesale price.
+- **Fallback:** for a variant whose `wholesalePrice` snapshot isn't populated
+  yet, the line falls back to `retail base price × 0.5` (the legacy ½-of-retail
+  behavior) so an un-synced product never blocks invoicing. Logged per line via
+  `log.info('dropship_line_pricing', …)` with the chosen `source`.
+
+  > Historical note: the original drop-ship cut priced **every** line at ½ of
+  > the retail price (an approximation that's only correct when retail is exactly
+  > 2× wholesale). That is now the fallback, not the default.
+
+**Vendor Bill stays in sync (A/P = A/R).** The retail-side QBO **Vendor Bill**
+(ns-retail `services/retailQbo/retailVendorBill.service.js` +
+`retailQbo.service.createBillForOrder`) — what the retail company owes the
+wholesale supplier — is built from the **same** `sync_id_maps.wholesalePrice`
+field (ns-retail reads it through a read-only `models/syncIdMap.server.js`
+mirror, single-owner discipline), with the identical `retail × factor`
+fallback (`QBO_RETAIL_WHOLESALE_PRICE_FACTOR`, 0.5). Because both the wholesale
+invoice and the retail vendor bill resolve each line from the same source, the
+two documents match by construction. (The bill-payment reconciliation in
+`retailBillReconcile.service.js` is amount-agnostic — it pays the bill's full
+balance when the wholesale invoice is `paid` — so this change does not alter
+reconciliation behavior.)
+
 **Separation in the UI.**
 
 - The wholesale **Orders** list (`app.orders._index.jsx`) excludes them with
