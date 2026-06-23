@@ -749,6 +749,29 @@ passes (charge / failed-followup / sync-retry). Collection is owned solely by
     hard-guards with `isRetailCustomerEmail` so a wholesale order id cannot
     resolve here (and vice versa).
 
+    **Line items data table (shared, sortable, printable).** The line-items
+    section on both Order Details pages (`app.orders.$id.jsx` and
+    `app.admin-orders.$id.jsx`) renders through one shared component,
+    `LineItemsTable` in `app/components/admin-ui.jsx`. It is a Polaris
+    `s-table` with **clickable, sortable column headers** (Product / SKU / Qty /
+    Unit price / Discount / Line total — `s-clickable` in each header, ▲/▼ on
+    the active column; the same header-toggle idiom the Orders/Admin-Orders
+    list pages use). Default sort is **Product A→Z**; clicking the active column
+    flips its direction, clicking a new column starts ascending. Sorting is
+    **client-side** over the loader-provided rows (the full line-item set is
+    already in hand — no loader round-trip) via a locale-aware `Intl.Collator`
+    for text columns and numeric compare for the rest, with an always-A→Z
+    tiebreak on product name. The component also exposes **Print** (opens a
+    clean, print-ready window of the current sorted order — opened
+    synchronously for popup-blocker safety, same pattern as the PDF-preview
+    windows) and **Export CSV** (downloads the current sorted order as a
+    BOM-prefixed UTF-8 CSV via a `Blob` + anchor click). Both pages keep their
+    own totals box as a sibling below the table (the wholesale page's
+    `invoiceCalc` breakdown vs. the admin page's `totals`) — only the
+    line-item table itself is shared. Pure Polaris `s-*`; the print window is a
+    separate generated document (not the admin-route DOM), so its inline styles
+    don't violate the no-CSS-in-admin-routes rule.
+
     **Invoice view + actions (parity with the wholesale Order Details page).**
     The detail page surfaces the full invoice the same way the wholesale page
     does: an **Invoice & payment** summary (status / method / amounts / balance

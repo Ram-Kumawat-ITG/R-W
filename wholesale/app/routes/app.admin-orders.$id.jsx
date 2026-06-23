@@ -24,6 +24,7 @@ import {
   PaymentStatusBadge,
   PaymentMethodBadge,
   OutcomeBadge,
+  LineItemsTable,
 } from "../components/admin-ui";
 import { carrierDisplayName } from "../utils/shipping.constants";
 import { formatAmount, fmtDateTime } from "../utils/format.utils";
@@ -931,47 +932,11 @@ export default function AdminOrderDetail() {
           </s-paragraph>
         ) : (
           <s-stack direction="block" gap="base">
-            <s-table>
-              <s-table-header-row>
-                <s-table-header>Product</s-table-header>
-                <s-table-header>SKU</s-table-header>
-                <s-table-header>Qty</s-table-header>
-                <s-table-header>Unit price</s-table-header>
-                <s-table-header>Discount</s-table-header>
-                <s-table-header>Line total</s-table-header>
-              </s-table-header-row>
-              <s-table-body>
-                {details.lineItems.map((li) => (
-                  <s-table-row key={li.id || `${li.name}-${li.sku}`}>
-                    <s-table-cell>
-                      <s-stack direction="block" gap="none">
-                        <s-text>{li.name}</s-text>
-                        {li.variantTitle && (
-                          <s-text tone="subdued">{li.variantTitle}</s-text>
-                        )}
-                        {li.vendor && (
-                          <s-text tone="subdued">by {li.vendor}</s-text>
-                        )}
-                        {li.giftCard && <s-badge tone="info">Gift card</s-badge>}
-                      </s-stack>
-                    </s-table-cell>
-                    <s-table-cell>{li.sku || "—"}</s-table-cell>
-                    <s-table-cell>{li.quantity}</s-table-cell>
-                    <s-table-cell>
-                      {formatAmount(li.unitPrice, currency)}
-                    </s-table-cell>
-                    <s-table-cell>
-                      {li.discount > 0
-                        ? `− ${formatAmount(li.discount, currency)}`
-                        : "—"}
-                    </s-table-cell>
-                    <s-table-cell>
-                      {formatAmount(li.lineTotal, currency)}
-                    </s-table-cell>
-                  </s-table-row>
-                ))}
-              </s-table-body>
-            </s-table>
+            <LineItemsTable
+              lineItems={details.lineItems}
+              currency={currency}
+              orderLabel={orderLabel}
+            />
 
             {totals && (
               <s-box
