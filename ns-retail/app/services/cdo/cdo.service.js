@@ -53,6 +53,11 @@ import {
   deriveDeliveredAt,
   extractTracking,
 } from "../../utils/orderStatus";
+import {
+  normalizeReferralCode,
+  escapeRegexLiteral,
+} from "../../utils/referralCode";
+import { orderEmail } from "../../utils/orderUtils";
 
 const log = createLogger("cdo.service");
 
@@ -242,8 +247,46 @@ export async function getSettings() {
       ? doc.vendorCommissions
       : [],
     commissionConfigVersion: doc?.commissionConfigVersion ?? 1,
+    // Optional per-tier business rules — see evaluateTierRules (bug 13 hook).
+    tierRules: Array.isArray(doc?.tierRules) ? doc.tierRules : [],
     configured: Boolean(doc),
   };
+}
+
+// Tier-specific business-rule extension point (bug 13). With no rules
+// configured this is a pass-through, so today every active code is equally
+// valid. When `cdo_settings.tierRules` is populated, a future rule can
+// restrict a code BY TIER (e.g. "30%+ codes are first-order only", "10% codes
+// are evergreen") by adding DATA + a small evaluator branch below — never a
+// rewrite of validateReferralCode. Returns { ok, reason? }.
+//
+//   codeDoc          – the matched cdo_practitioner_codes row
+//   settings         – getSettings() result (carries tierRules)
+//   context          – optional { email, customerId, ... } for rules that
+//                      need buyer history (e.g. first-order-only); evaluators
+//                      that need it and don't get it fail OPEN (don't block).
+//
+// Unknown / not-yet-implemented rule kinds fail OPEN so configuring a rule in
+// the UI before its evaluator ships can never break checkout.
+export function evaluateTierRules({ codeDoc, settings, context } = {}) {
+  void context;
+  const rules = Array.isArray(settings?.tierRules) ? settings.tierRules : [];
+  if (!rules.length) return { ok: true };
+  const tier = Number(codeDoc?.discountPercent ?? 0);
+  for (const rule of rules) {
+    if (!rule || rule.enabled === false) continue;
+    // null target = applies to all tiers; otherwise must match this code's tier.
+    if (rule.discountPercent != null && Number(rule.discountPercent) !== tier) {
+      continue;
+    }
+    switch (rule.kind) {
+      // Register concrete rule kinds here as they're built, e.g.:
+      //   case "first_order_only": return evaluateFirstOrderOnly(context);
+      default:
+        break; // unknown kind → fail open (ignore)
+    }
+  }
+  return { ok: true };
 }
 
 // ── Per-vendor commission configuration ──────────────────────────────
@@ -470,6 +513,49 @@ function computeOrderCommission(doc, { vendorCommissions, configVersion } = {}) 
     computedAt: new Date(),
   };
   return { commissionAmount, snapshot };
+}
+
+// Compute-on-read projection of an order's commission breakdown (bug 9 + 11).
+// Prefers the frozen `commissionSnapshot` captured at ingest (per-line vendor +
+// rate + amount). For LEGACY orders ingested before snapshots existed
+// (snapshot null — `commissionSnapshot` is forever null on those), it
+// reconstructs a best-effort SINGLE blended line from the stored
+// `commissionAmount` ÷ the commission base (product subtotal, falling back to
+// the order gross) so the detail view can still explain the math instead of
+// showing nothing — flagged `reconstructed:true` so the UI can label it
+// approximate. Pure (no DB) — safe to call from a loader projection.
+export function projectCommissionSnapshot(order) {
+  const snap = order?.commissionSnapshot;
+  if (snap && Array.isArray(snap.lines) && snap.lines.length) {
+    return {
+      lines: snap.lines.map((l) => ({
+        vendor: l.vendor || null,
+        revenue: Number(l.revenue) || 0,
+        rate: Number(l.rate) || 0,
+        amount: Number(l.amount) || 0,
+      })),
+      effectiveRate: Number.isFinite(snap.effectiveRate) ? snap.effectiveRate : null,
+      configVersion: snap.configVersion ?? null,
+      computedAt: snap.computedAt || null,
+      reconstructed: false,
+    };
+  }
+  const amount = roundMoney(Number(order?.commissionAmount) || 0);
+  if (amount <= 0) {
+    return { lines: [], effectiveRate: 0, configVersion: null, computedAt: null, reconstructed: true };
+  }
+  const revenue =
+    Number(order?.pricing?.subtotal) ||
+    Number(order?.amount) ||
+    0;
+  const effectiveRate = revenue > 0 ? Number((amount / revenue).toFixed(4)) : 0;
+  return {
+    lines: [{ vendor: null, revenue, rate: effectiveRate, amount }],
+    effectiveRate,
+    configVersion: null,
+    computedAt: null,
+    reconstructed: true,
+  };
 }
 
 // Dashboard KPIs + supporting lists. Computed in parallel; safe against
@@ -785,13 +871,15 @@ export async function getPrimaryCode(practitionerId) {
   );
 }
 
-// Code validation helper — used by createPractitionerCode + update. The
-// storefront matches case-insensitively, but we normalise to uppercase
-// at write time so the unique index works reliably.
+// Code validation helper — used by createPractitionerCode + update. Normalised
+// to LOWERCASE (via the shared normalizeReferralCode) so the admin path agrees
+// with the portal path and the catalogue schema — previously this uppercased
+// while the portal lowercased, and both only ended up lowercase because the
+// schema forced it. Now the canonical form is lowercase at every write site.
 function normalizeAndValidateCode(rawCode) {
-  const code = String(rawCode || "").trim().toUpperCase();
+  const code = normalizeReferralCode(rawCode);
   if (!code) throw new Error("Referral code is required");
-  if (!/^[A-Z0-9-]{3,40}$/.test(code)) {
+  if (!/^[a-z0-9-]{3,40}$/.test(code)) {
     throw new Error(
       "Code must be 3–40 characters, letters / digits / hyphens only",
     );
@@ -1113,11 +1201,17 @@ const CUSTOMER_TYPES = ["retailer", "patient"];
 // matching the { shop, code } uniqueness index. Omit it for single-tenant
 // callers (the lookup then ignores shop).
 export async function validateReferralCode(rawCode, { shop } = {}) {
-  const code = String(rawCode || "").trim().toUpperCase();
+  const code = normalizeReferralCode(rawCode);
   if (!code) return { valid: false, reason: "empty" };
   await connectDB();
 
-  const codeQuery = { code };
+  // Match the canonical (lowercase) code via a case-insensitive regex so any
+  // legacy mixed-case catalogue row still resolves. (Previously this UPPERCASED
+  // the input then matched it EXACTLY against the lowercase-stored catalogue —
+  // so it could never match; this also unifies it with resolvePractitionerReferral.)
+  const codeQuery = {
+    code: { $regex: `^${escapeRegexLiteral(code)}$`, $options: "i" },
+  };
   if (shop !== undefined) codeQuery.shop = shop;
   const codeDoc = await CdoPractitionerCode.findOne(codeQuery).lean();
   if (!codeDoc) return { valid: false, reason: "not_found", code };
@@ -1152,6 +1246,19 @@ export async function validateReferralCode(rawCode, { shop } = {}) {
     codeDoc.commissionRate != null
       ? codeDoc.commissionRate
       : settings.defaultCommissionRate;
+
+  // Tier-rule extension hook (bug 13). No-op until cdo_settings.tierRules is
+  // configured; lets the program later gate codes by tier without changing
+  // this function.
+  const tierGate = evaluateTierRules({ codeDoc, settings });
+  if (!tierGate.ok) {
+    return {
+      valid: false,
+      reason: tierGate.reason || "tier_rule",
+      code: codeDoc.code,
+      status: codeDoc.status,
+    };
+  }
 
   return {
     valid: true,
@@ -1752,19 +1859,33 @@ async function createCommissionForOrder(order, settings) {
         : settings.defaultCommissionRate;
   const earnedAt = order.placedAt || order.createdAt || new Date();
 
-  const commission = await CdoCommission.create({
-    shop: order.shop,
-    practitionerId: order.practitionerId,
-    practitionerEmail: order.practitionerEmail,
-    practitionerName: order.practitionerName,
-    orderId: order._id,
-    orderName: order.orderName,
-    currency: order.currency || settings.currency,
-    amount,
-    rate,
-    status: autoApprove ? "approved" : "pending",
-    earnedAt,
-  });
+  let commission;
+  try {
+    commission = await CdoCommission.create({
+      shop: order.shop,
+      practitionerId: order.practitionerId,
+      practitionerEmail: order.practitionerEmail,
+      practitionerName: order.practitionerName,
+      orderId: order._id,
+      orderName: order.orderName,
+      currency: order.currency || settings.currency,
+      amount,
+      rate,
+      status: autoApprove ? "approved" : "pending",
+      earnedAt,
+    });
+  } catch (err) {
+    // Idempotency net for the concurrent-webhook race: the `findOne` check
+    // above is not atomic, so two simultaneous deliveries can both pass it.
+    // The unique `orderId` index rejects the loser's insert with E11000 —
+    // treat that as "already created" and DO NOT append a second ledger
+    // entry (which would double-credit the practitioner).
+    if (err?.code === 11000) {
+      const winner = await CdoCommission.findOne({ orderId: order._id }).lean();
+      return { created: false, commission: winner };
+    }
+    throw err;
+  }
   await appendLedgerEntry({
     shop: order.shop,
     practitionerId: order.practitionerId,
@@ -2531,14 +2652,9 @@ export async function resolvePractitionerReferral(rawCode, { shop } = {}) {
   };
 }
 
-// Extract the buyer email from an orders/create payload (lowercased).
-function orderEmail(payload) {
-  return String(
-    payload?.email || payload?.contact_email || payload?.customer?.email || "",
-  )
-    .toLowerCase()
-    .trim();
-}
+// `orderEmail(payload)` now lives in utils/orderUtils.js (imported above) so
+// refund / chargeback / customer-merge handlers can reuse it instead of
+// duplicating the buyer-email extraction.
 
 // Resolve the practitioner referral for an order, with cdo_applications as
 // the PRIMARY source of truth and cdo_practitioner_codes as the catalogue
@@ -2566,25 +2682,28 @@ async function resolveOrderReferral({ shop, payload, rawCode, codeSource }) {
     app = await CdoApplication.findOne({ customerId: customerGid }).lean();
   }
   if (app && app.referral && app.referral.practitionerId && app.status !== "rejected") {
+    // The customer's signup-time `referral` snapshot is AUTHORITATIVE for the
+    // commission rate + discount. The terms a customer signed up under stay
+    // FIXED even if the practitioner later edits or archives the code — that's
+    // the documented cdo_applications contract. We deliberately do NOT silently
+    // re-read the practitioner's CURRENT catalogue rate here: doing so meant a
+    // returning customer's future orders earned whatever the rate was later
+    // edited to, with no notification and no audit trail. The frozen snapshot
+    // IS the audit trail of the rate in effect at signup.
     const referral = { ...app.referral, linkedAt: app.referral.linkedAt || new Date() };
 
-    // The customer→practitioner MAPPING is anchored to their application, but
-    // commission/discount TERMS must reflect the practitioner's CURRENT code —
-    // rate/discount edits apply to NEW orders (see cdoPractitionerCode). So
-    // re-resolve the live terms from the catalogue when the mapped code still
-    // resolves to the same practitioner; the snapshot is only a fallback.
-    if (app.referral.code) {
+    // Only FILL a missing rate (a legacy snapshot predating commissionRate, or
+    // a code archived before rates existed). Try the live catalogue for the
+    // SAME practitioner, then the program default — never overriding a rate the
+    // snapshot already froze.
+    if (referral.commissionRate == null && app.referral.code) {
       const live = await resolvePractitionerReferral(app.referral.code, { shop });
       if (live && String(live.practitionerId) === String(app.referral.practitionerId)) {
-        referral.code = live.code;
-        referral.codeId = live.codeId;
         referral.commissionRate = live.commissionRate;
-        referral.discountPercent = live.discountPercent;
-        referral.practitionerName = live.practitionerName || referral.practitionerName;
-        referral.practitionerEmail = live.practitionerEmail || referral.practitionerEmail;
+        if (referral.discountPercent == null) referral.discountPercent = live.discountPercent;
+        referral.codeId = referral.codeId || live.codeId;
       }
     }
-    // Still no rate (code archived / snapshot predates rates) → program default.
     if (referral.commissionRate == null) {
       const settings = await getSettings();
       referral.commissionRate = settings.defaultCommissionRate;
@@ -2772,10 +2891,14 @@ async function upsertReferralConversion({ shop, referral, order }) {
     referredEmail,
   });
   if (existing) {
-    if (existing.status !== "converted") {
-      existing.status = "converted";
-      existing.convertedAt = existing.convertedAt || when;
-    }
+    if (existing.status !== "converted") existing.status = "converted";
+    // First-touch `convertedAt` is set ONCE and never moved. A late-arriving or
+    // replayed Shopify webhook (order edits retry) must not overwrite it with an
+    // earlier (or any) value — that would push the conversion timestamp
+    // backward and corrupt cohort reports + first-touch attribution windows.
+    // Set it only when currently unset (also backfills legacy converted rows
+    // that never recorded one).
+    if (!existing.convertedAt) existing.convertedAt = when;
     if (!existing.orderId) existing.orderId = order._id;
     await existing.save();
     return existing;
@@ -3887,6 +4010,10 @@ export async function getCdoOrderDetail(id) {
     currency: o.currency || "USD",
     amount: o.amount || 0,
     commissionAmount: o.commissionAmount || 0,
+    // Per-line commission breakdown (vendor / revenue / rate / amount) for the
+    // detail page — from the frozen snapshot, or reconstructed for legacy
+    // orders that have none (bug 9 + 11).
+    commissionBreakdown: projectCommissionSnapshot(o),
     attributed: o.attributed === true,
     placedAt: o.placedAt || null,
     createdAt: o.createdAt || null,

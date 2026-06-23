@@ -37,7 +37,12 @@ const addressSchema = new mongoose.Schema(
 // under. Mirrors the resolved shape from cdo.service.validateReferralCode.
 const referralSchema = new mongoose.Schema(
   {
-    code: { type: String, uppercase: true, trim: true },
+    // LOWERCASE to match the cdo_practitioner_codes catalogue (`code` is
+    // lowercase there). Previously this snapshot forced UPPERCASE while the
+    // catalogue forced lowercase, so the two collections stored the same code
+    // in opposite case — joins only worked via case-insensitive regex. The
+    // canonical form is now lowercase everywhere (see utils/referralCode.js).
+    code: { type: String, lowercase: true, trim: true },
     codeId: String,
     practitionerId: String,
     practitionerSource: {

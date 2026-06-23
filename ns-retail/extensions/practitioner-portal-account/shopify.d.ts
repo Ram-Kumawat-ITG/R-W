@@ -7,12 +7,6 @@ declare module './src/PractitionerPortal.jsx' {
 }
 
 //@ts-ignore
-declare module './src/api.js' {
-  const shopify: import('@shopify/ui-extensions/customer-account.page.render').Api;
-  const globalThis: { shopify: typeof shopify };
-}
-
-//@ts-ignore
 declare module './src/ui.jsx' {
   const shopify: import('@shopify/ui-extensions/customer-account.page.render').Api;
   const globalThis: { shopify: typeof shopify };
@@ -20,12 +14,6 @@ declare module './src/ui.jsx' {
 
 //@ts-ignore
 declare module './src/sections.jsx' {
-  const shopify: import('@shopify/ui-extensions/customer-account.page.render').Api;
-  const globalThis: { shopify: typeof shopify };
-}
-
-//@ts-ignore
-declare module './src/config.js' {
   const shopify: import('@shopify/ui-extensions/customer-account.page.render').Api;
   const globalThis: { shopify: typeof shopify };
 }

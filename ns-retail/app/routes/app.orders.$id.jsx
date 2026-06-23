@@ -874,6 +874,44 @@ export default function OrderDetail() {
             </s-table-body>
           </s-table>
         )}
+
+        {/* Per-line commission breakdown — shows WHERE the money came from
+            (each line's vendor + rate), instead of only a single blended rate.
+            From the frozen snapshot, or reconstructed for legacy orders. */}
+        {order.commissionBreakdown && order.commissionBreakdown.lines.length > 0 ? (
+          <s-box paddingBlockStart="base">
+            <s-stack direction="block" gap="tight">
+              <s-text>
+                <strong>Commission breakdown</strong>
+                {order.commissionBreakdown.reconstructed
+                  ? " — reconstructed (legacy order, approximate)"
+                  : ""}
+              </s-text>
+              <s-table>
+                <s-table-header-row>
+                  <s-table-header>Vendor</s-table-header>
+                  <s-table-header>Revenue</s-table-header>
+                  <s-table-header>Rate</s-table-header>
+                  <s-table-header>Commission</s-table-header>
+                </s-table-header-row>
+                <s-table-body>
+                  {order.commissionBreakdown.lines.map((l, i) => (
+                    <s-table-row key={i}>
+                      <s-table-cell>{l.vendor || "—"}</s-table-cell>
+                      <s-table-cell>{formatCurrency(l.revenue, cur)}</s-table-cell>
+                      <s-table-cell>{formatPercent(l.rate)}</s-table-cell>
+                      <s-table-cell>{formatCurrency(l.amount, cur)}</s-table-cell>
+                    </s-table-row>
+                  ))}
+                </s-table-body>
+              </s-table>
+              <Row
+                label="Effective rate"
+                value={formatPercent(order.commissionBreakdown.effectiveRate)}
+              />
+            </s-stack>
+          </s-box>
+        ) : null}
       </s-section>
 
       {/* ── Audit & activity ── */}
