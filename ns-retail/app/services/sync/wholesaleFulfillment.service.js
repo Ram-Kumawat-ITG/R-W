@@ -78,6 +78,7 @@ const QUERY_ORDER_STATE = `#graphql
         id
         legacyResourceId
         status
+        displayStatus
         trackingInfo { number company url }
       }
     }
@@ -124,6 +125,19 @@ const MUTATION_TAGS_ADD = `#graphql
   mutation AddOrderTags($id: ID!, $tags: [String!]!) {
     tagsAdd(id: $id, tags: $tags) {
       node { id }
+      userErrors { field message }
+    }
+  }
+`;
+
+// Records a carrier delivery event on a fulfillment. Shopify derives the
+// order's native "Delivery status" column from these events — a DELIVERED event
+// is what flips it from "Tracking added" to "Delivered". (Requires the
+// write_fulfillments scope.)
+const MUTATION_FULFILLMENT_EVENT_CREATE = `#graphql
+  mutation CreateFulfillmentEvent($fulfillmentEvent: FulfillmentEventInput!) {
+    fulfillmentEventCreate(fulfillmentEvent: $fulfillmentEvent) {
+      fulfillmentEvent { id status }
       userErrors { field message }
     }
   }
@@ -178,6 +192,49 @@ function trackingInfoInput(tracking) {
   if (tracking.company) t.company = tracking.company;
   if (tracking.url) t.url = tracking.url;
   return Object.keys(t).length ? t : null;
+}
+
+// Push a DELIVERED FulfillmentEvent so the retail order's NATIVE Shopify
+// "Delivery status" reads "Delivered" (Shopify derives that column from
+// fulfillment events, not from tracking info). Best-effort: requires the
+// write_fulfillments scope — if it isn't granted yet the call fails and we log
+// it, but the delivered state is still recorded on cdo_orders by the caller, so
+// the ns-retail app UI reflects delivery regardless. Returns true on success.
+async function createDeliveredEvent({ admin, fulfillmentId, happenedAt, orderGid }) {
+  if (!fulfillmentId) return false;
+  let happenedAtIso;
+  if (happenedAt) {
+    const d = new Date(happenedAt);
+    if (!Number.isNaN(d.getTime())) happenedAtIso = d.toISOString();
+  }
+  try {
+    const res = await admin.graphql(MUTATION_FULFILLMENT_EVENT_CREATE, {
+      variables: {
+        fulfillmentEvent: {
+          fulfillmentId,
+          status: "DELIVERED",
+          ...(happenedAtIso ? { happenedAt: happenedAtIso } : {}),
+        },
+      },
+    });
+    const data = await res.json();
+    const errs = data?.data?.fulfillmentEventCreate?.userErrors || [];
+    if (errs.length) {
+      log.warn("delivered_event.user_errors", {
+        orderGid,
+        fulfillmentId,
+        errors: errs.map((e) => `${(e.field || []).join(".")}: ${e.message}`),
+      });
+      return false;
+    }
+    log.info("delivered_event.created", { orderGid, fulfillmentId });
+    return true;
+  } catch (err) {
+    // Almost always a missing write_fulfillments scope (needs re-auth) — never
+    // fatal; the cdo_orders delivered record still drives the app's own UI.
+    log.warn("delivered_event.failed", { orderGid, fulfillmentId, err: errMsg(err) });
+    return false;
+  }
 }
 
 export async function applyWholesaleFulfillment(payload) {
@@ -268,6 +325,12 @@ async function applyFulfillment({ admin, order, orderGid, retailShop, payload })
 
   let retailFulfillmentId = null;
   let action = null;
+  // True once Shopify CONFIRMS delivery (a DELIVERED event was created, or the
+  // fulfillment already reads DELIVERED). Gates what we record on cdo_orders so
+  // a retail order is never marked delivered before Shopify actually shows it —
+  // which keeps the reconciler retrying until the write_fulfillments scope is
+  // granted and the event lands.
+  let deliveredConfirmed = false;
 
   try {
     if (openFOs.length) {
@@ -313,13 +376,35 @@ async function applyFulfillment({ admin, order, orderGid, retailShop, payload })
         retailFulfillmentId = ff?.legacyResourceId || target.legacyResourceId || null;
         action = "tracking_updated";
       } else {
-        // Carrier status-only change (e.g. DELIVERED) with the same tracking
-        // number — do NOT call Shopify: `shipment_status` is carrier-driven and
-        // can't be set via the Admin API, and re-sending the same tracking is a
-        // pointless customer email. We still record the latest status + delivery
-        // date onto cdo_orders below (the order's derived Delivery status/date
-        // reflect it). This is the Delivered-milestone path.
+        // Carrier status-only change with the same tracking number — no
+        // tracking-info mutation (re-sending identical tracking would be a
+        // pointless customer email). The delivered case is handled below.
         action = isDelivered(tracking) ? "delivered" : "status_synced";
+      }
+
+      // DELIVERED milestone → push a Shopify FulfillmentEvent so the RETAIL
+      // order's NATIVE Shopify "Delivery status" flips from "Tracking added" to
+      // "Delivered". Shopify derives that column from fulfillment EVENTS, not
+      // from tracking info — so a tracking update alone never marks it
+      // delivered. Done regardless of whether the tracking number changed, and
+      // skipped (already confirmed) when the fulfillment already reads
+      // DELIVERED. Needs the write_fulfillments scope; if it's not granted the
+      // push fails → deliveredConfirmed stays false → we DON'T mark cdo_orders
+      // delivered, so the reconciler keeps retrying until the scope lands.
+      if (isDelivered(tracking)) {
+        if (String(target.displayStatus || "").toUpperCase() === "DELIVERED") {
+          deliveredConfirmed = true;
+        } else {
+          deliveredConfirmed = await createDeliveredEvent({
+            admin,
+            fulfillmentId: target.id,
+            happenedAt: tracking.deliveredAt,
+            orderGid,
+          });
+        }
+        if (action !== "tracking_updated") {
+          action = deliveredConfirmed ? "delivered" : "delivery_pending";
+        }
       }
     } else {
       // Nothing open to fulfill and no existing fulfillment to update — there's
@@ -344,17 +429,28 @@ async function applyFulfillment({ admin, order, orderGid, retailShop, payload })
   //    existing path, keyed on the RETAIL fulfillment id (so it lines up with
   //    the retail fulfillments/* webhook this mutation will also trigger).
   if (retailFulfillmentId) {
+    // Only stamp the retail fulfillment delivered once Shopify CONFIRMS it
+    // (deliveredConfirmed) — otherwise a delivered-but-unconfirmed state (scope
+    // not yet granted) would record `shipmentStatus: 'delivered'` and stop the
+    // reconciler from retrying. For a delivered-but-pending case we record a
+    // blank shipment status so the reconciler's gate stays "not delivered".
+    const recordedShipmentStatus = deliveredConfirmed
+      ? "delivered"
+      : isDelivered(tracking)
+        ? null
+        : tracking?.shipmentStatus || null;
     const restLike = {
       id: retailFulfillmentId,
       tracking_number: tracking?.number || null,
       tracking_company: tracking?.company || null,
       tracking_url: tracking?.url || null,
-      shipment_status: tracking?.shipmentStatus || null,
+      shipment_status: recordedShipmentStatus,
       status: tracking?.status || "success",
       created_at: tracking?.fulfilledAt || new Date().toISOString(),
       // Carries the delivery date through to cdo_orders.fulfillments[].deliveredAt
-      // so the retail order's derived Delivery date matches the wholesale one.
-      delivered_at: tracking?.deliveredAt || null,
+      // so the retail order's derived Delivery date matches the wholesale one —
+      // only once delivery is confirmed on Shopify.
+      delivered_at: deliveredConfirmed ? tracking?.deliveredAt || null : null,
     };
     try {
       await recordFulfillmentAndSync({

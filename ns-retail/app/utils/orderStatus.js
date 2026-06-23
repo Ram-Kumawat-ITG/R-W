@@ -60,6 +60,20 @@ function normalizeShipmentStatus(raw) {
   return v;
 }
 
+// A fulfillment counts as DELIVERED when the carrier reported `delivered`, OR
+// when an explicit `deliveredAt` is stamped. For DROP-SHIP orders the retail
+// Shopify fulfillment never receives a real carrier `delivered` scan — the
+// WHOLESALE store ships + tracks it — so the delivered state is mirrored onto
+// `deliveredAt` (first-write-wins). That stamp must therefore be honored even
+// when `shipmentStatus` is blank or was later blanked by a carrier-less
+// retail fulfillments/update webhook (a delivered package never un-delivers).
+function isFulfillmentDelivered(f) {
+  return (
+    normalizeShipmentStatus(f?.shipmentStatus) === "delivered" ||
+    Boolean(f?.deliveredAt)
+  );
+}
+
 // SHIPPING (fulfillment) status — what fraction of the order has shipped.
 // Trusts Shopify's order-level fulfillment_status when present, and self-heals
 // from fulfillments[] when that field is stale/missing (the bug where a
@@ -104,15 +118,20 @@ export function deriveDeliveryStatus(order) {
   const keys = active.map((f) => normalizeShipmentStatus(f.shipmentStatus));
   // A failed delivery needs attention — surface it over everything else.
   if (keys.includes("failure")) return "failure";
-  // Every shipment delivered → the whole order is delivered.
-  if (keys.every((k) => k === "delivered")) return "delivered";
+  // Every shipment delivered → the whole order is delivered. A mirrored
+  // `deliveredAt` counts as delivered even when shipmentStatus is blank
+  // (drop-ship: the retail fulfillment gets no real carrier scan).
+  if (active.every((f) => isFulfillmentDelivered(f))) return "delivered";
 
   // Otherwise report the least-progressed shipment so the still-in-flight part
-  // stays visible. A fulfillment with no carrier event yet ranks as "shipped".
+  // stays visible. A fulfillment with no carrier event yet ranks as "shipped";
+  // one stamped delivered ranks as delivered regardless of shipmentStatus.
   let lowestKey = "shipped";
   let lowestRank = Infinity;
-  for (const k of keys) {
-    const eff = k || "shipped";
+  for (const f of active) {
+    const eff = isFulfillmentDelivered(f)
+      ? "delivered"
+      : normalizeShipmentStatus(f.shipmentStatus) || "shipped";
     const rank = SHIPMENT_RANK[eff] ?? 0.5;
     if (rank < lowestRank) {
       lowestRank = rank;
@@ -131,9 +150,7 @@ export function deriveDeliveryStatus(order) {
 export function deriveDeliveredAt(order) {
   const active = activeFulfillments(order);
   if (active.length === 0) return null;
-  const delivered = active.filter(
-    (f) => normalizeShipmentStatus(f.shipmentStatus) === "delivered",
-  );
+  const delivered = active.filter((f) => isFulfillmentDelivered(f));
   if (delivered.length === 0 || delivered.length !== active.length) return null;
   const times = delivered
     .map((f) => {

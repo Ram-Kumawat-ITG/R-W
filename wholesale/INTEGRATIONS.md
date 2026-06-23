@@ -858,7 +858,89 @@ Order-Details views never re-POST a duplicate or conflicting update. The call
 is **best-effort and never throws** — a retail outage can't break wholesale
 fulfillment capture. It POSTs to `${NS_RETAIL_API_BASE}/api/sync/wholesale-fulfillment`
 with the shared `x-sync-secret` (`RETAIL_SYNC_SECRET`), gated by
-`isFulfillmentSyncEnabled()` (`NS_RETAIL_API_BASE` + secret set).
+`isFulfillmentSyncEnabled()` (`NS_RETAIL_API_BASE` + secret set). The POST is
+bounded by `NS_RETAIL_SYNC_TIMEOUT_MS` (default 10 s, `AbortSignal.timeout`) so
+a hung tunnel can't stall the webhook / page load / CRON tick.
+
+**Reliability — single backstop on the ns-retail side.** The push above fires
+the sync **once** per fulfillment change; if that single POST fails (ns-retail
+briefly down, the dev tunnel rotated, a transient 5xx) nothing re-fires it from
+here. Recovery is owned by **one** mechanism — the ns-retail **pull
+reconciler** (see "Pull-based backstop" below), which reads the wholesale
+fulfillment state straight from the shared Mongo DB and applies it without
+needing the tunnel. (An earlier wholesale-side retry CRON,
+`process-dropship-fulfillment-resync`, was **removed** — it only re-attempted
+the same flaky push and was redundant with the tunnel-independent pull
+reconciler.)
+
+> **Operational note.** The single most common cause of "fulfillment sync
+> stopped working" is `NS_RETAIL_API_BASE` (in wholesale's `.env`) pointing at a
+> **stale ns-retail tunnel** — Shopify CLI quick-tunnels (trycloudflare) rotate
+> their hostname on every `shopify app dev` restart, so the wholesale app keeps
+> POSTing to ns-retail's *previous* URL and every sync fails with
+> `network: fetch failed` / Cloudflare `530`. The fix is to update
+> `NS_RETAIL_API_BASE` to ns-retail's current `application_url` (and restart so
+> the env is re-read); the resync CRON then replays the backlog automatically.
+> Pin a stable URL (reserved ngrok domain / prod host) to avoid the rotation.
+
+**Pull-based backstop (ns-retail, tunnel-independent).** Because the push above
+depends on the wholesale→ns-retail tunnel being **up at the moment the
+wholesale order is fulfilled** — which it often isn't in dev (ns-retail not
+running / tunnel rotated → the push 530s and the retail order is left
+un-fulfilled) — ns-retail **also** reconciles by pulling. Both apps share one
+MongoDB and **ns-retail owns the retail Shopify Admin token**, so a CRON
+`reconcile-wholesale-fulfillments` (ns-retail
+`services/scheduler/jobs/processWholesaleFulfillmentReconcile.job.js` →
+`services/sync/wholesaleFulfillmentReconcile.reconcileWholesaleFulfillments`)
+reads the wholesale order's fulfillment state **directly from the shared DB**
+(read-only mirror `models/wholesaleOrder.server.js` over the wholesale
+`shopify_orders` collection) and fulfills the linked retail order **in-process**
+— no cross-app HTTP, no tunnel. It reuses the SAME `applyWholesaleFulfillment`
+the push receiver uses. Candidate gate: drop-ship mapping whose **wholesale
+order has a recorded fulfillment** AND whose **retail `cdo_orders` has none yet**
+(so it fulfills exactly once — the customer shipment email fires once — and
+never pre-emptively); `applyWholesaleFulfillment`'s open-fulfillment-order check
+prevents any double-fulfill if the push and pull race. This makes the push the
+fast path and the pull the reliable backstop. Cadence env-configurable
+(ns-retail `scheduler.config.js`): `CDO_FULFILLMENT_RECONCILE_CRON` (prod,
+default every 10 min) / `CDO_FULFILLMENT_RECONCILE_INTERVAL` (dev, e.g.
+`"1 minute"`). Cancellations stay push-only (they just tag the retail order).
+
+The reconciler also mirrors the **delivered milestone**, not just the first
+fulfillment: its candidate gate fires for either (a) the retail order not yet
+fulfilled → fulfill it, or (b) the wholesale order **delivered** while the retail
+order isn't → record delivery. It converges (skips once the retail side reflects
+the state) so the customer shipment email fires once and Shopify isn't churned
+between fulfillment and delivery.
+
+> **`deliveredAt` is authoritative for drop-ship delivery (retail side).** A
+> drop-ship order's RETAIL Shopify fulfillment never receives a real carrier
+> `delivered` scan — the WHOLESALE store ships + tracks it — so the delivered
+> state lives in `cdo_orders.fulfillments[].deliveredAt` (mirrored from
+> wholesale, first-write-wins). ns-retail's delivery derivation
+> (`app/utils/orderStatus.js` `deriveDeliveryStatus` / `deriveDeliveredAt`)
+> therefore treats a stamped `deliveredAt` as delivered **even when
+> `shipmentStatus` is blank** — important because a later carrier-less retail
+> `fulfillments/update` webhook can blank `shipmentStatus` back to `null` while
+> `deliveredAt` persists. Without this the retail Order List shows a delivered
+> drop-ship order as merely "shipped".
+
+**Native Shopify "Delivery status" (the merchant's Shopify admin Orders list).**
+The derivation above fixes ns-retail's OWN app UI. Shopify's **native** order
+list derives its "Delivery status" column from fulfillment **events**, not from
+tracking info — so a fulfillment created with only a tracking number sits at
+"Tracking added" forever. To mirror the delivered milestone onto the native
+column, `applyWholesaleFulfillment` pushes a **`fulfillmentEventCreate` with
+`status: DELIVERED`** (`happenedAt` = the wholesale delivery time) on the retail
+fulfillment when the wholesale order is delivered — gated on the fulfillment's
+`displayStatus` not already being `DELIVERED` (no duplicate events), best-effort
+(logged, never fatal). This needs the legacy **`write_fulfillments`** scope on
+the ns-retail app (distinct from the `*_fulfillment_orders` scopes that
+`fulfillmentCreate` uses) — granted via `access_scopes` in both
+`ns-retail/shopify.app*.toml`; **adding it requires a `shopify app deploy` /
+re-auth.** Until granted, the event call fails harmlessly and only the ns-retail
+app UI reflects delivery (via `deliveredAt`); after granting, the native Shopify
+order reads "Delivered" too.
 
 **Apply (ns-retail).** `POST /api/sync/wholesale-fulfillment`
 (`app/api/sync/wholesale-fulfillment.js`, shared-secret auth, module-level

@@ -148,6 +148,39 @@ async function ensureRecurring(agenda) {
       cron: schedulerConfig.billReconcileCron,
     });
   }
+
+  // ── Wholesale→Retail fulfillment reconciliation job ──
+  // Pull-based backstop: fulfills retail dropship orders whose linked WHOLESALE
+  // order is fulfilled, reading the shared Mongo DB directly (no dependency on
+  // the wholesale→ns-retail HTTP push being reachable at fulfillment time). Dev
+  // override mirrors the payout/settlement/bill-reconcile interval pattern.
+  if (schedulerConfig.fulfillmentReconcileIntervalOverride) {
+    await agenda.cancel({ name: JOB_NAMES.PROCESS_WHOLESALE_FULFILLMENT_RECONCILE });
+    await agenda.every(
+      schedulerConfig.fulfillmentReconcileIntervalOverride,
+      JOB_NAMES.PROCESS_WHOLESALE_FULFILLMENT_RECONCILE,
+      { tick: "dev" },
+    );
+    log.info("scheduler.fulfillment_reconcile_registered", {
+      mode: "dev-interval",
+      interval: schedulerConfig.fulfillmentReconcileIntervalOverride,
+    });
+    console.log(
+      `\n[scheduler] DEV MODE — reconcile-wholesale-fulfillments running every ${schedulerConfig.fulfillmentReconcileIntervalOverride}\n`,
+    );
+  } else {
+    await agenda.every(
+      schedulerConfig.fulfillmentReconcileCron,
+      JOB_NAMES.PROCESS_WHOLESALE_FULFILLMENT_RECONCILE,
+      { tick: "scheduled" },
+      { timezone: schedulerConfig.scheduleTimezone },
+    );
+    log.info("scheduler.fulfillment_reconcile_registered", {
+      mode: "cron",
+      timezone: schedulerConfig.scheduleTimezone,
+      cron: schedulerConfig.fulfillmentReconcileCron,
+    });
+  }
 }
 
 export async function getAgenda() {
