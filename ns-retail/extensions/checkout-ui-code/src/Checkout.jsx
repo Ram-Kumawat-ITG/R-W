@@ -318,6 +318,7 @@ function Extension() {
       if (applyResult?.type === "success") {
         applyState.value = "applied";
         applyMessage.value = `${confirmedCode} applied`;
+        // Customer tagging happens AFTER order is placed via the orders/create webhook.
       } else {
         applyState.value = "error";
         applyMessage.value =
@@ -463,6 +464,7 @@ function Extension() {
       if (result?.type === "success") {
         applyState.value = "applied";
         applyMessage.value = `${code} applied`;
+        // Customer tagging happens AFTER order is placed via the orders/create webhook.
       } else {
         applyState.value = "error";
         applyMessage.value =

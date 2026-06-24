@@ -86,6 +86,26 @@ const cdoApplicationSchema = new mongoose.Schema(
     // list a practitioner's referred customers.
     referral: { type: referralSchema, default: null },
 
+    // History of prior referral codes this customer used before upgrading.
+    // Entries are appended by upsertCustomerApplication() when the active code changes.
+    referralHistory: {
+      type: [
+        new mongoose.Schema(
+          {
+            code: { type: String, lowercase: true, trim: true },
+            practitionerId: String,
+            practitionerName: String,
+            practitionerEmail: { type: String, lowercase: true },
+            discountPercent: { type: Number, default: null },
+            commissionRate: { type: Number, default: null },
+            replacedAt: { type: Date, default: Date.now },
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+
     status: {
       type: String,
       enum: ["pending", "approved", "rejected"],

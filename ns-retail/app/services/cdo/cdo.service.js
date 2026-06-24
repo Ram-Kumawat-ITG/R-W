@@ -1435,6 +1435,72 @@ export async function listCustomersForPractitioner(practitionerId) {
   }));
 }
 
+// Update a customer's referral code. The `cdo_applications.referral` snapshot
+// is normally immutable (locked in at signup), but an admin may need to
+// re-assign a customer to a different code (same practitioner or not) after the
+// fact — e.g. a customer requested a discount code change, or a practitioner's
+// code was archived and their customers need reassignment.
+//
+// Validates that the NEW code exists, is active, and belongs to a practitioner.
+// Builds a fresh referral snapshot via the normal validation path (so commission
+// rates + other properties stay in sync with the code catalogue). Immutable
+// history: existing orders and commissions earned under the OLD code stay
+// locked at the old rate (they capture the snapshot at creation time, not at
+// lookup time); only NEW orders after this change use the new code's rate.
+//
+// Returns the updated customer application (with the new referral). Throws on
+// validation failure (code not found, not active, etc).
+export async function updateApplicationReferral({
+  customerId,
+  customerEmail,
+  newReferralCode,
+  actor = "admin",
+  shop,
+} = {}) {
+  if (!newReferralCode) {
+    throw new Error("New referral code is required");
+  }
+  if (!customerId && !customerEmail) {
+    throw new Error("Customer ID or email is required");
+  }
+
+  await connectDB();
+
+  // 1. Find the customer application
+  let customer;
+  if (customerId && isValidObjectId(customerId)) {
+    customer = await CdoApplication.findById(customerId);
+  } else if (customerEmail) {
+    customer = await CdoApplication.findOne({
+      email: String(customerEmail || "").toLowerCase().trim(),
+    });
+  }
+  if (!customer) {
+    throw new Error("Customer application not found");
+  }
+
+  // 2. Validate + snapshot the new code (same path as signup validation)
+  const newReferral = await buildReferralSnapshot(newReferralCode, { when: new Date(), shop });
+  if (!newReferral) {
+    throw new Error(`Referral code "${newReferralCode}" is not valid or not active`);
+  }
+
+  // 3. Capture the old code for the audit trail
+  const oldCode = customer.referral?.code || null;
+
+  // 4. Update the customer's referral snapshot and save
+  customer.referral = newReferral;
+  customer.updatedBy = actor;
+  await customer.save();
+
+  // 5. Audit logging
+  console.log(
+    `[cdo] ${actor} updated referral for ${customer.email}: ${oldCode || "(none)"} → ${newReferral.code}`,
+  );
+
+  return customer.toObject();
+}
+
 // ── Per-practitioner aggregations (Statistics + tab loaders) ─────────
 
 // Headline KPIs for the practitioner detail Details/Statistics card.
@@ -2656,46 +2722,64 @@ export async function resolvePractitionerReferral(rawCode, { shop } = {}) {
 // refund / chargeback / customer-merge handlers can reuse it instead of
 // duplicating the buyer-email extraction.
 
-// Resolve the practitioner referral for an order, with cdo_applications as
-// the PRIMARY source of truth and cdo_practitioner_codes as the catalogue
-// fallback:
+// Resolve the practitioner referral for an order.
 //
-//   1. PRIMARY — the customer's established cdo_applications mapping. If the
-//      buyer already has a (non-rejected) application carrying a `referral`,
-//      that frozen snapshot IS the customer→practitioner relationship; use
-//      it directly. The code is "valid + active" because the relationship
-//      exists. (source: "cdo_application")
-//   2. FALLBACK — first-touch. No mapping yet but the order carried a code
-//      (note attribute / discount code / customer tag): validate it against
-//      cdo_practitioner_codes (active + eligible practitioner) and let the
-//      pipeline create the mapping. (source: the code-discovery source)
-//   3. Neither → unattributed (standard retail order).
+// KEY CHANGE: If the order carries an EXPLICIT code (from cart attribute/discount)
+// that is DIFFERENT from the customer's current cdo_applications code, use the
+// order code. This allows customers to UPGRADE their referral code on any order.
+//
+// Priority:
+//   1. EXPLICIT CODE in order (if customer actively applied a new code)
+//      - If code differs from cdo_applications.referral.code, it's an upgrade
+//      - Validate it, update cdo_applications, and use it
+//   2. EXISTING MAPPING (cdo_applications) — only if order code matches or is empty
+//      - Frozen snapshot: rate stays fixed from signup, even if practitioner edits
+//   3. FALLBACK — first-touch. No explicit code but customer has a binding tag
+//   4. Neither → unattributed (standard retail order).
 //
 // Returns { referral, attributionSource } — referral is null for retail.
 async function resolveOrderReferral({ shop, payload, rawCode, codeSource }) {
-  // 1. PRIMARY: the customer's existing mapping in cdo_applications.
   const email = orderEmail(payload);
   const customerGid = payload?.customer?.admin_graphql_api_id || null;
+
+  // Find existing customer application
   let app = null;
   if (email) app = await CdoApplication.findOne({ email }).lean();
   if (!app && customerGid) {
     app = await CdoApplication.findOne({ customerId: customerGid }).lean();
   }
+
+  // UPGRADE LOGIC: If order has an EXPLICIT code AND it differs from the customer's
+  // existing code, treat it as an upgrade and use the new code.
+  if (rawCode && app && app.referral && app.referral.code) {
+    const normalizedNewCode = (String(rawCode) || "").toLowerCase().trim();
+    const normalizedExistingCode = (String(app.referral.code) || "").toLowerCase().trim();
+
+    if (normalizedNewCode !== normalizedExistingCode) {
+      // Customer is applying a DIFFERENT code — this is an explicit upgrade
+      console.log(
+        `[cdo.ingest] order ${payload?.id} for ${email}: customer upgrading code from "${app.referral.code}" to "${rawCode}"`,
+      );
+
+      // Validate the new code
+      const newReferral = await resolvePractitionerReferral(rawCode, { shop });
+      if (newReferral) {
+        // Validate binding: new code must be from same or permitted practitioner
+        const binding = await resolvePatientPractitioner({ email, customerId: customerGid });
+        if (!binding || String(binding.practitionerId) === String(newReferral.practitionerId)) {
+          // Binding allows it — use the new code
+          return { referral: newReferral, attributionSource: codeSource || "code_upgrade" };
+        }
+      }
+      // If new code validation fails, fall through to existing mapping
+    }
+  }
+
+  // PRIMARY: Use existing cdo_applications mapping if it exists
   if (app && app.referral && app.referral.practitionerId && app.status !== "rejected") {
-    // The customer's signup-time `referral` snapshot is AUTHORITATIVE for the
-    // commission rate + discount. The terms a customer signed up under stay
-    // FIXED even if the practitioner later edits or archives the code — that's
-    // the documented cdo_applications contract. We deliberately do NOT silently
-    // re-read the practitioner's CURRENT catalogue rate here: doing so meant a
-    // returning customer's future orders earned whatever the rate was later
-    // edited to, with no notification and no audit trail. The frozen snapshot
-    // IS the audit trail of the rate in effect at signup.
     const referral = { ...app.referral, linkedAt: app.referral.linkedAt || new Date() };
 
-    // Only FILL a missing rate (a legacy snapshot predating commissionRate, or
-    // a code archived before rates existed). Try the live catalogue for the
-    // SAME practitioner, then the program default — never overriding a rate the
-    // snapshot already froze.
+    // Only FILL a missing rate (legacy snapshots). Never override a frozen rate.
     if (referral.commissionRate == null && app.referral.code) {
       const live = await resolvePractitionerReferral(app.referral.code, { shop });
       if (live && String(live.practitionerId) === String(app.referral.practitionerId)) {
@@ -2711,15 +2795,10 @@ async function resolveOrderReferral({ shop, payload, rawCode, codeSource }) {
     return { referral, attributionSource: "cdo_application" };
   }
 
-  // 2. FALLBACK: validate a code carried on the order against the catalogue.
+  // FALLBACK: Validate order code against catalogue (first-touch or new customer)
   if (rawCode) {
     const referral = await resolvePractitionerReferral(rawCode, { shop });
     if (referral) {
-      // Permanent-binding guard. The cdo_applications case is handled in
-      // step 1; this also covers a patient who has a cdo_referrals binding
-      // but no application yet. If they're already bound to a DIFFERENT
-      // practitioner, a foreign code must NOT re-attribute the order — the
-      // relationship is permanent.
       const binding = await resolvePatientPractitioner({ email, customerId: customerGid });
       if (binding && String(binding.practitionerId) !== String(referral.practitionerId)) {
         console.warn(
@@ -2918,10 +2997,12 @@ async function upsertReferralConversion({ shop, referral, order }) {
   });
 }
 
-// First-touch cdo_applications mapping for an attributed buyer. Mirrors the
-// prior webhook behavior: attach the referral snapshot to an existing
-// application only if it has none (first-touch wins), else create a patient
-// application. Customer tagging stays in the webhook route (Shopify API).
+// Upsert the cdo_applications patient record for an attributed buyer.
+// - First touch: creates the application with the referral snapshot.
+// - Same code: no-op on referral (idempotent replay safety).
+// - Code upgrade (same practitioner, different code): pushes the old referral
+//   to referralHistory[] before overwriting with the new snapshot.
+// Customer tagging stays in the webhook route (Shopify API).
 async function upsertCustomerApplication({ shop, payload, referral }) {
   const email = String(
     payload?.email || payload?.contact_email || payload?.customer?.email || "",
@@ -2938,13 +3019,43 @@ async function upsertCustomerApplication({ shop, payload, referral }) {
   const existing = await CdoApplication.findOne({ email }).lean();
 
   if (existing) {
-    const updates = {};
-    if (!existing.referral) updates.referral = referral;
-    if (!existing.customerId && customerGid) updates.customerId = customerGid;
-    if (Object.keys(updates).length) {
-      await CdoApplication.updateOne({ _id: existing._id }, { $set: updates });
+    const setUpdates = {};
+    const mongoUpdate = {};
+
+    if (!existing.referral) {
+      // First touch on an existing application that has no referral yet.
+      setUpdates.referral = referral;
+    } else if (referral && referral.code) {
+      const existingCode = (String(existing.referral.code || "")).toLowerCase().trim();
+      const newCode = (String(referral.code || "")).toLowerCase().trim();
+      if (newCode && newCode !== existingCode) {
+        // Code upgrade: persist history then set new referral.
+        setUpdates.referral = referral;
+        mongoUpdate.$push = {
+          referralHistory: {
+            code: existing.referral.code,
+            practitionerId: existing.referral.practitionerId,
+            practitionerName: existing.referral.practitionerName || null,
+            practitionerEmail: existing.referral.practitionerEmail || null,
+            discountPercent: existing.referral.discountPercent ?? null,
+            commissionRate: existing.referral.commissionRate ?? null,
+            replacedAt: new Date(),
+          },
+        };
+        console.log(
+          `[cdo.ingest] cdo_application ${existing._id} code upgrade "${existingCode}" → "${newCode}" — old code pushed to referralHistory`,
+        );
+      }
+    }
+
+    if (!existing.customerId && customerGid) setUpdates.customerId = customerGid;
+
+    if (Object.keys(setUpdates).length) mongoUpdate.$set = setUpdates;
+
+    if (Object.keys(mongoUpdate).length) {
+      await CdoApplication.updateOne({ _id: existing._id }, mongoUpdate);
       console.log(
-        `[cdo.ingest] updated cdo_application ${existing._id} — set ${Object.keys(updates).join(", ")}`,
+        `[cdo.ingest] updated cdo_application ${existing._id} — ops: ${Object.keys(mongoUpdate).join(", ")}`,
       );
     }
     return;
@@ -2959,6 +3070,7 @@ async function upsertCustomerApplication({ shop, payload, referral }) {
     billingAddress: null,
     shippingAddress: null,
     referral,
+    referralHistory: [],
     status: "approved",
     submittedAt: new Date(),
     reviewedAt: null,

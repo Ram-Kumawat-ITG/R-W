@@ -101,6 +101,28 @@ const ApiService = {
     });
     return data?.result || { found: false };
   },
+
+  // POST /api/cdo/checkout-apply-code
+  // When a customer applies a referral code, immediately tag the Shopify
+  // customer so the code becomes the default for future orders. This is
+  // fire-and-forget (non-blocking) — tag sync failure doesn't affect checkout.
+  // Returns { ok, tagged, code?, practitionerName?, discountPercent? }
+  async applyAndTagCode(code, identity = {}, shop = '') {
+    try {
+      const data = await jsonPost('/api/cdo/checkout-apply-code', {
+        code,
+        email: identity.email || undefined,
+        customerId: identity.customerId || undefined,
+        shopifyCustomerId: identity.shopifyCustomerId || undefined,
+        shopifyShop: shop || undefined,
+      });
+      return data?.result || { ok: false, tagged: false };
+    } catch (err) {
+      console.warn('[ApiService.applyAndTagCode] failed:', err?.message);
+      // Non-blocking: return a falsy result but don't throw
+      return { ok: false, tagged: false };
+    }
+  },
 };
 
 export default ApiService;

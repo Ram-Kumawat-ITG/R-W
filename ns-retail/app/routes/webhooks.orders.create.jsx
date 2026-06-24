@@ -2,6 +2,7 @@ import { authenticate, unauthenticated } from "../shopify.server";
 import { ingestShopifyOrder } from "../services/cdo/cdo.service";
 import { ensureRetailInvoiceFromPayload } from "../services/retailQbo/retailOrderInvoice.service";
 import { extractPractitionerCode, extractCodeFromTags } from "../utils/orderCode";
+import { syncCustomerCodeTag } from "../utils/customerTags";
 
 // In-memory dedup of webhook ids — Shopify delivers at-least-once and
 // can fire the same payload multiple times in a short window. 5 min TTL
@@ -209,53 +210,13 @@ async function fetchCustomerTags(shop, customerGid) {
 }
 
 async function tagCustomerWithCode(shop, customerGid, code, practitionerEmail) {
-  const codeTag = `code:${code}`;
-  // Bare email as a tag (no prefix) per locked decision 2026-06-04 — lets
-  // the admin filter "all patients referred by drjohn@example.com" in
-  // Shopify admin's customer list.
-  const emailTag = practitionerEmail
-    ? String(practitionerEmail).toLowerCase().trim()
-    : null;
-
-  const { admin } = await unauthenticated.admin(shop);
-
-  // Fetch existing tags so we don't clobber other tags
-  const existing = await fetchCustomerTags(shop, customerGid);
-
-  // Determine which tags are missing — skip the whole update if both
-  // are already present.
-  const toAdd = [];
-  if (!existing.includes(codeTag)) toAdd.push(codeTag);
-  if (emailTag && !existing.includes(emailTag)) toAdd.push(emailTag);
-
-  if (!toAdd.length) {
-    console.log(`[webhooks.orders.create] tags already on ${customerGid}`);
-    return;
+  // Use the shared utility for tagging — it handles adding/removing code:*
+  // tags and preserves existing tags. Logs outcome internally.
+  try {
+    await syncCustomerCodeTag(shop, customerGid, code, practitionerEmail);
+  } catch (err) {
+    throw new Error(`Failed to tag customer ${customerGid}: ${err?.message || err}`);
   }
-
-  const updRes = await admin.graphql(
-    `mutation TagCustomer($input: CustomerInput!) {
-      customerUpdate(input: $input) {
-        customer { id tags }
-        userErrors { field message }
-      }
-    }`,
-    {
-      variables: {
-        input: { id: customerGid, tags: [...existing, ...toAdd] },
-      },
-    },
-  );
-  const updData = await updRes.json();
-  const errs = updData?.data?.customerUpdate?.userErrors || [];
-  if (errs.length) {
-    throw new Error(
-      `customerUpdate userErrors: ${errs.map((e) => e.message).join("; ")}`,
-    );
-  }
-  console.log(
-    `[webhooks.orders.create] tagged ${customerGid} with ${toAdd.map((t) => `"${t}"`).join(", ")}`,
-  );
 }
 
 export async function loader() {
