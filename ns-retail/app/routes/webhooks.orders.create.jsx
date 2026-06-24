@@ -27,15 +27,25 @@ const SEEN_TTL_MS = 5 * 60 * 1000;
 //      referral / commission / ledger / customer-mapping records
 //   6. Tag the customer with `code:<the-code>` when attributed
 export async function action({ request }) {
+  // Loud entry banner — fires on EVERY inbound POST to /webhooks/orders/create,
+  // before HMAC verify. Lets you confirm Shopify is hitting the route at all
+  // (vs. the request silently 404'ing or the subscription never being registered).
+  console.log(
+    `\n========================================\n[webhooks.orders.create] 🔔 WEBHOOK RECEIVED at ${new Date().toISOString()}\n========================================`,
+  );
+
   let shop, payload, webhookId;
   try {
     const res = await authenticate.webhook(request);
     shop = res.shop;
     payload = res.payload;
     webhookId = request.headers.get("x-shopify-webhook-id");
+    console.log(
+      `[webhooks.orders.create] ✅ HMAC verified · shop=${shop} · webhookId=${webhookId} · orderId=${payload?.id} · orderName=${payload?.name}`,
+    );
   } catch (err) {
     console.error(
-      "[webhooks.orders.create] HMAC auth failed:",
+      "[webhooks.orders.create] ❌ HMAC auth failed:",
       err?.message || err,
     );
     return new Response(null, { status: 401 });
@@ -43,18 +53,24 @@ export async function action({ request }) {
 
   if (webhookId) {
     if (_seenWebhookIds.has(webhookId)) {
-      console.log(`[webhooks.orders.create] duplicate webhook id ${webhookId}, skipping`);
+      console.log(
+        `[webhooks.orders.create] ⏭️  duplicate webhook id ${webhookId} — skipping (returning 200)`,
+      );
       return new Response(null, { status: 200 });
     }
     _seenWebhookIds.add(webhookId);
     setTimeout(() => _seenWebhookIds.delete(webhookId), SEEN_TTL_MS).unref?.();
   }
 
+  console.log(
+    `[webhooks.orders.create] 🚀 dispatching processOrder + forwardToWholesale (fire-and-forget) for order ${payload?.id}`,
+  );
+
   // Fire-and-forget so Shopify gets 200 fast. Errors inside the
   // promise are logged but don't affect the webhook response.
   processOrder({ shop, payload }).catch((err) => {
     console.error(
-      `[webhooks.orders.create] processing order ${payload?.id} failed:`,
+      `[webhooks.orders.create] ❌ processing order ${payload?.id} failed:`,
       err?.message || err,
     );
   });
@@ -69,11 +85,14 @@ export async function action({ request }) {
   // webhook 200 response.
   forwardToWholesaleDropship({ payload, retailShop: shop }).catch((err) => {
     console.error(
-      `[webhooks.orders.create] forward-to-wholesale failed for order ${payload?.id}:`,
+      `[webhooks.orders.create] ❌ forward-to-wholesale failed for order ${payload?.id}:`,
       err?.message || err,
     );
   });
 
+  console.log(
+    `[webhooks.orders.create] ✅ 200 returned to Shopify (downstream work continues in background) · order=${payload?.id}\n`,
+  );
   return new Response(null, { status: 200 });
 }
 
@@ -99,9 +118,13 @@ async function forwardToWholesaleDropship({ payload, retailShop }) {
   // eslint-disable-next-line no-undef
   const syncSecret = process.env.RETAIL_SYNC_SECRET;
 
+  console.log(
+    `[forward-to-wholesale] ▶️  starting forward for order ${payload?.id} · apiBase=${apiBase || "(missing)"} · wholesaleShop=${wholesaleShop || "(missing)"} · secretSet=${Boolean(syncSecret)}`,
+  );
+
   if (!apiBase || !wholesaleShop || !syncSecret) {
     console.warn(
-      "[forward-to-wholesale] missing env (WHOLESALE_API_BASE/WHOLESALE_SHOP/RETAIL_SYNC_SECRET) — skipping forward",
+      "[forward-to-wholesale] ⚠️  missing env (WHOLESALE_API_BASE/WHOLESALE_SHOP/RETAIL_SYNC_SECRET) — skipping forward",
     );
     return;
   }
@@ -109,6 +132,8 @@ async function forwardToWholesaleDropship({ payload, retailShop }) {
   const url = new URL(`${apiBase.replace(/\/$/, "")}/api/sync/retail-order`);
   url.searchParams.set("shop", wholesaleShop);
   if (retailShop) url.searchParams.set("retail_shop", retailShop);
+
+  console.log(`[forward-to-wholesale] 🌐 POST ${url.toString()}`);
 
   const res = await fetch(url.toString(), {
     method: "POST",
