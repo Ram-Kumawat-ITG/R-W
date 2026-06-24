@@ -22,7 +22,7 @@ import {
 // Discount tiers offered when a practitioner creates a code. Kept in sync with
 // the backend's PORTAL_DISCOUNT_PERCENTS (extensions can't import server
 // modules) — update both if this list changes.
-const DISCOUNT_PERCENTS = [10, 15, 20, 25, 30, 35]
+const DISCOUNT_PERCENTS = [10, 15, 20, 25, 30, 35, 40]
 
 // Commission payout-status filter options (mirrors CdoCommission.payoutStatus).
 const COMMISSION_PAYOUT_STATUSES = [
@@ -633,7 +633,7 @@ export function ReferralsSection({ onAuthError }) {
   // Create-form state (the form lives inside the modal).
   const modalRef = useRef(null)
   const [code, setCode] = useState('')
-  const [percent, setPercent] = useState('')
+  const [percent, setPercent] = useState('20')
   const [submitting, setSubmitting] = useState(false)
   const [formError, setFormError] = useState('')
   const [notice, setNotice] = useState('')

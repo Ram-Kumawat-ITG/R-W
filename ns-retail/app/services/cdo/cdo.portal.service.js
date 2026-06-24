@@ -740,6 +740,33 @@ export async function getReferredCustomers(
       },
     },
     {
+      // Join cdo_applications to get the authoritative current referral code.
+      // cdo_referral.referredAt is a first-touch timestamp that never updates
+      // on repeat code usage, so sorting by it gives a stale "latest" code.
+      // cdo_applications.referral.code is always the code resolved by the most
+      // recent order webhook (kept current by upsertCustomerApplication).
+      $lookup: {
+        from: "cdo_applications",
+        let: { email: "$referredEmail" },
+        pipeline: [
+          {
+            $match: {
+              $expr: { $eq: ["$email", "$$email"] },
+              "referral.code": { $exists: true, $ne: null },
+            },
+          },
+          { $project: { "referral.code": 1 } },
+          { $limit: 1 },
+        ],
+        as: "appData",
+      },
+    },
+    {
+      $addFields: {
+        currentCode: { $ifNull: [{ $arrayElemAt: ["$appData.referral.code", 0] }, null] },
+      },
+    },
+    {
       $facet: {
         rows: [
           { $skip: (p - 1) * size },
@@ -753,6 +780,7 @@ export async function getReferredCustomers(
               totalOrders: 1,
               lifetimeValue: 1,
               codes: 1,
+              currentCode: 1,
             },
           },
         ],
@@ -780,13 +808,15 @@ export async function getReferredCustomers(
           usedAt: c.usedAt || null,
         });
       }
+      // Authoritative current code: cdo_applications.referral.code (updated by the
+      // most recent order webhook). Falls back to the newest cdo_referral record
+      // for patients who pre-date the applications upgrade.
+      const currentCode = r.currentCode || codes[0]?.code || null;
       return {
         id: String(r.refId),
         name: r.referredName || null,
         email: r.referredEmail || null,
-        // The most recently used code is shown in the table's Code column; the
-        // full deduped history (newest-first) powers the expandable section.
-        referralCode: codes[0]?.code || null,
+        referralCode: currentCode,
         codes,
         registeredAt: r.registeredAt || null,
         totalOrders: r.totalOrders || 0,
@@ -928,7 +958,7 @@ export async function getDiscounts(practitionerId) {
 // The discount tiers offered in the portal dropdown (integer percents). Kept in
 // sync with the extension's own DISCOUNT_PERCENTS (extensions can't import
 // server modules) — update both if this list changes.
-export const PORTAL_DISCOUNT_PERCENTS = [10, 15, 20, 25, 30, 35];
+export const PORTAL_DISCOUNT_PERCENTS = [10, 15, 20, 25, 30, 35, 40];
 
 // 3–40 chars, lowercase alphanumeric + hyphen/underscore, starting alphanumeric.
 const CODE_RE = /^[a-z0-9][a-z0-9_-]{2,39}$/;

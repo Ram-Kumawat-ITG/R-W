@@ -20,7 +20,7 @@ import WholesaleApplication from "../../models/wholesaleApplication.server";
 // Default discount percentage applied to every freshly-generated practitioner
 // code. Stored as a fraction (0.10 = 10%) to match cdo_settings.defaultCommissionRate.
 // Admin can edit per-code later via the CDO admin UI.
-const DEFAULT_DISCOUNT_PERCENT = 0.1;
+const DEFAULT_DISCOUNT_PERCENT = 0.2;
 
 // eslint-disable-next-line no-undef
 const RETAIL_SHOP_DOMAIN = process.env.RETAIL_SHOP_DOMAIN || "";

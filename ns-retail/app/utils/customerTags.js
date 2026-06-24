@@ -50,10 +50,13 @@ export async function syncCustomerCodeTag(shop, customerGid, newCode, practition
   const data = await res.json();
   const existing = data?.data?.customer?.tags || [];
 
-  // Remove old code tags (code:*) and email tags if needed
-  const filtered = existing.filter(
-    (tag) => !tag.startsWith("code:") && (emailTag ? tag !== emailTag : true),
-  );
+  // Remove old code tags (code:*) and email tags if needed.
+  // Case-insensitive so "CODE:test15", "code:test15" etc. are all cleaned up.
+  const filtered = existing.filter((tag) => {
+    if (tag.toLowerCase().startsWith("code:")) return false;
+    if (emailTag && tag.toLowerCase() === emailTag.toLowerCase()) return false;
+    return true;
+  });
 
   // Add new code tag and email tag
   const toAdd = [];
@@ -104,9 +107,10 @@ export async function resolveCustomerCodeFromTag(shop, customerGid) {
   const data = await res.json();
   const tags = data?.data?.customer?.tags || [];
 
-  // Find the code:* tag
-  const codeTag = tags.find((tag) => tag.startsWith("code:"));
+  // Find the code:* tag (case-insensitive — we write lowercase but external
+  // tools or Shopify admin may have mixed case).
+  const codeTag = tags.find((tag) => tag.toLowerCase().startsWith("code:"));
   if (!codeTag) return null;
 
-  return codeTag.substring(5); // Remove "code:" prefix
+  return codeTag.substring(5).trim(); // Remove "code:" prefix
 }

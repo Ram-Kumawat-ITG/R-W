@@ -541,7 +541,7 @@ const CreateCodeModal = forwardRef(function CreateCodeModal(
   ref,
 ) {
   const [code, setCode] = useState("");
-  const [discountPercent, setDiscountPercent] = useState("");
+  const [discountPercent, setDiscountPercent] = useState("20");
 
   // Reset on open so a previous draft doesn't leak into the next create.
   useEffect(() => {
