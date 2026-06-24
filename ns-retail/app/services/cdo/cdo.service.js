@@ -1531,7 +1531,6 @@ export async function getPractitionerKpis(practitionerId, { dateFrom, dateTo } =
     orderAgg,
     commissionAgg,
     commissionByStatus,
-    lifetimeOrderAgg,
     pendingPayouts,
     paidPayouts,
     totalReferrals,
@@ -1539,7 +1538,7 @@ export async function getPractitionerKpis(practitionerId, { dateFrom, dateTo } =
     codeCount,
     referredCustomers,
     lastPaidPayout,
-    eligible,
+    eligibleAgg,
   ] = await Promise.all([
     CdoOrder.aggregate([
       { $match: orderMatch },
@@ -1562,14 +1561,14 @@ export async function getPractitionerKpis(practitionerId, { dateFrom, dateTo } =
       { $match: match },
       { $group: { _id: "$status", total: { $sum: "$amount" } } },
     ]),
-    // Lifetime referral orders + revenue (all-time, ignores the date chip).
-    CdoOrder.aggregate([
-      { $match: match },
-      { $group: { _id: null, orders: { $sum: 1 }, revenue: { $sum: "$amount" } } },
-    ]),
-    // Open (not-yet-settled) payouts — awaiting_approval/approved/processing.
+    // Open (not-yet-settled) payouts — all in-flight statuses.
     CdoPayout.aggregate([
-      { $match: { ...match, status: { $in: ["awaiting_approval", "approved", "processing"] } } },
+      {
+        $match: {
+          ...match,
+          status: { $in: ["draft", "awaiting_approval", "approved", "processing", "awaiting_settlement"] },
+        },
+      },
       { $group: { _id: null, total: { $sum: "$amount" } } },
     ]),
     CdoPayout.aggregate([
@@ -1578,10 +1577,23 @@ export async function getPractitionerKpis(practitionerId, { dateFrom, dateTo } =
     ]),
     CdoReferral.countDocuments(referralMatch),
     CdoReferral.countDocuments({ ...referralMatch, status: "converted" }),
-    CdoPractitionerCode.countDocuments({ practitionerId: profile.id }),
+    // Only count codes that are currently active.
+    CdoPractitionerCode.countDocuments({ practitionerId: profile.id, status: "active" }),
     CdoApplication.countDocuments({ "referral.practitionerId": profile.id }),
     CdoPayout.findOne({ ...match, status: "paid" }).sort({ paidAt: -1 }).select("paidAt").lean(),
-    getEligibleCommissions({ practitionerId: profile.id, periodEnd: new Date() }),
+    // Eligible = unpaid commissions (pending OR approved) not yet in a payout.
+    // Uses practitionerMatch so both practitionerId and practitionerEmail are matched.
+    CdoCommission.aggregate([
+      {
+        $match: {
+          ...match,
+          status: { $in: ["pending", "approved"] },
+          payoutId: null,
+          paused: { $ne: true },
+        },
+      },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ]),
   ]);
 
   const orderRow = orderAgg[0] || { revenue: 0, commissionFromOrders: 0, orders: 0 };
@@ -1597,13 +1609,9 @@ export async function getPractitionerKpis(practitionerId, { dateFrom, dateTo } =
   const totalCommissionPaid = byStatus.paid;
   const pendingCommissions = roundMoney(byStatus.pending + byStatus.approved);
 
-  // This practitioner's next-cycle payout (eligible total, gated by minimum).
-  const eligibleTotal = roundMoney(
-    (eligible || []).reduce((s, c) => s + (Number(c.amount) || 0), 0),
-  );
+  // Upcoming payout: eligible unpaid commissions gated by the minimum threshold.
+  const eligibleTotal = roundMoney(eligibleAgg[0]?.total || 0);
   const upcomingPayoutAmount = eligibleTotal >= minAmount ? eligibleTotal : 0;
-
-  const lifetime = lifetimeOrderAgg[0] || { orders: 0, revenue: 0 };
 
   return {
     totalOrders: orderRow.orders || 0,
@@ -1621,12 +1629,9 @@ export async function getPractitionerKpis(practitionerId, { dateFrom, dateTo } =
     pendingCommissions,
     // ── Referral footprint ──
     referredCustomers,
-    totalReferralOrders: lifetime.orders || 0,
-    lifetimeReferralRevenue: roundMoney(lifetime.revenue || 0),
     // ── Payout cadence ──
     lastPayoutDate: lastPaidPayout?.paidAt || null,
     upcomingPayoutAmount,
-    nextExpectedPayoutAmount: upcomingPayoutAmount,
     nextPayoutDate: nextPayoutDate(),
     minimumPayoutAmount: minAmount,
   };
