@@ -88,7 +88,10 @@ function sum(rows, field) {
 
 export async function listPractitioners() {
   await connectDB();
-  const [rows, heldIds] = await Promise.all([
+  const settings = await getSettings();
+  const minAmount = Number(settings.minimumPayoutAmount) || 0;
+
+  const [rows, heldIds, pendingComms, paidPayouts] = await Promise.all([
     WholesaleApplication.find(PRACTITIONER_FILTER)
       .sort({ submittedAt: -1 })
       .select(
@@ -96,24 +99,89 @@ export async function listPractitioners() {
       )
       .lean(),
     getHeldPractitionerIds(),
+    // All unpaid commissions — grouped in JS to handle the practitionerId /
+    // practitionerEmail dual-key pattern without double-counting.
+    CdoCommission.find({ status: { $in: ["pending", "approved"] } })
+      .select("practitionerId practitionerEmail amount payoutId paused")
+      .lean(),
+    // All paid payouts sorted desc — first match per practitioner = most recent.
+    CdoPayout.find({ status: "paid" })
+      .sort({ paidAt: -1 })
+      .select("practitionerId practitionerEmail paidAt amount")
+      .lean(),
   ]);
+
   const held = new Set(heldIds.map(String));
 
-  return rows.map((r) => ({
-    id: r._id.toString(),
-    firstName: r.firstName || "",
-    lastName: r.lastName || "",
-    name: `${r.firstName || ""} ${r.lastName || ""}`.trim(),
-    email: r.email || "",
-    phone: r.phone || "",
-    businessName: r.businessName || "",
-    submittedAt: r.submittedAt || null,
-    customerId: r.customerId || null,
-    status: r.status || "approved",
-    // Practitioner-level payout hold (cdo_practitioner_holds). Distinct
-    // from per-commission pause; gates the automated payout CRON.
-    payoutsPaused: held.has(r._id.toString()),
-  }));
+  // Build commission lookup maps. Each commission goes into the ID map when
+  // practitionerId is set, otherwise into the email map — so a commission with
+  // both fields populated is counted exactly once (under its ID).
+  const commById = new Map();   // practitionerId  → { pending, eligible }
+  const commByEmail = new Map(); // practitionerEmail → { pending, eligible }
+  for (const c of pendingComms) {
+    const amt = Number(c.amount) || 0;
+    const isEligible = !c.payoutId && c.paused !== true;
+    if (c.practitionerId) {
+      const key = String(c.practitionerId);
+      if (!commById.has(key)) commById.set(key, { pending: 0, eligible: 0 });
+      const e = commById.get(key);
+      e.pending += amt;
+      if (isEligible) e.eligible += amt;
+    } else if (c.practitionerEmail) {
+      const key = c.practitionerEmail.toLowerCase();
+      if (!commByEmail.has(key)) commByEmail.set(key, { pending: 0, eligible: 0 });
+      const e = commByEmail.get(key);
+      e.pending += amt;
+      if (isEligible) e.eligible += amt;
+    }
+  }
+
+  // Last paid payout per practitioner (paidPayouts is already sorted desc so
+  // first match wins).
+  const lastPayoutById = new Map();
+  const lastPayoutByEmail = new Map();
+  for (const p of paidPayouts) {
+    if (p.practitionerId) {
+      const key = String(p.practitionerId);
+      if (!lastPayoutById.has(key))
+        lastPayoutById.set(key, { date: p.paidAt, amount: p.amount });
+    }
+    if (p.practitionerEmail) {
+      const key = p.practitionerEmail.toLowerCase();
+      if (!lastPayoutByEmail.has(key))
+        lastPayoutByEmail.set(key, { date: p.paidAt, amount: p.amount });
+    }
+  }
+
+  return rows.map((r) => {
+    const id = r._id.toString();
+    const email = (r.email || "").toLowerCase();
+
+    // Prefer ID lookup, fall back to email lookup.
+    const comm = commById.get(id) || commByEmail.get(email) || { pending: 0, eligible: 0 };
+    const eligible = roundMoney(comm.eligible);
+    const lastPayout = lastPayoutById.get(id) || lastPayoutByEmail.get(email) || null;
+
+    return {
+      id,
+      firstName: r.firstName || "",
+      lastName: r.lastName || "",
+      name: `${r.firstName || ""} ${r.lastName || ""}`.trim(),
+      email: r.email || "",
+      phone: r.phone || "",
+      businessName: r.businessName || "",
+      submittedAt: r.submittedAt || null,
+      customerId: r.customerId || null,
+      status: r.status || "approved",
+      // Practitioner-level payout hold (cdo_practitioner_holds).
+      payoutsPaused: held.has(id),
+      // Financial summary columns.
+      pendingCommissions: roundMoney(comm.pending),
+      upcomingPayout: eligible >= minAmount ? eligible : 0,
+      lastPayoutDate: lastPayout?.date || null,
+      lastPayoutAmount: lastPayout?.amount || 0,
+    };
+  });
 }
 
 export async function countPractitioners() {
@@ -2028,13 +2096,16 @@ export async function reverseCommission(commissionId) {
   return c.toObject();
 }
 
-// Approved, not-yet-paid, not-yet-batched commissions earned on/before
-// the period end. The batch builder applies the per-practitioner minimum.
+// Unpaid, not-yet-batched commissions earned on/before the period end.
+// Includes both "pending" (created, not yet reviewed) and "approved"
+// (admin-verified) so the upcoming-payout preview and KPIs reflect the
+// full balance owed. The batch builder still applies the per-practitioner
+// minimum before disbursing.
 export async function getEligibleCommissions({ practitionerId, periodEnd } = {}) {
   await connectDB();
   // Eligibility excludes individually-paused commissions and any
   // commission owned by a practitioner whose payouts are on hold.
-  const filter = { status: "approved", payoutId: null, paused: { $ne: true } };
+  const filter = { status: { $in: ["pending", "approved"] }, payoutId: null, paused: { $ne: true } };
   if (practitionerId) {
     if (await isPractitionerPaused(practitionerId)) return [];
     filter.practitionerId = practitionerId;
