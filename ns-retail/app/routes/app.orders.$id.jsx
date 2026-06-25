@@ -301,8 +301,8 @@ export default function OrderDetail() {
   }, [pdfFetcher.data, pdfFetcher.state]);
 
   return (
-    <s-stack direction="block" gap="base">
-      <s-box paddingBlockEnd="base">
+    <s-stack direction="block" gap="small-200">
+      <s-box paddingBlockEnd="small-200">
         <s-button variant="tertiary" icon="arrow-left" onClick={() => navigate("/app/orders")}>
           Back to Orders
         </s-button>
@@ -344,8 +344,8 @@ export default function OrderDetail() {
           </s-stack>
           <Row label="Source channel" value={order.sourceName} />
         </s-grid>
-        <s-box paddingBlockStart="base">
-          <s-stack direction="block" gap="tight">
+        <s-box paddingBlockStart="small-200">
+          <s-stack direction="block" gap="small-200">
             <s-stack direction="block" gap="none">
               <s-text tone="subdued">Order tags</s-text>
               {order.tags?.length ? (
@@ -360,9 +360,11 @@ export default function OrderDetail() {
                 <s-text>—</s-text>
               )}
             </s-stack>
-            <Row label="Order notes" value={order.note} />
-            {order.noteAttributes?.length > 0 &&
-              order.noteAttributes.map((a, i) => <Row key={i} label={a.name || "—"} value={a.value || "—"} />)}
+            <s-grid gap="base" gridTemplateColumns="repeat(2, minmax(0, 1fr))">
+              <Row label="Order notes" value={order.note} />
+              {order.noteAttributes?.length > 0 &&
+                order.noteAttributes.map((a, i) => <Row key={i} label={a.name || "—"} value={a.value || "—"} />)}
+            </s-grid>
           </s-stack>
         </s-box>
       </s-section>
@@ -370,30 +372,34 @@ export default function OrderDetail() {
       {/* ── Customer ── */}
       <s-grid gap="base" gridTemplateColumns="repeat(2, minmax(0, 1fr))">
         <s-section heading="Customer information">
-          <s-stack direction="block" gap="tight">
-            <Row label="Name" value={order.customer.name} />
-            <Row label="Email" value={order.customer.email} />
-            <Row label="Phone" value={order.customer.phone} />
-            <AddressBlock label="Billing address" a={order.billingAddress} />
-            <AddressBlock label="Shipping address" a={order.shippingAddress} />
+          <s-stack direction="block" gap="base">
+            <s-grid gap="base" gridTemplateColumns="repeat(3, minmax(0, 1fr))">
+              <Row label="Name" value={order.customer.name} />
+              <Row label="Email" value={order.customer.email} />
+              <Row label="Phone" value={order.customer.phone} />
+            </s-grid>
+            <s-grid gap="base" gridTemplateColumns="repeat(2, minmax(0, 1fr))">
+              <AddressBlock label="Billing address" a={order.billingAddress} />
+              <AddressBlock label="Shipping address" a={order.shippingAddress} />
+            </s-grid>
           </s-stack>
         </s-section>
 
         <s-section heading="Referral & practitioner">
           {order.attributed ? (
-            <s-stack direction="block" gap="tight">
+            <s-grid gap="base" gridTemplateColumns="repeat(2, minmax(0, 1fr))">
               <Row label="Referral code" value={order.referralCode} />
-              <Row label="Practitioner" value={order.practitioner?.name || order.practitioner?.email} />
-              <Row label="Practitioner email" value={order.practitioner?.email} />
               <Row
                 label="Commission rate"
                 value={order.referral?.commissionRate != null ? formatPercent(order.referral.commissionRate) : "—"}
               />
+              <Row label="Practitioner" value={order.practitioner?.name || order.practitioner?.email} />
+              <Row label="Practitioner email" value={order.practitioner?.email} />
               <Row
                 label="Attribution source"
                 value={order.attribution?.source ? `${order.attribution.source} (${order.attribution.code || "—"})` : "—"}
               />
-            </s-stack>
+            </s-grid>
           ) : (
             <s-paragraph tone="subdued">This order carried no (valid) referral code — standard retail order.</s-paragraph>
           )}
@@ -439,20 +445,20 @@ export default function OrderDetail() {
       {/* ── Pricing / tax / discount ── */}
       <s-grid gap="base" gridTemplateColumns="repeat(2, minmax(0, 1fr))">
         <s-section heading="Pricing">
-          <s-stack direction="block" gap="tight">
+          <s-grid gap="base" gridTemplateColumns="repeat(2, minmax(0, 1fr))">
             <Row label="Subtotal" value={formatCurrency(p.subtotal, cur)} />
-            <Row label="Discounts" value={formatCurrency(p.totalDiscounts, cur)} />
             <Row label="Tax" value={formatCurrency(p.totalTax, cur)} />
             <Row label="Shipping" value={formatCurrency(p.totalShipping, cur)} />
+            <Row label="Discounts" value={formatCurrency(p.totalDiscounts, cur)} />
             <Row label="Total" value={formatCurrency(p.total ?? order.amount, cur)} />
             {order.discountCodes.length > 0 ? (
               <Row label="Discount codes" value={order.discountCodes.map((d) => d.code).join(", ")} />
             ) : null}
-          </s-stack>
+          </s-grid>
         </s-section>
 
         <s-section heading="Tax & discount details">
-          <s-stack direction="block" gap="tight">
+          <s-grid gap="base" gridTemplateColumns="repeat(2, minmax(0, 1fr))">
             {order.taxLines?.length ? (
               order.taxLines.map((t, i) => (
                 <Row
@@ -471,7 +477,7 @@ export default function OrderDetail() {
             ) : (
               <Row label="Discounts" value={formatCurrency(p.totalDiscounts, cur)} />
             )}
-          </s-stack>
+          </s-grid>
         </s-section>
       </s-grid>
 
@@ -881,12 +887,17 @@ export default function OrderDetail() {
         {order.commissionBreakdown && order.commissionBreakdown.lines.length > 0 ? (
           <s-box paddingBlockStart="base">
             <s-stack direction="block" gap="tight">
-              <s-text>
-                <strong>Commission breakdown</strong>
-                {order.commissionBreakdown.reconstructed
-                  ? " — reconstructed (legacy order, approximate)"
-                  : ""}
-              </s-text>
+              <s-stack direction="inline" gap="base" alignItems="center">
+                <s-text>
+                  <strong>Commission breakdown</strong>
+                  {order.commissionBreakdown.reconstructed
+                    ? " — reconstructed (legacy order, approximate)"
+                    : ""}
+                </s-text>
+                <s-text tone="subdued">
+                  Effective rate: {formatPercent(order.commissionBreakdown.effectiveRate)}
+                </s-text>
+              </s-stack>
               <s-table>
                 <s-table-header-row>
                   <s-table-header>Vendor</s-table-header>
@@ -905,10 +916,6 @@ export default function OrderDetail() {
                   ))}
                 </s-table-body>
               </s-table>
-              <Row
-                label="Effective rate"
-                value={formatPercent(order.commissionBreakdown.effectiveRate)}
-              />
             </s-stack>
           </s-box>
         ) : null}
@@ -916,12 +923,12 @@ export default function OrderDetail() {
 
       {/* ── Audit & activity ── */}
       <s-section heading="Order timeline">
-        <s-stack direction="block" gap="tight">
+        <s-grid gap="base" gridTemplateColumns="repeat(3, minmax(0, 1fr))">
           {order.timeline.map((t, i) => (
             <Row key={i} label={t.label} value={formatDateTime(t.at)} />
           ))}
           <Row label="Shopify order id" value={order.shopifyOrderId} />
-        </s-stack>
+        </s-grid>
       </s-section>
 
       <s-grid gap="base" gridTemplateColumns="repeat(2, minmax(0, 1fr))">

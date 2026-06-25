@@ -179,75 +179,109 @@ function PractitionerCard({ practitioner }) {
 
 function UpcomingPayoutSummary({ upcoming }) {
   return (
-    <s-box padding="base" background="bg-surface-secondary" border-radius="base">
-      <s-stack direction="block" gap="base">
-        <s-text variant="headingSm">Upcoming Payout</s-text>
+    <div style={{ border: "1px solid #e1e3e5", borderRadius: "8px", overflow: "hidden" }}>
 
-        {/* Live countdown */}
-        <PayoutCountdown payoutRunAt={upcoming.payoutRunAt} />
+      {/* Header bar */}
+      <div style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        padding: "12px 20px",
+        background: "#f6f6f7",
+        borderBottom: "1px solid #e1e3e5",
+      }}>
+        <span style={{ fontWeight: 600, fontSize: "14px", color: "#303030" }}>
+          Upcoming Payout
+        </span>
+        <span style={{ fontSize: "13px", color: "#6d7175" }}>
+          {formatDate(upcoming.estimatedDate)} ·{" "}
+          {new Date(upcoming.payoutRunAt).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+            timeZoneName: "short",
+          })}
+        </span>
+      </div>
 
-        {/* Summary cards */}
-        <s-stack direction="inline" gap="base" wrap>
-          <MetricCard
-            label="Scheduled Total"
-            value={formatCurrency(upcoming.totalAmount)}
-            tone={upcoming.totalAmount > 0 ? "success" : undefined}
-            sublabel={`${formatNumber(upcoming.practitionerCount)} practitioner(s) · ${formatNumber(upcoming.commissionCount)} commission(s)`}
-          />
-          <MetricCard
-            label="Total Sales Value"
-            value={formatCurrency(upcoming.totalSalesValue)}
-            sublabel={`${formatNumber(upcoming.totalOrderCount)} attributed order(s)`}
-          />
-          <MetricCard
-            label="Payout Date"
-            value={formatDate(upcoming.estimatedDate)}
-            sublabel={new Date(upcoming.payoutRunAt).toLocaleTimeString([], {
-              hour: "2-digit",
-              minute: "2-digit",
-              timeZoneName: "short",
-            })}
-          />
-          <MetricCard
-            label="Min Threshold"
-            value={formatCurrency(upcoming.minimumPayoutAmount)}
-            sublabel={
-              upcoming.belowMinimumCount > 0
-                ? `${formatNumber(upcoming.belowMinimumCount)} practitioner(s) below minimum`
-                : "All practitioners qualify"
-            }
-          />
-        </s-stack>
+      <div style={{ padding: "20px", background: "#fff" }}>
+        <s-stack direction="block" gap="base">
 
-        {/* Practitioner breakdown */}
-        {upcoming.breakdown.length === 0 ? (
-          <s-box padding="small-200" background="bg-surface" border-radius="base">
-            <s-text tone="subdued">
-              No practitioners qualify for this cycle yet. Commissions accrue until
-              each practitioner reaches the minimum threshold of{" "}
-              {formatCurrency(upcoming.minimumPayoutAmount)}.
-            </s-text>
-          </s-box>
-        ) : (
-          <s-stack direction="block" gap="small-200">
-            {upcoming.breakdown.map((p) => (
-              <PractitionerCard key={p.practitionerId} practitioner={p} />
-            ))}
+          {/* Countdown + summary cards side by side */}
+          <s-stack direction="inline" gap="base" wrap alignItems="flex-start">
+            {/* Countdown */}
+            <s-box
+              padding="base"
+              background="bg-surface-secondary"
+              border-radius="base"
+              min-inline-size="300px"
+            >
+              <s-stack direction="block" gap="small-200">
+                <s-text tone="subdued">Time until next payout run</s-text>
+                <PayoutCountdown payoutRunAt={upcoming.payoutRunAt} />
+              </s-stack>
+            </s-box>
+
+            {/* KPI cards */}
+            <s-box flex="1">
+              <s-stack direction="inline" gap="base" wrap>
+                <MetricCard
+                  label="Scheduled Total"
+                  value={formatCurrency(upcoming.totalAmount)}
+                  tone={upcoming.totalAmount > 0 ? "success" : undefined}
+                  sublabel={`${formatNumber(upcoming.practitionerCount)} practitioner(s) · ${formatNumber(upcoming.commissionCount)} commission(s)`}
+                />
+                <MetricCard
+                  label="Total Sales Value"
+                  value={formatCurrency(upcoming.totalSalesValue)}
+                  sublabel={`${formatNumber(upcoming.totalOrderCount)} attributed order(s)`}
+                />
+                <MetricCard
+                  label="Min Threshold"
+                  value={formatCurrency(upcoming.minimumPayoutAmount)}
+                  sublabel={
+                    upcoming.belowMinimumCount > 0
+                      ? `${formatNumber(upcoming.belowMinimumCount)} below minimum`
+                      : "All practitioners qualify"
+                  }
+                />
+              </s-stack>
+            </s-box>
           </s-stack>
-        )}
 
-        {/* Below-minimum notice */}
-        {upcoming.belowMinimumCount > 0 && (
-          <s-box padding="small-200" background="bg-surface" border-radius="base">
-            <s-text tone="subdued">
-              {formatNumber(upcoming.belowMinimumCount)} practitioner(s) are accruing commissions
-              below the {formatCurrency(upcoming.minimumPayoutAmount)} minimum — they will carry
-              forward to the next cycle.
-            </s-text>
-          </s-box>
-        )}
-      </s-stack>
-    </s-box>
+          {/* Divider */}
+          <div style={{ borderTop: "1px solid #e1e3e5" }} />
+
+          {/* Practitioner breakdown heading */}
+          <s-stack direction="inline" gap="none" alignItems="center" justifyContent="space-between">
+            <s-text variant="headingSm">Practitioner Breakdown</s-text>
+            {upcoming.belowMinimumCount > 0 && (
+              <s-text tone="subdued">
+                {formatNumber(upcoming.belowMinimumCount)} practitioner(s) below the{" "}
+                {formatCurrency(upcoming.minimumPayoutAmount)} minimum — carrying forward
+              </s-text>
+            )}
+          </s-stack>
+
+          {/* Practitioner cards */}
+          {upcoming.breakdown.length === 0 ? (
+            <s-box padding="base" background="bg-surface-secondary" border-radius="base">
+              <s-text tone="subdued">
+                No practitioners qualify for this cycle yet. Commissions accrue until each
+                practitioner reaches the minimum threshold of{" "}
+                {formatCurrency(upcoming.minimumPayoutAmount)}.
+              </s-text>
+            </s-box>
+          ) : (
+            <s-stack direction="block" gap="small-200">
+              {upcoming.breakdown.map((p) => (
+                <PractitionerCard key={p.practitionerId} practitioner={p} />
+              ))}
+            </s-stack>
+          )}
+
+        </s-stack>
+      </div>
+    </div>
   );
 }
 
