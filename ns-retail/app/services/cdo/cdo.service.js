@@ -752,14 +752,50 @@ export async function getDashboardMetrics() {
   };
 }
 
-// Next calendar 25th (the production payout schedule). Pure date math; dev
-// runs on CDO_PAYOUT_INTERVAL but the business-meaningful "next payout date"
-// is still the 25th.
+// Convert a wall-clock time in a named IANA timezone to a UTC Date.
+// Uses Intl.DateTimeFormat to resolve the UTC offset at the target moment
+// so the result is correct across DST transitions (Node 20+ / V8 full ICU).
+function zonedToUtc(year, month, day, hour, minute, tz) {
+  const naive = new Date(Date.UTC(year, month, day, hour, minute, 0));
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+  const get = (parts, type) =>
+    parseInt(parts.find((p) => p.type === type)?.value ?? '0', 10);
+  const parts = fmt.formatToParts(naive);
+  const h = get(parts, 'hour');
+  const tzUtcMs = Date.UTC(
+    get(parts, 'year'), get(parts, 'month') - 1, get(parts, 'day'),
+    h === 24 ? 0 : h, get(parts, 'minute'), get(parts, 'second')
+  );
+  return new Date(naive.getTime() + (naive.getTime() - tzUtcMs));
+}
+
+// Next scheduled payout as an exact UTC Date, honouring CDO_PAYOUT_CRON and
+// CDO_PAYOUT_TZ. Parses the first three cron fields (minute hour day-of-month).
+function nextPayoutRunAt(from = new Date()) {
+  const cronParts = schedulerConfig.payoutCron.split(' ');
+  const cronMin  = parseInt(cronParts[0], 10); // 30
+  const cronHour = parseInt(cronParts[1], 10); // 0
+  const cronDay  = parseInt(cronParts[2], 10); // 25
+  const tz = schedulerConfig.scheduleTimezone;
+
+  for (let mo = 0; mo <= 2; mo++) {
+    const ref = new Date(from.getFullYear(), from.getMonth() + mo, 1);
+    const candidate = zonedToUtc(ref.getFullYear(), ref.getMonth(), cronDay, cronHour, cronMin, tz);
+    if (candidate > from) return candidate;
+  }
+  const ref = new Date(from.getFullYear(), from.getMonth() + 3, 1);
+  return zonedToUtc(ref.getFullYear(), ref.getMonth(), cronDay, cronHour, cronMin, tz);
+}
+
+// Legacy helper — calendar date only (no time). Kept for the portal summary
+// and any other callers that don't need the exact run time.
 function nextPayoutDate(from = new Date()) {
-  const d = new Date(from);
-  return d.getDate() < 25
-    ? new Date(d.getFullYear(), d.getMonth(), 25)
-    : new Date(d.getFullYear(), d.getMonth() + 1, 25);
+  const run = nextPayoutRunAt(from);
+  return new Date(run.getFullYear(), run.getMonth(), run.getDate());
 }
 
 // Forward-looking preview of what the NEXT payout run will disburse — a
@@ -797,10 +833,90 @@ export async function getUpcomingPayouts({ shop } = {}) {
     .sort((a, b) => b.amount - a.amount);
   const belowMinimum = [...groups.values()].filter((g) => g.amount < minAmount);
 
+  const payoutRun = nextPayoutRunAt();
   return {
+    estimatedDate: nextPayoutDate(),
+    payoutRunAt: payoutRun.toISOString(),
+    minimumPayoutAmount: minAmount,
+    totalAmount: roundMoney(breakdown.reduce((s, g) => s + g.amount, 0)),
+    practitionerCount: breakdown.length,
+    commissionCount: breakdown.reduce((s, g) => s + g.commissionCount, 0),
+    breakdown,
+    belowMinimumCount: belowMinimum.length,
+  };
+}
+
+// Detailed upcoming-payout batch preview: same eligibility rules as
+// getUpcomingPayouts() but enriched with per-order breakdowns for every
+// practitioner. Read-only — no writes. Used by the Upcoming Payout tab.
+export async function getUpcomingPayoutBatchDetails({ shop } = {}) {
+  await connectDB();
+  const settings = await getSettings();
+  const minAmount = Number(settings.minimumPayoutAmount) || 0;
+
+  const eligible = await getEligibleCommissions({ periodEnd: new Date() });
+  const rows = shop ? eligible.filter((c) => c.shop === shop) : eligible;
+
+  // Batch-fetch all linked orders in one query to avoid N+1
+  const orderIds = rows.map((c) => c.orderId).filter(Boolean);
+  const orderDocs = orderIds.length
+    ? await CdoOrder.find({ _id: { $in: orderIds } })
+        .select(
+          "orderName orderNumber shopifyOrderId customerName customerEmail amount commissionAmount referral placedAt status currency",
+        )
+        .lean()
+    : [];
+  const orderMap = new Map(orderDocs.map((o) => [String(o._id), o]));
+
+  const groups = new Map();
+  for (const c of rows) {
+    const key = c.practitionerId;
+    if (!key) continue;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        practitionerId: key,
+        practitionerName: c.practitionerName || c.practitionerEmail || "—",
+        commissionCount: 0,
+        amount: 0,
+        salesTotal: 0,
+        orders: [],
+      });
+    }
+    const g = groups.get(key);
+    const order = c.orderId ? orderMap.get(String(c.orderId)) : null;
+    const orderTotal = Number(order?.amount) || 0;
+
+    g.commissionCount += 1;
+    g.amount = roundMoney(g.amount + (Number(c.amount) || 0));
+    g.salesTotal = roundMoney(g.salesTotal + orderTotal);
+
+    g.orders.push({
+      commissionId: String(c._id),
+      orderName: order?.orderName || c.orderName || "—",
+      customerName: order?.customerName || order?.customerEmail || "—",
+      orderDate: order?.placedAt || null,
+      orderTotal,
+      referralCode: order?.referral?.code || "—",
+      commissionRate: Number(c.rate) || 0,
+      commissionAmount: Number(c.amount) || 0,
+      orderStatus: order?.status || "—",
+      currency: order?.currency || c.currency || "USD",
+    });
+  }
+
+  const breakdown = [...groups.values()]
+    .filter((g) => g.amount >= minAmount)
+    .sort((a, b) => b.amount - a.amount);
+  const belowMinimum = [...groups.values()].filter((g) => g.amount < minAmount);
+
+  const payoutRun = nextPayoutRunAt();
+  return {
+    payoutRunAt: payoutRun.toISOString(),
     estimatedDate: nextPayoutDate(),
     minimumPayoutAmount: minAmount,
     totalAmount: roundMoney(breakdown.reduce((s, g) => s + g.amount, 0)),
+    totalSalesValue: roundMoney(breakdown.reduce((s, g) => s + g.salesTotal, 0)),
+    totalOrderCount: breakdown.reduce((s, g) => s + g.orders.length, 0),
     practitionerCount: breakdown.length,
     commissionCount: breakdown.reduce((s, g) => s + g.commissionCount, 0),
     breakdown,

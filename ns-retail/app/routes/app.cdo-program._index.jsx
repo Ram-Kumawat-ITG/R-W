@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
 import { getDashboardMetrics } from "../services/cdo/cdo.service";
@@ -8,6 +9,7 @@ import {
   formatNumber,
   formatPercent,
   formatDate,
+  formatDateTime,
 } from "../utils/format";
 
 export const loader = async ({ request }) => {
@@ -21,6 +23,68 @@ const MONTH_LABEL = (key) => {
   const d = new Date(Number(y), Number(m) - 1, 1);
   return d.toLocaleDateString("en-US", { month: "short", year: "numeric" });
 };
+
+// ── Countdown helpers ─────────────────────────────────────────────────────────
+
+function calcTimeLeft(targetIso) {
+  const diff = new Date(targetIso).getTime() - Date.now();
+  if (diff <= 0) return null;
+  return {
+    days:    Math.floor(diff / 86_400_000),
+    hours:   Math.floor((diff % 86_400_000) / 3_600_000),
+    minutes: Math.floor((diff % 3_600_000)  / 60_000),
+    seconds: Math.floor((diff % 60_000)     / 1_000),
+  };
+}
+
+function CountdownUnit({ value, label }) {
+  return (
+    <s-box
+      padding="base"
+      border-color="border"
+      border-width="base"
+      border-radius="base"
+      min-inline-size="80px"
+    >
+      <s-stack direction="block" gap="none" alignItems="center">
+        <s-text variant="headingLg">
+          {String(value).padStart(2, "0")}
+        </s-text>
+        <s-text tone="subdued">{label}</s-text>
+      </s-stack>
+    </s-box>
+  );
+}
+
+function PayoutCountdown({ payoutRunAt }) {
+  // null = not yet hydrated (avoids SSR / client mismatch)
+  const [timeLeft, setTimeLeft] = useState(null);
+
+  useEffect(() => {
+    const tick = () => setTimeLeft(calcTimeLeft(payoutRunAt));
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [payoutRunAt]);
+
+  if (!timeLeft) return null;
+
+  return (
+    <s-stack direction="block" gap="small-200">
+      <s-stack direction="inline" gap="small-200" wrap>
+        <CountdownUnit value={timeLeft.days}    label="Days"    />
+        <CountdownUnit value={timeLeft.hours}   label="Hours"   />
+        <CountdownUnit value={timeLeft.minutes} label="Minutes" />
+        <CountdownUnit value={timeLeft.seconds} label="Seconds" />
+      </s-stack>
+      <s-text tone="subdued">
+        Next payout run: {formatDateTime(payoutRunAt)}
+      </s-text>
+    </s-stack>
+  );
+}
+
+// ── Page ──────────────────────────────────────────────────────────────────────
 
 export default function CdoDashboard() {
   const { metrics } = useLoaderData();
@@ -72,8 +136,23 @@ export default function CdoDashboard() {
         </s-grid>
       </s-section>
 
+      {/* ── Upcoming payout ───────────────────────────────────────────── */}
       <s-section heading="Upcoming payout (next cycle)">
         <s-stack direction="block" gap="base">
+
+          {/* Countdown banner */}
+          <s-box
+            padding="base"
+            background="bg-surface-secondary"
+            border-radius="base"
+          >
+            <s-stack direction="block" gap="small-200">
+              <s-text variant="headingSm">Time until next payout run</s-text>
+              <PayoutCountdown payoutRunAt={upcoming.payoutRunAt} />
+            </s-stack>
+          </s-box>
+
+          {/* Summary cards */}
           <s-grid gap="base" gridTemplateColumns="repeat(3, minmax(0, 1fr))">
             <MetricCard
               label="Scheduled total"
@@ -82,8 +161,13 @@ export default function CdoDashboard() {
               sublabel={`${formatNumber(upcoming.practitionerCount)} practitioner(s) · ${formatNumber(upcoming.commissionCount)} commission(s)`}
             />
             <MetricCard
-              label="Estimated payout date"
+              label="Payout date"
               value={formatDate(upcoming.estimatedDate)}
+              sublabel={new Date(upcoming.payoutRunAt).toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+                timeZoneName: "short",
+              })}
             />
             <MetricCard
               label="Min payout threshold"
@@ -95,6 +179,8 @@ export default function CdoDashboard() {
               }
             />
           </s-grid>
+
+          {/* Breakdown table */}
           {upcoming.breakdown.length === 0 ? (
             <s-paragraph tone="subdued">
               No practitioner clears the minimum payout this cycle yet. Commissions accrue until
