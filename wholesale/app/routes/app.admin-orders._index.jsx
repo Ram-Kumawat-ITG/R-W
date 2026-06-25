@@ -29,11 +29,11 @@ import { formatAmount, parseDateOnly, startOfDay } from "../utils/format.utils";
 // Admin Orders — orders placed by the retail drop-ship customer
 // (DROPSHIP_RETAIL_CUSTOMER_EMAIL). These run on a separate flow from the
 // wholesale order pipeline: each new order gets an UNPAID QBO invoice on
-// creation, and the dedicated process-dropship-payments CRON collects it
-// against the configured drop-ship NMI vault (DROPSHIP_NMI_VAULT_ID) — they
-// are NOT touched by the wholesale payment CRON. (Orders ingested before
-// drop-ship invoicing existed remain as legacy "Admin order" rows with no
-// invoice.)
+// creation, collected via the Admin Order Batch Payment UI
+// (/app/admin-orders/batch) rather than an auto-charge CRON. The admin reviews
+// all unpaid invoices, enters a single payment reference, and marks the batch
+// paid in one step. (Orders ingested before drop-ship invoicing existed remain
+// as legacy "Admin order" rows with no invoice.)
 //
 // This page is read-only — it surfaces what Shopify sent us so an admin can
 // audit drop-ship fulfillment.
@@ -631,6 +631,16 @@ export default function AdminOrdersList() {
 
   return (
     <s-page inlineSize="large" heading="Admin Orders">
+      <s-box paddingBlockEnd="base">
+        <s-stack direction="inline" gap="small-200" alignItems="center">
+          <s-button variant="primary" onClick={() => navigate("/app/admin-orders/batch")}>
+            Batch Payment
+          </s-button>
+          <s-text tone="subdued">
+            Mark multiple unpaid invoices paid in a single operation
+          </s-text>
+        </s-stack>
+      </s-box>
       <AdvancedFilters
         fields={FILTER_FIELDS}
         values={{ q, fulfillment, payment, dateFrom, dateTo }}
@@ -639,7 +649,7 @@ export default function AdminOrdersList() {
         applying={tableLoading}
         description={`Orders placed by the retail drop-ship customer${
           customerEmail ? ` (${customerEmail})` : ""
-        }. Each new order gets an unpaid QBO invoice on creation; the drop-ship payment job collects it automatically against the card on file and marks it paid in QBO. They are handled separately from the wholesale payment flow.`}
+        }. Each new order gets an unpaid QBO invoice on creation. Use the Batch Payment button above to mark multiple invoices paid at once with a single payment reference.`}
       />
       <s-section padding="none">
         <s-box padding="base">

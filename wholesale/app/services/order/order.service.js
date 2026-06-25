@@ -372,7 +372,7 @@ async function invoiceDropshipOrder({ shop, order, local }) {
   const orderEmail = order.email || order.customer?.email || ''
   console.log(
     `[orders] DROP-SHIP — ${shopifyOrderId} placed by retail drop-ship customer ` +
-      `(${orderEmail}); creating UNPAID QBO invoice (collection deferred to dropship CRON).`,
+      `(${orderEmail}); creating UNPAID QBO invoice (collected via Admin Order Batch Payment UI).`,
   )
   try {
     const customerMap = await ensureDropshipCustomerMap({ shop, order })

@@ -58,6 +58,7 @@ export default [
   route("/api/admin/orders/:id/resume-auto-charge", "api/admin/resume-auto-charge.js"),
   route("/api/admin/orders/:id/pause-reminders", "api/admin/pause-reminders.js"),
   route("/api/admin/orders/:id/resume-reminders", "api/admin/resume-reminders.js"),
+  route("/api/admin/admin-order-batch", "api/admin/admin-order-batch.js"),
   route("/api/sync/retail-order", "api/sync/retail-order.js"),
   route("/api/sync/retail-inventory-update", "api/sync/retail-inventory-update.js"),
   route("/api/admin/sync/backfill", "api/admin/sync-backfill.js"),
