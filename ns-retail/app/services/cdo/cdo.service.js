@@ -267,6 +267,158 @@ export async function listPayouts() {
   }));
 }
 
+// Practitioners without ACH banking are batched as method: "check" payouts.
+// This view lists ALL check-method payouts, enriched with the practitioner's
+// known referral codes, for the Check Payouts admin queue.
+export async function listCheckPayouts() {
+  await connectDB();
+  const rows = await CdoPayout.find({ method: "check" })
+    .sort({ createdAt: -1 })
+    .lean();
+  if (!rows.length) return [];
+
+  // Batch-load referral codes for all practitioners in one query
+  const practitionerIds = [...new Set(rows.map((r) => r.practitionerId).filter(Boolean))];
+  const referralDocs = practitionerIds.length
+    ? await CdoReferral.find({ practitionerId: { $in: practitionerIds } })
+        .select("practitionerId referralCode")
+        .lean()
+    : [];
+  const codeMap = new Map();
+  for (const rd of referralDocs) {
+    const pid = rd.practitionerId;
+    if (!codeMap.has(pid)) codeMap.set(pid, new Set());
+    if (rd.referralCode) codeMap.get(pid).add(rd.referralCode);
+  }
+
+  return rows.map((r) => ({
+    id: r._id.toString(),
+    practitionerId: r.practitionerId || null,
+    practitionerName: r.practitionerName || r.practitionerEmail || "—",
+    practitionerEmail: r.practitionerEmail || "—",
+    amount: r.amount || 0,
+    currency: r.currency || "USD",
+    method: r.method || "check",
+    status: r.status || "awaiting_approval",
+    commissionCount: Array.isArray(r.commissionIds) ? r.commissionIds.length : 0,
+    periodStart: r.periodStart || null,
+    periodEnd: r.periodEnd || null,
+    reference: r.reference || "",
+    paidAt: r.paidAt || null,
+    checkDetails: r.checkDetails
+      ? {
+          checkNumber: r.checkDetails.checkNumber || null,
+          checkDate: r.checkDetails.checkDate || null,
+          notes: r.checkDetails.notes || null,
+          issuedBy: r.checkDetails.issuedBy || null,
+          issuedAt: r.checkDetails.issuedAt || null,
+        }
+      : null,
+    bankingError: r.bankingError || null,
+    remarks: (r.remarks || []).map((rem) => ({
+      kind: rem.kind,
+      message: rem.message,
+      actor: rem.actor,
+      createdAt: rem.createdAt,
+    })),
+    referralCodes: [...(codeMap.get(r.practitionerId) || [])],
+    lastError: r.lastError || null,
+    approvedBy: r.approvedBy || null,
+    approvedAt: r.approvedAt || null,
+  }));
+}
+
+// Mark a check payout as paid after the admin has physically issued and
+// mailed the check. Settles the linked commissions and appends a ledger debit
+// — mirroring the ACH finalizeSettledPayout path but without a QBO BillPayment
+// or provider transfer (the check is the payment instrument). Idempotent ledger
+// write; safe to call if the payout was previously in any non-terminal status.
+export async function markCheckPayoutPaid(payoutId, { checkNumber, checkDate, notes, actor } = {}) {
+  if (!isValidObjectId(payoutId)) throw new Error("Invalid payout id");
+  await connectDB();
+  const payout = await CdoPayout.findById(payoutId);
+  if (!payout) throw new Error("Payout not found");
+  if (payout.method !== "check") throw new Error("This payout is not a check payout");
+  if (payout.status === "paid") throw new Error("Payout is already marked as paid");
+  if (payout.status === "cancelled" || payout.status === "rejected") {
+    throw new Error(`Cannot mark a ${payout.status} payout as paid`);
+  }
+
+  const now = new Date();
+  const checkDateObj = checkDate ? new Date(checkDate) : now;
+  const txnRef = checkNumber ? `check:${String(checkNumber).trim()}` : "check:manual";
+
+  payout.checkDetails = {
+    checkNumber: String(checkNumber || "").trim() || null,
+    checkDate: checkDateObj,
+    notes: String(notes || "").trim() || null,
+    issuedBy: actor || "admin",
+    issuedAt: now,
+  };
+  payout.status = "paid";
+  payout.paidAt = now;
+  pushPayoutRemark(payout, {
+    kind: "check_issued",
+    message: [
+      "Check issued",
+      checkNumber ? `#${String(checkNumber).trim()}` : null,
+      `dated ${checkDateObj.toISOString().slice(0, 10)}`,
+      `by ${actor || "admin"}`,
+      notes ? `— ${String(notes).trim()}` : null,
+    ]
+      .filter(Boolean)
+      .join(" "),
+    actor,
+    source: "admin",
+  });
+  await payout.save();
+
+  // Settle the linked commissions (same fields as ACH finalizeSettledPayout)
+  await CdoCommission.updateMany(
+    { _id: { $in: payout.commissionIds } },
+    {
+      $set: {
+        status: "paid",
+        payoutId: payout._id,
+        payoutStatus: "paid",
+        payoutDate: now,
+        payoutTxnRef: txnRef,
+        payoutFailureReason: null,
+      },
+    },
+  );
+
+  // Ledger debit — idempotent (same guard as ACH settlement)
+  const existingDebit = await CdoTransaction.findOne({
+    relatedType: "CdoPayout",
+    relatedId: payout._id,
+    type: "payout",
+  }).lean();
+  if (!existingDebit) {
+    await appendLedgerEntry({
+      shop: payout.shop,
+      practitionerId: payout.practitionerId,
+      practitionerEmail: payout.practitionerEmail,
+      practitionerName: payout.practitionerName,
+      currency: payout.currency,
+      type: "payout",
+      amount: -roundMoney(payout.amount),
+      relatedType: "CdoPayout",
+      relatedId: payout._id,
+      description: `Check payout ${payout.reference} — check #${payout.checkDetails.checkNumber || "N/A"}`,
+      occurredAt: now,
+    });
+  }
+
+  await reflectPayoutOnBatches(payout, {
+    itemStatus: "paid",
+    txnRef,
+    payoutDate: now,
+  });
+
+  return payout.toObject();
+}
+
 export async function listReferrals() {
   await connectDB();
   const rows = await CdoReferral.find({})
@@ -2283,6 +2435,13 @@ export async function buildPayoutBatch({ periodStart, periodEnd, practitionerId,
 
     const first = commissions[0];
     const reference = `CDO-${periodEndDate.toISOString().slice(0, 7).replace("-", "")}-${String(pid).slice(-6)}`;
+
+    // Determine payout method: probe the practitioner's ACH banking. If it
+    // isn't valid (missing, disabled, or incomplete fields) the payout is
+    // queued as a check payout for manual admin processing instead of ACH.
+    const bankingProbe = await resolvePractitionerBanking(pid);
+    const payoutMethod = bankingProbe.ok ? "ach" : "check";
+
     const payout = new CdoPayout({
       shop: first.shop,
       practitionerId: pid,
@@ -2291,16 +2450,20 @@ export async function buildPayoutBatch({ periodStart, periodEnd, practitionerId,
       practitionerName: first.practitionerName,
       currency: first.currency || settings.currency,
       amount: total,
-      method: "ach",
+      method: payoutMethod,
       status: "awaiting_approval",
       commissionIds: commissions.map((c) => c._id),
       periodStart: periodStartDate,
       periodEnd: periodEndDate,
       reference,
+      bankingError: payoutMethod === "check" ? bankingProbe.errors.join("; ") : null,
     });
     pushPayoutRemark(payout, {
       kind: "batch_created",
-      message: `Batched ${commissions.length} commission(s) totalling ${total} ${payout.currency}`,
+      message:
+        payoutMethod === "check"
+          ? `Batched ${commissions.length} commission(s) totalling ${total} ${payout.currency} — CHECK payout (no valid ACH banking: ${bankingProbe.errors.join("; ")})`
+          : `Batched ${commissions.length} commission(s) totalling ${total} ${payout.currency}`,
       actor,
       source: actor ? "admin" : "system",
     });
