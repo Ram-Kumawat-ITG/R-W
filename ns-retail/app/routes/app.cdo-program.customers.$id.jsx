@@ -140,9 +140,12 @@ export default function CdoCustomerDetailLayout() {
     profile.email?.[0]?.toUpperCase() ||
     "?";
 
+  // Show just the numeric portion of the Shopify GID (strip gid://shopify/Customer/)
+  const shortId = profile.customerId ? profile.customerId.split("/").pop() : null;
+
   return (
     <>
-      <s-box paddingBlockEnd="base">
+      <s-box paddingBlockEnd="small-200">
         <s-button
           variant="tertiary"
           icon="arrow-left"
@@ -152,55 +155,76 @@ export default function CdoCustomerDetailLayout() {
         </s-button>
       </s-box>
 
-      <s-section padding="none">
-        <s-box padding="base">
-          <s-stack direction="block" gap="base">
-            <s-stack direction="inline" gap="base" alignItems="center">
-              <s-avatar initials={initials} size="large" />
-              <s-stack direction="block" gap="none">
-                <s-heading>
-                  {profile.name || profile.email || "Practitioner"}
-                </s-heading>
-                {profile.email && (
-                  <s-text tone="subdued">{profile.email}</s-text>
-                )}
-                <s-stack direction="inline" gap="small-200" alignItems="center">
-                  <StatusBadge status={profile.status} />
-                  <s-badge tone={hold?.paused ? "warning" : "success"}>
-                    {hold?.paused ? "Payouts paused" : "Payouts active"}
-                  </s-badge>
-                  {profile.businessName && (
-                    <s-text tone="subdued">· {profile.businessName}</s-text>
-                  )}
-                  {profile.customerId && (
-                    <s-text tone="subdued">· ID {profile.customerId}</s-text>
-                  )}
-                </s-stack>
-                {hold?.paused && (
-                  <s-text tone="subdued">
-                    Commission payouts paused
-                    {hold.pausedBy ? ` by ${hold.pausedBy}` : ""}
-                    {hold.pausedAt ? ` on ${formatDateTime(hold.pausedAt)}` : ""}
-                    {hold.note ? ` — ${hold.note}` : ""}. Commissions still accrue; manage on the
-                    Settings tab.
-                  </s-text>
-                )}
-                {profile.submittedAt && (
-                  <s-text tone="subdued">
-                    Registered {formatDateTime(profile.submittedAt)}
-                    {profile.country ? ` · From ${profile.country}` : ""}
-                  </s-text>
-                )}
-              </s-stack>
-            </s-stack>
-          </s-stack>
-        </s-box>
-      </s-section>
+      {/* Practitioner hero card */}
+      <div style={{
+        background: "#fff",
+        border: "1px solid #e1e3e5",
+        borderRadius: "8px",
+        overflow: "hidden",
+        marginBottom: "20px",
+      }}>
+        {/* Teal accent strip */}
+        <div style={{ height: "4px", background: "linear-gradient(90deg, #00a47c 0%, #007c59 100%)" }} />
 
-      <s-box paddingBlockStart="base">
-        <CustomerTabs practitionerId={profile.id} />
-      </s-box>
+        <div style={{ padding: "20px 24px", display: "flex", alignItems: "flex-start", gap: "16px" }}>
+          <s-avatar initials={initials} size="large" />
 
+          <div style={{ flex: 1, minWidth: 0 }}>
+            {/* Name + status badges */}
+            <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "8px", marginBottom: "4px" }}>
+              <span style={{ fontSize: "20px", fontWeight: "600", color: "#303030", lineHeight: "1.3" }}>
+                {profile.name || profile.email || "Practitioner"}
+              </span>
+              <StatusBadge status={profile.status} />
+              <s-badge tone={hold?.paused ? "warning" : "success"}>
+                {hold?.paused ? "Payouts paused" : "Payouts active"}
+              </s-badge>
+            </div>
+
+            {/* Email */}
+            {profile.email && (
+              <div style={{ fontSize: "14px", color: "#6d7175", marginBottom: "10px" }}>
+                {profile.email}
+              </div>
+            )}
+
+            {/* Compact metadata row */}
+            <div style={{ display: "flex", flexWrap: "wrap", rowGap: "4px", columnGap: "20px", fontSize: "13px", color: "#8c9196" }}>
+              {profile.businessName && <span>{profile.businessName}</span>}
+              {shortId && <span>Customer #{shortId}</span>}
+              {profile.submittedAt && (
+                <span>Registered {formatDateTime(profile.submittedAt)}</span>
+              )}
+              {profile.country && <span>From {profile.country}</span>}
+            </div>
+          </div>
+        </div>
+
+        {/* Paused payouts warning strip */}
+        {hold?.paused && (
+          <div style={{
+            background: "#fff3cd",
+            borderTop: "1px solid #f5e197",
+            padding: "10px 24px",
+            fontSize: "13px",
+            color: "#856404",
+            display: "flex",
+            alignItems: "flex-start",
+            gap: "8px",
+          }}>
+            <span style={{ flexShrink: 0 }}>⚠</span>
+            <span>
+              Commission payouts paused
+              {hold.pausedBy ? ` by ${hold.pausedBy}` : ""}
+              {hold.pausedAt ? ` on ${formatDateTime(hold.pausedAt)}` : ""}
+              {hold.note ? ` — ${hold.note}` : ""}.{" "}
+              Commissions still accrue; manage on the Settings tab.
+            </span>
+          </div>
+        )}
+      </div>
+
+      <CustomerTabs practitionerId={profile.id} />
       <Outlet />
     </>
   );
