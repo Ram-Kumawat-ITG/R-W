@@ -42,24 +42,21 @@ import crypto from 'node:crypto'
 // ── Tunables ────────────────────────────────────────────────────────────
 
 // Wholesale handling markup, tiered by total cart quantity. The product
-// owner's spec (2026-06-22):
+// owner's spec (revised 2026-06-25 — the prior 4-item $4 tier was removed,
+// 4+ items now charges a flat $5 capped fee):
 //
 //   1–2 products → +$2
 //   3 products   → +$3
-//   4 products   → +$4
-//   5 or more    → +$5
+//   4 or more    → +$5
 //
-// Cents on the wire. Capped at $5 — wholesale customers expect a flat
-// handling fee regardless of order size beyond the 5-unit threshold.
-// Replaces the prior `totalQty × PER_ITEM_CENTS` linear markup; the
-// retail handler (ns-retail/app/api/shipping/rates.js) still uses the
-// linear formula, so the drop-ship markup-stripping logic in
-// services/dropship/dropship.service.js — which strips RETAIL's markup
-// before cloning the order — is intentionally unchanged.
+// Cents on the wire. The same formula is mirrored in the retail handler
+// (ns-retail/app/api/shipping/rates.js) so both stores quote consistent
+// handling, and the drop-ship reverse-calc in
+// services/dropship/dropship.service.js strips this exact tier from
+// retail-cloned wholesale orders.
 function tieredMarkupCents(qty) {
   if (qty <= 2) return 200
   if (qty === 3) return 300
-  if (qty === 4) return 400
   return 500
 }
 

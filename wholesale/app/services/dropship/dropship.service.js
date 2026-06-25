@@ -524,28 +524,21 @@ function buildShopifyShippingAddress(order) {
 }
 
 /**
- * Build the shipping line for the wholesale order at the REAL carrier
- * cost (not retail's marked-up price).
+ * Build the shipping line for the wholesale order.
  *
- * Retail's checkout charged the customer:
- *   retail_shipping = carrier_real_rate + (totalQty × SHIPPING_PER_QTY_CENTS)
+ * Pass-through: the wholesale draft order carries the EXACT shipping
+ * price the customer paid at retail checkout (carrier cost + tiered
+ * handling markup, whatever the retail order's `shipping_lines[0].price`
+ * happens to be). No reverse-calculation, no markup stripping.
  *
- * The wholesale order should reflect ONLY the real carrier portion —
- * the per-qty markup is retail's margin and must NOT propagate to the
- * supplier-side order. Reverse-calculation:
+ * Policy decision (2026-06-25): the supplier-side order should reflect
+ * what the customer actually paid for shipping, not the carrier-only
+ * portion. The earlier reverse-calc — which subtracted the tiered
+ * markup so wholesale saw only the real carrier cost — has been
+ * removed at the product owner's request.
  *
- *   real_carrier_cost = retail_shipping − (totalQty × SHIPPING_PER_QTY_CENTS)
- *
- * The markup constant is read from `dropshipConfig.shippingMarkupPerQtyCents`,
- * which reads the SAME `SHIPPING_PER_QTY_CENTS` env that the carrier-service
- * callback at app/api/shipping/rates.js uses. Both ends MUST share the same
- * value — the env file is the single source of truth.
- *
- * Edge cases:
- *   • No shipping_lines on retail order → returns null (no shipping line on wholesale).
- *   • Markup exceeds retail shipping (static fallback rates, free-shipping
- *     promos) → flooring at $0 so wholesale never sees a NEGATIVE shipping
- *     line. Acceptable trade-off until proper static-fallback handling lands.
+ * Edge case: no shipping_lines on retail order → returns null (no
+ * shipping line on wholesale).
  */
 function buildShippingLine(order) {
   const lines = Array.isArray(order?.shipping_lines) ? order.shipping_lines : []
@@ -553,17 +546,10 @@ function buildShippingLine(order) {
   if (!first) return null
 
   const retailPriceDollars = parseFloat(first?.price || '0')
-  const perItemCents = Number(dropshipConfig.shippingMarkupPerQtyCents) || 100
-  const totalQty = (order?.line_items || []).reduce(
-    (sum, it) => sum + (Number(it?.quantity) || 0),
-    0,
-  )
-  const markupDollars = (totalQty * perItemCents) / 100
-  const realCostDollars = Math.max(0, retailPriceDollars - markupDollars)
 
   return {
     title: first?.title || 'Shipping',
-    price: realCostDollars.toFixed(2),
+    price: Math.max(0, retailPriceDollars).toFixed(2),
   }
 }
 
