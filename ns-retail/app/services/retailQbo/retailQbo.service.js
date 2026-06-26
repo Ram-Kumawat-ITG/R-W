@@ -178,14 +178,95 @@ export async function resolveSalesItemId() {
   return _salesItemId;
 }
 
+// ── Per-product Items (SKU column support) ───────────────────────────
+//
+// QBO populates the invoice's SKU column from the referenced Item's `Sku`
+// field — there is no per-line SKU override. To surface the correct SKU on
+// each line we resolve (find-or-create) a dedicated Service Item per SKU,
+// keyed by the SKU value.  Everything is best-effort: a failed resolution
+// falls back to the shared default item so invoicing never breaks.
+
+// In-process cache: sku → qboItemId (reset on process restart, re-resolved
+// via QBO query — idempotent so this is safe).
+const _retailItemCache = new Map();
+
+// QBO Item Name must be unique and cannot contain ':'. We append the SKU to
+// make the name unique even when multiple variants share the same title.
+function sanitizeRetailItemName(name, sku) {
+  const base = String(name || "").replace(/:/g, "-").trim();
+  const skuPart = sku ? ` (${String(sku).replace(/:/g, "-").trim()})` : "";
+  let full = `${base}${skuPart}`.trim();
+  if (!full) full = sku ? `SKU ${sku}` : "Item";
+  return full.length > 100 ? full.slice(0, 100).trim() : full;
+}
+
+async function findRetailItemBySku(sku) {
+  if (!sku) return null;
+  const res = await retailQbo.query(
+    `SELECT * FROM Item WHERE Sku = '${escapeQuery(sku)}' MAXRESULTS 1`,
+  );
+  return res?.QueryResponse?.Item?.[0] || null;
+}
+
+async function findRetailItemByName(name) {
+  if (!name) return null;
+  const res = await retailQbo.query(
+    `SELECT * FROM Item WHERE Name = '${escapeQuery(name)}' MAXRESULTS 1`,
+  );
+  return res?.QueryResponse?.Item?.[0] || null;
+}
+
+async function createRetailItem({ name, sku }) {
+  const incomeRef = await resolveIncomeAccountRef();
+  if (!incomeRef) throw new Error("createRetailItem: no IncomeAccountRef available");
+  const Name = sanitizeRetailItemName(name, sku);
+  const payload = { Name, Sku: sku, Type: "Service", IncomeAccountRef: incomeRef };
+  try {
+    const res = await retailQbo.post("/item", payload);
+    const created = res?.Item;
+    if (!created?.Id) throw new Error("QBO retail item create returned no Id");
+    return created;
+  } catch (err) {
+    // Name collision — adopt only when the SKU matches to avoid cross-product poisoning.
+    if (/duplicate name|6240/i.test(err?.message || "")) {
+      const existing = await findRetailItemByName(Name);
+      if (existing?.Id && String(existing.Sku || "") === String(sku || "")) {
+        return existing;
+      }
+    }
+    throw err;
+  }
+}
+
+// Resolve a SKU to a QBO Item id: process cache → QBO query → create.
+// Returns the id string, or null on any failure (caller falls back to
+// the shared default item). `name` seeds the Item Name on first create.
+async function findOrCreateRetailItemBySku({ sku, name }) {
+  const clean = sku ? String(sku).trim() : "";
+  if (!clean) return null;
+  try {
+    if (_retailItemCache.has(clean)) return _retailItemCache.get(clean);
+    let item = await findRetailItemBySku(clean);
+    if (!item) item = await createRetailItem({ name, sku: clean });
+    const qboItemId = item?.Id ? String(item.Id) : null;
+    if (qboItemId) _retailItemCache.set(clean, qboItemId);
+    return qboItemId;
+  } catch (err) {
+    log.warn("retail.item.resolve_failed", { sku: clean, err: err?.message || String(err) });
+    return null;
+  }
+}
+
 // ── Invoices ─────────────────────────────────────────────────────────
 
 // Build the QBO Invoice payload from a cdo_orders snapshot. Every product +
-// shipping line posts to the single sales item (NON tax code — Shopify's tax
-// total is carried via TxnTaxDetail). A DiscountLine applies order discounts,
-// and a reconciling Adjustment line guarantees the QBO TotalAmt equals the
-// Shopify order total.
-function buildInvoiceLines({ order, itemId }) {
+// shipping line posts to either a per-SKU item (so the QBO SKU column
+// populates) or the shared default item as a fallback. A DiscountLine applies
+// order discounts, and a reconciling Adjustment line guarantees QBO TotalAmt
+// equals the Shopify order total.
+//
+// `skuToItemId` — Map<string, string> pre-resolved by createInvoiceForOrder.
+function buildInvoiceLines({ order, itemId, skuToItemId = new Map() }) {
   const lines = [];
   let productSum = 0;
   for (const li of order.lineItems || []) {
@@ -193,14 +274,20 @@ function buildInvoiceLines({ order, itemId }) {
     const unit = round2(li.price);
     const amount = round2(qty * unit);
     productSum += amount;
-    const descParts = [li.title, li.variantTitle].filter(Boolean).join(" · ");
-    const desc = [descParts, li.sku ? `SKU: ${li.sku}` : null].filter(Boolean).join(" — ");
+    // SKU is used as the QBO Item key (→ populates the dedicated SKU column).
+    // Use the raw stored value so the column display matches what's in the data.
+    const rawSku = li.sku ? String(li.sku).trim() : null;
+    const productPart = [li.title, li.variantTitle].filter(Boolean).join(" — ");
+    // Format: "Product Name — Variant by Vendor" (mirrors wholesale formatLineDescription).
+    // SKU goes to the dedicated QBO column; omit it from description.
+    const desc = li.vendor ? `${productPart} by ${li.vendor}` : productPart;
+    const lineItemId = (rawSku && skuToItemId.get(rawSku)) || itemId;
     lines.push({
       DetailType: "SalesItemLineDetail",
       Amount: amount,
       ...(desc ? { Description: desc.slice(0, 4000) } : {}),
       SalesItemLineDetail: {
-        ItemRef: { value: itemId },
+        ItemRef: { value: lineItemId },
         Qty: qty,
         UnitPrice: unit,
         TaxCodeRef: { value: "NON" },
@@ -262,7 +349,17 @@ export async function createInvoiceForOrder({ order, customerId, itemId, request
   if (!customerId) throw new Error("createInvoiceForOrder: customerId is required");
   if (!itemId) throw new Error("createInvoiceForOrder: itemId is required");
 
-  const { lines, tax } = buildInvoiceLines({ order, itemId });
+  // Pre-resolve per-product QBO Items so the invoice's SKU column populates.
+  // Best-effort: a null result leaves the line on the shared default item.
+  const skuToItemId = new Map();
+  for (const li of order.lineItems || []) {
+    const rawSku = li.sku ? String(li.sku).trim() : null;
+    if (!rawSku || skuToItemId.has(rawSku)) continue;
+    const qboItemId = await findOrCreateRetailItemBySku({ sku: rawSku, name: li.title || undefined });
+    if (qboItemId) skuToItemId.set(rawSku, qboItemId);
+  }
+
+  const { lines, tax } = buildInvoiceLines({ order, itemId, skuToItemId });
   if (lines.length === 0) {
     throw new Error("createInvoiceForOrder: order has no line items to invoice");
   }
@@ -619,14 +716,11 @@ export async function createBillForOrder({
         : round2((Number(li.price) || 0) * factor);
     const amount = round2(unit * qty);
     if (!(amount > 0)) continue;
-    const titleParts = [li.title, li.variantTitle].filter(Boolean).join(" · ");
-    const desc = [
-      titleParts,
-      li.sku ? `SKU: ${li.sku}` : null,
-      `${qty} × ${unit.toFixed(2)} (wholesale)`,
-    ]
+    const productPart = [li.title, li.variantTitle].filter(Boolean).join(" — ");
+    const titleParts = li.vendor ? `${productPart} by ${li.vendor}` : productPart;
+    const desc = [titleParts, `${qty} × ${unit.toFixed(2)} (wholesale)`]
       .filter(Boolean)
-      .join(" — ");
+      .join("\n");
     lines.push({
       DetailType: "AccountBasedExpenseLineDetail",
       Amount: amount,
