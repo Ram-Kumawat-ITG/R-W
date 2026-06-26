@@ -765,8 +765,23 @@ export default function OrderDetail() {
           ) : null}
 
           <s-stack direction="inline" gap="base" alignItems="center">
+            {q?.invoiceUrl ? (
+              <s-button
+                variant="primary"
+                onClick={() => window.open(q.invoiceUrl, "_blank")}
+              >
+                View Invoice ↗
+              </s-button>
+            ) : null}
+            {q?.billUrl ? (
+              <s-button
+                variant="primary"
+                onClick={() => window.open(q.billUrl, "_blank")}
+              >
+                View Vendor Bill ↗
+              </s-button>
+            ) : null}
             <s-button
-              variant="primary"
               disabled={qboBusy}
               onClick={() =>
                 qboFetcher.submit(

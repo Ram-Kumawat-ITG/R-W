@@ -8,6 +8,8 @@ import ShopifyOrder from "../models/order.server";
 import Invoice from "../models/invoice.server";
 import PaymentAttempt from "../models/paymentAttempt.server";
 import QboItemMap from "../models/qboItemMap.server";
+import DropshipMapping from "../models/dropshipMapping.server";
+import RetailCdoOrder from "../models/retailCdoOrder.server";
 import {
   RETAIL_CUSTOMER_EMAIL,
   isRetailCustomerEmail,
@@ -153,6 +155,38 @@ export const loader = async ({ request, params }) => {
     }
   }
 
+  // ── Vendor bill (A/P) — 2-hop join: wholesaleOrderId → retailOrderGid → cdo_orders ──
+  // Reads the retail QBO bill (A/P) created on the ns-retail side for this
+  // drop-ship order. Graceful: a missing mapping (legacy or pre-dropship orders)
+  // or a QBO outage must not 500 the page.
+  let vendorBill = null;
+  if (order.shopifyOrderId) {
+    try {
+      const mapping = await DropshipMapping.findOne({
+        wholesaleOrderId: order.shopifyOrderId,
+      }).select("retailOrderGid").lean();
+      if (mapping?.retailOrderGid) {
+        const cdoOrder = await RetailCdoOrder.findOne({
+          shopifyOrderId: mapping.retailOrderGid,
+        }).select("retailQbo").lean();
+        if (cdoOrder?.retailQbo) {
+          const rq = cdoOrder.retailQbo;
+          vendorBill = {
+            qboBillId: rq.qboBillId || null,
+            qboBillDocNumber: rq.qboBillDocNumber || null,
+            qboBillTotal: rq.qboBillTotal ?? null,
+            billUrl: rq.billUrl || null,
+            billSyncStatus: rq.billSyncStatus || null,
+            billPaymentStatus: rq.billPaymentStatus || null,
+            billReconcileStatus: rq.billReconcileStatus || null,
+          };
+        }
+      }
+    } catch (e) {
+      console.error("[admin-order-detail] vendor bill lookup failed:", e?.message || e);
+    }
+  }
+
   // Project everything we render out of the raw Shopify webhook payload so we
   // don't ship the whole blob (gateway data, etc.) to the client.
   const details = extractDetails(order.rawPayload, order.currency);
@@ -166,6 +200,7 @@ export const loader = async ({ request, params }) => {
     invoice: invoice ? serialize(invoice) : null,
     attempts: attempts.map(serialize),
     qbo: { invoice: qboInvoice, error: qboInvoiceError, url: qboInvoiceUrl },
+    vendorBill,
     // Gates the "Collect payment now" button — collection needs a configured
     // drop-ship vault. (The endpoint re-checks server-side regardless.)
     dropshipVaultConfigured: Boolean(dropshipPaymentConfig.vaultId),
@@ -364,7 +399,7 @@ function AddressBlock({ address }) {
 }
 
 export default function AdminOrderDetail() {
-  const { order, details, retailCustomerEmail, invoice, attempts, qbo, dropshipVaultConfigured } =
+  const { order, details, retailCustomerEmail, invoice, attempts, qbo, vendorBill, dropshipVaultConfigured } =
     useLoaderData();
   const navigate = useNavigate();
   const shopify = useAppBridge();
@@ -562,271 +597,7 @@ export default function AdminOrderDetail() {
         </s-box>
       )}
 
-      {/* ───── Invoice & payment ───── */}
-      <s-section heading="Invoice & payment">
-        {!invoice ? (
-          <s-paragraph tone="subdued">
-            No invoice has been created for this order yet.
-          </s-paragraph>
-        ) : (
-          <s-stack direction="block" gap="base">
-            <s-stack direction="inline" gap="base" alignItems="center">
-              <PaymentStatusBadge status={invoice.paymentStatus} />
-              <PaymentMethodBadge method={invoice.paymentMethod} />
-              <s-text tone="subdued">
-                {invoice.attemptCount}/{invoice.maxAttempts} attempts
-              </s-text>
-            </s-stack>
 
-            <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
-              <s-grid-item>
-                <KV
-                  label="Amount due"
-                  value={formatAmount(invoice.amountDue, invoice.currency)}
-                />
-              </s-grid-item>
-              <s-grid-item>
-                <KV
-                  label="Amount paid"
-                  value={formatAmount(invoice.amountPaid || 0, invoice.currency)}
-                />
-              </s-grid-item>
-              <s-grid-item>
-                <KV
-                  label="Balance"
-                  value={formatAmount(invoiceOutstanding, invoice.currency)}
-                />
-              </s-grid-item>
-              <s-grid-item>
-                <KV label="Due date" value={invoice.qboDueDate} />
-              </s-grid-item>
-              <s-grid-item>
-                <KV
-                  label="Paid at"
-                  value={invoice.paidAt ? fmtDateTime(invoice.paidAt) : null}
-                />
-              </s-grid-item>
-              <s-grid-item>
-                <KV
-                  label="Last attempt"
-                  value={
-                    invoice.lastAttemptAt ? fmtDateTime(invoice.lastAttemptAt) : null
-                  }
-                />
-              </s-grid-item>
-            </s-grid>
-
-            {invoice.lastAttemptError && (
-              <s-banner tone="warning" heading="Last attempt error">
-                <s-paragraph>{invoice.lastAttemptError}</s-paragraph>
-              </s-banner>
-            )}
-
-            <s-stack direction="inline" gap="base">
-              {canCollect && (
-                <s-button
-                  variant="primary"
-                  onClick={onCollectNow}
-                  disabled={!dropshipVaultConfigured}
-                  {...(collectLoading ? { loading: true } : {})}
-                >
-                  Collect payment now
-                </s-button>
-              )}
-            </s-stack>
-            {canCollect && !dropshipVaultConfigured && (
-              <s-paragraph tone="subdued">
-                Set <s-text>DROPSHIP_NMI_VAULT_ID</s-text> to enable manual
-                collection (the monthly drop-ship CRON needs it too).
-              </s-paragraph>
-            )}
-          </s-stack>
-        )}
-      </s-section>
-
-      {/* ───── QuickBooks invoice (live) ───── */}
-      {invoice?.qboInvoiceId && (
-        <s-section heading="QuickBooks invoice">
-          <s-stack direction="block" gap="base">
-            <s-stack
-              direction="inline"
-              gap="base"
-              alignItems="center"
-              justifyContent="space-between"
-            >
-              <s-stack direction="inline" gap="base" alignItems="center">
-                {qbo?.invoice?.docNumber && (
-                  <s-badge tone="info">#{qbo.invoice.docNumber}</s-badge>
-                )}
-                <s-text tone="subdued">QBO id: {invoice.qboInvoiceId}</s-text>
-                {qbo?.url && (
-                  <s-link href={qbo.url} target="_blank">
-                    Open in QuickBooks ↗
-                  </s-link>
-                )}
-              </s-stack>
-              <s-stack direction="inline" gap="base">
-                <s-button
-                  variant="secondary"
-                  onClick={onSendInvoice}
-                  {...(sendInvoiceLoading ? { loading: true } : {})}
-                >
-                  Send invoice
-                </s-button>
-                <s-button
-                  variant="secondary"
-                  onClick={onViewPdf}
-                  {...(pdfLoading ? { loading: true } : {})}
-                >
-                  View invoice PDF
-                </s-button>
-              </s-stack>
-            </s-stack>
-
-            {qbo?.error && (
-              <s-banner tone="warning" heading="Could not load live QBO invoice">
-                <s-paragraph>{qbo.error}</s-paragraph>
-                <s-paragraph tone="subdued">
-                  Use the QuickBooks link to view the current state.
-                </s-paragraph>
-              </s-banner>
-            )}
-
-            {qbo?.invoice && (
-              <>
-                <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
-                  <s-grid-item>
-                    <KV label="Customer" value={qbo.invoice.customerName} />
-                  </s-grid-item>
-                  <s-grid-item>
-                    <KV label="Bill email" value={qbo.invoice.billEmail} />
-                  </s-grid-item>
-                  <s-grid-item>
-                    <KV label="Currency" value={qbo.invoice.currency} />
-                  </s-grid-item>
-                  <s-grid-item>
-                    <KV label="Txn date" value={qbo.invoice.txnDate} />
-                  </s-grid-item>
-                  <s-grid-item>
-                    <KV label="Due date" value={qbo.invoice.dueDate} />
-                  </s-grid-item>
-                  <s-grid-item>
-                    <KV label="Email status" value={qbo.invoice.emailStatus} />
-                  </s-grid-item>
-                </s-grid>
-
-                {qbo.invoice.productLines.length === 0 ? (
-                  <s-paragraph tone="subdued">
-                    QBO invoice has no product lines.
-                  </s-paragraph>
-                ) : (
-                  <s-table>
-                    <s-table-header-row>
-                      <s-table-header>Qty</s-table-header>
-                      <s-table-header>Product(s)</s-table-header>
-                      <s-table-header>SKU</s-table-header>
-                      <s-table-header>Rate</s-table-header>
-                      <s-table-header>Amount</s-table-header>
-                    </s-table-header-row>
-                    <s-table-body>
-                      {qbo.invoice.productLines.map((l, i) => (
-                        <s-table-row key={l.id || i}>
-                          <s-table-cell>{l.qty ?? "—"}</s-table-cell>
-                          <s-table-cell>
-                            {l.description || l.itemName || "—"}
-                          </s-table-cell>
-                          <s-table-cell>{l.sku || "—"}</s-table-cell>
-                          <s-table-cell>
-                            {l.unitPrice != null
-                              ? formatAmount(l.unitPrice, qbo.invoice.currency)
-                              : "—"}
-                          </s-table-cell>
-                          <s-table-cell>
-                            {l.amount != null
-                              ? formatAmount(l.amount, qbo.invoice.currency)
-                              : "—"}
-                          </s-table-cell>
-                        </s-table-row>
-                      ))}
-                    </s-table-body>
-                  </s-table>
-                )}
-
-                <s-box
-                  padding="base"
-                  border="base"
-                  borderRadius="base"
-                  background="subdued"
-                >
-                  <s-stack direction="block" gap="tight">
-                    <TotalsRow
-                      label="Subtotal"
-                      value={formatAmount(
-                        qbo.invoice.productSubtotal,
-                        qbo.invoice.currency,
-                      )}
-                    />
-                    <TotalsRow
-                      label="Discount"
-                      value={
-                        qbo.invoice.discount > 0
-                          ? `− ${formatAmount(qbo.invoice.discount, qbo.invoice.currency)}`
-                          : formatAmount(0, qbo.invoice.currency)
-                      }
-                      tone={qbo.invoice.discount > 0 ? "success" : undefined}
-                    />
-                    <TotalsRow
-                      label="Shipping charges"
-                      value={formatAmount(qbo.invoice.shipping, qbo.invoice.currency)}
-                    />
-                    <TotalsRow
-                      label="Sales tax"
-                      value={formatAmount(qbo.invoice.totalTax, qbo.invoice.currency)}
-                    />
-                    {qbo.invoice.processingFee > 0 && (
-                      <TotalsRow
-                        label={qbo.invoice.processingFeeLabel || "Processing fee"}
-                        value={formatAmount(
-                          qbo.invoice.processingFee,
-                          qbo.invoice.currency,
-                        )}
-                      />
-                    )}
-                    {Math.abs(qbo.invoice.otherCharges) > 0.005 && (
-                      <TotalsRow
-                        label="Other charges"
-                        value={formatAmount(
-                          qbo.invoice.otherCharges,
-                          qbo.invoice.currency,
-                        )}
-                      />
-                    )}
-                    <s-divider />
-                    <TotalsRow
-                      label="Grand total"
-                      value={formatAmount(qbo.invoice.totalAmt, qbo.invoice.currency)}
-                      strong
-                    />
-                    <TotalsRow
-                      label="Balance due"
-                      value={formatAmount(qbo.invoice.balance, qbo.invoice.currency)}
-                      strong
-                      tone={qbo.invoice.balance === 0 ? "success" : undefined}
-                    />
-                  </s-stack>
-                </s-box>
-
-                {qbo.invoice.linkedPayments.length > 0 && (
-                  <s-paragraph tone="subdued">
-                    Linked QBO payments:{" "}
-                    {qbo.invoice.linkedPayments.map((p) => p.id).join(", ")}
-                  </s-paragraph>
-                )}
-              </>
-            )}
-          </s-stack>
-        </s-section>
-      )}
 
       {/* ───── Order information ───── */}
       <s-section heading="Order information">
@@ -880,146 +651,6 @@ export default function AdminOrderDetail() {
             <KV label="Processed at" value={fmtDateTime(details.meta.processedAt)} />
           </s-grid-item>
         </s-grid>
-      </s-section>
-
-      {/* ───── Customer ───── */}
-      <s-section heading="Customer">
-        <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
-          <s-grid-item>
-            <KV
-              label="Name"
-              value={details.customer?.name}
-            />
-          </s-grid-item>
-          <s-grid-item>
-            <KV
-              label="Email"
-              value={details.customer?.email || order.customerEmail}
-            />
-          </s-grid-item>
-          <s-grid-item>
-            <KV label="Phone" value={details.customer?.phone} />
-          </s-grid-item>
-          <s-grid-item>
-            <KV
-              label="Shopify customer ID"
-              value={details.customer?.id || order.shopifyCustomerId}
-            />
-          </s-grid-item>
-        </s-grid>
-      </s-section>
-
-      {/* ───── Tags ───── */}
-      <s-section heading={`Order tags (${details.tags.length})`}>
-        {details.tags.length ? (
-          <s-stack direction="inline" gap="small-200">
-            {details.tags.map((t) => (
-              <s-badge key={t} tone="default">
-                {t}
-              </s-badge>
-            ))}
-          </s-stack>
-        ) : (
-          <s-paragraph tone="subdued">No tags on this order.</s-paragraph>
-        )}
-      </s-section>
-
-      {/* ───── Line items + totals ───── */}
-      <s-section heading={`Items (${details.lineItems.length})`}>
-        {!details.lineItems.length ? (
-          <s-paragraph tone="subdued">
-            No line items recorded for this order.
-          </s-paragraph>
-        ) : (
-          <s-stack direction="block" gap="base">
-            <LineItemsTable
-              lineItems={details.lineItems}
-              currency={currency}
-              orderLabel={orderLabel}
-            />
-
-            {totals && (
-              <s-box
-                padding="base"
-                border="base"
-                borderRadius="base"
-                background="subdued"
-              >
-                <s-stack direction="block" gap="tight">
-                  <TotalsRow
-                    label="Order subtotal"
-                    value={formatAmount(totals.lineItemsTotal, currency)}
-                  />
-                  <TotalsRow
-                    label="Discount"
-                    value={
-                      totals.discounts > 0
-                        ? `− ${formatAmount(totals.discounts, currency)}`
-                        : formatAmount(0, currency)
-                    }
-                    tone={totals.discounts > 0 ? "success" : undefined}
-                  />
-                  <TotalsRow
-                    label="Adjusted subtotal"
-                    value={formatAmount(totals.subtotal, currency)}
-                  />
-                  <TotalsRow
-                    label="Shipping"
-                    value={formatAmount(totals.shipping, currency)}
-                  />
-                  <TotalsRow
-                    label={
-                      totals.taxesIncluded ? "Sales tax (included)" : "Sales tax"
-                    }
-                    value={formatAmount(totals.tax, currency)}
-                  />
-                  <s-divider />
-                  <TotalsRow
-                    label="Grand total"
-                    value={formatAmount(totals.grandTotal, currency)}
-                    strong
-                  />
-                </s-stack>
-              </s-box>
-            )}
-          </s-stack>
-        )}
-      </s-section>
-
-      {/* ───── Shipping ───── */}
-      <s-section heading="Shipping">
-        <s-grid gridTemplateColumns="1fr 1fr" gap="large-100">
-          <s-grid-item>
-            <s-stack direction="block" gap="none">
-              <s-text tone="subdued">Shipping address</s-text>
-              <AddressBlock address={details.shippingAddress} />
-            </s-stack>
-          </s-grid-item>
-          <s-grid-item>
-            <s-stack direction="block" gap="none">
-              <s-text tone="subdued">Billing address</s-text>
-              <AddressBlock address={details.billingAddress} />
-            </s-stack>
-          </s-grid-item>
-        </s-grid>
-        {details.shippingLines.length > 0 && (
-          <s-box paddingBlockStart="base">
-            <s-stack direction="block" gap="tight">
-              <s-text>
-                <strong>Shipping method</strong>
-              </s-text>
-              {details.shippingLines.map((s, i) => (
-                <TotalsRow
-                  key={i}
-                  label={
-                    s.carrier ? `${s.title} (${s.carrier})` : s.title
-                  }
-                  value={formatAmount(s.price, currency)}
-                />
-              ))}
-            </s-stack>
-          </s-box>
-        )}
       </s-section>
 
       {/* ───── Fulfillment & tracking ───── */}
@@ -1184,6 +815,146 @@ export default function AdminOrderDetail() {
         )}
       </s-section>
 
+      {/* ───── Line items + totals ───── */}
+      <s-section heading={`Items (${details.lineItems.length})`}>
+        {!details.lineItems.length ? (
+          <s-paragraph tone="subdued">
+            No line items recorded for this order.
+          </s-paragraph>
+        ) : (
+          <s-stack direction="block" gap="base">
+            <LineItemsTable
+              lineItems={details.lineItems}
+              currency={currency}
+              orderLabel={orderLabel}
+            />
+
+            {totals && (
+              <s-box
+                padding="base"
+                border="base"
+                borderRadius="base"
+                background="subdued"
+              >
+                <s-stack direction="block" gap="tight">
+                  <TotalsRow
+                    label="Order subtotal"
+                    value={formatAmount(totals.lineItemsTotal, currency)}
+                  />
+                  <TotalsRow
+                    label="Discount"
+                    value={
+                      totals.discounts > 0
+                        ? `− ${formatAmount(totals.discounts, currency)}`
+                        : formatAmount(0, currency)
+                    }
+                    tone={totals.discounts > 0 ? "success" : undefined}
+                  />
+                  <TotalsRow
+                    label="Adjusted subtotal"
+                    value={formatAmount(totals.subtotal, currency)}
+                  />
+                  <TotalsRow
+                    label="Shipping"
+                    value={formatAmount(totals.shipping, currency)}
+                  />
+                  <TotalsRow
+                    label={
+                      totals.taxesIncluded ? "Sales tax (included)" : "Sales tax"
+                    }
+                    value={formatAmount(totals.tax, currency)}
+                  />
+                  <s-divider />
+                  <TotalsRow
+                    label="Grand total"
+                    value={formatAmount(totals.grandTotal, currency)}
+                    strong
+                  />
+                </s-stack>
+              </s-box>
+            )}
+          </s-stack>
+        )}
+      </s-section>
+
+      {/* ───── Customer ───── */}
+      <s-section heading="Customer">
+        <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
+          <s-grid-item>
+            <KV
+              label="Name"
+              value={details.customer?.name}
+            />
+          </s-grid-item>
+          <s-grid-item>
+            <KV
+              label="Email"
+              value={details.customer?.email || order.customerEmail}
+            />
+          </s-grid-item>
+          <s-grid-item>
+            <KV label="Phone" value={details.customer?.phone} />
+          </s-grid-item>
+          <s-grid-item>
+            <KV
+              label="Shopify customer ID"
+              value={details.customer?.id || order.shopifyCustomerId}
+            />
+          </s-grid-item>
+        </s-grid>
+      </s-section>
+
+      {/* ───── Tags ───── */}
+      <s-section heading={`Order tags (${details.tags.length})`}>
+        {details.tags.length ? (
+          <s-stack direction="inline" gap="small-200">
+            {details.tags.map((t) => (
+              <s-badge key={t} tone="default">
+                {t}
+              </s-badge>
+            ))}
+          </s-stack>
+        ) : (
+          <s-paragraph tone="subdued">No tags on this order.</s-paragraph>
+        )}
+      </s-section>
+
+      {/* ───── Shipping ───── */}
+      <s-section heading="Shipping">
+        <s-grid gridTemplateColumns="1fr 1fr" gap="large-100">
+          <s-grid-item>
+            <s-stack direction="block" gap="none">
+              <s-text tone="subdued">Shipping address</s-text>
+              <AddressBlock address={details.shippingAddress} />
+            </s-stack>
+          </s-grid-item>
+          <s-grid-item>
+            <s-stack direction="block" gap="none">
+              <s-text tone="subdued">Billing address</s-text>
+              <AddressBlock address={details.billingAddress} />
+            </s-stack>
+          </s-grid-item>
+        </s-grid>
+        {details.shippingLines.length > 0 && (
+          <s-box paddingBlockStart="base">
+            <s-stack direction="block" gap="tight">
+              <s-text>
+                <strong>Shipping method</strong>
+              </s-text>
+              {details.shippingLines.map((s, i) => (
+                <TotalsRow
+                  key={i}
+                  label={
+                    s.carrier ? `${s.title} (${s.carrier})` : s.title
+                  }
+                  value={formatAmount(s.price, currency)}
+                />
+              ))}
+            </s-stack>
+          </s-box>
+        )}
+      </s-section>
+
       {/* ───── Notes ───── */}
       <s-section heading="Notes">
         <s-stack direction="block" gap="base">
@@ -1265,6 +1036,361 @@ export default function AdminOrderDetail() {
           </s-box>
         )}
       </s-section>
+
+      {/* ───── Invoice & payment ───── */}
+      <s-section heading="Invoice & payment">
+        {!invoice ? (
+          <s-paragraph tone="subdued">
+            No invoice has been created for this order yet.
+          </s-paragraph>
+        ) : (
+          <s-stack direction="block" gap="base">
+            <s-stack direction="inline" gap="base" alignItems="center">
+              <PaymentStatusBadge status={invoice.paymentStatus} />
+              <PaymentMethodBadge method={invoice.paymentMethod} />
+              <s-text tone="subdued">
+                {invoice.attemptCount}/{invoice.maxAttempts} attempts
+              </s-text>
+            </s-stack>
+
+            <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
+              <s-grid-item>
+                <KV
+                  label="Amount due"
+                  value={formatAmount(invoice.amountDue, invoice.currency)}
+                />
+              </s-grid-item>
+              <s-grid-item>
+                <KV
+                  label="Amount paid"
+                  value={formatAmount(invoice.amountPaid || 0, invoice.currency)}
+                />
+              </s-grid-item>
+              <s-grid-item>
+                <KV
+                  label="Balance"
+                  value={formatAmount(invoiceOutstanding, invoice.currency)}
+                />
+              </s-grid-item>
+              <s-grid-item>
+                <KV label="Due date" value={invoice.qboDueDate} />
+              </s-grid-item>
+              <s-grid-item>
+                <KV
+                  label="Paid at"
+                  value={invoice.paidAt ? fmtDateTime(invoice.paidAt) : null}
+                />
+              </s-grid-item>
+              <s-grid-item>
+                <KV
+                  label="Last attempt"
+                  value={
+                    invoice.lastAttemptAt ? fmtDateTime(invoice.lastAttemptAt) : null
+                  }
+                />
+              </s-grid-item>
+            </s-grid>
+
+            {invoice.lastAttemptError && (
+              <s-banner tone="warning" heading="Last attempt error">
+                <s-paragraph>{invoice.lastAttemptError}</s-paragraph>
+              </s-banner>
+            )}
+
+            <s-stack direction="inline" gap="base">
+              {canCollect && (
+                <s-button
+                  variant="primary"
+                  onClick={onCollectNow}
+                  disabled={!dropshipVaultConfigured}
+                  {...(collectLoading ? { loading: true } : {})}
+                >
+                  Collect payment now
+                </s-button>
+              )}
+            </s-stack>
+            {canCollect && !dropshipVaultConfigured && (
+              <s-paragraph tone="subdued">
+                Set <s-text>DROPSHIP_NMI_VAULT_ID</s-text> to enable manual
+                collection (the monthly drop-ship CRON needs it too).
+              </s-paragraph>
+            )}
+          </s-stack>
+        )}
+      </s-section>
+
+      {/* ───── QuickBooks invoice (live) ───── */}
+      {(invoice?.qboInvoiceId || vendorBill) && (
+        <s-section heading="QuickBooks invoice">
+          <s-stack direction="block" gap="base">
+
+            {/* ─ Invoice ─ */}
+            <s-stack direction="block" gap="tight">
+              <s-stack direction="inline" gap="base" alignItems="center">
+                <s-text><strong>Invoice</strong></s-text>
+                {invoice?.qboInvoiceId ? (
+                  <>
+                    {qbo?.invoice?.docNumber && (
+                      <s-badge tone="info">#{qbo.invoice.docNumber}</s-badge>
+                    )}
+                    <s-badge tone="success">Synced to QBO</s-badge>
+                  </>
+                ) : (
+                  <s-badge tone="neutral">Not yet synced to QBO</s-badge>
+                )}
+              </s-stack>
+
+              {invoice?.qboInvoiceId ? (
+                <s-stack direction="block" gap="base">
+                  <s-stack
+                    direction="inline"
+                    gap="base"
+                    alignItems="center"
+                    justifyContent="space-between"
+                  >
+                    <s-text tone="subdued">QBO id: {invoice.qboInvoiceId}</s-text>
+                    <s-stack direction="inline" gap="base">
+                      {qbo?.url && (
+                        <s-button
+                          variant="secondary"
+                          onClick={() => window.open(qbo.url, "_blank")}
+                        >
+                          View Invoice ↗
+                        </s-button>
+                      )}
+                      <s-button
+                        variant="secondary"
+                        onClick={onSendInvoice}
+                        {...(sendInvoiceLoading ? { loading: true } : {})}
+                      >
+                        Send invoice
+                      </s-button>
+                      <s-button
+                        variant="secondary"
+                        onClick={onViewPdf}
+                        {...(pdfLoading ? { loading: true } : {})}
+                      >
+                        View invoice PDF
+                      </s-button>
+                    </s-stack>
+                  </s-stack>
+
+                  {qbo?.error && (
+                    <s-banner tone="warning" heading="Could not load live QBO invoice">
+                      <s-paragraph>{qbo.error}</s-paragraph>
+                      <s-paragraph tone="subdued">
+                        Use the QuickBooks link to view the current state.
+                      </s-paragraph>
+                    </s-banner>
+                  )}
+
+                  {qbo?.invoice && (
+                    <>
+                      <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
+                        <s-grid-item>
+                          <KV label="Customer" value={qbo.invoice.customerName} />
+                        </s-grid-item>
+                        <s-grid-item>
+                          <KV label="Bill email" value={qbo.invoice.billEmail} />
+                        </s-grid-item>
+                        <s-grid-item>
+                          <KV label="Currency" value={qbo.invoice.currency} />
+                        </s-grid-item>
+                        <s-grid-item>
+                          <KV label="Txn date" value={qbo.invoice.txnDate} />
+                        </s-grid-item>
+                        <s-grid-item>
+                          <KV label="Due date" value={qbo.invoice.dueDate} />
+                        </s-grid-item>
+                        <s-grid-item>
+                          <KV label="Email status" value={qbo.invoice.emailStatus} />
+                        </s-grid-item>
+                      </s-grid>
+
+                      {qbo.invoice.productLines.length === 0 ? (
+                        <s-paragraph tone="subdued">
+                          QBO invoice has no product lines.
+                        </s-paragraph>
+                      ) : (
+                        <s-table>
+                          <s-table-header-row>
+                            <s-table-header>Qty</s-table-header>
+                            <s-table-header>Product(s)</s-table-header>
+                            <s-table-header>SKU</s-table-header>
+                            <s-table-header>Rate</s-table-header>
+                            <s-table-header>Amount</s-table-header>
+                          </s-table-header-row>
+                          <s-table-body>
+                            {qbo.invoice.productLines.map((l, i) => (
+                              <s-table-row key={l.id || i}>
+                                <s-table-cell>{l.qty ?? "—"}</s-table-cell>
+                                <s-table-cell>
+                                  {l.description || l.itemName || "—"}
+                                </s-table-cell>
+                                <s-table-cell>{l.sku || "—"}</s-table-cell>
+                                <s-table-cell>
+                                  {l.unitPrice != null
+                                    ? formatAmount(l.unitPrice, qbo.invoice.currency)
+                                    : "—"}
+                                </s-table-cell>
+                                <s-table-cell>
+                                  {l.amount != null
+                                    ? formatAmount(l.amount, qbo.invoice.currency)
+                                    : "—"}
+                                </s-table-cell>
+                              </s-table-row>
+                            ))}
+                          </s-table-body>
+                        </s-table>
+                      )}
+
+                      <s-box
+                        padding="base"
+                        border="base"
+                        borderRadius="base"
+                        background="subdued"
+                      >
+                        <s-stack direction="block" gap="tight">
+                          <TotalsRow
+                            label="Subtotal"
+                            value={formatAmount(
+                              qbo.invoice.productSubtotal,
+                              qbo.invoice.currency,
+                            )}
+                          />
+                          <TotalsRow
+                            label="Discount"
+                            value={
+                              qbo.invoice.discount > 0
+                                ? `− ${formatAmount(qbo.invoice.discount, qbo.invoice.currency)}`
+                                : formatAmount(0, qbo.invoice.currency)
+                            }
+                            tone={qbo.invoice.discount > 0 ? "success" : undefined}
+                          />
+                          <TotalsRow
+                            label="Shipping charges"
+                            value={formatAmount(qbo.invoice.shipping, qbo.invoice.currency)}
+                          />
+                          <TotalsRow
+                            label="Sales tax"
+                            value={formatAmount(qbo.invoice.totalTax, qbo.invoice.currency)}
+                          />
+                          {qbo.invoice.processingFee > 0 && (
+                            <TotalsRow
+                              label={qbo.invoice.processingFeeLabel || "Processing fee"}
+                              value={formatAmount(
+                                qbo.invoice.processingFee,
+                                qbo.invoice.currency,
+                              )}
+                            />
+                          )}
+                          {Math.abs(qbo.invoice.otherCharges) > 0.005 && (
+                            <TotalsRow
+                              label="Other charges"
+                              value={formatAmount(
+                                qbo.invoice.otherCharges,
+                                qbo.invoice.currency,
+                              )}
+                            />
+                          )}
+                          <s-divider />
+                          <TotalsRow
+                            label="Grand total"
+                            value={formatAmount(qbo.invoice.totalAmt, qbo.invoice.currency)}
+                            strong
+                          />
+                          <TotalsRow
+                            label="Balance due"
+                            value={formatAmount(qbo.invoice.balance, qbo.invoice.currency)}
+                            strong
+                            tone={qbo.invoice.balance === 0 ? "success" : undefined}
+                          />
+                        </s-stack>
+                      </s-box>
+
+                      {qbo.invoice.linkedPayments.length > 0 && (
+                        <s-paragraph tone="subdued">
+                          Linked QBO payments:{" "}
+                          {qbo.invoice.linkedPayments.map((p) => p.id).join(", ")}
+                        </s-paragraph>
+                      )}
+                    </>
+                  )}
+                </s-stack>
+              ) : (
+                <s-paragraph tone="subdued">
+                  Invoice not yet synced to QuickBooks. Syncs automatically — check back shortly.
+                </s-paragraph>
+              )}
+            </s-stack>
+
+            {/* ─ Vendor bill (A/P) ─ */}
+            {vendorBill && (
+              <>
+                <s-divider />
+                <s-stack direction="block" gap="tight">
+                  <s-stack direction="inline" gap="base" alignItems="center">
+                    <s-text><strong>Vendor bill (A/P)</strong></s-text>
+                    {vendorBill.qboBillId ? (
+                      <>
+                        <s-badge tone="success">Created</s-badge>
+                        {vendorBill.billPaymentStatus === "paid" ? (
+                          <s-badge tone="success">Paid</s-badge>
+                        ) : (
+                          <s-badge tone="neutral">Unpaid</s-badge>
+                        )}
+                      </>
+                    ) : vendorBill.billSyncStatus === "creating" ? (
+                      <s-badge tone="info">Creating…</s-badge>
+                    ) : vendorBill.billSyncStatus === "error" ? (
+                      <s-badge tone="critical">Sync error</s-badge>
+                    ) : (
+                      <s-badge tone="neutral">Not created</s-badge>
+                    )}
+                  </s-stack>
+
+                  {vendorBill.qboBillId ? (
+                    <s-stack direction="block" gap="base">
+                      <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
+                        <s-grid-item>
+                          <KV label="Bill ID" value={vendorBill.qboBillId} />
+                        </s-grid-item>
+                        <s-grid-item>
+                          <KV label="Doc number" value={vendorBill.qboBillDocNumber} />
+                        </s-grid-item>
+                        <s-grid-item>
+                          <KV
+                            label="Amount"
+                            value={
+                              vendorBill.qboBillTotal != null
+                                ? formatAmount(vendorBill.qboBillTotal, "USD")
+                                : null
+                            }
+                          />
+                        </s-grid-item>
+                      </s-grid>
+                      {vendorBill.billUrl && (
+                        <s-button
+                          variant="secondary"
+                          onClick={() => window.open(vendorBill.billUrl, "_blank")}
+                        >
+                          View Vendor Bill ↗
+                        </s-button>
+                      )}
+                    </s-stack>
+                  ) : (
+                    <s-paragraph tone="subdued">
+                      No vendor bill yet. The retail side creates a QBO bill (A/P)
+                      automatically once this drop-ship order is fulfilled.
+                    </s-paragraph>
+                  )}
+                </s-stack>
+              </>
+            )}
+
+          </s-stack>
+        </s-section>
+      )}
 
       {/* ───── Email history ───── */}
       {invoice && (

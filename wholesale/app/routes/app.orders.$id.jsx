@@ -2339,59 +2339,73 @@ export default function OrderDetail() {
       )}
 
       {/* ───── QuickBooks invoice (live fetch) ───── */}
-      {invoice?.qboInvoiceId && (
+      {invoice && (
         <s-section heading="QuickBooks invoice">
           <s-stack direction="block" gap="base">
-            <s-stack
-              direction="inline"
-              gap="base"
-              alignItems="center"
-              justifyContent="space-between"
-            >
-              <s-stack direction="inline" gap="base" alignItems="center">
-                {qbo?.invoice?.docNumber && (
-                  <s-badge tone="info">#{qbo.invoice.docNumber}</s-badge>
-                )}
-                <s-text tone="subdued">
-                  QBO id: {invoice.qboInvoiceId}
-                </s-text>
-                {qbo?.url && (
-                  <s-link href={qbo.url} target="_blank">
-                    Open in QuickBooks ↗
-                  </s-link>
-                )}
-              </s-stack>
-              <s-stack direction="inline" gap="base">
-                <s-button
-                  variant="secondary"
-                  onClick={onSendInvoice}
-                  {...(sendInvoiceLoading ? { loading: true } : {})}
-                >
-                  Send invoice
-                </s-button>
-                <s-button
-                  variant="secondary"
-                  onClick={onViewPdf}
-                  {...(pdfLoading ? { loading: true } : {})}
-                >
-                  View invoice PDF
-                </s-button>
-              </s-stack>
+            {/* Status header */}
+            <s-stack direction="inline" gap="base" alignItems="center">
+              {invoice.qboInvoiceId ? (
+                <>
+                  {qbo?.invoice?.docNumber && (
+                    <s-badge tone="info">#{qbo.invoice.docNumber}</s-badge>
+                  )}
+                  <s-badge tone="success">Synced to QBO</s-badge>
+                </>
+              ) : (
+                <s-badge tone="neutral">Not yet synced to QBO</s-badge>
+              )}
             </s-stack>
 
-            {qbo?.error && (
-              <s-banner
-                tone="warning"
-                heading="Could not load live QBO invoice"
-              >
-                <s-paragraph>{qbo.error}</s-paragraph>
-                <s-paragraph tone="subdued">
-                  The local mirror above still shows what we recorded at
-                  creation time. Use the QuickBooks link to view the
-                  current state.
-                </s-paragraph>
-              </s-banner>
-            )}
+            {invoice.qboInvoiceId ? (
+              <>
+                <s-stack
+                  direction="inline"
+                  gap="base"
+                  alignItems="center"
+                  justifyContent="space-between"
+                >
+                  <s-text tone="subdued">
+                    QBO id: {invoice.qboInvoiceId}
+                  </s-text>
+                  <s-stack direction="inline" gap="base">
+                    {qbo?.url && (
+                      <s-button
+                        variant="secondary"
+                        onClick={() => window.open(qbo.url, "_blank")}
+                      >
+                        View Invoice ↗
+                      </s-button>
+                    )}
+                    <s-button
+                      variant="secondary"
+                      onClick={onSendInvoice}
+                      {...(sendInvoiceLoading ? { loading: true } : {})}
+                    >
+                      Send invoice
+                    </s-button>
+                    <s-button
+                      variant="secondary"
+                      onClick={onViewPdf}
+                      {...(pdfLoading ? { loading: true } : {})}
+                    >
+                      View invoice PDF
+                    </s-button>
+                  </s-stack>
+                </s-stack>
+
+                {qbo?.error && (
+                  <s-banner
+                    tone="warning"
+                    heading="Could not load live QBO invoice"
+                  >
+                    <s-paragraph>{qbo.error}</s-paragraph>
+                    <s-paragraph tone="subdued">
+                      The local mirror above still shows what we recorded at
+                      creation time. Use the QuickBooks link to view the
+                      current state.
+                    </s-paragraph>
+                  </s-banner>
+                )}
 
             {qbo?.invoice && (
               <>
@@ -2603,6 +2617,12 @@ export default function OrderDetail() {
                   </s-paragraph>
                 )}
               </>
+            )}
+              </>
+            ) : (
+              <s-paragraph tone="subdued">
+                Invoice not yet synced to QuickBooks. Syncs automatically — check back shortly.
+              </s-paragraph>
             )}
           </s-stack>
         </s-section>
