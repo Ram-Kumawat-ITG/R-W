@@ -52,7 +52,7 @@ const log = createLogger('invoice.service')
 const CLAIM_WAIT_MS = 30_000
 const CLAIM_POLL_MS = 500
 
-export async function createInvoiceForOrder({ shop, order, localOrder, customerMap, isDropship = false }) {
+export async function createInvoiceForOrder({ shop, order, localOrder, customerMap, isDropship = false, retailOrderName = null }) {
   const shopifyOrderId = String(order.id)
 
   // Drop-ship invoices lock `paymentMethod: 'dropship'` regardless of the
@@ -207,7 +207,9 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
       currency: order.currency || 'USD',
       lines,
       memo,
-      docNumber: order.name?.replace(/^#/, '') || shopifyOrderId,
+      docNumber: isDropship && retailOrderName
+        ? `RS-${retailOrderName}`.slice(0, 21)
+        : (order.name?.replace(/^#/, '') || shopifyOrderId),
       dueDate,
       shipAddr,
       shipDate,

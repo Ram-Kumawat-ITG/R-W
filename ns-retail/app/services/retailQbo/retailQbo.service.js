@@ -268,6 +268,7 @@ export async function createInvoiceForOrder({ order, customerId, itemId, request
   }
 
   const email = order.customerEmail || order.customer?.email || null;
+  const invoiceDocNumber = order.orderName || String(order.shopifyOrderId || "").split("/").pop() || "";
   const payload = {
     CustomerRef: { value: String(customerId) },
     Line: lines,
@@ -278,6 +279,7 @@ export async function createInvoiceForOrder({ order, customerId, itemId, request
       value: `Retail order ${order.orderName || order.shopifyOrderId || ""}`.trim().slice(0, 1000),
     },
     ...(order.currency ? { CurrencyRef: { value: order.currency } } : {}),
+    ...(invoiceDocNumber ? { DocNumber: String(invoiceDocNumber).slice(0, 21) } : {}),
   };
 
   // QBO caps requestid at 50 chars; order.shopifyOrderId is the full GID, so
@@ -655,8 +657,9 @@ export async function createBillForOrder({
     Line: lines,
     ...(apAccountId ? { APAccountRef: { value: String(apAccountId) } } : {}),
     ...(order.placedAt ? { TxnDate: toQboDate(order.placedAt) } : {}),
-    // Vendor's reference for the bill — the retail order number for traceability.
-    ...(orderRef ? { DocNumber: String(orderRef).slice(0, 21) } : {}),
+    // Vendor's reference for the bill — RS-<retail order number> for traceability
+    // and to match the corresponding wholesale Admin Order Invoice (RS-#1234).
+    ...(orderRef ? { DocNumber: `RS-${orderRef}`.slice(0, 21) } : {}),
     PrivateNote: `Dropship cost — retail order ${orderRef} → ${retailQboConfig.dropshipVendorName}`
       .trim()
       .slice(0, 4000),

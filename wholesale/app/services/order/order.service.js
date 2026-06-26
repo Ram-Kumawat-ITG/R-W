@@ -26,6 +26,7 @@ import {
 } from '../../utils/shipping.constants'
 import { trackingConfig } from './tracking.config'
 import { isRetailCustomerEmail } from '../dropship/dropship.config'
+import DropshipMapping from '../../models/dropshipMapping.server'
 import { notifyRetailOfDropshipChange } from '../sync/fulfillmentSync.service'
 import { createLogger } from '../../utils/logger.utils'
 
@@ -378,12 +379,24 @@ async function invoiceDropshipOrder({ shop, order, local }) {
     const customerMap = await ensureDropshipCustomerMap({ shop, order })
     console.log(`[orders] drop-ship customer ready — qboId=${customerMap.qboCustomerId}`)
 
+    // Resolve the retail order name from the dropship mapping so the QBO invoice
+    // DocNumber uses the RS-#<retail> format (e.g. "RS-#1234") rather than the
+    // wholesale order number. Best-effort — falls back to order.name if not found.
+    const mapping = await DropshipMapping.findOne({ shop, wholesaleOrderId: shopifyOrderId })
+      .select('retailOrderName')
+      .lean()
+    const retailOrderName = mapping?.retailOrderName || null
+    console.log(
+      `[orders] drop-ship mapping — wholesaleOrderId=${shopifyOrderId} retailOrderName=${retailOrderName || '(not found)'}`,
+    )
+
     const invoice = await createInvoiceForOrder({
       shop,
       order,
       localOrder: local,
       customerMap,
       isDropship: true,
+      retailOrderName,
     })
 
     local.qboInvoiceId = invoice.qboInvoiceId
