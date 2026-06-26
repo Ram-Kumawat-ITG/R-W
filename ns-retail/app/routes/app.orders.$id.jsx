@@ -10,10 +10,7 @@ import {
   sendRetailInvoiceForOrder,
   getRetailInvoicePdf,
 } from "../services/retailQbo/retailOrderInvoice.service";
-import {
-  ensureRetailVendorBillForOrder,
-  getRetailBillPdf,
-} from "../services/retailQbo/retailVendorBill.service";
+import { ensureRetailVendorBillForOrder } from "../services/retailQbo/retailVendorBill.service";
 import { reconcileRetailVendorBillForOrder } from "../services/retailQbo/retailBillReconcile.service";
 import StatusBadge from "../components/cdo/StatusBadge";
 import { ShippingBadge, DeliveryBadge } from "../components/cdo/StatusBadges";
@@ -170,16 +167,6 @@ export const action = async ({ request }) => {
       }
       return { status: "error", op: "invoice-pdf", message: r.error || "Could not load the invoice PDF." };
     }
-    if (op === "bill-pdf") {
-      const r = await getRetailBillPdf({ shop, shopifyOrderId });
-      if (r.ok) {
-        return { status: "success", op: "bill-pdf", base64: r.base64, contentType: r.contentType, filename: r.filename };
-      }
-      if (r.reason === "no_bill") {
-        return { status: "error", op: "bill-pdf", message: "Create the vendor bill first, then preview it." };
-      }
-      return { status: "error", op: "bill-pdf", message: r.error || "Could not load the vendor bill PDF." };
-    }
     return { status: "error", message: "Unknown action." };
   } catch (e) {
     return { status: "error", message: e?.message || "Action failed." };
@@ -313,52 +300,6 @@ export default function OrderDetail() {
       pdfWindowRef.current = null;
     }
   }, [pdfFetcher.data, pdfFetcher.state]);
-
-  const billPdfFetcher = useFetcher();
-  const billPdfLoading = billPdfFetcher.state !== "idle";
-  const billPdfWindowRef = useRef(null);
-  const handledBillPdfRef = useRef(null);
-
-  const onViewBillPdf = () => {
-    billPdfWindowRef.current = window.open("about:blank", "_blank");
-    billPdfFetcher.submit(
-      { _action: "bill-pdf", shopifyOrderId: order.shopifyOrderId || "" },
-      { method: "POST" },
-    );
-  };
-
-  useEffect(() => {
-    if (!billPdfFetcher.data || billPdfFetcher.state !== "idle") return;
-    if (billPdfFetcher.data.op !== "bill-pdf") return;
-    if (handledBillPdfRef.current === billPdfFetcher.data) return;
-    handledBillPdfRef.current = billPdfFetcher.data;
-
-    const data = billPdfFetcher.data;
-    if (data.status === "success" && data.base64) {
-      const binary = atob(data.base64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      const blob = new Blob([bytes], { type: data.contentType || "application/pdf" });
-      const blobUrl = URL.createObjectURL(blob);
-      const win = billPdfWindowRef.current;
-      if (win && !win.closed) {
-        win.location.href = blobUrl;
-      } else {
-        const a = document.createElement("a");
-        a.href = blobUrl;
-        a.download = data.filename || "vendor-bill.pdf";
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-      }
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
-      billPdfWindowRef.current = null;
-    } else if (data.status === "error") {
-      const win = billPdfWindowRef.current;
-      if (win && !win.closed) win.close();
-      billPdfWindowRef.current = null;
-    }
-  }, [billPdfFetcher.data, billPdfFetcher.state]);
 
   return (
     <s-stack direction="block" gap="small-200">
@@ -862,11 +803,6 @@ export default function OrderDetail() {
                 }
               >
                 Reconcile bill (mark paid)
-              </s-button>
-            ) : null}
-            {q?.qboBillId ? (
-              <s-button disabled={billPdfLoading} onClick={onViewBillPdf}>
-                Preview bill PDF
               </s-button>
             ) : null}
             {q?.qboInvoiceId ? (

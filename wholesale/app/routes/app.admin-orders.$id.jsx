@@ -410,13 +410,10 @@ export default function AdminOrderDetail() {
 
   // ── Invoice actions (reuse the shared /api/admin/orders/:id/* endpoints) ──
   const pdfFetcher = useFetcher();
-  const billPdfFetcher = useFetcher();
   const sendInvoiceFetcher = useFetcher();
   const collectFetcher = useFetcher();
   const pdfWindowRef = useRef(null);
-  const billPdfWindowRef = useRef(null);
   const handledPdfRef = useRef(null);
-  const handledBillPdfRef = useRef(null);
   const handledSendRef = useRef(null);
   const handledCollectRef = useRef(null);
 
@@ -470,52 +467,6 @@ export default function AdminOrderDetail() {
   }, [pdfFetcher.data, pdfFetcher.state, shopify]);
   const pdfLoading =
     pdfFetcher.state === "submitting" || pdfFetcher.state === "loading";
-
-  // View vendor bill PDF — same popup-safe pattern as onViewPdf above.
-  const onViewBillPdf = () => {
-    setBannerError(null);
-    billPdfWindowRef.current = window.open("about:blank", "_blank");
-    billPdfFetcher.submit(null, {
-      method: "POST",
-      action: `/api/admin/orders/${order._id}/qbo-bill-pdf`,
-    });
-  };
-  useEffect(() => {
-    if (!billPdfFetcher.data || billPdfFetcher.state !== "idle") return;
-    if (handledBillPdfRef.current === billPdfFetcher.data) return;
-    handledBillPdfRef.current = billPdfFetcher.data;
-    const data = billPdfFetcher.data;
-    if (data.status === "success" && data.result?.base64) {
-      const { base64, contentType, filename } = data.result;
-      const binary = atob(base64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      const blob = new Blob([bytes], { type: contentType || "application/pdf" });
-      const blobUrl = URL.createObjectURL(blob);
-      const win = billPdfWindowRef.current;
-      if (win && !win.closed) {
-        win.location.href = blobUrl;
-        try { win.document.title = filename; } catch {}
-      } else {
-        const a = document.createElement("a");
-        a.href = blobUrl;
-        a.download = filename || "vendor-bill.pdf";
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-      }
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
-      billPdfWindowRef.current = null;
-    } else if (data.status === "error") {
-      const win = billPdfWindowRef.current;
-      if (win && !win.closed) win.close();
-      billPdfWindowRef.current = null;
-      setBannerError(data.message || "Failed to load vendor bill PDF");
-      shopify?.toast?.show(data.message || "Failed to load PDF", { isError: true });
-    }
-  }, [billPdfFetcher.data, billPdfFetcher.state, shopify]);
-  const billPdfLoading =
-    billPdfFetcher.state === "submitting" || billPdfFetcher.state === "loading";
 
   // Send invoice email — QBO mails the CURRENT invoice document.
   const onSendInvoice = () => {
@@ -682,9 +633,6 @@ export default function AdminOrderDetail() {
                   Open in QBO ↗
                 </s-button>
               )}
-              <s-button variant="secondary" onClick={onViewBillPdf} {...(billPdfLoading ? { loading: true } : {})}>
-                View Bill PDF
-              </s-button>
             </s-stack>
           ) : (
             <s-text tone="subdued">No vendor bill linked yet.</s-text>
