@@ -703,11 +703,27 @@ export async function fetchProductVendors(admin) {
 //   configVersion     — cdo_settings.commissionConfigVersion (tags the snapshot)
 function computeOrderCommission(doc, { vendorCommissions, configVersion } = {}) {
   const rateMap = buildVendorRateMap(vendorCommissions);
-  const lines = (doc.lineItems || []).map((li) => {
-    const revenue = roundMoney(
-      (Number(li.price) || 0) * (Number(li.quantity) || 0) -
-        (Number(li.totalDiscount) || 0),
-    );
+  const rawLines = doc.lineItems || [];
+
+  // Safety net: Shopify sometimes sends total_discount:"0.00" on each line item
+  // even when an order-level discount code was applied (the allocation lives in
+  // discount_allocations instead). mapShopifyOrderToDoc already falls back to
+  // discount_allocations, but if stored data pre-dates that fix (or a new edge
+  // case slips through), distribute the order-level discount proportionally so
+  // commission is never calculated on the gross undiscounted price.
+  const lineDiscountSum = rawLines.reduce((s, li) => s + (Number(li.totalDiscount) || 0), 0);
+  const orderDiscount = Number(doc.pricing?.totalDiscounts) || 0;
+  const needsDistribution = lineDiscountSum === 0 && orderDiscount > 0;
+  const lineSubtotalSum = needsDistribution
+    ? rawLines.reduce((s, li) => s + (Number(li.price) || 0) * (Number(li.quantity) || 0), 0)
+    : 0;
+
+  const lines = rawLines.map((li) => {
+    const lineSubtotal = (Number(li.price) || 0) * (Number(li.quantity) || 0);
+    const lineDiscount = needsDistribution && lineSubtotalSum > 0
+      ? roundMoney(orderDiscount * (lineSubtotal / lineSubtotalSum))
+      : (Number(li.totalDiscount) || 0);
+    const revenue = roundMoney(lineSubtotal - lineDiscount);
     const rate = rateMap.get(vendorKey(li.vendor)) || 0;
     return {
       vendor: li.vendor || null,
@@ -3237,18 +3253,31 @@ function mapShopifyOrderToDoc(payload, { referral, attribution, shop }) {
       phone: cust.phone || o.phone || null,
     },
 
-    lineItems: (o.line_items || []).map((li) => ({
-      productId: li.product_id != null ? String(li.product_id) : null,
-      variantId: li.variant_id != null ? String(li.variant_id) : null,
-      sku: li.sku || null,
-      title: li.title || null,
-      variantTitle: li.variant_title || null,
-      // Product vendor — drives per-line commission (see computeOrderCommission).
-      vendor: li.vendor || null,
-      quantity: Number(li.quantity) || 0,
-      price: money(li.price),
-      totalDiscount: money(li.total_discount),
-    })),
+    lineItems: (o.line_items || []).map((li) => {
+      // Shopify guarantees total_discount = sum(discount_allocations[].amount).
+      // In practice, basic order-level discount codes sometimes arrive with
+      // total_discount:"0.00" while the per-line allocation is only in
+      // discount_allocations.  Fall back to summing allocations so the stored
+      // value (and the UI Discount column) reflect the actual line discount.
+      const directDiscount = money(li.total_discount);
+      const totalDiscount = directDiscount > 0
+        ? directDiscount
+        : roundMoney(
+            (li.discount_allocations || []).reduce((s, a) => s + money(a.amount), 0),
+          );
+      return {
+        productId: li.product_id != null ? String(li.product_id) : null,
+        variantId: li.variant_id != null ? String(li.variant_id) : null,
+        sku: li.sku || null,
+        title: li.title || null,
+        variantTitle: li.variant_title || null,
+        // Product vendor — drives per-line commission (see computeOrderCommission).
+        vendor: li.vendor || null,
+        quantity: Number(li.quantity) || 0,
+        price: money(li.price),
+        totalDiscount,
+      };
+    }),
 
     currency: o.currency || "USD",
     amount: total,
