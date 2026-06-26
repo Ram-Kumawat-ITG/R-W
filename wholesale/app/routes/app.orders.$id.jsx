@@ -37,6 +37,7 @@ import {
   OutcomeBadge,
   ShipmentStatusBadge,
   LineItemsTable,
+  CollapsibleSection,
 } from "../components/admin-ui";
 import { carrierDisplayName } from "../utils/shipping.constants";
 import { formatAmount, fmtDateTime } from "../utils/format.utils";
@@ -1439,7 +1440,7 @@ export default function OrderDetail() {
       )}
 
       {/* ───── Status pipeline ───── */}
-      <s-section heading="Status pipeline">
+      <CollapsibleSection heading="Status pipeline" storageKey="w-ord-status" defaultOpen>
         <s-stack
           direction="inline"
           gap="base"
@@ -1453,10 +1454,10 @@ export default function OrderDetail() {
             </Fragment>
           ))}
         </s-stack>
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Overview ───── */}
-      <s-section heading="Overview">
+      <CollapsibleSection heading="Overview" storageKey="w-ord-overview">
         <s-stack direction="block" gap="base">
           <s-stack direction="inline" gap="base" alignItems="center">
             <ProcessingBadge
@@ -1522,15 +1523,16 @@ export default function OrderDetail() {
             </s-banner>
           )}
         </s-stack>
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Shipment tracking ───── */}
-      <s-section
+      <CollapsibleSection
         heading={`Shipment tracking${
           order.trackingUpdatedAt
             ? ` · updated ${new Date(order.trackingUpdatedAt).toLocaleString()}`
             : ""
         }`}
+        storageKey="w-ord-shipment"
       >
         {!order.fulfillments?.length ? (
           <s-paragraph tone="subdued">
@@ -1687,11 +1689,12 @@ export default function OrderDetail() {
             )}
           </s-stack>
         )}
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Line items + totals ───── */}
-      <s-section
+      <CollapsibleSection
         heading={`Line items (${breakdown?.lineItems?.length ?? 0})`}
+        storageKey="w-ord-lineitems"
       >
         {!breakdown?.lineItems?.length ? (
           <s-paragraph tone="subdued">
@@ -1776,10 +1779,10 @@ export default function OrderDetail() {
             )}
           </s-stack>
         )}
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Customer ───── */}
-      <s-section heading="Customer">
+      <CollapsibleSection heading="Customer" storageKey="w-ord-customer">
         <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
           <s-grid-item>
             <KV label="Email" value={order.customerEmail} />
@@ -1819,10 +1822,10 @@ export default function OrderDetail() {
             />
           </s-grid-item>
         </s-grid>
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Invoice & payment ───── */}
-      <s-section heading="Invoice & payment">
+      <CollapsibleSection heading="Invoice & payment" storageKey="w-ord-invoice">
         {!invoice ? (
           <s-paragraph tone="subdued">
             No invoice has been created for this order yet.
@@ -2286,11 +2289,11 @@ export default function OrderDetail() {
 
           </s-stack>
         )}
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Immediate Payment — self-pay link + QR ───── */}
       {invoice?.paymentMethod === "immediate" && payLink && (
-        <s-section heading="Payment link (Immediate Payment)">
+        <CollapsibleSection heading="Payment link (Immediate Payment)" storageKey="w-ord-paylink">
           <s-stack direction="block" gap="base">
             <s-paragraph>
               This customer pays each invoice on demand via a secure link
@@ -2335,12 +2338,12 @@ export default function OrderDetail() {
               invoice” to update the emailed/QBO copy to this current link.
             </s-text>
           </s-stack>
-        </s-section>
+        </CollapsibleSection>
       )}
 
       {/* ───── QuickBooks invoice (live fetch) ───── */}
       {invoice && (
-        <s-section heading="QuickBooks invoice">
+        <CollapsibleSection heading="QuickBooks invoice" storageKey="w-ord-qbo">
           <s-stack direction="block" gap="base">
             {/* Status header */}
             <s-stack direction="inline" gap="base" alignItems="center">
@@ -2625,13 +2628,14 @@ export default function OrderDetail() {
               </s-paragraph>
             )}
           </s-stack>
-        </s-section>
+        </CollapsibleSection>
       )}
 
       {/* ───── Email history ───── */}
       {invoice && (
-        <s-section
+        <CollapsibleSection
           heading={`Email history (${invoice.emailEvents?.length || 0})`}
+          storageKey="w-ord-emails"
         >
           {!invoice.emailEvents || invoice.emailEvents.length === 0 ? (
             <s-paragraph tone="subdued">
@@ -2696,12 +2700,12 @@ export default function OrderDetail() {
               </s-table-body>
             </s-table>
           )}
-        </s-section>
+        </CollapsibleSection>
       )}
 
       {/* ───── Attempt history ───── */}
       {invoice && (
-        <s-section heading={`Attempt history (${attempts.length})`}>
+        <CollapsibleSection heading={`Attempt history (${attempts.length})`} storageKey="w-ord-attempts">
           {attempts.length === 0 ? (
             <s-paragraph tone="subdued">No charge attempts yet.</s-paragraph>
           ) : (
@@ -2740,12 +2744,12 @@ export default function OrderDetail() {
               </s-table-body>
             </s-table>
           )}
-        </s-section>
+        </CollapsibleSection>
       )}
 
       {/* ───── Remarks (CRON + admin follow-up timeline) ───── */}
       {invoice && (
-        <s-section heading={`Remarks (${invoice.remarks?.length || 0})`}>
+        <CollapsibleSection heading={`Remarks (${invoice.remarks?.length || 0})`} storageKey="w-ord-remarks">
           {!invoice.remarks?.length ? (
             <s-paragraph tone="subdued">
               No remarks yet. CRON ticks and admin settlement actions
@@ -2803,7 +2807,7 @@ export default function OrderDetail() {
               </s-table-body>
             </s-table>
           )}
-        </s-section>
+        </CollapsibleSection>
       )}
 
       <s-modal

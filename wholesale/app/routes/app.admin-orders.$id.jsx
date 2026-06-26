@@ -27,6 +27,7 @@ import {
   PaymentMethodBadge,
   OutcomeBadge,
   LineItemsTable,
+  CollapsibleSection,
 } from "../components/admin-ui";
 import { carrierDisplayName } from "../utils/shipping.constants";
 import { formatAmount, fmtDateTime } from "../utils/format.utils";
@@ -409,10 +410,13 @@ export default function AdminOrderDetail() {
 
   // ── Invoice actions (reuse the shared /api/admin/orders/:id/* endpoints) ──
   const pdfFetcher = useFetcher();
+  const billPdfFetcher = useFetcher();
   const sendInvoiceFetcher = useFetcher();
   const collectFetcher = useFetcher();
   const pdfWindowRef = useRef(null);
+  const billPdfWindowRef = useRef(null);
   const handledPdfRef = useRef(null);
+  const handledBillPdfRef = useRef(null);
   const handledSendRef = useRef(null);
   const handledCollectRef = useRef(null);
 
@@ -466,6 +470,52 @@ export default function AdminOrderDetail() {
   }, [pdfFetcher.data, pdfFetcher.state, shopify]);
   const pdfLoading =
     pdfFetcher.state === "submitting" || pdfFetcher.state === "loading";
+
+  // View vendor bill PDF — same popup-safe pattern as onViewPdf above.
+  const onViewBillPdf = () => {
+    setBannerError(null);
+    billPdfWindowRef.current = window.open("about:blank", "_blank");
+    billPdfFetcher.submit(null, {
+      method: "POST",
+      action: `/api/admin/orders/${order._id}/qbo-bill-pdf`,
+    });
+  };
+  useEffect(() => {
+    if (!billPdfFetcher.data || billPdfFetcher.state !== "idle") return;
+    if (handledBillPdfRef.current === billPdfFetcher.data) return;
+    handledBillPdfRef.current = billPdfFetcher.data;
+    const data = billPdfFetcher.data;
+    if (data.status === "success" && data.result?.base64) {
+      const { base64, contentType, filename } = data.result;
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const blob = new Blob([bytes], { type: contentType || "application/pdf" });
+      const blobUrl = URL.createObjectURL(blob);
+      const win = billPdfWindowRef.current;
+      if (win && !win.closed) {
+        win.location.href = blobUrl;
+        try { win.document.title = filename; } catch {}
+      } else {
+        const a = document.createElement("a");
+        a.href = blobUrl;
+        a.download = filename || "vendor-bill.pdf";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+      billPdfWindowRef.current = null;
+    } else if (data.status === "error") {
+      const win = billPdfWindowRef.current;
+      if (win && !win.closed) win.close();
+      billPdfWindowRef.current = null;
+      setBannerError(data.message || "Failed to load vendor bill PDF");
+      shopify?.toast?.show(data.message || "Failed to load PDF", { isError: true });
+    }
+  }, [billPdfFetcher.data, billPdfFetcher.state, shopify]);
+  const billPdfLoading =
+    billPdfFetcher.state === "submitting" || billPdfFetcher.state === "loading";
 
   // Send invoice email — QBO mails the CURRENT invoice document.
   const onSendInvoice = () => {
@@ -599,8 +649,51 @@ export default function AdminOrderDetail() {
 
 
 
+      {/* ───── QuickBooks quick overview ───── */}
+      <CollapsibleSection heading="QuickBooks" storageKey="wa-ord-qbo-overview" defaultOpen>
+        <s-stack direction="block" gap="base">
+          {invoice && (
+            <s-stack direction="inline" gap="base" alignItems="center" wrap>
+              <s-text><strong>Invoice</strong></s-text>
+              {invoice.qboInvoiceId ? (
+                <>
+                  <s-badge tone="info">#{invoice.qboDocNumber || invoice.qboInvoiceId}</s-badge>
+                  <PaymentStatusBadge status={invoice.paymentStatus} />
+                  {qbo.url && (
+                    <s-button variant="secondary" onClick={() => window.open(qbo.url, "_blank")}>
+                      Open in QBO ↗
+                    </s-button>
+                  )}
+                  <s-button variant="secondary" onClick={onViewPdf} {...(pdfLoading ? { loading: true } : {})}>
+                    View Invoice PDF
+                  </s-button>
+                </>
+              ) : (
+                <s-text tone="subdued">Not yet created</s-text>
+              )}
+            </s-stack>
+          )}
+          {vendorBill?.qboBillId ? (
+            <s-stack direction="inline" gap="base" alignItems="center" wrap>
+              <s-text><strong>Vendor Bill</strong></s-text>
+              <s-badge tone="info">#{vendorBill.qboBillDocNumber || vendorBill.qboBillId}</s-badge>
+              {vendorBill.billUrl && (
+                <s-button variant="secondary" onClick={() => window.open(vendorBill.billUrl, "_blank")}>
+                  Open in QBO ↗
+                </s-button>
+              )}
+              <s-button variant="secondary" onClick={onViewBillPdf} {...(billPdfLoading ? { loading: true } : {})}>
+                View Bill PDF
+              </s-button>
+            </s-stack>
+          ) : (
+            <s-text tone="subdued">No vendor bill linked yet.</s-text>
+          )}
+        </s-stack>
+      </CollapsibleSection>
+
       {/* ───── Order information ───── */}
-      <s-section heading="Order information">
+      <CollapsibleSection heading="Order information" storageKey="wa-ord-info">
         <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
           <s-grid-item>
             <KV label="Order name" value={order.shopifyOrderName} />
@@ -651,15 +744,16 @@ export default function AdminOrderDetail() {
             <KV label="Processed at" value={fmtDateTime(details.meta.processedAt)} />
           </s-grid-item>
         </s-grid>
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Fulfillment & tracking ───── */}
-      <s-section
+      <CollapsibleSection
         heading={`Fulfillment & tracking${
           order.trackingUpdatedAt
             ? ` · updated ${new Date(order.trackingUpdatedAt).toLocaleString()}`
             : ""
         }`}
+        storageKey="wa-ord-fulfillment"
       >
         {!fulfillments.length ? (
           <s-paragraph tone="subdued">
@@ -813,10 +907,10 @@ export default function AdminOrderDetail() {
             )}
           </s-stack>
         )}
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Line items + totals ───── */}
-      <s-section heading={`Items (${details.lineItems.length})`}>
+      <CollapsibleSection heading={`Items (${details.lineItems.length})`} storageKey="wa-ord-items">
         {!details.lineItems.length ? (
           <s-paragraph tone="subdued">
             No line items recorded for this order.
@@ -875,10 +969,10 @@ export default function AdminOrderDetail() {
             )}
           </s-stack>
         )}
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Customer ───── */}
-      <s-section heading="Customer">
+      <CollapsibleSection heading="Customer" storageKey="wa-ord-customer">
         <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
           <s-grid-item>
             <KV
@@ -902,10 +996,10 @@ export default function AdminOrderDetail() {
             />
           </s-grid-item>
         </s-grid>
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Tags ───── */}
-      <s-section heading={`Order tags (${details.tags.length})`}>
+      <CollapsibleSection heading={`Order tags (${details.tags.length})`} storageKey="wa-ord-tags">
         {details.tags.length ? (
           <s-stack direction="inline" gap="small-200">
             {details.tags.map((t) => (
@@ -917,10 +1011,10 @@ export default function AdminOrderDetail() {
         ) : (
           <s-paragraph tone="subdued">No tags on this order.</s-paragraph>
         )}
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Shipping ───── */}
-      <s-section heading="Shipping">
+      <CollapsibleSection heading="Shipping" storageKey="wa-ord-shipping">
         <s-grid gridTemplateColumns="1fr 1fr" gap="large-100">
           <s-grid-item>
             <s-stack direction="block" gap="none">
@@ -953,10 +1047,10 @@ export default function AdminOrderDetail() {
             </s-stack>
           </s-box>
         )}
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Notes ───── */}
-      <s-section heading="Notes">
+      <CollapsibleSection heading="Notes" storageKey="wa-ord-notes">
         <s-stack direction="block" gap="base">
           <s-stack direction="block" gap="none">
             <s-text tone="subdued">Order note</s-text>
@@ -979,10 +1073,10 @@ export default function AdminOrderDetail() {
             </s-stack>
           )}
         </s-stack>
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Additional Shopify metadata ───── */}
-      <s-section heading="Additional metadata">
+      <CollapsibleSection heading="Additional metadata" storageKey="wa-ord-meta">
         <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
           <s-grid-item>
             <KV label="Source" value={details.meta.sourceName} />
@@ -1035,10 +1129,10 @@ export default function AdminOrderDetail() {
             </s-link>
           </s-box>
         )}
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Invoice & payment ───── */}
-      <s-section heading="Invoice & payment">
+      <CollapsibleSection heading="Invoice & payment" storageKey="wa-ord-invoice">
         {!invoice ? (
           <s-paragraph tone="subdued">
             No invoice has been created for this order yet.
@@ -1117,11 +1211,11 @@ export default function AdminOrderDetail() {
             )}
           </s-stack>
         )}
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── QuickBooks invoice (live) ───── */}
       {(invoice?.qboInvoiceId || vendorBill) && (
-        <s-section heading="QuickBooks invoice">
+        <CollapsibleSection heading="QuickBooks invoice" storageKey="wa-ord-qbo">
           <s-stack direction="block" gap="base">
 
             {/* ─ Invoice ─ */}
@@ -1389,12 +1483,12 @@ export default function AdminOrderDetail() {
             )}
 
           </s-stack>
-        </s-section>
+        </CollapsibleSection>
       )}
 
       {/* ───── Email history ───── */}
       {invoice && (
-        <s-section heading={`Email history (${invoice.emailEvents?.length || 0})`}>
+        <CollapsibleSection heading={`Email history (${invoice.emailEvents?.length || 0})`} storageKey="wa-ord-emails">
           {!invoice.emailEvents || invoice.emailEvents.length === 0 ? (
             <s-paragraph tone="subdued">
               No invoice emails have been sent yet for this order.
@@ -1439,12 +1533,12 @@ export default function AdminOrderDetail() {
               </s-table-body>
             </s-table>
           )}
-        </s-section>
+        </CollapsibleSection>
       )}
 
       {/* ───── Attempt history ───── */}
       {invoice && (
-        <s-section heading={`Attempt history (${attempts.length})`}>
+        <CollapsibleSection heading={`Attempt history (${attempts.length})`} storageKey="wa-ord-attempts">
           {attempts.length === 0 ? (
             <s-paragraph tone="subdued">No charge attempts yet.</s-paragraph>
           ) : (
@@ -1479,12 +1573,12 @@ export default function AdminOrderDetail() {
               </s-table-body>
             </s-table>
           )}
-        </s-section>
+        </CollapsibleSection>
       )}
 
       {/* ───── Remarks (CRON + admin follow-up timeline) ───── */}
       {invoice && (
-        <s-section heading={`Remarks (${invoice.remarks?.length || 0})`}>
+        <CollapsibleSection heading={`Remarks (${invoice.remarks?.length || 0})`} storageKey="wa-ord-remarks">
           {!invoice.remarks?.length ? (
             <s-paragraph tone="subdued">
               No remarks yet. Drop-ship collection ticks and admin actions
@@ -1534,7 +1628,7 @@ export default function AdminOrderDetail() {
               </s-table-body>
             </s-table>
           )}
-        </s-section>
+        </CollapsibleSection>
       )}
     </s-page>
   );

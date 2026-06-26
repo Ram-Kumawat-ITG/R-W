@@ -26,6 +26,7 @@ import {
   resolveDropshipExpenseAccountId,
   createBillForOrder,
   billWebUrl,
+  getBillPdf,
 } from "./retailQbo.service";
 import { createLogger } from "../../utils/logger.utils";
 
@@ -217,5 +218,31 @@ export async function ensureRetailVendorBillForOrder({ shop, shopifyOrderId, for
     );
     log.error("bill.create_failed", { shopifyOrderId, err });
     return { ok: false, reason: "error", error: msg };
+  }
+}
+
+// Fetch the QBO vendor bill PDF for a retail order. Returns { ok, base64,
+// contentType, filename } on success, or { ok: false, reason, error } on failure.
+export async function getRetailBillPdf({ shop, shopifyOrderId }) {
+  if (!shopifyOrderId) return { ok: false, reason: "missing_order_id" };
+  if (!isRetailQboConfigured()) return { ok: false, reason: "not_configured" };
+  await connectDB();
+  const order = await CdoOrder.findOne({ shop, shopifyOrderId })
+    .select("retailQbo")
+    .lean();
+  if (!order) return { ok: false, reason: "order_not_found" };
+  const billId = order.retailQbo?.qboBillId;
+  if (!billId) return { ok: false, reason: "no_bill" };
+  try {
+    const pdf = await getBillPdf(billId);
+    return {
+      ok: true,
+      base64: pdf.buffer.toString("base64"),
+      contentType: pdf.contentType || "application/pdf",
+      filename: `vendor-bill-${order.retailQbo?.qboBillDocNumber || billId}.pdf`,
+    };
+  } catch (err) {
+    log.error("bill.pdf_failed", { shopifyOrderId, billId, err });
+    return { ok: false, reason: "error", error: err?.message || String(err) };
   }
 }

@@ -52,6 +52,7 @@ export default [
   route("/api/admin/orders/:id/charge-card", "api/admin/charge-card.js"),
   route("/api/admin/orders/:id/preview-payment", "api/admin/preview-payment.js"),
   route("/api/admin/orders/:id/qbo-invoice-pdf", "api/admin/qbo-invoice-pdf.js"),
+  route("/api/admin/orders/:id/qbo-bill-pdf", "api/admin/qbo-bill-pdf.js"),
   route("/api/admin/orders/:id/send-invoice", "api/admin/send-invoice.js"),
   route("/api/admin/orders/:id/refresh-pay-link", "api/admin/refresh-pay-link.js"),
   route("/api/admin/orders/:id/pause-auto-charge", "api/admin/pause-auto-charge.js"),

@@ -27,6 +27,8 @@ export default [
   // Path strings are relative to the app/ directory.
   route("/api/auth/check-email", "api/auth/check-email.js"),
   route("/api/cdo/validate-code", "api/cdo/validate-code.js"),
+  // Internal cross-repo endpoint: wholesale proxies vendor bill PDF requests here.
+  route("/api/cdo/bill-pdf", "api/cdo/bill-pdf.js"),
   route("/api/cdo/checkout-validate-code", "api/cdo/checkout-validate-code.js"),
   // Apply a validated referral code to the cart and immediately tag the
   // Shopify customer. Called from the checkout UI extension when the buyer

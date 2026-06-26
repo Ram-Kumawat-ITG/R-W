@@ -418,6 +418,13 @@ export async function getInvoicePdf(invoiceId) {
   });
 }
 
+export async function getBillPdf(billId) {
+  if (!billId) throw new Error("getBillPdf: billId is required");
+  return qboRetailGetBinary(`/bill/${encodeURIComponent(billId)}/pdf`, {
+    accept: "application/pdf",
+  });
+}
+
 // Deep link for the admin UI so operators can open the invoice in QBO.
 export function invoiceWebUrl(invoiceId) {
   return `${retailQboConfig.appBaseUrl}/app/invoice?txnId=${invoiceId}`;

@@ -669,3 +669,39 @@ export function LineItemsTable({ lineItems = [], currency, orderLabel = "" }) {
     </s-stack>
   );
 }
+
+// ── CollapsibleSection ────────────────────────────────────────────────
+//
+// Wraps content in an s-section with a clickable heading that expands or
+// collapses the body. State persists across renders in sessionStorage so
+// the user's layout is preserved while navigating within the same tab.
+// The first section on each order detail page passes defaultOpen so it
+// starts expanded; all others start collapsed.
+export function CollapsibleSection({ heading, children, defaultOpen = false, storageKey }) {
+  const key = storageKey ? `cs:${storageKey}` : null;
+  const [open, setOpen] = useState(() => {
+    if (!key) return defaultOpen;
+    try {
+      const v = sessionStorage.getItem(key);
+      return v !== null ? v === "true" : defaultOpen;
+    } catch {
+      return defaultOpen;
+    }
+  });
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (key) try { sessionStorage.setItem(key, String(next)); } catch {}
+  };
+  return (
+    <s-section>
+      <s-clickable onClick={toggle}>
+        <s-stack direction="inline" gap="base" alignItems="center" justifyContent="space-between">
+          <s-text variant="headingMd">{heading}</s-text>
+          <s-text tone="subdued">{open ? "▲" : "▼"}</s-text>
+        </s-stack>
+      </s-clickable>
+      {open ? <s-box paddingBlockStart="base">{children}</s-box> : null}
+    </s-section>
+  );
+}
