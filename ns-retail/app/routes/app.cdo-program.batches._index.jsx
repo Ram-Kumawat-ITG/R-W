@@ -1,5 +1,5 @@
 /* eslint-disable react/prop-types */
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useNavigate, useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
 import {
@@ -9,6 +9,7 @@ import {
 import DataTable from "../components/cdo/DataTable";
 import MetricCard from "../components/cdo/MetricCard";
 import StatusBadge from "../components/cdo/StatusBadge";
+import PayoutCountdown from "../components/cdo/PayoutCountdown";
 import {
   formatCurrency,
   formatDate,
@@ -31,62 +32,6 @@ export const loader = async ({ request }) => {
   ]);
   return { rows, upcoming };
 };
-
-// ── Countdown helpers ─────────────────────────────────────────────────────────
-
-function calcTimeLeft(targetIso) {
-  const diff = new Date(targetIso).getTime() - Date.now();
-  if (diff <= 0) return null;
-  return {
-    days:    Math.floor(diff / 86_400_000),
-    hours:   Math.floor((diff % 86_400_000) / 3_600_000),
-    minutes: Math.floor((diff % 3_600_000)  / 60_000),
-    seconds: Math.floor((diff % 60_000)     / 1_000),
-  };
-}
-
-function CountdownUnit({ value, label }) {
-  return (
-    <s-box
-      padding="base"
-      border-color="border"
-      border-width="base"
-      border-radius="base"
-      min-inline-size="80px"
-    >
-      <s-stack direction="block" gap="none" alignItems="center">
-        <s-text variant="headingLg">
-          {String(value).padStart(2, "0")}
-        </s-text>
-        <s-text tone="subdued">{label}</s-text>
-      </s-stack>
-    </s-box>
-  );
-}
-
-function PayoutCountdown({ payoutRunAt }) {
-  const [timeLeft, setTimeLeft] = useState(null);
-  useEffect(() => {
-    const tick = () => setTimeLeft(calcTimeLeft(payoutRunAt));
-    tick();
-    const id = setInterval(tick, 1000);
-    return () => clearInterval(id);
-  }, [payoutRunAt]);
-  if (!timeLeft) return null;
-  return (
-    <s-stack direction="block" gap="small-200">
-      <s-stack direction="inline" gap="small-200" wrap>
-        <CountdownUnit value={timeLeft.days}    label="Days"    />
-        <CountdownUnit value={timeLeft.hours}   label="Hours"   />
-        <CountdownUnit value={timeLeft.minutes} label="Minutes" />
-        <CountdownUnit value={timeLeft.seconds} label="Seconds" />
-      </s-stack>
-      <s-text tone="subdued">
-        Next payout run: {formatDateTime(payoutRunAt)}
-      </s-text>
-    </s-stack>
-  );
-}
 
 // ── Practitioner card with expandable order breakdown ─────────────────────────
 
