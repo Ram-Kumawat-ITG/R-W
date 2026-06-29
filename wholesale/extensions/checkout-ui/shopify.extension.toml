@@ -1,0 +1,50 @@
+# Learn more about configuring your checkout UI extension:
+# https://shopify.dev/docs/api/checkout-ui-extensions/latest/configuration
+
+# The version of APIs your extension will receive. Learn more:
+# https://shopify.dev/docs/api/usage/versioning
+api_version = "2026-04"
+
+[[extensions]]
+name = "checkout-ui"
+handle = "checkout-ui"
+type = "ui_extension"
+# 36-char UUIDv4. The CLI's auto-generated value had a 20-character last
+# segment (instead of 12) which Shopify's app-config validator rejects
+# silently — extension fails to load on the storefront. Regenerated.
+uid = "fddfc370-27c7-c30f-4ee0-a927194e2acc"
+
+# Controls where in Shopify your extension will be injected,
+# and the file that contains your extension's source code. Learn more:
+# https://shopify.dev/docs/api/checkout-ui-extensions/latest/extension-targets-overview
+
+[[extensions.targeting]]
+module = "./src/Checkout.jsx"
+target = "purchase.checkout.block.render"
+
+[extensions.capabilities]
+# Disabled — extension does NOT call the Storefront API. With `api_access`
+# turned on, Shopify proactively fetches a private storefront access
+# token at boot from `/private_access_tokens?...`, which 401s in dev
+# preview before the customer is authenticated and floods the console.
+# Variant GID + fee rate come from extension settings (synchronous), so
+# no API access is needed. Set back to `true` only if a future change
+# reintroduces `shopify.query`.
+# https://shopify.dev/docs/api/checkout-ui-extensions/latest/configuration#api-access
+api_access = false
+
+# Gives your extension access to make external network calls, using the
+# JavaScript `fetch()` API. Learn more:
+# https://shopify.dev/docs/api/checkout-ui-extensions/latest/configuration#network-access
+# network_access = true
+
+# Merchant settings removed 2026-06-29 — variant GID + fee rate now
+# hardcoded as constants in src/Checkout.jsx for simplicity. Re-enable
+# this block if either value ever needs to be merchant-configurable
+# without redeploy.
+#
+# [extensions.settings]
+# [[extensions.settings.fields]]
+# key = "fee_variant_gid"
+# type = "single_line_text_field"
+# name = "Processing Fee variant GID"

@@ -201,6 +201,219 @@ Active session storage is **MongoDB** via `@shopify/shopify-app-session-storage-
 
 ## Changelog
 
+### 2026-06-29 — Checkout UI extension: variant GID + fee rate switched from settings to hardcoded constants
+
+Follow-up simplification to the regeneration entry below. The first cut read the variant GID + fee rate from `shopify.settings.value` so the merchant could configure them per install in the checkout customization editor. In practice for a single-store wholesale app the merchant-paste step was friction with no upside — the variant is the same on every deploy.
+
+**Change** — [wholesale/extensions/checkout-ui/src/Checkout.jsx](wholesale/extensions/checkout-ui/src/Checkout.jsx):
+
+| Before | After |
+|---|---|
+| `shopify.settings.value.fee_variant_gid` | `const FEE_VARIANT_GID = 'gid://shopify/ProductVariant/REPLACE_ME'` at top of file |
+| `shopify.settings.value.fee_rate_percent` (default 3) | `const FEE_PERCENT = 3` at top of file |
+| `[extensions.settings]` block in toml | Commented out with re-enable instructions |
+| `readString` / `readFeeRate` helpers | Removed — no longer needed |
+| "Settings empty" warning log | Replaced with "`FEE_VARIANT_GID still placeholder`" guard so a forgotten paste still produces a loud log |
+
+**Operator step now is literally one paste** — open `src/Checkout.jsx`, replace `REPLACE_ME` with the real variant GID, rebuild. The block still needs to be added to the checkout customization layout in admin (block has no settings panel any more — just drag it in).
+
+**Trade-off accepted:** changing the variant or rate requires a code change + rebuild. Acceptable for the wholesale app's single-store deploy model.
+
+---
+
+### 2026-06-29 — Checkout UI extension regenerated — 3% processing fee via cart line
+
+Re-scaffolded the `wholesale/extensions/checkout-ui/` extension (we'd deleted it earlier in the week when the storefront-token 401 made dev preview unusable). This time the lessons from the first attempt are baked in, the storefront API path is avoided entirely, and the fee logic is consolidated.
+
+**Generation:**
+
+```
+shopify app generate extension --template=checkout_ui --name=checkout-ui
+```
+
+CLI created the standard scaffold + ran `npm install` for `@shopify/ui-extensions@2026.4.x` + `preact` + `@preact/signals`.
+
+**Files in the extension** ([wholesale/extensions/checkout-ui/](wholesale/extensions/checkout-ui/)):
+
+| File | Purpose |
+|---|---|
+| `package.json` | Deps: `preact`, `@preact/signals`, `@shopify/ui-extensions@2026.4.x` |
+| `tsconfig.json` | Preact JSX routing (`jsx: react-jsx` + `jsxImportSource: preact`). This file's absence in our previous attempt caused JSX to bind to React, the bundle to load silently, and the page to render blank — fixed in scaffold this time. |
+| `shopify.extension.toml` | Target = `purchase.checkout.block.render`, `api_access = false`, two merchant settings: `fee_variant_gid` + `fee_rate_percent` |
+| `src/Checkout.jsx` | The fee logic |
+| `shopify.d.ts` | TS ambient types (CLI default) |
+| `locales/` | Empty — extension is headless |
+
+**Three lessons from the first attempt are encoded in the scaffold:**
+
+1. **`uid` is a real UUID** — the CLI's auto-generated value had a malformed 20-character last segment (`fddfc370-27c7-c30f-4ee0-a927194e2accadefd40c`) which the Shopify app-config validator silently rejects. Replaced with a well-formed UUIDv4.
+2. **`api_access = false`** — even though Storefront API is not used in the code, leaving `api_access = true` causes Shopify to proactively fetch a private storefront token at extension boot, which 401s in dev preview before the customer authenticates and floods the console. Disabled.
+3. **Variant GID from settings, not a Storefront API lookup** — earlier prototype tried `shopify.query` to resolve the variant from a product handle at runtime; the lookup 401'd in dev. Replaced with synchronous read from `shopify.settings.value.fee_variant_gid`.
+
+**Logic in `Checkout.jsx`:**
+
+| Step | Code |
+|---|---|
+| Read settings | `shopify.settings.value.fee_variant_gid` + `fee_rate_percent` (default 3%) |
+| Capability gate | `shopify.instructions.value.lines.canAddCartLine` — true only after shipping address entered, which IS the moment the operator wants (totals update at the shipping step) |
+| Compute base | `subtotal − existingFeeLineTotal` (self-compensation — fee never compounds on itself when the cart re-renders) |
+| Quantity-as-cents trick | Variant priced at $0.01, `quantity = round(base × rate × 100)`. Cart shows `Processing Fee × 24056 — $240.56`. |
+| Diff | `addCartLine` first time, `updateCartLine` when quantity changes, `removeCartLine` when target falls to zero |
+| Signal subscription | `useSignalEffect` — auto-fires on every `subtotalAmount` / `lines` / `instructions` mutation |
+
+**Merchant operator setup (one-time, all in Shopify admin):**
+
+1. Products → Add product
+   - Title: `Processing Fee`
+   - Variant price: $0.01
+   - Track inventory: OFF
+   - Charge tax on this product: OFF
+   - Sales channels: unchecked (hide from storefront catalog)
+2. Open the variant → copy GID from URL (format `gid://shopify/ProductVariant/X`)
+3. Settings → Checkout → Customize → add the `checkout-ui` block to the checkout layout → in its settings paste the variant GID into "Processing Fee variant GID" (and optionally override the rate).
+
+**What customer sees** on an NS-only $8,000 cart (free shipping eligible per the existing rule):
+
+```
+Subtotal              $8,000.00
+Processing Fee × 24000  $240.00
+Shipping  USPS Ground (FREE)  $0.00
+Tax                       —
+─────────────────────────────────
+Total                 $8,240.00
+```
+
+The fee appears as a real cart line. Total reflects it correctly. No surprise at payment time.
+
+**Out of scope:**
+- Self-service profile update / customer account portal (doesn't touch checkout)
+- Retail (ns-retail) — wholesale-only per scope
+- Removing the QBO invoice 3% fee — kept active for QA. Once shipping-baked QBO fee is verified redundant with this checkout-side fee, set `INVOICE_FEE_RATE_CARD=0` in wholesale `.env` to avoid double-charge.
+- Production deploy — needs `shopify app deploy` after testing in dev preview.
+
+---
+
+### 2026-06-29 — Reverted: 3% processing fee removed from shipping rate (will move to Checkout UI extension)
+
+The two same-day entries that baked a 3% processing fee into the carrier-service rate (and the follow-up that kept the fee firing under free-shipping) have been **reverted in full**. Reason: the fee was bleeding into the shipping line in a way the customer could not parse — at $8,000 NS-only carts the rate showed `USPS Ground Advantage — $240.00` and the customer reads that as a $240 shipping cost, not a $0 free shipping + $240 processing fee.
+
+The fee logic is being moved to a **Checkout UI extension** (separate ticket — extension was deleted earlier this week and will be rebuilt). At checkout the fee will appear as its own clearly-labeled line item, not hidden in shipping.
+
+**Reverted to** — the state from the "free shipping on NS cart ≥ $500" entry below (still active):
+
+| Cart | Shipping rate composition | Customer sees |
+|---|---|---|
+| Mixed vendor | `carrier_real + tiered_handling` | e.g. `USPS Ground Advantage — $15.00` |
+| NS-only, $501+ | `0` | `USPS Ground Advantage (FREE — orders over $500) — $0.00` |
+| NS-only, $400 | `carrier_real + tiered_handling` (below threshold) | normal carrier price |
+
+**Files touched:** only [wholesale/app/api/shipping/rates.js](wholesale/app/api/shipping/rates.js) — removed the `PROCESSING_FEE_RATE` block, `processingFeeCents` calc, `subtotalCents` source, and the description/service-name decorations that referenced "3% processing fee". Free-shipping detection (vendor=NS + subtotal≥$500) + tiered handling markup (`tieredMarkupCents`) are untouched.
+
+**QBO invoice 3% fee:** still active per `INVOICE_FEE_RATE_CARD=0.03`. No `.env` change is needed any more during QA (no double-charge risk since shipping is fee-free again).
+
+---
+
+### 2026-06-29 — Wholesale shipping: free shipping on Natural Solutions cart ≥ $500
+
+**Why:** Wholesale storefront customers buying $500+ of Natural Solutions products should get free shipping. Drop-ship / mixed-vendor carts continue paying USPS rate + tiered handling markup.
+
+**Rule (both conditions required):**
+1. **Every line item's vendor is `"Natural Solutions"`** (case-insensitive, trimmed) — even one third-party item disqualifies the entire cart
+2. **Cart subtotal ≥ $500** (sum of `items[].price × quantity`, pre-discount — Shopify's carrier-service payload does not expose post-discount totals)
+
+When both fire: real carrier rate + tiered handling markup both go to **$0**. Customer still picks Ground vs Priority vs Express (each shown at $0 with its own delivery window) so the choice still has meaning.
+
+**Change** — [wholesale/app/api/shipping/rates.js](wholesale/app/api/shipping/rates.js) action handler:
+
+| Block | What |
+|---|---|
+| New constants | `FREE_SHIPPING_VENDOR = 'Natural Solutions'`, `FREE_SHIPPING_THRESHOLD_USD = 500` (hardcoded — env knob deliberately not added per product owner) |
+| Detection | `rate.items.every((it) => (it?.vendor||'').trim().toLowerCase() === FREE_SHIPPING_VENDOR.toLowerCase())` + subtotal sum |
+| Response | `finalCents = isFreeShipping ? 0 : r.rateCents + baseCents`; service name decorated with `(FREE — orders over $500)`; description switched |
+| Log | "FREE shipping ELIGIBLE — vendor=NS × N line(s), subtotal=$X" diagnostic line so operators can confirm the rule is firing |
+
+**Decision matrix:**
+
+| Cart | All items NS? | Subtotal | Free shipping? |
+|---|---|---|---|
+| 1 NS product · $400 | ✅ | $400 | ❌ (below threshold) |
+| 1 NS product · $501 | ✅ | $501 | ✅ |
+| NS + 3rd-party mix · $700 | ❌ | $700 | ❌ (vendor mismatch) |
+| 5 NS products · $1200 | ✅ | $1200 | ✅ |
+
+**Out of scope:**
+- Retail (ns-retail) — wholesale-only per product owner. Retail rates handler unchanged.
+- Post-discount subtotal — would require reading `rate.subtotal_price` if Shopify sends it (not always present). Pre-discount accepted as accurate enough — customers using discount codes on $500+ carts is rare in wholesale.
+- Partial free shipping (NS portion of mixed cart goes free) — strict mode chosen for predictable invoicing.
+- Per-vendor configurable list — `FREE_SHIPPING_VENDOR` is a single constant. Adding a second vendor requires a code change.
+
+**Drop-ship interaction:** wholesale `buildShippingLine` passes through the retail order's shipping price as-is (no reverse calc) — so when a retail order with NS-only cart ≥ $500 triggers free shipping on retail's carrier-service callback, the wholesale clone draft order's shipping line will also be $0. Acceptable — supplier gets the same shipping value the customer paid.
+
+**Test plan:**
+1. Add 1 NS product worth $501 to wholesale cart → checkout shows USPS rates all at $0 with "(FREE — orders over $500)" labels
+2. Add a third-party-vendor item alongside → all rates revert to real carrier + markup
+3. Cart with $499 NS only → real carrier + markup (below threshold)
+4. Empty / no NS items → existing flow
+
+**Verification log to watch:**
+- `[shipping.rates] FREE shipping ELIGIBLE — vendor=NS × N line(s), subtotal=$X.XX`
+- Followed by `[shipping.rates] Direct carriers OK: N rate(s) FREE on $X.XX NS-only cart`
+
+---
+
+### 2026-06-29 — Check-payout mailing address source switched from Shipping → Billing
+
+Follow-up to the same-day commission-payout entry below. The first cut used the **shipping** address as the "Mail checks here" default. Per the program owner, checks are financial documents and should route to the **billing** address (where invoices + 1099s already go) — shipping is for product parcels and may differ (clinic / warehouse / drop-ship destination).
+
+**Renames** (consistent across all 6 touched files):
+
+| Old | New |
+|---|---|
+| `commission.check.useShippingAddress` (Mongoose + form values + Yup + API + admin display) | `commission.check.useBillingAddress` |
+| Form checkbox label: "Mail checks to my shipping address (from Step 2)" | "Mail checks to my billing address (from Step 2)" |
+| API copy-from source: `payload.shippingAddress` | `payload.billingAddress` |
+| Admin detail label: "Shipping address (Step 2)" | "Billing address (Step 2)" |
+
+**Side benefit** — `billingAddress` is **always populated** in this app (Step 2 makes it required), so the edge case where `shippingAddress = null` (because `shippingSameAsBilling: true`) — which would have left `check.mailingAddress` unset under the old shipping-source code — is no longer a concern.
+
+**Theme bundle rebuilt** via `npm run build:theme`. Confirmed via grep on the built `react-app-bundle.js`: `useBillingAddress` × 8, `useShippingAddress` × 0.
+
+---
+
+### 2026-06-29 — Commission payout method (ACH vs Check) at registration
+
+**Why:** The wholesale registration form previously forced every practitioner to submit a bank account for commission payouts — there was no path to receive payouts by paper check. Per the program owner, practitioners need to choose at signup: **ACH bank transfer** *or* **paper check**, with full address validation on the check side.
+
+**Change:**
+
+| File | Change |
+|---|---|
+| [wholesale/app/models/wholesaleApplication.server.js](wholesale/app/models/wholesaleApplication.server.js) | New `commission.payoutMethod` enum (`'ach'` / `'check'`, default `'ach'` for legacy back-compat). New `commission.check` sub-document with `payableTo` + `useShippingAddress` + `mailingAddress` (reuses the existing `addressSchema`). Bank fields stay where they were. |
+| [wholesale/registration-form/src/schema/step3.schema.js](wholesale/registration-form/src/schema/step3.schema.js) | Yup schema: existing bank-field requireds gated on `payoutMethod === 'ach'` via new `reqWhenPayoutAch` helper. Check fields validated via a parent-level `.test('commission-check-required')` that emits per-field `ValidationError`s — yup's `.when` can't traverse parent boundaries cleanly so the test handles it. ZIP regex stays soft (only validates *shape* when a value is present; required-ness comes from the parent test). |
+| [wholesale/registration-form/src/components/Step3Payment.jsx](wholesale/registration-form/src/components/Step3Payment.jsx) | New `PAYOUT_METHODS` constant + selector card UI (reuses the `rf-pay-card` CSS already used by payment method). `CommissionBankSection` rewritten to gate the ACH form on `payoutMethod === 'ach'` and render a new Check form (Payable to + "Use shipping address" checkbox + conditional mailing address with country/state dropdowns). "Use same as ACH payment" checkbox now gated on **both** payment AND payout being ACH. |
+| [wholesale/app/api/registration-form.js](wholesale/app/api/registration-form.js) | Persistence branched on `payoutMethod`. ACH path: encrypts `bankAccountNumber` via `encryptField` (AES-256-GCM keyed by `SHOPIFY_API_SECRET`) + saves `bankAccountLast4` + strips the legacy plaintext field — **also fixes a pre-existing bug** where this handler was storing the bank account number in plaintext (the customer-self-service `profile.service` path was already doing the encryption; this handler wasn't). Check path: defaults `payableTo` to `${firstName} ${lastName}` when blank, copies `shippingAddress` into `mailingAddress` when `useShippingAddress` is true. Server wipes the non-selected branch's fields so the doc never carries stale ACH data when a check practitioner switches their mind on the form. |
+| [wholesale/app/routes/app.customers.$id.jsx](wholesale/app/routes/app.customers.$id.jsx) | Admin "Commission payout" section renders the right view per method: a "Bank transfer (ACH)" badge + bank fields for ACH, a "Paper check" badge + `payableTo` + resolved mailing address for check. |
+| Theme bundle | Rebuilt via `npm run build:theme` — `extensions/theme-extension/assets/react-app-bundle.{css,js}` regenerated. |
+
+**Schema invariants** (worth keeping straight when reading the doc later):
+- `commission.enabled` always `true` after submit (back-compat — opt-out was removed earlier; this entry doesn't bring it back).
+- Bank account number is **encrypted at rest** going forward; legacy rows pre-dating this change still carry plaintext `bankAccountNumber` until the next save. `bankAccountLast4` is the only plaintext component the admin UI surfaces.
+- `payoutMethod = 'check'` rows never carry bank fields at all (server wipes them); `payoutMethod = 'ach'` rows never carry `check.*`. Lookups can branch on `payoutMethod` without defensive coalescing.
+
+**Out of scope:**
+- Self-service profile update (`profile.service.js`) — does not yet allow toggling between ACH/Check or editing check fields. Practitioners who registered before this change still have only ACH fields in the profile editor. Separate ticket.
+- Payout execution — when commissions actually move money to a check-method practitioner, the operator workflow (print check, mail, mark sent) needs UI. CDO payout orchestrator path unchanged.
+- Validation of US-only ZIP format — current regex `[A-Za-z0-9 -]{3,10}` is permissive to accept international postal codes; the country dropdown lists every entry from `countries.json`.
+
+**Operator test plan:**
+1. Submit a new registration with **Bank Transfer** selected — confirm `wholesale_applications.commission.payoutMethod === 'ach'`, `bankAccountEncrypted` populated, `bankAccountLast4` correct, no `check.*` fields, plaintext `bankAccountNumber` absent.
+2. Submit one with **Paper Check + "Use shipping address"** — confirm `check.useShippingAddress = true`, `mailingAddress` matches shipping, no bank fields present.
+3. Submit one with **Paper Check + custom address** — confirm mailing address persisted exactly as entered; verify ZIP regex rejects garbage like "??".
+4. Verify admin Customer detail page renders the right view per method.
+5. Edge case — submit with **invalid routing number** while ACH selected — yup ABA-checksum rejects before submit.
+
+---
+
 ### 2026-06-25 — Drop-ship `buildShippingLine` reverse-calc removed · wholesale carries full retail shipping price
 
 **Why:** Earlier the wholesale clone of a retail order had its shipping line **reverse-calculated** — the tiered markup ($2/$3/$5) was subtracted so the wholesale draft order only carried the real carrier cost. The product owner has reversed this policy: the wholesale order should carry the **exact** shipping price the customer paid at retail checkout, markup and all.

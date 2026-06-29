@@ -87,14 +87,51 @@ const w9Schema = new mongoose.Schema(
   { _id: false },
 );
 
-// Commission payout bank — separate from `payment` (which is HOW the
-// practitioner pays us). This is HOW WE PAY THEM commissions. Storage
-// keeps the last 4 for display + the full account number for future
-// NMI / QBO payout integration. Practitioners can opt out at signup
-// and add details later via the admin.
+// Commission payout — separate from `payment` (which is HOW the
+// practitioner pays us). This is HOW WE PAY THEM commissions.
+//
+// Two payout methods (selected at signup, captured in `payoutMethod`):
+//   - 'ach'   — direct deposit to a bank account (bankAccount* fields)
+//   - 'check' — paper check mailed to an address (check.* fields)
+//
+// Sensitive ACH fields (account number) are AES-256-GCM encrypted at
+// rest via utils/crypto.utils.js — only the last 4 digits ever appear
+// in plaintext. Check fields are PII but not sensitive enough to
+// encrypt (name + mailing address — same level as shippingAddress).
+//
+// Existing rows pre-dating the `payoutMethod` field implicitly default
+// to 'ach' because every legacy row carries bank fields and no check
+// fields. The default below makes this explicit on new writes.
+const commissionCheckSchema = new mongoose.Schema(
+  {
+    // Name printed on the check ("Pay to the order of …"). Falls back to
+    // `${firstName} ${lastName}` on the application doc when blank.
+    payableTo: String,
+    // When true, mail the check to the application's billingAddress.
+    // When false, use the embedded mailingAddress below.
+    //
+    // Why billing (not shipping): checks are financial documents and
+    // commonly travel with invoice mail / accountant routing — same
+    // pattern as 1099 distribution. Shipping address is for product
+    // parcels and may be a clinic/warehouse, not finance.
+    useBillingAddress: { type: Boolean, default: true },
+    mailingAddress: { type: addressSchema, default: null },
+  },
+  { _id: false },
+);
+
 const commissionSchema = new mongoose.Schema(
   {
     enabled: { type: Boolean, default: false },
+    // Payout method chosen at signup. `null` only on truly-legacy rows
+    // (pre-2026-06-29 schema) — code paths default these to 'ach' for
+    // back-compat since every legacy row has bank fields populated.
+    payoutMethod: {
+      type: String,
+      enum: ['ach', 'check'],
+      default: 'ach',
+    },
+    // ── ACH bank fields (used when payoutMethod === 'ach') ─────────
     bankAccountName: String,
     bankRoutingNumber: String,
     // Legacy plaintext field — kept for back-compat with rows written
@@ -108,6 +145,10 @@ const commissionSchema = new mongoose.Schema(
     // for audit so we know whether to keep the two accounts in sync if
     // the payment ACH later changes.
     sourcedFromPaymentAch: { type: Boolean, default: false },
+
+    // ── Check fields (used when payoutMethod === 'check') ──────────
+    check: { type: commissionCheckSchema, default: null },
+
     updatedAt: { type: Date, default: Date.now },
   },
   { _id: false },

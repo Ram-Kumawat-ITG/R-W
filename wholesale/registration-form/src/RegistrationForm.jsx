@@ -77,16 +77,33 @@ const defaultValues = {
     achAccountNumber: "",
     achAccountType: "",
   },
-  // Commission bank — ALWAYS required for every practitioner. The
+  // Commission payout — ALWAYS required for every practitioner. The
   // `enabled` field stays in the data model for back-compat with older
   // docs and future opt-out flows, but defaults to true here.
+  //
+  // `payoutMethod` defaults to 'ach' so existing bank-flow registrations
+  // need zero behaviour change. Check fields default to empty + the
+  // "Use shipping address" toggle defaults to true (most common case).
   commission: {
     enabled: true,
+    payoutMethod: "ach",
     useSamePaymentAccount: false,
     bankAccountName: "",
     bankRoutingNumber: "",
     bankAccountNumber: "",
     bankAccountType: "",
+    check: {
+      payableTo: "",
+      useBillingAddress: true,
+      mailingAddress: {
+        line1: "",
+        line2: "",
+        city: "",
+        state: "",
+        zip: "",
+        country: "",
+      },
+    },
   },
   signature: { drawn: null },
   // Step 4 — W-9 form. legalName auto-fills from firstName + lastName on
@@ -322,24 +339,46 @@ function FormBody({ onBack }) {
         cardPayload.achAccountType = values.payment.achAccountType;
       }
 
-      // Commission bank — ALWAYS included (required for every practitioner).
+      // Commission payout — ALWAYS included (required for every practitioner).
+      // Branch on payoutMethod so we only forward fields for the selected
+      // method. The server also wipes the unused branch defensively, but
+      // sending a clean payload makes the wire shape match what was filled.
+      //
       // useSamePaymentAccount is a UI-only flag (already used to mirror
       // payment ACH values into the commission fields client-side) and
       // isn't persisted on its own.
-      const commissionPayload = {
-        enabled: true,
-        bankAccountName: values.commission.bankAccountName,
-        bankRoutingNumber: values.commission.bankRoutingNumber,
-        bankAccountNumber: values.commission.bankAccountNumber,
-        bankAccountLast4: (
-          values.commission.bankAccountNumber || ""
-        ).slice(-4),
-        bankAccountType: values.commission.bankAccountType,
-        sourcedFromPaymentAch: Boolean(
-          values.commission.useSamePaymentAccount &&
-            values.payment.method === "ach",
-        ),
-      };
+      const payoutMethod =
+        values.commission.payoutMethod === "check" ? "check" : "ach";
+      const commissionPayload =
+        payoutMethod === "ach"
+          ? {
+              enabled: true,
+              payoutMethod: "ach",
+              bankAccountName: values.commission.bankAccountName,
+              bankRoutingNumber: values.commission.bankRoutingNumber,
+              bankAccountNumber: values.commission.bankAccountNumber,
+              bankAccountLast4: (
+                values.commission.bankAccountNumber || ""
+              ).slice(-4),
+              bankAccountType: values.commission.bankAccountType,
+              sourcedFromPaymentAch: Boolean(
+                values.commission.useSamePaymentAccount &&
+                  values.payment.method === "ach",
+              ),
+            }
+          : {
+              enabled: true,
+              payoutMethod: "check",
+              check: {
+                payableTo: values.commission.check?.payableTo || "",
+                useBillingAddress: Boolean(
+                  values.commission.check?.useBillingAddress,
+                ),
+                mailingAddress: values.commission.check?.useBillingAddress
+                  ? null // server fills from billingAddress
+                  : { ...(values.commission.check?.mailingAddress || {}) },
+              },
+            };
 
       // W-9 payload — data fields only. No signature here: the Step 3
       // signature serves dual purpose (terms + W-9 cert). Backend mirrors
