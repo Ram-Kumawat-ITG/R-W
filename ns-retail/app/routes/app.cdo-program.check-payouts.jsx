@@ -251,10 +251,8 @@ function PractitionerCard({
             <span style={{ fontWeight: 600, fontSize: "14px", color: "#303030" }}>{row.name}</span>
             <s-badge>Check</s-badge>
             {row.cronOverride && <s-badge tone="warning">CRON Override</s-badge>}
-            {row.currentPayoutStatus ? (
+            {row.currentPayoutStatus && (
               <StatusBadge status={row.currentPayoutStatus} />
-            ) : (
-              <s-badge tone="info">No Active Batch</s-badge>
             )}
           </div>
           <div style={{ fontSize: "12px", color: "#6d7175", marginTop: "3px" }}>
@@ -666,19 +664,8 @@ export default function CheckPayouts() {
   );
 
   // Row 2 — batch status
-  const unbatchedRows = rows.filter((r) => !r.currentPayoutId && r.upcomingPayoutAmount > 0);
-  const unbatchedAmount = unbatchedRows.reduce((sum, r) => sum + (r.upcomingPayoutAmount || 0), 0);
-
-  const awaitingApprovalRows = rows.filter((r) =>
-    ["draft", "awaiting_approval"].includes(r.currentPayoutStatus || ""),
-  );
-  const awaitingApprovalAmount = awaitingApprovalRows.reduce(
-    (sum, r) => sum + (r.upcomingPayoutAmount || 0),
-    0,
-  );
-
-  const readyToPayRows = rows.filter((r) => r.currentPayoutStatus === "approved");
-  const readyToPayAmount = readyToPayRows.reduce(
+  const pendingCheckRows = rows.filter((r) => r.upcomingPayoutAmount > 0);
+  const totalAmountToBePaid = pendingCheckRows.reduce(
     (sum, r) => sum + (r.upcomingPayoutAmount || 0),
     0,
   );
@@ -722,10 +709,8 @@ export default function CheckPayouts() {
               Practitioners opting for physical check — excluded from automated ACH CRON
             </span>
           </div>
-          <div style={{ padding: "16px 20px", display: "flex", flexDirection: "column", gap: "12px" }}>
-
-            {/* Row 1 — overview */}
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "12px" }}>
+          <div style={{ padding: "16px 20px" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: "12px" }}>
               <MetricCard
                 label="Total Practitioners"
                 value={String(rows.length)}
@@ -746,42 +731,17 @@ export default function CheckPayouts() {
                 value={formatCurrency(totalPaidHistorical, "USD")}
                 sublabel={`${totalCheckPayoutsIssued} payout${totalCheckPayoutsIssued === 1 ? "" : "s"} issued`}
               />
-            </div>
-
-            {/* Row 2 — batch status (maps 1:1 to admin actions) */}
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "12px" }}>
-              <MetricCard
-                label="Excluded from Batch"
-                value={formatCurrency(unbatchedAmount, "USD")}
-                tone={unbatchedRows.length > 0 ? "warning" : undefined}
-                sublabel={
-                  unbatchedRows.length > 0
-                    ? `${unbatchedRows.length} practitioner${unbatchedRows.length === 1 ? "" : "s"} — issue check`
-                    : "all practitioners batched"
-                }
-              />
-              <MetricCard
-                label="Pending Approval"
-                value={String(awaitingApprovalRows.length)}
-                tone={awaitingApprovalRows.length > 0 ? "warning" : undefined}
-                sublabel={
-                  awaitingApprovalRows.length > 0
-                    ? `${formatCurrency(awaitingApprovalAmount, "USD")} — awaiting review`
-                    : "no pending approvals"
-                }
-              />
               <MetricCard
                 label="Amount to Be Paid"
-                value={formatCurrency(readyToPayAmount, "USD")}
-                tone={readyToPayRows.length > 0 ? "success" : undefined}
+                value={formatCurrency(totalAmountToBePaid, "USD")}
+                tone={totalAmountToBePaid > 0 ? "warning" : undefined}
                 sublabel={
-                  readyToPayRows.length > 0
-                    ? `${readyToPayRows.length} approved — ready to pay`
-                    : "none approved yet"
+                  pendingCheckRows.length > 0
+                    ? `${pendingCheckRows.length} practitioner${pendingCheckRows.length === 1 ? "" : "s"} pending`
+                    : "no pending checks"
                 }
               />
             </div>
-
           </div>
         </div>
 
