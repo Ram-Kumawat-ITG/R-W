@@ -656,12 +656,32 @@ export default function CheckPayouts() {
 
   // ── Summary stats ───────────────────────────────────────────────────────────
 
-  const totalCommission = rows.reduce((sum, r) => sum + (r.totalCommission || 0), 0);
-  const totalPending = rows.reduce((sum, r) => sum + (r.upcomingPayoutAmount || 0), 0);
-  const awaitingApproval = rows.filter((r) =>
+  // Row 1 — overview
+  const totalOrders = rows.reduce((sum, r) => sum + (r.upcomingOrderCount || 0), 0);
+  const totalCommissionEarned = rows.reduce((sum, r) => sum + (r.totalCommission || 0), 0);
+  const totalPaidHistorical = rows.reduce((sum, r) => sum + (r.totalPaid || 0), 0);
+  const totalCheckPayoutsIssued = rows.reduce(
+    (sum, r) => sum + r.recentPayouts.filter((rp) => rp.status === "paid").length,
+    0,
+  );
+
+  // Row 2 — batch status
+  const unbatchedRows = rows.filter((r) => !r.currentPayoutId && r.upcomingPayoutAmount > 0);
+  const unbatchedAmount = unbatchedRows.reduce((sum, r) => sum + (r.upcomingPayoutAmount || 0), 0);
+
+  const awaitingApprovalRows = rows.filter((r) =>
     ["draft", "awaiting_approval"].includes(r.currentPayoutStatus || ""),
-  ).length;
-  const readyToPay = rows.filter((r) => r.currentPayoutStatus === "approved").length;
+  );
+  const awaitingApprovalAmount = awaitingApprovalRows.reduce(
+    (sum, r) => sum + (r.upcomingPayoutAmount || 0),
+    0,
+  );
+
+  const readyToPayRows = rows.filter((r) => r.currentPayoutStatus === "approved");
+  const readyToPayAmount = readyToPayRows.reduce(
+    (sum, r) => sum + (r.upcomingPayoutAmount || 0),
+    0,
+  );
 
   // ── Active vs settled split ─────────────────────────────────────────────────
 
@@ -689,7 +709,7 @@ export default function CheckPayouts() {
     <s-page inlineSize="large" heading="Check Payout Queue">
       <s-stack direction="block" gap="base">
 
-        {/* Stats header — matches UpcomingPayoutSummary style from Payout Batches */}
+        {/* Stats header */}
         <div style={{ border: "1px solid #e1e3e5", borderRadius: "8px", overflow: "hidden" }}>
           <div style={{
             display: "flex", alignItems: "center", justifyContent: "space-between",
@@ -702,37 +722,66 @@ export default function CheckPayouts() {
               Practitioners opting for physical check — excluded from automated ACH CRON
             </span>
           </div>
-          <div style={{ padding: "16px 20px" }}>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: "12px" }}>
+          <div style={{ padding: "16px 20px", display: "flex", flexDirection: "column", gap: "12px" }}>
+
+            {/* Row 1 — overview */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "12px" }}>
               <MetricCard
-                label="Practitioners"
+                label="Total Practitioners"
                 value={String(rows.length)}
                 sublabel="in check queue"
               />
               <MetricCard
-                label="Total Earned"
-                value={formatCurrency(totalCommission, "USD")}
-                sublabel="all-time commissions"
+                label="Total Orders"
+                value={String(totalOrders)}
+                sublabel="pending commissions"
               />
               <MetricCard
-                label="Pending Payout"
-                value={formatCurrency(totalPending, "USD")}
-                tone={totalPending > 0 ? "warning" : undefined}
-                sublabel={totalPending > 0 ? "unbatched & owed" : "none outstanding"}
+                label="Total Commission Amount"
+                value={formatCurrency(totalCommissionEarned, "USD")}
+                sublabel="all-time earned"
               />
               <MetricCard
-                label="Awaiting Approval"
-                value={String(awaitingApproval)}
-                tone={awaitingApproval > 0 ? "warning" : undefined}
-                sublabel={awaitingApproval > 0 ? "batches pending review" : "queue clear"}
-              />
-              <MetricCard
-                label="Ready to Pay"
-                value={String(readyToPay)}
-                tone={readyToPay > 0 ? "success" : undefined}
-                sublabel={readyToPay > 0 ? "approved — issue check" : "none approved yet"}
+                label="Total Check Payouts"
+                value={formatCurrency(totalPaidHistorical, "USD")}
+                sublabel={`${totalCheckPayoutsIssued} payout${totalCheckPayoutsIssued === 1 ? "" : "s"} issued`}
               />
             </div>
+
+            {/* Row 2 — batch status (maps 1:1 to admin actions) */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "12px" }}>
+              <MetricCard
+                label="Excluded from Batch"
+                value={formatCurrency(unbatchedAmount, "USD")}
+                tone={unbatchedRows.length > 0 ? "warning" : undefined}
+                sublabel={
+                  unbatchedRows.length > 0
+                    ? `${unbatchedRows.length} practitioner${unbatchedRows.length === 1 ? "" : "s"} — issue check`
+                    : "all practitioners batched"
+                }
+              />
+              <MetricCard
+                label="Pending Approval"
+                value={String(awaitingApprovalRows.length)}
+                tone={awaitingApprovalRows.length > 0 ? "warning" : undefined}
+                sublabel={
+                  awaitingApprovalRows.length > 0
+                    ? `${formatCurrency(awaitingApprovalAmount, "USD")} — awaiting review`
+                    : "no pending approvals"
+                }
+              />
+              <MetricCard
+                label="Amount to Be Paid"
+                value={formatCurrency(readyToPayAmount, "USD")}
+                tone={readyToPayRows.length > 0 ? "success" : undefined}
+                sublabel={
+                  readyToPayRows.length > 0
+                    ? `${readyToPayRows.length} approved — ready to pay`
+                    : "none approved yet"
+                }
+              />
+            </div>
+
           </div>
         </div>
 
