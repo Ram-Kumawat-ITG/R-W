@@ -11,7 +11,7 @@
 // Override these per-environment so dev / staging / prod each point at
 // their own internal customer without a code change.
 
-import { readEnv, readInt } from '../../utils/env.utils'
+import { readEnv } from '../../utils/env.utils'
 
 export const dropshipConfig = {
   retailCustomerEmail: readEnv('DROPSHIP_RETAIL_CUSTOMER_EMAIL', {
@@ -20,15 +20,12 @@ export const dropshipConfig = {
   retailCustomerTag: readEnv('DROPSHIP_RETAIL_CUSTOMER_TAG', {
     fallback: 'ns-retail-internal',
   }),
-  // SHARED with the carrier-service callback at app/api/shipping/rates.js —
-  // markup per cart-item, in cents, applied on TOP of every real carrier
-  // quote retail charges its customer. Drop-ship reverses this math so the
-  // parallel wholesale order only carries the REAL carrier cost
-  // (retail_shipping − totalQty × this_value).
-  //
-  // Default $1/item — matches rates.js default. Keep both ends in sync via
-  // the same env var (single source of truth).
-  shippingMarkupPerQtyCents: readInt('SHIPPING_PER_QTY_CENTS', 100),
+  // NOTE: the shipping markup is no longer configurable here. As of
+  // 2026-06-25 it is a tiered table (1-2 items → $2, 3 → $3, 4+ → $5)
+  // hard-coded inside the carrier-service callbacks and inside the
+  // drop-ship reverse-calc (dropship.service.buildShippingLine).
+  // Three locations, one tier table — keep them in lock-step on any
+  // change. The legacy `SHIPPING_PER_QTY_CENTS` env var is no longer read.
 }
 
 // Pre-normalized (trimmed + lowercased) anchor email. The orchestrator and

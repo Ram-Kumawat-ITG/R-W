@@ -771,15 +771,73 @@ export default function CustomerDetail() {
         )}
       </s-section>
 
-      {/* ───── Commission payout bank ───── */}
-      <s-section heading="Commission payout bank">
+      {/* ───── Commission payout ───── */}
+      <s-section heading="Commission payout">
         {!a.commission || !a.commission.enabled ? (
           <s-paragraph tone="subdued">
-            No commission bank account on file. Practitioner opted out at signup
+            No commission payout on file. Practitioner opted out at signup
             — admin can collect later if commissions need to be paid out.
           </s-paragraph>
-        ) : (
+        ) : a.commission.payoutMethod === "check" ? (
           <s-stack direction="block" gap="large-100">
+            <s-stack direction="block" gap="tight">
+              <s-text tone="subdued">Method</s-text>
+              <s-badge tone="info">Paper check</s-badge>
+            </s-stack>
+            <s-grid gridTemplateColumns="1fr 1fr" gap="large-100">
+              <s-grid-item>
+                <KV
+                  label="Payable to"
+                  value={a.commission.check?.payableTo || "—"}
+                />
+              </s-grid-item>
+              <s-grid-item>
+                <KV
+                  label="Mailing"
+                  value={
+                    a.commission.check?.useBillingAddress
+                      ? "Billing address (Step 2)"
+                      : "Custom address (below)"
+                  }
+                />
+              </s-grid-item>
+            </s-grid>
+            {!a.commission.check?.useBillingAddress &&
+              a.commission.check?.mailingAddress && (
+                <s-stack direction="block" gap="tight">
+                  <s-text tone="subdued">Mailing address</s-text>
+                  <s-paragraph>
+                    {[
+                      a.commission.check.mailingAddress.line1,
+                      a.commission.check.mailingAddress.line2,
+                      [
+                        a.commission.check.mailingAddress.city,
+                        a.commission.check.mailingAddress.state,
+                        a.commission.check.mailingAddress.zip,
+                      ]
+                        .filter(Boolean)
+                        .join(", "),
+                      a.commission.check.mailingAddress.country,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </s-paragraph>
+                </s-stack>
+              )}
+            {a.commission.updatedAt && (
+              <KV
+                label="Last updated"
+                value={new Date(a.commission.updatedAt).toLocaleString()}
+              />
+            )}
+          </s-stack>
+        ) : (
+          // ACH (default) — bank fields
+          <s-stack direction="block" gap="large-100">
+            <s-stack direction="block" gap="tight">
+              <s-text tone="subdued">Method</s-text>
+              <s-badge tone="info">Bank transfer (ACH)</s-badge>
+            </s-stack>
             <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
               <s-grid-item>
                 <KV

@@ -27,8 +27,8 @@
 //   3. Calls USPS + UPS direct-carrier APIs in parallel:
 //        • USPS Web Tools v3 (USPS_CLIENT_ID / USPS_CLIENT_SECRET)
 //        • UPS Rating v2403  (UPS_CLIENT_ID / UPS_CLIENT_SECRET / UPS_SHIPPER_NUMBER)
-//      Dedups by (carrier, service), applies markup (totalQty × PER_ITEM_CENTS),
-//      sorts cheapest-first, returns to Shopify.
+//      Dedups by (carrier, service), applies the tiered handling markup
+//      (see `tieredMarkupCents`), sorts cheapest-first, returns to Shopify.
 //   4. If NEITHER carrier returns rates (credentials missing / API down):
 //      returns an EMPTY rates list. Shopify will show "no shipping
 //      available" at checkout — this is intentional so we never quote
@@ -45,13 +45,24 @@ import crypto from "node:crypto";
 
 // ── Tunables ────────────────────────────────────────────────────────────
 
-// Base shipping rate per cart-item, in cents. The user's spec: 5 items → $5
-// on the cheapest carrier (UPS Ground / multiplier 1.0). Tune via env if
-// pricing ever needs to change without a redeploy.
-const PER_ITEM_CENTS = Number.parseInt(
-  process.env.SHIPPING_PER_QTY_CENTS || "100",
-  10,
-);
+// Retail handling markup, tiered by total cart quantity. The product
+// owner's spec (mirrored 1:1 with wholesale on 2026-06-25):
+//
+//   1–2 products → +$2
+//   3 products   → +$3
+//   4 or more    → +$5
+//
+// Cents on the wire. Replaces the prior `totalQty × PER_ITEM_CENTS`
+// linear formula. The drop-ship reverse-calc in
+// wholesale/app/services/dropship/dropship.service.js must mirror this
+// function — when a retail order is cloned onto wholesale, this exact
+// markup is subtracted so the wholesale shipping line carries the real
+// carrier cost only.
+function tieredMarkupCents(qty) {
+  if (qty <= 2) return 200;
+  if (qty === 3) return 300;
+  return 500;
+}
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -576,9 +587,10 @@ export async function action({ request }) {
   );
 
   // ── 2. Fetch live rates from all configured direct carriers ──────────
-  // Markup formula = totalQty × PER_ITEM_CENTS, added on top of every
-  // real carrier quote. Configurable via SHIPPING_PER_QTY_CENTS env var.
-  const baseCents = totalQty * PER_ITEM_CENTS;
+  // Handling markup is TIERED by total cart quantity (see `tieredMarkupCents`):
+  //   1–2 items → +$2, 3 → +$3, 4+ → +$5.
+  // Added on top of every real carrier quote.
+  const baseCents = tieredMarkupCents(totalQty);
 
   const directRates = await fetchDirectCarrierRates(rate);
   if (directRates && directRates.length) {
@@ -614,7 +626,7 @@ export async function action({ request }) {
     );
 
     console.log(
-      `[shipping.rates] Direct carriers OK: ${rates.length} real rate(s), markup=$${baseCents / 100} on ${totalQty} item(s)`,
+      `[shipping.rates] Direct carriers OK: ${rates.length} real rate(s), tiered markup=$${baseCents / 100} on ${totalQty} item(s)`,
     );
     return ratesResponse(rates);
   }

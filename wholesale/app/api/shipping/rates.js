@@ -42,24 +42,21 @@ import crypto from 'node:crypto'
 // ── Tunables ────────────────────────────────────────────────────────────
 
 // Wholesale handling markup, tiered by total cart quantity. The product
-// owner's spec (2026-06-22):
+// owner's spec (revised 2026-06-25 — the prior 4-item $4 tier was removed,
+// 4+ items now charges a flat $5 capped fee):
 //
 //   1–2 products → +$2
 //   3 products   → +$3
-//   4 products   → +$4
-//   5 or more    → +$5
+//   4 or more    → +$5
 //
-// Cents on the wire. Capped at $5 — wholesale customers expect a flat
-// handling fee regardless of order size beyond the 5-unit threshold.
-// Replaces the prior `totalQty × PER_ITEM_CENTS` linear markup; the
-// retail handler (ns-retail/app/api/shipping/rates.js) still uses the
-// linear formula, so the drop-ship markup-stripping logic in
-// services/dropship/dropship.service.js — which strips RETAIL's markup
-// before cloning the order — is intentionally unchanged.
+// Cents on the wire. The same formula is mirrored in the retail handler
+// (ns-retail/app/api/shipping/rates.js) so both stores quote consistent
+// handling, and the drop-ship reverse-calc in
+// services/dropship/dropship.service.js strips this exact tier from
+// retail-cloned wholesale orders.
 function tieredMarkupCents(qty) {
   if (qty <= 2) return 200
   if (qty === 3) return 300
-  if (qty === 4) return 400
   return 500
 }
 
@@ -531,7 +528,7 @@ export async function action({ request }) {
     console.error('[shipping.rates] invalid JSON body')
     return ratesResponse([])
   }
-
+console.log('[shipping.rates---------------------------------------------] payload received:', JSON.stringify(payload , null , 2))
   const rate = payload?.rate
   if (!rate || !rate.destination || !Array.isArray(rate.items)) {
     console.warn('[shipping.rates] missing rate.destination or rate.items')
@@ -546,10 +543,48 @@ export async function action({ request }) {
     `[shipping.rates] inbound: ${rate.items.length} line(s), totalQty=${totalQty}, dest=${rate.destination?.country}/${rate.destination?.province}/${rate.destination?.postal_code}`,
   )
 
+  // ── 1a. Free-shipping rule (wholesale store) ─────────────────────────
+  //
+  // Both conditions must hold:
+  //   (a) Every line item's vendor is exactly "Natural Solutions"
+  //       (case-insensitive, trimmed — guards against trailing spaces in
+  //       admin-typed vendor names)
+  //   (b) Cart subtotal (sum of items[].price * quantity, pre-discount)
+  //       is >= $500 USD.
+  //
+  // When both are met, real carrier rate + handling markup are both
+  // zeroed and the service_name is decorated so the customer sees why.
+  // The customer still picks Ground vs Priority vs Express — they're
+  // all shown at $0 with their respective delivery windows so the
+  // pick has meaning. Pre-discount subtotal is by design: Shopify's
+  // carrier-service payload doesn't expose post-discount totals.
+  const FREE_SHIPPING_VENDOR = 'Natural Solutions'
+  const FREE_SHIPPING_THRESHOLD_USD = 500
+
+  const allItemsNaturalSolutions = rate.items.every(
+    (it) =>
+      (it?.vendor || '').trim().toLowerCase() ===
+      FREE_SHIPPING_VENDOR.toLowerCase(),
+  )
+  const cartSubtotalUsd =
+    rate.items.reduce(
+      (sum, it) => sum + (Number(it?.price) || 0) * (Number(it?.quantity) || 0),
+      0,
+    ) / 100
+  const isFreeShipping =
+    allItemsNaturalSolutions && cartSubtotalUsd >= FREE_SHIPPING_THRESHOLD_USD
+
+  if (isFreeShipping) {
+    console.log(
+      `[shipping.rates] FREE shipping ELIGIBLE — vendor=NS × ${rate.items.length} line(s), subtotal=$${cartSubtotalUsd.toFixed(2)}`,
+    )
+  }
+
   // ── 2. Fetch live rates from all configured direct carriers ──────────
   // Handling markup is TIERED by total cart quantity (see `tieredMarkupCents`):
-  //   1–2 items → +$2, 3 → +$3, 4 → +$4, 5+ → +$5.
-  // Added on top of every real carrier quote.
+  //   1–2 items → +$2, 3 → +$3, 4+ → +$5.
+  // Added on top of every real carrier quote. Skipped entirely when the
+  // free-shipping rule above fires (rate total goes to $0).
   const baseCents = tieredMarkupCents(totalQty)
 
   const directRates = await fetchDirectCarrierRates(rate)
@@ -567,13 +602,21 @@ export async function action({ request }) {
     }
 
     const rates = Array.from(dedup.values()).map((r) => {
-      const finalCents = r.rateCents + baseCents
+      // Free-shipping rule wins over carrier cost + handling markup.
+      // Customer still sees per-service labels (Ground/Priority/Express)
+      // for delivery-speed choice — only the prices flatten to $0.
+      const finalCents = isFreeShipping ? 0 : r.rateCents + baseCents
+      const baseName = `${r.carrier} ${r.service}`.trim()
       return {
-        service_name: `${r.carrier} ${r.service}`.trim(),
+        service_name: isFreeShipping
+          ? `${baseName} (FREE — orders over $${FREE_SHIPPING_THRESHOLD_USD})`
+          : baseName,
         service_code: r.code,
         total_price: String(finalCents), // STRING in cents
         currency: r.currency || 'USD',
-        description: `${r.carrier} ${r.service} (incl. handling)`,
+        description: isFreeShipping
+          ? `Complimentary on Natural Solutions orders over $${FREE_SHIPPING_THRESHOLD_USD}`
+          : `${r.carrier} ${r.service} (incl. handling)`,
         ...(r.deliveryDateMin ? { min_delivery_date: r.deliveryDateMin } : {}),
         ...(r.deliveryDateMax ? { max_delivery_date: r.deliveryDateMax } : {}),
       }
@@ -586,7 +629,9 @@ export async function action({ request }) {
     )
 
     console.log(
-      `[shipping.rates] Direct carriers OK: ${rates.length} real rate(s), tiered markup=$${baseCents / 100} on ${totalQty} item(s)`,
+      isFreeShipping
+        ? `[shipping.rates] Direct carriers OK: ${rates.length} rate(s) FREE on $${cartSubtotalUsd.toFixed(2)} NS-only cart`
+        : `[shipping.rates] Direct carriers OK: ${rates.length} real rate(s), tiered markup=$${baseCents / 100} on ${totalQty} item(s)`,
     )
     return ratesResponse(rates)
   }

@@ -1,7 +1,10 @@
 import { authenticate, unauthenticated } from "../shopify.server";
 import { ingestShopifyOrder } from "../services/cdo/cdo.service";
 import { ensureRetailInvoiceFromPayload } from "../services/retailQbo/retailOrderInvoice.service";
-import { extractPractitionerCode, extractCodeFromTags } from "../utils/orderCode";
+import {
+  extractPractitionerCode,
+  extractCodeFromTags,
+} from "../utils/orderCode";
 import { syncCustomerCodeTag } from "../utils/customerTags";
 
 // In-memory dedup of webhook ids — Shopify delivers at-least-once and
@@ -202,13 +205,21 @@ async function processOrder({ shop, payload }) {
   // The helper logs the outcome (success / reason it was skipped / error), and
   // the orders/paid + orders/updated handlers retry the same idempotent call,
   // so a transient QBO failure here self-heals on the next order event.
-  await ensureRetailInvoiceFromPayload({ shop, payload, trigger: "orders/create" });
+  await ensureRetailInvoiceFromPayload({
+    shop,
+    payload,
+    trigger: "orders/create",
+  });
 
   // Tag the customer with the canonical code when the order attributed and
   // we have a linked customer. Guest checkouts may have no customer — the
   // cdo_application mapping (by email) still happened inside the service.
   if (result?.attributed && result.customerGid && result.referralCode) {
-    await tagCustomerWithCode(shop, result.customerGid, result.referralCode).catch((err) => {
+    await tagCustomerWithCode(
+      shop,
+      result.customerGid,
+      result.referralCode,
+    ).catch((err) => {
       console.error(
         `[webhooks.orders.create] tag customer ${result.customerGid} failed:`,
         err?.message || err,

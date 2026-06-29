@@ -41,7 +41,7 @@ const PAYMENT_METHODS = [
 const TAX_CLASSIFICATIONS = [
   { value: 'individual', label: 'Individual / sole proprietor' },
   { value: 'c_corp', label: 'C Corporation' },
-  { value: 's_corp', label: 'S Corporation' },
+  { value: 's_corp', label: 'S Corporation' },  
   { value: 'partnership', label: 'Partnership' },
   { value: 'trust_estate', label: 'Trust / estate' },
   { value: 'llc', label: 'Limited liability company (LLC)' },
