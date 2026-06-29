@@ -10,6 +10,7 @@ import connectDB from "../services/APIService/mongo.service";
 import ShopifyOrder from "../models/order.server";
 import Invoice from "../models/invoice.server";
 import { RETAIL_CUSTOMER_EMAIL } from "../services/dropship/dropship.config";
+import { carrierDisplayName } from "../utils/shipping.constants";
 import { ProcessingBadge, PaymentMethodShortText } from "../components/admin-ui";
 import {
   formatAmount,
@@ -277,7 +278,8 @@ export const loader = async ({ request }) => {
     .select(
       "shopifyOrderId shopifyOrderNumber shopifyOrderName customerEmail " +
         "currency totalAmount processingStatus paymentStatus paidAt " +
-        "qboInvoiceId invoiceRef receivedAt completedAt processingError rejectionCode",
+        "qboInvoiceId invoiceRef receivedAt completedAt processingError rejectionCode " +
+        "fulfillmentStatus shippedAt deliveredAt fulfillments",
     )
     .lean();
 
@@ -316,6 +318,20 @@ export const loader = async ({ request }) => {
         completedAt: r.completedAt || null,
         processingError: r.processingError || null,
         rejectionCode: r.rejectionCode || null,
+        fulfillmentStatus: r.fulfillmentStatus || null,
+        shippedAt: r.shippedAt || null,
+        deliveredAt: r.deliveredAt || null,
+        // First fulfillment with a tracking URL — used for the Delivery
+        // column link. Formatted server-side so shipping.constants stays
+        // out of the browser bundle.
+        primaryTracking: (() => {
+          const f = (r.fulfillments || []).find((f) => f.trackingUrl || f.trackingNumber);
+          if (!f) return null;
+          return {
+            carrier: carrierDisplayName(f.carrierKey, f.trackingCompany),
+            trackingUrl: f.trackingUrl || null,
+          };
+        })(),
         invoice: inv
           ? {
               paymentStatus: inv.paymentStatus,
@@ -625,7 +641,7 @@ export default function OrdersList() {
               <s-table-header>Settled at</s-table-header>
               <s-table-header>Due</s-table-header>
               <s-table-header>Remarks</s-table-header>
-              <s-table-header>Order date</s-table-header>
+              <s-table-header>Delivery</s-table-header>
               {/* Dedicated action column — replaces the previous
                   whole-row click navigation. See the inline comment on
                   the View button below for the rationale. */}
@@ -646,7 +662,14 @@ export default function OrdersList() {
                 return (
                   <s-table-row key={r.id}>
                     <s-table-cell>
-                      <s-text>{orderLabel}</s-text>
+                      <s-stack direction="block" gap="none">
+                        <s-text>{orderLabel}</s-text>
+                        {r.receivedAt && (
+                          <s-text tone="subdued">
+                            {new Date(r.receivedAt).toLocaleDateString()}
+                          </s-text>
+                        )}
+                      </s-stack>
                     </s-table-cell>
                     <s-table-cell>{r.customerEmail || "—"}</s-table-cell>
                     <s-table-cell>
@@ -686,9 +709,7 @@ export default function OrdersList() {
                       />
                     </s-table-cell>
                     <s-table-cell>
-                      {r.receivedAt
-                        ? new Date(r.receivedAt).toLocaleString()
-                        : "—"}
+                      <DeliveryStatusBadge order={r} />
                     </s-table-cell>
                     <s-table-cell>
                       <s-button
@@ -937,6 +958,49 @@ function RemarksCell({ invoice, currency }) {
       )}
       {!showChequeWarning && !showFailedWarning && !latest && (
         <s-text tone="subdued">—</s-text>
+      )}
+    </s-stack>
+  );
+}
+
+// Fulfillment / delivery status badge for the Order List.
+// Stacked layout: ship/delivery date → status badge → carrier tracking link.
+// Status is derived from `deliveredAt`, `fulfillmentStatus`, and `shippedAt`.
+function DeliveryStatusBadge({ order }) {
+  const { deliveredAt, fulfillmentStatus, shippedAt, processingStatus, primaryTracking } = order;
+
+  if (processingStatus === "cancelled" && !shippedAt) {
+    return <s-text tone="subdued">—</s-text>;
+  }
+
+  // Resolve badge + date label from the most authoritative signal available.
+  let badge = null;
+  let dateLabel = null;
+  if (deliveredAt) {
+    badge = <s-badge tone="success">Delivered</s-badge>;
+    dateLabel = new Date(deliveredAt).toLocaleDateString();
+  } else if (fulfillmentStatus === "fulfilled" || (shippedAt && !fulfillmentStatus)) {
+    badge = <s-badge tone="info">Fulfilled</s-badge>;
+    if (shippedAt) dateLabel = new Date(shippedAt).toLocaleDateString();
+  } else if (fulfillmentStatus === "partial") {
+    badge = <s-badge tone="warning">Partially fulfilled</s-badge>;
+    if (shippedAt) dateLabel = new Date(shippedAt).toLocaleDateString();
+  }
+
+  if (!badge) return <s-text tone="subdued">Unfulfilled</s-text>;
+
+  return (
+    <s-stack direction="block" gap="none">
+      {dateLabel && <s-text tone="subdued">{dateLabel}</s-text>}
+      {badge}
+      {primaryTracking && (
+        primaryTracking.trackingUrl ? (
+          <s-link url={primaryTracking.trackingUrl} external>
+            {primaryTracking.carrier} ↗
+          </s-link>
+        ) : (
+          <s-text tone="subdued">{primaryTracking.carrier}</s-text>
+        )
       )}
     </s-stack>
   );
