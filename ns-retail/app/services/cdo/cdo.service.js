@@ -328,11 +328,222 @@ export async function listCheckPayouts() {
   }));
 }
 
+// Practitioner-wise view of all check-preferred practitioners — the primary
+// data source for the Check Payout admin page. Returns one row per practitioner
+// whose wholesale_applications.commission.payoutMethod === 'check', regardless
+// of whether a payout batch has been generated yet. Each row carries aggregate
+// commission stats, the current open payout (if any), and the per-order detail
+// list for the upcoming payout so the admin can expand and review before issuing
+// the physical check.
+export async function listCheckPayoutPractitioners() {
+  await connectDB();
+
+  // All practitioners who have explicitly chosen check as their payout method.
+  const practitioners = await WholesaleApplication.find({
+    "commission.payoutMethod": "check",
+    ...PRACTITIONER_FILTER,
+  })
+    .select("firstName lastName email businessName commission")
+    .lean();
+
+  if (!practitioners.length) return [];
+
+  const practitionerIds = practitioners.map((p) => String(p._id));
+
+  // Load all data in parallel.
+  const [allCommissions, openPayouts, recentPayouts, holds] = await Promise.all([
+    // All commissions for these practitioners — paid + pending — for aggregate stats.
+    CdoCommission.find({ practitionerId: { $in: practitionerIds } })
+      .select("practitionerId orderId orderName amount rate status payoutId earnedAt")
+      .lean(),
+    // Open (in-flight) check payouts awaiting admin action.
+    CdoPayout.find({
+      practitionerId: { $in: practitionerIds },
+      method: "check",
+      status: { $in: ["draft", "awaiting_approval", "approved"] },
+    })
+      .select("practitionerId status amount commissionIds periodStart periodEnd reference bankingError remarks")
+      .lean(),
+    // Recent completed payouts for the history panel (last 10 per practitioner).
+    CdoPayout.find({
+      practitionerId: { $in: practitionerIds },
+      method: "check",
+      status: { $in: ["paid", "rejected", "cancelled"] },
+    })
+      .sort({ paidAt: -1 })
+      .select("practitionerId status amount paidAt checkDetails reference qboBillId qboBillPaymentId")
+      .lean(),
+    // Hold records — carries the cronOverride flag.
+    CdoPractitionerHold.find({ practitionerId: { $in: practitionerIds } }).lean(),
+  ]);
+
+  // For the expandable orders view we need the CdoOrder documents. Scope the
+  // join to only the orders referenced by upcoming work (open payout or unbatched
+  // commissions) so we don't load the full all-time order history.
+  const openPayoutCommIds = new Set(
+    openPayouts.flatMap((p) => (p.commissionIds || []).map(String)),
+  );
+  const openPayoutPractitionerIds = new Set(openPayouts.map((p) => p.practitionerId));
+
+  // Commissions that are eligible to be in the next batch (not yet reserved).
+  const unbatchedComms = allCommissions.filter(
+    (c) =>
+      !openPayoutPractitionerIds.has(c.practitionerId) &&
+      ["pending", "approved"].includes(c.status) &&
+      !c.payoutId,
+  );
+
+  const upcomingOrderIds = [
+    ...allCommissions
+      .filter((c) => openPayoutCommIds.has(String(c._id)))
+      .map((c) => c.orderId),
+    ...unbatchedComms.map((c) => c.orderId),
+  ].filter(Boolean);
+
+  const orderDocs = upcomingOrderIds.length
+    ? await CdoOrder.find({ _id: { $in: upcomingOrderIds } })
+        .select("_id orderName amount currency createdAt")
+        .lean()
+    : [];
+  const orderMap = new Map(orderDocs.map((o) => [String(o._id), o]));
+
+  return practitioners.map((p) => {
+    const pid = String(p._id);
+    const comms = allCommissions.filter((c) => c.practitionerId === pid);
+    const openPayout = openPayouts.find((payout) => payout.practitionerId === pid) || null;
+    const hold = holds.find((h) => h.practitionerId === pid) || null;
+
+    // Aggregate stats across all commissions for this practitioner.
+    const paidComms = comms.filter((c) => c.status === "paid");
+    const pendingComms = comms.filter((c) => ["pending", "approved"].includes(c.status));
+    const totalCommission = roundMoney(comms.reduce((s, c) => s + (c.amount || 0), 0));
+    const totalPaid = roundMoney(paidComms.reduce((s, c) => s + (c.amount || 0), 0));
+
+    // Upcoming payout: open batch if one exists, otherwise unbatched pending commissions.
+    let upcomingOrders = [];
+    let upcomingPayoutAmount = 0;
+    let upcomingOrderCount = 0;
+
+    if (openPayout) {
+      upcomingPayoutAmount = openPayout.amount || 0;
+      const openCommIdSet = new Set((openPayout.commissionIds || []).map(String));
+      const openComms = comms.filter((c) => openCommIdSet.has(String(c._id)));
+      upcomingOrderCount = openComms.length;
+      upcomingOrders = openComms.map((c) => {
+        const order = orderMap.get(String(c.orderId));
+        return {
+          commissionId: String(c._id),
+          orderName: c.orderName || order?.orderName || "—",
+          orderDate: order?.createdAt || c.earnedAt || null,
+          orderAmount: order?.amount ?? null,
+          currency: order?.currency || "USD",
+          commissionAmount: c.amount || 0,
+          commissionRate: c.rate || 0,
+        };
+      });
+    } else {
+      const unbatched = pendingComms.filter((c) => !c.payoutId);
+      upcomingPayoutAmount = roundMoney(unbatched.reduce((s, c) => s + (c.amount || 0), 0));
+      upcomingOrderCount = unbatched.length;
+      upcomingOrders = unbatched.map((c) => {
+        const order = orderMap.get(String(c.orderId));
+        return {
+          commissionId: String(c._id),
+          orderName: c.orderName || order?.orderName || "—",
+          orderDate: order?.createdAt || c.earnedAt || null,
+          orderAmount: order?.amount ?? null,
+          currency: order?.currency || "USD",
+          commissionAmount: c.amount || 0,
+          commissionRate: c.rate || 0,
+        };
+      });
+    }
+
+    const totalSales = roundMoney(
+      upcomingOrders.reduce((s, o) => s + (o.orderAmount || 0), 0),
+    );
+
+    const practitionerRecentPayouts = recentPayouts
+      .filter((rp) => rp.practitionerId === pid)
+      .slice(0, 10)
+      .map((rp) => ({
+        id: String(rp._id),
+        amount: rp.amount || 0,
+        status: rp.status,
+        paidAt: rp.paidAt || null,
+        reference: rp.reference || null,
+        checkNumber: rp.checkDetails?.checkNumber || null,
+        checkDate: rp.checkDetails?.checkDate || null,
+        issuedBy: rp.checkDetails?.issuedBy || null,
+        notes: rp.checkDetails?.notes || null,
+        qboBillId: rp.qboBillId || null,
+        qboBillPaymentId: rp.qboBillPaymentId || null,
+      }));
+
+    return {
+      id: pid,
+      name: `${p.firstName || ""} ${p.lastName || ""}`.trim() || p.email || "—",
+      email: p.email || "—",
+      preferredMethod: "check",
+      checkPayableTo: p.commission?.check?.payableTo || null,
+      cronOverride: hold?.checkPayoutCronOverride === true,
+      cronOverrideSetBy: hold?.cronOverrideSetBy || null,
+      cronOverrideNote: hold?.cronOverrideNote || null,
+      // Aggregate stats.
+      totalCommission,
+      totalPaid,
+      totalSales,
+      // Upcoming payout.
+      upcomingPayoutAmount,
+      upcomingOrderCount,
+      currentPayoutId: openPayout ? String(openPayout._id) : null,
+      currentPayoutStatus: openPayout?.status || null,
+      currentPayoutReference: openPayout?.reference || null,
+      currentPayoutBankingError: openPayout?.bankingError || null,
+      currentPayoutRemarks: openPayout
+        ? (openPayout.remarks || []).map((rem) => ({
+            kind: rem.kind,
+            message: rem.message,
+            actor: rem.actor,
+            createdAt: rem.createdAt,
+          }))
+        : [],
+      // Per-order detail for expandable view.
+      orders: upcomingOrders,
+      // Payout history.
+      recentPayouts: practitionerRecentPayouts,
+    };
+  });
+}
+
+// Set or clear the CRON override flag for a check-preferred practitioner.
+// When override=true, buildPayoutBatch will treat this practitioner as ACH
+// (run the banking probe) instead of routing them to the check queue.
+// Upserts the CdoPractitionerHold document (safe to call even if no hold
+// exists yet).
+export async function setCheckPayoutCronOverride(practitionerId, override, actor, note) {
+  await connectDB();
+  if (!isValidObjectId(practitionerId)) throw new Error("Invalid practitioner id");
+  return CdoPractitionerHold.findOneAndUpdate(
+    { practitionerId },
+    {
+      $set: {
+        checkPayoutCronOverride: !!override,
+        cronOverrideSetBy: actor || "admin",
+        cronOverrideSetAt: new Date(),
+        cronOverrideNote: note || null,
+      },
+    },
+    { upsert: true, new: true },
+  );
+}
+
 // Mark a check payout as paid after the admin has physically issued and
-// mailed the check. Settles the linked commissions and appends a ledger debit
-// — mirroring the ACH finalizeSettledPayout path but without a QBO BillPayment
-// or provider transfer (the check is the payment instrument). Idempotent ledger
-// write; safe to call if the payout was previously in any non-terminal status.
+// mailed the check. Settles the linked commissions, creates a QBO Vendor Bill
+// and BillPayment (mirroring the ACH executeApprovedPayout + finalizeSettledPayout
+// split, collapsed into one step since check payouts are immediately paid), and
+// appends a ledger debit. QBO failure is non-fatal — a remark is logged and the
+// payout remains paid so the check record is not lost. Idempotent ledger write.
 export async function markCheckPayoutPaid(payoutId, { checkNumber, checkDate, notes, actor } = {}) {
   if (!isValidObjectId(payoutId)) throw new Error("Invalid payout id");
   await connectDB();
@@ -408,6 +619,84 @@ export async function markCheckPayoutPaid(payoutId, { checkNumber, checkDate, no
       description: `Check payout ${payout.reference} — check #${payout.checkDetails.checkNumber || "N/A"}`,
       occurredAt: now,
     });
+  }
+
+  // QBO: Vendor Bill + BillPayment — mirrors the ACH path collapsed into one
+  // step (no async settlement). Idempotent on each QBO id field so a retry
+  // after a partial failure picks up from where it left off.
+  try {
+    if (!payout.qboVendorId) {
+      const { qboVendorId } = await findOrCreateVendor({
+        practitionerId: payout.practitionerId,
+        practitionerSource: payout.practitionerSource || "wholesale",
+        displayName: payout.practitionerName,
+        email: payout.practitionerEmail,
+      });
+      payout.qboVendorId = qboVendorId;
+      await payout.save();
+    }
+
+    if (!payout.qboBillId) {
+      const commissions = await CdoCommission.find({
+        _id: { $in: payout.commissionIds },
+      }).lean();
+      const lines = commissions.map((c) => ({
+        amount: c.amount,
+        description: `Commission — ${c.orderName || "order"} (rate ${(Number(c.rate) * 100).toFixed(1)}%)`,
+      }));
+      const bill = await createBill({
+        vendorId: payout.qboVendorId,
+        lines,
+        docNumber: payout.reference,
+        privateNote: [
+          `CDO check payout ${payout.reference}`,
+          `Check #${payout.checkDetails.checkNumber || "N/A"}`,
+          `dated ${checkDateObj.toISOString().slice(0, 10)}`,
+          `issued by ${actor || "admin"}`,
+          notes ? `— ${String(notes).trim()}` : null,
+        ]
+          .filter(Boolean)
+          .join(" — "),
+        txnDate: checkDateObj,
+        requestId: `cdo-bill-${payout._id}`,
+      });
+      payout.qboBillId = String(bill.Id);
+      payout.billCreatedAt = new Date();
+      pushPayoutRemark(payout, {
+        kind: "bill_created",
+        message: `QBO Bill ${bill.Id} created (${payout.amount} ${payout.currency})`,
+        actor,
+        source: "admin",
+      });
+      await payout.save();
+    }
+
+    if (!payout.qboBillPaymentId) {
+      const payment = await createBillPayment({
+        vendorId: payout.qboVendorId,
+        billId: payout.qboBillId,
+        amount: payout.amount,
+        requestId: `cdo-pay-${payout._id}`,
+      });
+      payout.qboBillPaymentId = String(payment.Id);
+      payout.paymentRecordedAt = new Date();
+      pushPayoutRemark(payout, {
+        kind: "payment_recorded",
+        message: `QBO BillPayment ${payment.Id} recorded (check payment)`,
+        actor,
+        source: "admin",
+      });
+      await payout.save();
+    }
+  } catch (qboErr) {
+    console.error("[cdo] markCheckPayoutPaid: QBO sync failed:", qboErr?.message || qboErr);
+    pushPayoutRemark(payout, {
+      kind: "qbo_error",
+      message: `QBO sync failed — ${qboErr?.message || "unknown error"}. Retry manually via QBO sync.`,
+      actor,
+      source: "admin",
+    });
+    await payout.save();
   }
 
   await reflectPayoutOnBatches(payout, {
@@ -2391,11 +2680,22 @@ export async function getEligibleCommissions({ practitionerId, periodEnd } = {})
   // commission owned by a practitioner whose payouts are on hold.
   const filter = { status: { $in: ["pending", "approved"] }, payoutId: null, paused: { $ne: true } };
   if (practitionerId) {
+    // Single-practitioner lookup (e.g. admin generating a manual check payout):
+    // apply only the per-practitioner hold gate; the check-preference exclusion
+    // does NOT apply because the admin is explicitly targeting this practitioner.
     if (await isPractitionerPaused(practitionerId)) return [];
     filter.practitionerId = practitionerId;
   } else {
-    const held = await getHeldPractitionerIds();
-    if (held.length) filter.practitionerId = { $nin: held };
+    // Full-batch / CRON mode: exclude both held practitioners and check-preferred
+    // practitioners (those who want manual cheque payouts, not automated ACH).
+    // Check-preferred practitioners with an active cronOverride are NOT excluded —
+    // the override lets the admin push them through the ACH path for one run.
+    const [held, checkPreferred] = await Promise.all([
+      getHeldPractitionerIds(),
+      getCheckPreferredPractitionerIds(),
+    ]);
+    const excluded = [...new Set([...held, ...checkPreferred])];
+    if (excluded.length) filter.practitionerId = { $nin: excluded };
   }
   if (periodEnd) filter.earnedAt = { $lte: new Date(periodEnd) };
   return CdoCommission.find(filter).sort({ earnedAt: 1 }).lean();
@@ -2407,17 +2707,24 @@ export async function getEligibleCommissions({ practitionerId, periodEnd } = {})
 // payouts. Reserves the commissions (sets payoutId) so a second run won't
 // double-batch them. Skips practitioners below the minimum payout amount
 // or who already have an open payout for the period.
-export async function buildPayoutBatch({ periodStart, periodEnd, practitionerId, actor } = {}) {
+export async function buildPayoutBatch({ periodStart, periodEnd, practitionerId, actor, onlyCommissionIds } = {}) {
   await connectDB();
   const settings = await getSettings();
   const minAmount = Number(settings.minimumPayoutAmount) || 0;
   const periodEndDate = periodEnd ? new Date(periodEnd) : new Date();
   const periodStartDate = periodStart ? new Date(periodStart) : null;
 
-  const eligible = await getEligibleCommissions({
+  let eligible = await getEligibleCommissions({
     practitionerId,
     periodEnd: periodEndDate,
   });
+
+  // When the admin selects specific commissions (check payout partial selection),
+  // filter to only those IDs. Bypasses the minimum so admins can issue partial checks.
+  if (onlyCommissionIds && onlyCommissionIds.length > 0) {
+    const selectedSet = new Set(onlyCommissionIds.map(String));
+    eligible = eligible.filter((c) => selectedSet.has(String(c._id)));
+  }
 
   // Group by practitioner.
   const groups = new Map();
@@ -2432,7 +2739,8 @@ export async function buildPayoutBatch({ periodStart, periodEnd, practitionerId,
   const skipped = [];
   for (const [pid, commissions] of groups.entries()) {
     const total = roundMoney(commissions.reduce((s, c) => s + (Number(c.amount) || 0), 0));
-    if (total < minAmount) {
+    // Skip minimum check when admin explicitly selected specific commissions.
+    if (total < minAmount && !onlyCommissionIds) {
       skipped.push({ practitionerId: pid, total, reason: "below_minimum", minAmount });
       continue;
     }
@@ -2452,11 +2760,57 @@ export async function buildPayoutBatch({ periodStart, periodEnd, practitionerId,
     const first = commissions[0];
     const reference = `CDO-${periodEndDate.toISOString().slice(0, 7).replace("-", "")}-${String(pid).slice(-6)}`;
 
-    // Determine payout method: probe the practitioner's ACH banking. If it
-    // isn't valid (missing, disabled, or incomplete fields) the payout is
-    // queued as a check payout for manual admin processing instead of ACH.
-    const bankingProbe = await resolvePractitionerBanking(pid);
-    const payoutMethod = bankingProbe.ok ? "ach" : "check";
+    // Determine payout method.
+    //
+    // Priority 1 — check the practitioner's preferred payout method and
+    // the admin CRON-override flag from cdo_practitioner_holds.
+    //
+    //   • payoutMethod === 'check' AND no cronOverride:
+    //       FULL-BATCH (CRON) call  → skip entirely. Commissions stay in the
+    //         approved pool untouched; the admin processes them manually via
+    //         the Check Payout queue (generate-payout action).
+    //       SINGLE-PRACTITIONER (admin UI) call → create a check payout so
+    //         the admin can record the physical cheque details.
+    //
+    //   • payoutMethod === 'ach' / unset, OR cronOverride is active:
+    //       Fall through to the ACH banking probe as before. If banking is
+    //       invalid the payout still lands in the check queue (bankingError set).
+    //
+    // `practitionerId` being passed distinguishes the two call sites:
+    //   - CRON: buildPayoutBatch({ periodEnd, actor: 'system' })  → no pid
+    //   - Admin: buildPayoutBatch({ practitionerId, actor })      → pid set
+    const [practitionerApp, practitionerHold] = await Promise.all([
+      WholesaleApplication.findById(pid).select("commission").lean(),
+      CdoPractitionerHold.findOne({ practitionerId: pid }).lean(),
+    ]);
+    const preferredMethod = practitionerApp?.commission?.payoutMethod;
+    const cronOverride = practitionerHold?.checkPayoutCronOverride === true;
+    const prefersCheck = preferredMethod === "check" && !cronOverride;
+
+    if (prefersCheck && !practitionerId) {
+      // CRON full-batch mode: skip check-preferred practitioners completely.
+      // Their commissions remain pending/approved and will be processed by the
+      // admin via the Check Payout queue.
+      skipped.push({ practitionerId: pid, total, reason: "check_preferred" });
+      continue;
+    }
+
+    let payoutMethod, bankingError, batchRemark;
+    if (prefersCheck) {
+      // Admin-triggered single-practitioner path: create the check payout.
+      payoutMethod = "check";
+      bankingError = null;
+      batchRemark = `Batched ${commissions.length} commission(s) totalling ${total} — CHECK payout (practitioner prefers check)`;
+    } else {
+      // ACH path: probe banking; invalid banking falls back to check.
+      const bankingProbe = await resolvePractitionerBanking(pid);
+      payoutMethod = bankingProbe.ok ? "ach" : "check";
+      bankingError = payoutMethod === "check" ? bankingProbe.errors.join("; ") : null;
+      batchRemark =
+        payoutMethod === "check"
+          ? `Batched ${commissions.length} commission(s) totalling ${total} — CHECK payout (no valid ACH banking: ${bankingProbe.errors.join("; ")})`
+          : `Batched ${commissions.length} commission(s) totalling ${total}`;
+    }
 
     const payout = new CdoPayout({
       shop: first.shop,
@@ -2472,14 +2826,11 @@ export async function buildPayoutBatch({ periodStart, periodEnd, practitionerId,
       periodStart: periodStartDate,
       periodEnd: periodEndDate,
       reference,
-      bankingError: payoutMethod === "check" ? bankingProbe.errors.join("; ") : null,
+      bankingError,
     });
     pushPayoutRemark(payout, {
       kind: "batch_created",
-      message:
-        payoutMethod === "check"
-          ? `Batched ${commissions.length} commission(s) totalling ${total} ${payout.currency} — CHECK payout (no valid ACH banking: ${bankingProbe.errors.join("; ")})`
-          : `Batched ${commissions.length} commission(s) totalling ${total} ${payout.currency}`,
+      message: batchRemark,
       actor,
       source: actor ? "admin" : "system",
     });
@@ -3818,6 +4169,69 @@ export async function getHeldPractitionerIds() {
   return rows.map((r) => r.practitionerId).filter(Boolean);
 }
 
+// Practitioner IDs whose preferred payout method is "check" and who have no
+// active CRON override. These practitioners are excluded from ALL automated
+// CRON processing (eligibility, auto-approval, and batching). Their commissions
+// accumulate as pending/approved and are processed manually via the Check Payout
+// queue. An admin can set checkPayoutCronOverride=true on a practitioner's hold
+// record to temporarily include them in the automated ACH path.
+async function getCheckPreferredPractitionerIds() {
+  await connectDB();
+  const [checkApps, overrideHolds] = await Promise.all([
+    WholesaleApplication.find({ "commission.payoutMethod": "check" }).select("_id").lean(),
+    CdoPractitionerHold.find({ checkPayoutCronOverride: true }).select("practitionerId").lean(),
+  ]);
+  const overrideSet = new Set(overrideHolds.map((h) => String(h.practitionerId)));
+  return checkApps.map((a) => String(a._id)).filter((id) => !overrideSet.has(id));
+}
+
+// Cancel any non-paid payouts for check-preferred practitioners and release
+// their commission reservations back to the approved pool. Called at the start
+// of every automated CRON run so that legacy payouts (created before the
+// check-preference guard was enforced) are cleaned up automatically.
+//
+// Only targets statuses that haven't settled money:
+//   draft | awaiting_approval | approved | processing | failed
+// Does NOT touch "paid", "rejected", or "cancelled".
+export async function voidCheckPreferredPayouts() {
+  await connectDB();
+  const checkPreferredIds = await getCheckPreferredPractitionerIds();
+  if (!checkPreferredIds.length) return { voided: 0 };
+
+  const openPayouts = await CdoPayout.find({
+    practitionerId: { $in: checkPreferredIds },
+    status: { $in: ["draft", "awaiting_approval", "approved", "processing", "failed"] },
+  }).lean();
+
+  if (!openPayouts.length) return { voided: 0 };
+
+  for (const payout of openPayouts) {
+    // Release commission reservations so they re-enter the eligible pool
+    // for manual check-payout processing.
+    await CdoCommission.updateMany(
+      { payoutId: payout._id },
+      { $set: { payoutId: null, payoutStatus: null } },
+    );
+    // Mark the payout cancelled with a clear audit reason.
+    await CdoPayout.updateOne(
+      { _id: payout._id },
+      {
+        $set: {
+          status: "cancelled",
+          lastError:
+            "Cancelled by CRON: practitioner prefers check payout. Use the Check Payout queue to process manually.",
+        },
+      },
+    );
+  }
+
+  log.info("payouts.check_preferred_voided", {
+    count: openPayouts.length,
+    practitionerIds: [...new Set(openPayouts.map((p) => p.practitionerId))],
+  });
+  return { voided: openPayouts.length };
+}
+
 // ── Phase 5: fully-automated payout run (CRON) ───────────────────────
 //
 // The hands-off pipeline behind process-commission-payouts. Chains the
@@ -3832,10 +4246,18 @@ export async function getHeldPractitionerIds() {
 // count flipped pending→approved.
 export async function autoApproveEligibleCommissions({ shop } = {}) {
   await connectDB();
-  const held = await getHeldPractitionerIds();
+  // Exclude both held practitioners and check-preferred practitioners.
+  // Check-preferred commissions must not be auto-approved by the CRON —
+  // they stay pending until the admin manually generates a check payout
+  // and records payment in the Check Payout queue.
+  const [held, checkPreferred] = await Promise.all([
+    getHeldPractitionerIds(),
+    getCheckPreferredPractitionerIds(),
+  ]);
+  const excluded = [...new Set([...held, ...checkPreferred])];
   const filter = { status: "pending", paused: { $ne: true } };
   if (shop) filter.shop = shop;
-  if (held.length) filter.practitionerId = { $nin: held };
+  if (excluded.length) filter.practitionerId = { $nin: excluded };
   const res = await CdoCommission.updateMany(filter, {
     $set: { status: "approved" },
   });
@@ -4036,6 +4458,12 @@ export async function runAutomatedPayouts({ shop, periodEnd, mode = "cron", trig
   };
 
   try {
+    // 0. Cancel any legacy non-paid payouts for check-preferred practitioners
+    //    and release their commission reservations. This cleans up payouts that
+    //    were created before the check-preference exclusion was enforced, and
+    //    ensures every CRON run starts with a clean slate for those practitioners.
+    await voidCheckPreferredPayouts();
+
     // 1. Accrue (safety net) + 2. auto-approve (no manual approval).
     const accrual = await accrueCommissionsForOrders({ shop });
     summary.accrued = accrual.createdCount || 0;
@@ -4316,11 +4744,36 @@ export async function reprocessBatch(batchId, { actor } = {}) {
     status: "running",
   });
 
+  // Fetch check-preferred IDs once so we can skip (and cancel) their payouts
+  // in the loop below instead of retrying a transfer that will always fail.
+  const checkPreferredIds = new Set(await getCheckPreferredPractitionerIds());
+
   const items = [];
   try {
     for (const pid of failedPayoutIds) {
       const payout = await CdoPayout.findById(pid).lean();
       if (!payout || payout.status === "paid") continue; // already settled — skip
+
+      // If the practitioner prefers check payouts, cancel this payout and
+      // release the commissions rather than retrying the failed transfer.
+      if (checkPreferredIds.has(String(payout.practitionerId))) {
+        await CdoCommission.updateMany(
+          { payoutId: payout._id },
+          { $set: { payoutId: null, payoutStatus: null } },
+        );
+        await CdoPayout.updateOne(
+          { _id: payout._id },
+          {
+            $set: {
+              status: "cancelled",
+              lastError:
+                "Cancelled during reprocess: practitioner prefers check payout. Use the Check Payout queue.",
+            },
+          },
+        );
+        continue;
+      }
+
       batch.payoutIds.push(payout._id);
       await markPayoutCommissionsProcessing(payout, batch, items, startedAt);
     }
