@@ -556,6 +556,9 @@ export default function CheckPayouts() {
   // Per-commission selection for Issue Check modal (Set of commissionId strings)
   const [selectedCommIds, setSelectedCommIds] = useState(new Set());
 
+  // Active queue filter
+  const [queueFilter, setQueueFilter] = useState("all");
+
   // ── Modal open helpers ──────────────────────────────────────────────────────
 
   const openMarkPaid = (payoutId, name, amount) => {
@@ -746,48 +749,88 @@ export default function CheckPayouts() {
         </div>
 
         {/* Active queue */}
-        <div style={{ border: "1px solid #e1e3e5", borderRadius: "8px", overflow: "hidden" }}>
-          <div style={{
-            padding: "12px 20px", background: "#f6f6f7", borderBottom: "1px solid #e1e3e5",
-            display: "flex", alignItems: "center", gap: "8px",
-          }}>
-            <span style={{ fontWeight: 600, fontSize: "14px", color: "#303030" }}>
-              Active Queue
-            </span>
-            <span style={{
-              background: active.length > 0 ? "#2c5ee8" : "#8c9196",
-              color: "#fff", borderRadius: "10px", padding: "1px 8px",
-              fontSize: "11px", fontWeight: 600,
-            }}>
-              {active.length}
-            </span>
-          </div>
-          <div style={{ padding: "16px 20px" }}>
-            {active.length === 0 ? (
+        {(() => {
+          const FILTERS = [
+            { key: "all",         label: "All",           count: active.length,                                        match: () => true },
+            { key: "pending",     label: "Pending Check", count: active.filter((r) => r.upcomingPayoutAmount > 0).length, match: (r) => r.upcomingPayoutAmount > 0 },
+            { key: "no-pending",  label: "No Pending",    count: active.filter((r) => r.upcomingPayoutAmount === 0).length, match: (r) => r.upcomingPayoutAmount === 0 },
+            { key: "in-batch",    label: "In Batch",      count: active.filter((r) => !!r.currentPayoutId).length,       match: (r) => !!r.currentPayoutId },
+          ].filter((f) => f.key === "all" || f.count > 0); // hide empty filters (except All)
+
+          const filteredActive = active.filter(FILTERS.find((f) => f.key === queueFilter)?.match ?? (() => true));
+
+          return (
+            <div style={{ border: "1px solid #e1e3e5", borderRadius: "8px", overflow: "hidden" }}>
+              {/* Header */}
               <div style={{
-                textAlign: "center", padding: "40px 16px",
-                color: "#6d7175", fontSize: "13px",
+                padding: "10px 20px", background: "#f6f6f7", borderBottom: "1px solid #e1e3e5",
+                display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap",
               }}>
-                No practitioners with pending check payouts.
-                <br />
-                <span style={{ fontSize: "12px" }}>
-                  Check-preferred practitioners will appear here once they have eligible commissions.
+                <span style={{ fontWeight: 600, fontSize: "14px", color: "#303030" }}>
+                  Active Queue
                 </span>
+                {/* Filter pills */}
+                <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                  {FILTERS.map((f) => {
+                    const isActive = queueFilter === f.key;
+                    return (
+                      <button
+                        key={f.key}
+                        onClick={() => setQueueFilter(f.key)}
+                        style={{
+                          display: "flex", alignItems: "center", gap: "5px",
+                          padding: "4px 10px",
+                          border: isActive ? "1px solid #303030" : "1px solid #c9cccf",
+                          borderRadius: "20px",
+                          background: isActive ? "#303030" : "#fff",
+                          color: isActive ? "#fff" : "#6d7175",
+                          fontSize: "12px", fontWeight: isActive ? 600 : 400,
+                          cursor: "pointer", outline: "none", whiteSpace: "nowrap",
+                          transition: "all 0.15s ease",
+                        }}
+                      >
+                        {f.label}
+                        <span style={{
+                          background: isActive ? "rgba(255,255,255,0.25)" : "#e1e3e5",
+                          color: isActive ? "#fff" : "#6d7175",
+                          borderRadius: "10px", padding: "0 5px",
+                          fontSize: "11px", fontWeight: 600,
+                        }}>
+                          {f.count}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
-            ) : (
-              <s-stack direction="block" gap="small-200">
-                {active.map((row, i) => (
-                  <PractitionerCard
-                    key={row.id}
-                    row={row}
-                    defaultExpanded={i === 0}
-                    {...sharedCardProps}
-                  />
-                ))}
-              </s-stack>
-            )}
-          </div>
-        </div>
+
+              {/* Body */}
+              <div style={{ padding: "16px 20px" }}>
+                {filteredActive.length === 0 ? (
+                  <div style={{
+                    textAlign: "center", padding: "40px 16px",
+                    color: "#6d7175", fontSize: "13px",
+                  }}>
+                    {queueFilter === "all"
+                      ? "No practitioners with pending check payouts."
+                      : `No practitioners match the "${FILTERS.find((f) => f.key === queueFilter)?.label}" filter.`}
+                  </div>
+                ) : (
+                  <s-stack direction="block" gap="small-200">
+                    {filteredActive.map((row, i) => (
+                      <PractitionerCard
+                        key={row.id}
+                        row={row}
+                        defaultExpanded={i === 0 && filteredActive.length === 1}
+                        {...sharedCardProps}
+                      />
+                    ))}
+                  </s-stack>
+                )}
+              </div>
+            </div>
+          );
+        })()}
 
         {/* Completed / settled practitioners */}
         {settled.length > 0 && (
