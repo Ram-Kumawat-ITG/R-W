@@ -5,70 +5,48 @@ name = "Natural Solutions App"
 application_url = "https://e630-182-70-242-149.ngrok-free.app"
 embedded = true
 
-[build]
-automatically_update_urls_on_dev = true
-
 [webhooks]
 api_version = "2026-07"
 
   [[webhooks.subscriptions]]
-  topics = [ "app/uninstalled" ]
-  uri = "/webhooks/app/uninstalled" 
-
-  [[webhooks.subscriptions]]
-  topics = [ "app/scopes_update" ]
-  uri = "/webhooks/app/scopes_update"
-
-  [[webhooks.subscriptions]]
-  topics = ["customers/delete"]
+  topics = [ "customers/delete" ]
   uri = "/webhooks/customers/delete"
-
-  [[webhooks.subscriptions]]
-  topics = ["customers/create"]
-  uri = "/webhooks/customers/create"
-
-  [[webhooks.subscriptions]]
-  topics = ["customers/update"]
-  uri = "/webhooks/customers/update"
-
-  [[webhooks.subscriptions]]
-  uri = "/webhooks/orders/create"
-  topics = [ "orders/create" ]
-
-  # NOTE: `orders/create` is a protected customer data topic and CANNOT
-  # be declared here until the app is approved in the Partners dashboard
-  # (Partners → App → API access → Protected customer data access).
-  # Until then it is registered programmatically after install — see
-  # app/services/shopify/registerWebhooks.server.js.
-
-  # NOTE: fulfillments/create + fulfillments/update carry protected customer
-  # data — same approval gate as `orders/create`. They are NOT declared here
-  # (declaring an unapproved protected topic fails `shopify app deploy`);
-  # instead they're registered programmatically after install via
-  # REQUIRED_SUBSCRIPTIONS → ensureProtectedWebhooks. Testable meanwhile via
-  # `shopify app webhook trigger` / fulfilling a test order.
-
-  [[webhooks.subscriptions]]
-  topics = [ "products/create" ]
-  uri = "/webhooks/products/create"
-
-  [[webhooks.subscriptions]]
-  topics = [ "products/update" ]
-  uri = "/webhooks/products/update"
 
   [[webhooks.subscriptions]]
   topics = [ "products/delete" ]
   uri = "/webhooks/products/delete"
 
   [[webhooks.subscriptions]]
+  topics = [ "products/create" ]
+  uri = "/webhooks/products/create"
+
+  [[webhooks.subscriptions]]
+  topics = [ "customers/create" ]
+  uri = "/webhooks/customers/create"
+
+  [[webhooks.subscriptions]]
+  topics = [ "products/update" ]
+  uri = "/webhooks/products/update"
+
+  [[webhooks.subscriptions]]
+  topics = [ "orders/create" ]
+  uri = "/webhooks/orders/create"
+
+  [[webhooks.subscriptions]]
   topics = [ "inventory_levels/update" ]
   uri = "/webhooks/inventory_levels/update"
 
+  [[webhooks.subscriptions]]
+  topics = [ "app/scopes_update" ]
+  uri = "/webhooks/app/scopes_update"
+
+  [[webhooks.subscriptions]]
+  topics = [ "app/uninstalled" ]
+  uri = "/webhooks/app/uninstalled"
+
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-# NOTE: `read_customers` is protected customer data and requires Partners
-# dashboard approval before it can be requested. `read_orders` is unprotected.
-scopes = "customer_read_customers,customer_read_orders,customer_write_orders,read_assigned_fulfillment_orders,read_cart_transforms,read_customers,read_discounts,read_files,read_gift_cards,read_inventory,read_locations,read_markets,read_product_listings,read_products,read_publications,read_shipping,read_third_party_fulfillment_orders,unauthenticated_read_checkouts,unauthenticated_read_customers,unauthenticated_read_product_inventory,unauthenticated_read_product_listings,write_cart_transforms,write_checkouts,write_customers,write_draft_orders,write_files,write_gift_cards,write_merchant_managed_fulfillment_orders,write_order_edits,write_orders,write_products,write_publications,write_shipping,write_third_party_fulfillment_orders"
+scopes = "read_inventory,read_orders,write_customers,write_files,write_inventory,write_products"
 
 [auth]
 redirect_urls = [ "https://e630-182-70-242-149.ngrok-free.app/api/auth" ]
@@ -77,3 +55,6 @@ redirect_urls = [ "https://e630-182-70-242-149.ngrok-free.app/api/auth" ]
 url = "https://e630-182-70-242-149.ngrok-free.app"
 subpath = "wholesale-application"
 prefix = "apps"
+
+[build]
+automatically_update_urls_on_dev = true
