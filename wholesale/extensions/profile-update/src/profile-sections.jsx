@@ -277,12 +277,30 @@ function initialForm(profile) {
     },
     commission: {
       enabled: commission.enabled ?? true,
+      // Default to 'ach' to match registration form's default.
+      payoutMethod: commission.payoutMethod === 'check' ? 'check' : 'ach',
+      // ── ACH branch ──
       bankAccountName: commission.bankAccountName || '',
       bankRoutingNumber: commission.bankRoutingNumber || '',
       bankAccountNumber: '', // never pre-fill
       bankAccountLast4: commission.bankAccountLast4 || '',
       bankAccountType: commission.bankAccountType || 'Checking',
       sourcedFromPaymentAch: !!commission.sourcedFromPaymentAch,
+      // ── Check branch ──
+      check: {
+        payableTo: commission.check?.payableTo || '',
+        // Default true (matches registration form). When toggled off, the
+        // user fills out mailingAddress below.
+        useBillingAddress: commission.check?.useBillingAddress !== false,
+        mailingAddress: {
+          line1: commission.check?.mailingAddress?.line1 || '',
+          line2: commission.check?.mailingAddress?.line2 || '',
+          city: commission.check?.mailingAddress?.city || '',
+          state: commission.check?.mailingAddress?.state || '',
+          zip: commission.check?.mailingAddress?.zip || '',
+          country: commission.check?.mailingAddress?.country || 'United States',
+        },
+      },
     },
     w9: {
       legalName: w9.legalName || '',
@@ -1163,11 +1181,40 @@ function ACHSection({ form, setForm }) {
   )
 }
 
-// 9. Commission payout bank
-function CommissionSection({ form, setForm }) {
+// 9. Commission payout — ACH (bank) OR Check (mailed paper check).
+// Mirrors registration-form/src/components/Step3Payment.jsx
+// `CommissionBankSection`. When the practitioner switches payoutMethod,
+// the OTHER branch's fields are wiped server-side on save so only the
+// selected method's data lives on the doc.
+function CommissionSection({ form, setForm, errorMap = {} }) {
+  const err = (k) => errorMap[k] || undefined
+
   function setComm(patch) {
     setForm({ ...form, commission: { ...form.commission, ...patch } })
   }
+  function setCheck(patch) {
+    setForm({
+      ...form,
+      commission: {
+        ...form.commission,
+        check: { ...(form.commission.check || {}), ...patch },
+      },
+    })
+  }
+  function setMailing(patch) {
+    const check = form.commission.check || {}
+    setForm({
+      ...form,
+      commission: {
+        ...form.commission,
+        check: {
+          ...check,
+          mailingAddress: { ...(check.mailingAddress || {}), ...patch },
+        },
+      },
+    })
+  }
+
   // When "use my ACH" is on, pre-fill the commission inputs from the ACH
   // section (read-only mirror). Lets the practitioner avoid re-typing the
   // same routing+last4 they already provided for invoice settlement.
@@ -1188,80 +1235,185 @@ function CommissionSection({ form, setForm }) {
       setComm({ sourcedFromPaymentAch: false })
     }
   }
+
+  const payoutMethod = form.commission.payoutMethod || 'ach'
   const last4 = form.commission.bankAccountLast4
   const fromAch = !!form.commission.sourcedFromPaymentAch
   const hasAchOnFile = !!form.ach.achAccountLast4
+  const useBilling = form.commission.check?.useBillingAddress !== false
+
   return (
     <Collapsible
-      title="Commission payout bank"
-      description="Where we deposit your commission payouts. Different from your ACH payment account."
+      title="Commission payouts"
+      description="How you'd like to receive commission earnings — direct deposit (ACH) or mailed paper check."
     >
       <s-stack direction="block" gap="base">
         <s-checkbox
-          label="Enable commission payouts to this account"
-          accessibilityLabel="Enable commission payouts to this account"
+          label="Enable commission payouts"
+          accessibilityLabel="Enable commission payouts"
           checked={!!form.commission.enabled}
           onchange={(e) => setComm({ enabled: e.target.checked })}
         />
 
         {form.commission.enabled && (
           <>
-            {hasAchOnFile && (
-              <s-checkbox
-                label="Use my ACH payment account for commission payouts"
-                accessibilityLabel="Use my ACH payment account for commission payouts"
-                checked={fromAch}
-                onchange={(e) => toggleSourcedFromAch(e.target.checked)}
-              />
+            {/* ── Payout method selector ─────────────────────────────── */}
+            <s-select
+              label="Payout method"
+              id="field-commission.payoutMethod"
+              value={payoutMethod}
+              onchange={(e) => setComm({ payoutMethod: e.target.value })}
+            >
+              <s-option value="ach">ACH / Bank transfer (direct deposit)</s-option>
+              <s-option value="check">Check (mailed paper check)</s-option>
+            </s-select>
+
+            {/* ── ACH branch ─────────────────────────────────────────── */}
+            {payoutMethod === 'ach' && (
+              <>
+                {hasAchOnFile && (
+                  <s-checkbox
+                    label="Use my ACH payment account for commission payouts"
+                    accessibilityLabel="Use my ACH payment account for commission payouts"
+                    checked={fromAch}
+                    onchange={(e) => toggleSourcedFromAch(e.target.checked)}
+                  />
+                )}
+                {last4 && (
+                  <s-text color="subdued">
+                    Currently on file: ending in <s-text type="strong">{last4}</s-text>.
+                  </s-text>
+                )}
+                <s-grid gridTemplateColumns="2fr 1fr" gap="base">
+                  <s-text-field
+                    label="Account holder name"
+                    id="field-commission.bankAccountName"
+                    value={form.commission.bankAccountName}
+                    disabled={fromAch}
+                    oninput={(e) => setComm({ bankAccountName: e.target.value })}
+                  />
+                  <s-select
+                    label="Account type"
+                    value={form.commission.bankAccountType}
+                    disabled={fromAch}
+                    onchange={(e) => setComm({ bankAccountType: e.target.value })}
+                  >
+                    <s-option value="Checking">Checking</s-option>
+                    <s-option value="Savings">Savings</s-option>
+                  </s-select>
+                </s-grid>
+                <s-grid gridTemplateColumns="1fr 1fr" gap="base">
+                  <s-text-field
+                    label="Routing number"
+                    id="field-commission.bankRoutingNumber"
+                    placeholder="123456789"
+                    value={form.commission.bankRoutingNumber}
+                    disabled={fromAch}
+                    oninput={(e) =>
+                      setComm({ bankRoutingNumber: String(e.target.value).replace(/\D/g, '') })
+                    }
+                    autocomplete="off"
+                    inputMode="numeric"
+                    maxLength={9}
+                  />
+                  <s-text-field
+                    label="Account number (leave blank to keep current)"
+                    id="field-commission.bankAccountNumber"
+                    type="password"
+                    autocomplete="off"
+                    inputMode="numeric"
+                    maxLength={17}
+                    value={form.commission.bankAccountNumber}
+                    disabled={fromAch}
+                    oninput={(e) =>
+                      setComm({ bankAccountNumber: String(e.target.value).replace(/\D/g, '') })
+                    }
+                  />
+                </s-grid>
+              </>
             )}
-            {last4 && (
-              <s-text color="subdued">
-                Currently on file: ending in <s-text type="strong">{last4}</s-text>.
-              </s-text>
+
+            {/* ── Check branch ───────────────────────────────────────── */}
+            {payoutMethod === 'check' && (
+              <>
+                <s-text-field
+                  label="Payable to"
+                  id="field-commission.check.payableTo"
+                  placeholder="Name or business name printed on the check"
+                  value={form.commission.check?.payableTo || ''}
+                  error={err('commission.check.payableTo')}
+                  oninput={(e) => setCheck({ payableTo: e.target.value })}
+                />
+                <s-checkbox
+                  label="Mail checks to my billing address"
+                  accessibilityLabel="Mail checks to my billing address"
+                  checked={useBilling}
+                  onchange={(e) => setCheck({ useBillingAddress: e.target.checked })}
+                />
+                {!useBilling && (
+                  <>
+                    <s-text color="subdued">Mailing address for checks</s-text>
+                    <s-text-field
+                      label="Address line 1"
+                      id="field-commission.check.mailingAddress.line1"
+                      placeholder="Street address"
+                      value={form.commission.check.mailingAddress.line1}
+                      error={err('commission.check.mailingAddress.line1')}
+                      oninput={(e) => setMailing({ line1: e.target.value })}
+                    />
+                    <s-text-field
+                      label="Address line 2 (optional)"
+                      placeholder="Apartment, suite, etc."
+                      value={form.commission.check.mailingAddress.line2}
+                      oninput={(e) => setMailing({ line2: e.target.value })}
+                    />
+                    <s-grid gridTemplateColumns="1fr 1fr" gap="base">
+                      <s-text-field
+                        label="City"
+                        id="field-commission.check.mailingAddress.city"
+                        value={form.commission.check.mailingAddress.city}
+                        error={err('commission.check.mailingAddress.city')}
+                        oninput={(e) => setMailing({ city: e.target.value })}
+                      />
+                      <s-select
+                        label="State"
+                        id="field-commission.check.mailingAddress.state"
+                        value={form.commission.check.mailingAddress.state}
+                        error={err('commission.check.mailingAddress.state')}
+                        onchange={(e) => setMailing({ state: e.target.value })}
+                      >
+                        <s-option value="">Select state</s-option>
+                        {US_STATES.map((s) => (
+                          <s-option key={s.code} value={s.code}>{s.name}</s-option>
+                        ))}
+                      </s-select>
+                    </s-grid>
+                    <s-grid gridTemplateColumns="1fr 1fr" gap="base">
+                      <s-text-field
+                        label="ZIP / Postal code"
+                        id="field-commission.check.mailingAddress.zip"
+                        maxLength={10}
+                        value={form.commission.check.mailingAddress.zip}
+                        error={err('commission.check.mailingAddress.zip')}
+                        oninput={(e) => setMailing({ zip: e.target.value })}
+                      />
+                      <s-select
+                        label="Country"
+                        id="field-commission.check.mailingAddress.country"
+                        value={form.commission.check.mailingAddress.country}
+                        error={err('commission.check.mailingAddress.country')}
+                        onchange={(e) => setMailing({ country: e.target.value })}
+                      >
+                        <s-option value="">Select country</s-option>
+                        {COUNTRIES.map((c) => (
+                          <s-option key={c} value={c}>{c}</s-option>
+                        ))}
+                      </s-select>
+                    </s-grid>
+                  </>
+                )}
+              </>
             )}
-            <s-grid gridTemplateColumns="2fr 1fr" gap="base">
-              <s-text-field
-                label="Account holder name"
-                value={form.commission.bankAccountName}
-                disabled={fromAch}
-                oninput={(e) => setComm({ bankAccountName: e.target.value })}
-              />
-              <s-select
-                label="Account type"
-                value={form.commission.bankAccountType}
-                disabled={fromAch}
-                onchange={(e) => setComm({ bankAccountType: e.target.value })}
-              >
-                <s-option value="Checking">Checking</s-option>
-                <s-option value="Savings">Savings</s-option>
-              </s-select>
-            </s-grid>
-            <s-grid gridTemplateColumns="1fr 1fr" gap="base">
-              <s-text-field
-                label="Routing number"
-                placeholder="123456789"
-                value={form.commission.bankRoutingNumber}
-                disabled={fromAch}
-                oninput={(e) =>
-                  setComm({ bankRoutingNumber: String(e.target.value).replace(/\D/g, '') })
-                }
-                autocomplete="off"
-                inputMode="numeric"
-                maxLength={9}
-              />
-              <s-text-field
-                label="Account number (leave blank to keep current)"
-                type="password"
-                autocomplete="off"
-                inputMode="numeric"
-                maxLength={17}
-                value={form.commission.bankAccountNumber}
-                disabled={fromAch}
-                oninput={(e) =>
-                  setComm({ bankAccountNumber: String(e.target.value).replace(/\D/g, '') })
-                }
-              />
-            </s-grid>
           </>
         )}
       </s-stack>
@@ -1479,16 +1631,36 @@ export function ProfileSections({ api, customerId, profile, onSaved }) {
             }
           : {}),
       },
-      commission: {
-        enabled: form.commission.enabled,
-        sourcedFromPaymentAch: !!form.commission.sourcedFromPaymentAch,
-        bankAccountName: form.commission.bankAccountName,
-        bankRoutingNumber: form.commission.bankRoutingNumber,
-        bankAccountType: form.commission.bankAccountType,
-        ...(form.commission.bankAccountNumber
-          ? { bankAccountNumber: form.commission.bankAccountNumber }
-          : {}),
-      },
+      commission: (() => {
+        const c = form.commission
+        const method = c.payoutMethod === 'check' ? 'check' : 'ach'
+        const base = {
+          enabled: !!c.enabled,
+          payoutMethod: method,
+        }
+        if (method === 'ach') {
+          return {
+            ...base,
+            sourcedFromPaymentAch: !!c.sourcedFromPaymentAch,
+            bankAccountName: c.bankAccountName,
+            bankRoutingNumber: c.bankRoutingNumber,
+            bankAccountType: c.bankAccountType,
+            // Only send full account number when retyped — backend treats
+            // empty as "keep current encrypted value".
+            ...(c.bankAccountNumber ? { bankAccountNumber: c.bankAccountNumber } : {}),
+          }
+        }
+        // Check branch — backend resolves mailingAddress against billing
+        // when useBillingAddress=true.
+        return {
+          ...base,
+          check: {
+            payableTo: c.check?.payableTo || '',
+            useBillingAddress: c.check?.useBillingAddress !== false,
+            mailingAddress: { ...(c.check?.mailingAddress || {}) },
+          },
+        }
+      })(),
       w9: {
         legalName: form.w9.legalName,
         taxClassification: form.w9.taxClassification,
@@ -1662,18 +1834,76 @@ export function ProfileSections({ api, customerId, profile, onSaved }) {
       }
     }
 
-    // ── Commission (step3 ish) ────────────────────────────────────────
-    if (
-      form.commission.enabled &&
-      form.commission.bankRoutingNumber &&
-      !isValidABA(form.commission.bankRoutingNumber)
-    ) {
-      out.push({ section: 'commission', message: 'Commission routing number failed checksum.' })
-    }
-    if (form.commission.enabled && form.commission.bankAccountNumber) {
-      const acct = String(form.commission.bankAccountNumber).replace(/\D/g, '')
-      if (acct.length < 4 || acct.length > 17) {
-        out.push({ section: 'commission', message: 'Commission account number must be 4–17 digits.' })
+    // ── Commission (mirrors step3.schema.js) ──────────────────────────
+    if (form.commission.enabled) {
+      const payoutMethod = form.commission.payoutMethod || 'ach'
+      if (payoutMethod === 'ach') {
+        // Mirrors registration's step3.schema.js: routing + name always
+        // required for ACH. Account number is required ONLY when no
+        // encrypted value exists on file (last4 is the proxy for that).
+        // Skip these requirements when sourcedFromPaymentAch=true (fields
+        // are derived from the payment.ach.* section, server re-derives).
+        const fromAch = !!form.commission.sourcedFromPaymentAch
+        const hasOnFile = !!form.commission.bankAccountLast4
+        if (!fromAch) {
+          if (!form.commission.bankAccountName?.trim()) {
+            setErr(
+              'commission.bankAccountName',
+              'Account holder name is required.',
+              'commission',
+            )
+          }
+          if (!form.commission.bankRoutingNumber?.trim()) {
+            setErr(
+              'commission.bankRoutingNumber',
+              'Routing number is required.',
+              'commission',
+            )
+          } else if (!isValidABA(form.commission.bankRoutingNumber)) {
+            setErr(
+              'commission.bankRoutingNumber',
+              'Routing number failed checksum.',
+              'commission',
+            )
+          }
+          if (!hasOnFile && !form.commission.bankAccountNumber) {
+            setErr(
+              'commission.bankAccountNumber',
+              'Bank account number is required.',
+              'commission',
+            )
+          }
+        }
+        if (form.commission.bankAccountNumber) {
+          const acct = String(form.commission.bankAccountNumber).replace(/\D/g, '')
+          if (acct.length < 4 || acct.length > 17) {
+            setErr(
+              'commission.bankAccountNumber',
+              'Commission account number must be 4–17 digits.',
+              'commission',
+            )
+          }
+        }
+      } else {
+        // Check branch — payableTo required; mailing address required
+        // when not reusing billing address.
+        const chk = form.commission.check || {}
+        if (!chk.payableTo?.trim()) {
+          setErr('commission.check.payableTo', 'Payable-to name is required.', 'commission')
+        }
+        if (chk.useBillingAddress === false) {
+          const m = chk.mailingAddress || {}
+          const mailingRequired = ['line1', 'city', 'state', 'zip', 'country']
+          for (const k of mailingRequired) {
+            if (!m[k]?.trim()) {
+              setErr(
+                `commission.check.mailingAddress.${k}`,
+                `${ADDR_LABELS[k] || k} is required.`,
+                'commission',
+              )
+            }
+          }
+        }
       }
     }
 
@@ -1810,14 +2040,25 @@ export function ProfileSections({ api, customerId, profile, onSaved }) {
         <PaymentMethodSection form={form} setForm={setForm} />
       </s-grid>
 
-      {/* Card on file — inline card inputs, tokenized server-side on Save */}
-      <CardSection form={form} setForm={setForm} />
+      {/* Card on file — inline card inputs, tokenized server-side on Save.
+          Rendered ONLY when payment.method === 'card' so a Check / ACH /
+          Immediate customer doesn't see card fields that don't apply to them.
+          Their stored card (if any from a prior method) stays on the backend
+          and reappears if they switch back to 'card'. */}
+      {form.payment.method === 'card' && (
+        <CardSection form={form} setForm={setForm} />
+      )}
 
-      {/* ACH bank | Commission bank — side by side */}
-      <s-grid gridTemplateColumns="1fr 1fr" gap="large" alignItems="start">
+      {/* ACH bank account — rendered ONLY when payment.method === 'ach'.
+          Same reasoning as CardSection above: hides fields that don't
+          apply, preserves stored data on the backend across method switches. */}
+      {form.payment.method === 'ach' && (
         <ACHSection form={form} setForm={setForm} />
-        <CommissionSection form={form} setForm={setForm} />
-      </s-grid>
+      )}
+
+      {/* Commission payouts — independent of the customer's PAYMENT method
+          (this is how WE pay THEM). Always rendered, full width. */}
+      <CommissionSection form={form} setForm={setForm} errorMap={errorMap} />
 
       {/* W-9 form — full width (perjury text needs space) */}
       <W9Section form={form} setForm={setForm} profile={profile} errorMap={errorMap} />

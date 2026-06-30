@@ -1,10 +1,14 @@
 // extensions/checkout-ui/src/Checkout.jsx
 //
-// Processing fee — N% of cart subtotal — added at checkout as a real
-// cart line item. Shopify Checkout UI extensions cannot increase the
-// cart total directly; the only supported path is to add a line item
-// via `applyCartLinesChange({type:'addCartLine', ...})` referencing a
+// Processing fee — N% of cart GRAND TOTAL (items + shipping + tax) —
+// added at checkout as a real cart line item. Shopify Checkout UI
+// extensions cannot increase the cart total directly; the only
+// supported path is to add a line item via
+// `applyCartLinesChange({type:'addCartLine', ...})` referencing a
 // real ProductVariant.
+//
+// Base = totalAmount - existingFee (self-compensation so the fee
+// doesn't compound on itself when the cart re-renders).
 //
 // VARIANT GID + FEE RATE are HARDCODED below.
 //   • Edit the two constants and rebuild — no merchant setup needed.
@@ -39,7 +43,8 @@ import { useSignalEffect } from '@preact/signals'
 //   gid://shopify/ProductVariant/<numeric_id>
 const FEE_VARIANT_GID = 'gid://shopify/ProductVariant/45231995191365'
 
-// Percentage charged on cart subtotal (3 = 3%).
+// Percentage charged on cart GRAND TOTAL (items + shipping + tax).
+// 3 = 3%.
 const FEE_PERCENT = 3
 
 export default async () => {
@@ -71,8 +76,11 @@ function ProcessingFee() {
       return
     }
 
-    const subtotal = Number(shopify.cost.subtotalAmount.value?.amount) || 0
-    if (subtotal === 0) return
+    // Use GRAND TOTAL (items + shipping + tax). Note: totalAmount
+    // ALREADY includes our existing fee line, so we subtract it below
+    // in `realBase` to prevent the fee from compounding on itself.
+    const totalAmount = Number(shopify.cost.totalAmount.value?.amount) || 0
+    if (totalAmount === 0) return
 
     const feeRate = FEE_PERCENT / 100
     const lines = shopify.lines.value || []
@@ -112,14 +120,14 @@ function ProcessingFee() {
 
     // Subtract the fee we already added so the percentage doesn't
     // compound on itself when the cart re-renders.
-    const realBase = subtotal - existingFeeDollars
+    const realBase = totalAmount - existingFeeDollars
 
     // Variant price = $0.01 → quantity = cents-of-fee.
     const targetQty = Math.max(0, Math.round(realBase * feeRate * 100))
 
     // eslint-disable-next-line no-console
     console.log(
-      `[processing-fee] 💵 subtotal=$${subtotal.toFixed(2)} · realBase=$${realBase.toFixed(2)} · rate=${FEE_PERCENT}% · targetQty=${targetQty} (= $${(targetQty / 100).toFixed(2)}) · existingQty=${existingFeeLine?.quantity ?? 0}`,
+      `[processing-fee] 💵 totalAmount=$${totalAmount.toFixed(2)} · realBase=$${realBase.toFixed(2)} · rate=${FEE_PERCENT}% · targetQty=${targetQty} (= $${(targetQty / 100).toFixed(2)}) · existingQty=${existingFeeLine?.quantity ?? 0}`,
     )
 
     if (targetQty <= 0) {
