@@ -25,6 +25,24 @@ const idMapSchema = new mongoose.Schema(
     // sync handler so the next webhook sees delta=0 and skips, preventing
     // infinite mirror loops.
     retailAvailable: { type: Number, default: null },
+    // ── Price snapshots (productVariant rows only) ─────────────────────
+    // Last-known per-variant prices captured at sync time. Stored on each
+    // `productVariant` row so downstream services (drop-ship orchestration,
+    // commission math, price-divergence audits) can compare the two stores'
+    // pricing without hitting Shopify again. Currency is the variant's
+    // shop-level currency (USD here).
+    //
+    //   wholesalePrice         — Shopify variant.price (regular) on wholesale
+    //   retailPrice            — Shopify variant.price (regular) on retail
+    //   wholesaleCompareAtPrice — Shopify variant.compare_at_price (sale-from) on wholesale, optional
+    //   retailCompareAtPrice    — Shopify variant.compare_at_price (sale-from) on retail, optional
+    //
+    // All four are Number for direct compare/arithmetic; null when the source
+    // variant doesn't carry a value. Updated on every create + update sync.
+    wholesalePrice: { type: Number, default: null },
+    retailPrice: { type: Number, default: null },
+    wholesaleCompareAtPrice: { type: Number, default: null },
+    retailCompareAtPrice: { type: Number, default: null },
   },
   { collection: 'sync_id_maps', timestamps: true },
 )

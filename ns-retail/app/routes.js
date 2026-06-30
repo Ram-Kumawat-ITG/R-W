@@ -27,7 +27,14 @@ export default [
   // Path strings are relative to the app/ directory.
   route("/api/auth/check-email", "api/auth/check-email.js"),
   route("/api/cdo/validate-code", "api/cdo/validate-code.js"),
+  // Internal cross-repo endpoint: wholesale proxies vendor bill PDF requests here.
+  route("/api/cdo/bill-pdf", "api/cdo/bill-pdf.js"),
   route("/api/cdo/checkout-validate-code", "api/cdo/checkout-validate-code.js"),
+  // Apply a validated referral code to the cart and immediately tag the
+  // Shopify customer. Called from the checkout UI extension when the buyer
+  // applies a code. Tags the customer so the code becomes the default for
+  // future orders.
+  route("/api/cdo/checkout-apply-code", "api/cdo/checkout-apply-code.js"),
   // Looks up a logged-in customer's `code:*` tag via Shopify Admin GraphQL
   // (checkout extensions can't read customer.tags directly — known Shopify
   // limitation). Called from the checkout UI extension on mount.
@@ -35,6 +42,9 @@ export default [
     "/api/cdo/checkout-find-by-customer-id",
     "api/cdo/checkout-find-by-customer-id.js",
   ),
+  // Admin API to update a customer's referral code after signup.
+  // Validates the new code, builds a fresh snapshot, updates cdo_applications.
+  route("/api/cdo/update-customer-referral", "api/cdo/update-customer-referral.js"),
   route("/api/signup-form", "api/signup-form.js"),
   // Practitioner Portal — Customer Account UI extension backend (/api/portal/*).
   // Read-only over the cdo_* collections ns-retail owns; auth via the customer
@@ -47,4 +57,17 @@ export default [
   route("/api/portal/payouts", "api/portal/payouts.js"),
   route("/api/portal/referrals", "api/portal/referrals.js"),
   route("/api/portal/discounts", "api/portal/discounts.js"),
+  // Shopify Carrier Service callback — receives the cart origin + destination
+  // + items at checkout, fetches live rates from USPS + UPS (or falls back
+  // to STATIC_CARRIER_RATES placeholder when credentials are unset), and
+  // returns rates to Shopify with per-quantity markup.
+  // 1:1 with wholesale/app/api/shipping/rates.js — keep them in sync.
+  // Each store has its own carrier service registered via the
+  // `carrierServiceCreate` Admin GraphQL mutation pointing at this URL.
+  route("/api/shipping/rates", "api/shipping/rates.js"),
+  // Inbound cross-repo sync: the WHOLESALE app POSTs here when a drop-ship
+  // wholesale order is fulfilled / shipped / delivered / cancelled, so we
+  // mirror that status (carrier + tracking + delivery) onto the linked retail
+  // Shopify order. Shared-secret auth (x-sync-secret = RETAIL_SYNC_SECRET).
+  route("/api/sync/wholesale-fulfillment", "api/sync/wholesale-fulfillment.js"),
 ];

@@ -10,6 +10,7 @@
 // (e.g. "1 minute"). concurrency:1 so two ticks never overlap.
 
 import {
+  advancePendingPayoutTransfers,
   listPayoutsAwaitingSettlement,
   checkPayoutSettlement,
 } from "../../cdo/cdo.service";
@@ -33,6 +34,11 @@ export function registerProcessPayoutSettlementsJob(agenda) {
       let errors = 0;
 
       try {
+        // Advance any provider-side pending transfers FIRST so this same tick
+        // can settle them — automates Dwolla Sandbox's "Process Bank Transfers"
+        // via API (no-op on production ACH). Best-effort; never blocks the sweep.
+        await advancePendingPayoutTransfers();
+
         const rows = await listPayoutsAwaitingSettlement();
         for (const r of rows) {
           checked += 1;

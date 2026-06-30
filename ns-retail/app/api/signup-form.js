@@ -2,6 +2,7 @@ import connectDB from "../db/mongo.server";
 import CdoApplication from "../models/cdoApplication.server";
 import CdoPractitionerCode from "../models/cdoPractitionerCode.server";
 import CdoReferral from "../models/cdoReferral.server";
+import { checkPatientBinding } from "../services/cdo/cdo.service";
 import { authenticate } from "../shopify.server";
 
 function json(status, body) {
@@ -116,6 +117,43 @@ export async function action({ request }) {
       // Don't block signup on transient DB failure — but don't tag either
       verifiedCode = null;
       verifiedCodeDoc = null;
+    }
+  }
+
+  // ── Permanent patient↔practitioner binding ──────────────────────────
+  // A returning patient may only sign up under the practitioner they're
+  // already associated with. If this email is already bound to a DIFFERENT
+  // practitioner, reject the code — the relationship is permanent. Same
+  // practitioner (a different / updated code) is allowed and falls through.
+  if (verifiedCodeDoc) {
+    try {
+      const verdict = await checkPatientBinding({
+        email,
+        practitionerId: verifiedCodeDoc.practitionerId
+          ? String(verifiedCodeDoc.practitionerId)
+          : null,
+      });
+      if (!verdict.ok) {
+        return json(409, {
+          status: "error",
+          message: "You are already associated with another practitioner",
+          result: {
+            fieldErrors: [
+              {
+                field: "practitionerCode",
+                message:
+                  "You are already associated with another practitioner",
+              },
+            ],
+          },
+        });
+      }
+    } catch (err) {
+      // Don't block signup on a transient binding-lookup failure.
+      console.error(
+        "[api.signup-form] binding check failed (non-fatal):",
+        err?.message || err,
+      );
     }
   }
 

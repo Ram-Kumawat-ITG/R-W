@@ -11,8 +11,10 @@ import { ensureCustomerForOrder, ensureDropshipCustomerMap } from '../customer/c
 import {
   createInvoiceForOrder,
   appendInvoiceRemark,
+  propagateSuccessfulPayment,
+  dispatchInvoiceLifecycleEmails,
 } from '../invoice/invoice.service'
-import { toYmd } from '../invoice/invoice.utils'
+import { toYmd, applyDerivedPaymentStatus } from '../invoice/invoice.utils'
 import { chargeInvoice } from '../payment/payment.service'
 import { validateShopifyOrder } from './order.validator'
 import { paymentConfig } from '../payment/payment.config'
@@ -26,6 +28,8 @@ import {
 } from '../../utils/shipping.constants'
 import { trackingConfig } from './tracking.config'
 import { isRetailCustomerEmail } from '../dropship/dropship.config'
+import DropshipMapping from '../../models/dropshipMapping.server'
+import { notifyRetailOfDropshipChange } from '../sync/fulfillmentSync.service'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('order.service')
@@ -306,6 +310,17 @@ export async function processShopifyOrder({ shop, order, webhookId }) {
       return await ShopifyOrder.findById(local._id)
     }
 
+    // Step 3 — Practitioner prepaid short-circuit. Approved wholesale
+    // customers who complete payment directly at Shopify checkout arrive
+    // with financial_status='paid'. There is nothing left to collect —
+    // the money landed in Shopify's ledger via checkout and the QBO
+    // invoice was just created above. Skip the NMI charge entirely;
+    // settle the invoice immediately and let propagateSuccessfulPayment
+    // record the QBO Payment + mirror the completed state everywhere.
+    if (order.financial_status === 'paid') {
+      return await settlePrepaidOrder({ shop, order, local, invoice, customerMap })
+    }
+
     // Step 3 — optional immediate NMI charge. Only cards are charged
     // automatically. Cheque / ACH invoices are held until an admin acts
     // from the Order Details page (mark received or fall back to card).
@@ -356,6 +371,88 @@ export async function processShopifyOrder({ shop, order, webhookId }) {
   }
 }
 
+// Settle a Practitioner Order that was already paid at Shopify checkout.
+// Called from processShopifyOrder when order.financial_status === 'paid',
+// after the approval gate and QBO invoice creation.
+//
+// What this does:
+//   1. Marks the invoice fully paid (amountPaid = amountDue, paidAt = now).
+//   2. Pre-marks shopifyMarkedPaid=true + shopifyRecordedTotal=amountDue so
+//      propagateSuccessfulPayment skips posting a manual SALE transaction and
+//      skips orderMarkAsPaid — both redundant because the payment already
+//      landed in Shopify's ledger via the checkout flow.
+//   3. Appends a system_note explaining the checkout-paid path.
+//   4. Calls propagateSuccessfulPayment (transactionId=undefined) which
+//      records the QBO Payment, updates ShopifyOrder to processingStatus=
+//      'completed', and dispatches the lifecycle email re-send.
+//
+// The invoice is naturally excluded from the payment CRON after this:
+//   PASS 1 filters paymentStatus:'pending' — a 'paid' invoice doesn't match.
+//   PASS 2 backstops any partial QBO sync failure on the next tick.
+//
+// Admin Orders (drop-ship) and unapproved customers are unaffected — both
+// are handled earlier in the pipeline before reaching this function.
+async function settlePrepaidOrder({ shop, order, local, invoice, customerMap }) {
+  const shopifyOrderId = String(order.id)
+  const now = new Date()
+
+  console.log(
+    `[orders] PREPAID — order ${shopifyOrderId} paid at Shopify checkout ` +
+      `(financial_status=${order.financial_status}); settling QBO invoice immediately.`,
+  )
+  try {
+    // Mark the invoice as fully paid. Pre-set shopifyMarkedPaid + the
+    // cumulative shopifyRecordedTotal to the full amount so the Shopify
+    // sync step inside propagateSuccessfulPayment sees shopOwed=0 and
+    // skips the redundant SALE transaction + orderMarkAsPaid — the
+    // checkout payment already covers both.
+    invoice.amountPaid = invoice.amountDue
+    invoice.paidAt = now
+    invoice.shopifyMarkedPaid = true
+    invoice.shopifyMarkedPaidAt = now
+    invoice.shopifyRecordedTotal = invoice.amountDue
+    applyDerivedPaymentStatus(invoice) // → paymentStatus = 'paid'
+
+    await appendInvoiceRemark(invoice._id, {
+      kind: 'system_note',
+      message:
+        `Order paid at Shopify checkout (financial_status=${order.financial_status}); ` +
+        `invoice settled immediately — no NMI charge required.`,
+      source: 'system',
+      currency: invoice.currency,
+    })
+
+    // Record the QBO Payment, update ShopifyOrder → completed, send email.
+    // No NMI transaction id — the payment originated from Shopify checkout.
+    await propagateSuccessfulPayment({ invoice, customerMap, transactionId: undefined })
+
+    // propagateSuccessfulPayment set processingStatus='completed' on the
+    // ShopifyOrder via findOneAndUpdate. Re-fetch so the returned doc
+    // reflects the terminal state rather than the stale in-memory object.
+    const updated = await ShopifyOrder.findById(local._id)
+
+    console.log(
+      `[orders] PREPAID DONE order=${shopifyOrderId} qboInvoice=${invoice.qboInvoiceId} ` +
+        `paymentStatus=${invoice.paymentStatus}`,
+    )
+    log.info('prepaid.settled', {
+      shopifyOrderId,
+      qboInvoiceId: invoice.qboInvoiceId,
+      invoiceId: invoice._id.toString(),
+      amountDue: invoice.amountDue,
+    })
+    return updated || local
+  } catch (err) {
+    console.error(`[orders] PREPAID FAILED order=${shopifyOrderId}: ${err.message}`)
+    console.error(err.stack || err)
+    log.error('prepaid.failed', { shopifyOrderId, err })
+    local.processingStatus = 'failed'
+    local.processingError = err.message
+    await local.save()
+    throw err
+  }
+}
+
 // Drop-ship order handler — orders placed by the retail drop-ship customer
 // (DROPSHIP_RETAIL_CUSTOMER_EMAIL) get an UNPAID QBO invoice on creation; the
 // dedicated process-dropship-payments CRON later charges the configured NMI
@@ -371,11 +468,22 @@ async function invoiceDropshipOrder({ shop, order, local }) {
   const orderEmail = order.email || order.customer?.email || ''
   console.log(
     `[orders] DROP-SHIP — ${shopifyOrderId} placed by retail drop-ship customer ` +
-      `(${orderEmail}); creating UNPAID QBO invoice (collection deferred to dropship CRON).`,
+      `(${orderEmail}); creating UNPAID QBO invoice (collected via Admin Order Batch Payment UI).`,
   )
   try {
     const customerMap = await ensureDropshipCustomerMap({ shop, order })
     console.log(`[orders] drop-ship customer ready — qboId=${customerMap.qboCustomerId}`)
+
+    // Resolve the retail order name from the dropship mapping so the QBO invoice
+    // DocNumber uses the RS-#<retail> format (e.g. "RS-#1234") rather than the
+    // wholesale order number. Best-effort — falls back to order.name if not found.
+    const mapping = await DropshipMapping.findOne({ shop, wholesaleOrderId: shopifyOrderId })
+      .select('retailOrderName')
+      .lean()
+    const retailOrderName = mapping?.retailOrderName || null
+    console.log(
+      `[orders] drop-ship mapping — wholesaleOrderId=${shopifyOrderId} retailOrderName=${retailOrderName || '(not found)'}`,
+    )
 
     const invoice = await createInvoiceForOrder({
       shop,
@@ -383,6 +491,7 @@ async function invoiceDropshipOrder({ shop, order, local }) {
       localOrder: local,
       customerMap,
       isDropship: true,
+      retailOrderName,
     })
 
     local.qboInvoiceId = invoice.qboInvoiceId
@@ -589,6 +698,15 @@ export async function handleOrderCancelled({ shop, order, webhookId }) {
     `[orders] order doc set processingStatus=cancelled reason="${cancelReason}" cancelledAt=${shopifyCancelledAt.toISOString()}`,
   )
 
+  // Mirror the cancellation onto the linked retail Shopify order (drop-ship
+  // only; gated + deduped inside). Fired here — before the invoice/QBO work —
+  // so it runs even for orders that never carried an invoice. Best-effort.
+  try {
+    await notifyRetailOfDropshipChange({ localOrder, event: 'cancelled' })
+  } catch (err) {
+    log.warn('cancel.retail_sync_failed', { shopifyOrderId, err })
+  }
+
   // ── 3. Cancel the linked Invoice (if any) + void in QBO ───────
   if (!localOrder.invoiceRef) {
     console.log(`[orders] no Invoice linked — nothing to cancel in QBO`)
@@ -687,15 +805,22 @@ export async function handleOrderCancelled({ shop, order, webhookId }) {
 
 // Write the order's shipping (carrier + tracking, one line per shipment) to
 // the linked QBO invoice's CustomerMemo so it appears on the customer's
-// invoice. Best-effort — a QBO failure must never break tracking capture.
-// Called from both fulfillment paths whenever tracking changed. Idempotent:
-// setInvoiceShippingMemo replaces the managed shipping block, so re-writing
-// the same lines is a no-op for the customer-visible result.
+// invoice, then re-send the invoice email so the customer sees the latest
+// tracking info. Best-effort — QBO or email failure must never break tracking
+// capture. Called from both fulfillment paths whenever tracking changed.
+// Idempotent: setInvoiceShipping replaces the managed shipping block, and
+// dispatchInvoiceLifecycleEmails deduplicates on the shipDate/trackingNum
+// snapshot so re-writing the same info is a no-op.
 async function pushShippingToInvoice(localOrder) {
   if (!localOrder?.invoiceRef) return
   let invoice
   try {
-    invoice = await Invoice.findById(localOrder.invoiceRef).select('qboInvoiceId qboSyncToken')
+    invoice = await Invoice.findById(localOrder.invoiceRef).select(
+      'qboInvoiceId qboSyncToken customerEmail paymentStatus amountPaid ' +
+        'invoiceEmailSentAt invoiceEmailLastSentAt invoiceEmailedStatus ' +
+        'invoiceEmailedAmountPaid invoiceEmailedShipDate invoiceEmailedTrackingNum ' +
+        'lastEmailError emailEvents',
+    )
   } catch {
     return
   }
@@ -713,8 +838,7 @@ async function pushShippingToInvoice(localOrder) {
       return f.trackingUrl ? `${head}\n  Track: ${f.trackingUrl}` : head
     })
   // Official Ship Date for the QBO invoice = the Shopify fulfillment date
-  // (earliest shipment), overwriting the order-creation date set at invoice
-  // creation. Date-only (YYYY-MM-DD) to match QBO's ShipDate field.
+  // (earliest shipment). Date-only (YYYY-MM-DD) to match QBO's ShipDate field.
   const shipDate = localOrder.shippedAt ? toYmd(localOrder.shippedAt) : undefined
   // Native QBO TrackingNum (renders in the header below Ship Date): carrier +
   // number per shipment, joined for multi-shipment orders.
@@ -731,18 +855,34 @@ async function pushShippingToInvoice(localOrder) {
       shipDate,
       trackingNum,
     })
-    if (updated?.SyncToken && updated.SyncToken !== invoice.qboSyncToken) {
-      await Invoice.updateOne({ _id: invoice._id }, { $set: { qboSyncToken: updated.SyncToken } })
-    }
+    if (updated?.SyncToken) invoice.qboSyncToken = updated.SyncToken
     console.log(
       `[orders] shipping synced to QBO invoice ${invoice.qboInvoiceId} ` +
         `(${lines.length} line(s), shipDate=${shipDate || '(unchanged)'})`,
     )
   } catch (err) {
-    log.warn('fulfillment.invoice_memo_failed', {
-      invoiceId: String(localOrder.invoiceRef),
-      err,
+    log.warn('fulfillment.invoice_memo_failed', { invoiceId: String(localOrder.invoiceRef), err })
+  }
+  // Re-send the invoice email with updated shipping details. customerMap is
+  // not available in this context — dispatchInvoiceLifecycleEmails falls back
+  // to invoice.customerEmail automatically when customerMap is null.
+  try {
+    await dispatchInvoiceLifecycleEmails({
+      invoice,
+      customerMap: null,
+      event: 'fulfillment',
+      shipDate,
+      trackingNum,
     })
+  } catch (err) {
+    log.warn('fulfillment.invoice_email_failed', { invoiceId: String(localOrder.invoiceRef), err })
+  }
+  // Single save persists both the QBO SyncToken and any email snapshot fields
+  // mutated by dispatchInvoiceLifecycleEmails (emailEvents, invoiceEmailedShipDate, etc.).
+  try {
+    await invoice.save()
+  } catch (err) {
+    log.warn('fulfillment.invoice_save_failed', { invoiceId: String(localOrder.invoiceRef), err })
   }
 }
 
@@ -758,6 +898,31 @@ function recomputeShipDate(localOrder) {
   const next = earliest ? earliest.getTime() : null
   if (prev !== next) {
     localOrder.shippedAt = earliest
+    return true
+  }
+  return false
+}
+
+// Recompute the order's official Delivery Date — set ONLY when every active
+// (non-cancelled) shipment has a `deliveredAt`; the value is the LATEST of them
+// (the moment the whole order became delivered). Null while any active shipment
+// is still in flight. Mirrors recomputeShipDate. Mutates localOrder; returns
+// true when the value changed (so callers know to persist + mirror to retail).
+function recomputeDeliveredAt(localOrder) {
+  const active = (localOrder.fulfillments || []).filter(
+    (f) => String(f.status || '').toLowerCase() !== 'cancelled',
+  )
+  let next = null
+  if (active.length) {
+    const times = active.map((f) =>
+      f.deliveredAt ? new Date(f.deliveredAt).getTime() : NaN,
+    )
+    if (times.every((t) => Number.isFinite(t))) next = new Date(Math.max(...times))
+  }
+  const prev = localOrder.deliveredAt ? new Date(localOrder.deliveredAt).getTime() : null
+  const nextMs = next ? next.getTime() : null
+  if (prev !== nextMs) {
+    localOrder.deliveredAt = next
     return true
   }
   return false
@@ -794,6 +959,13 @@ function applyFulfillmentToOrder(localOrder, n) {
   const fulfilledAt = n.fulfilledAt ? new Date(n.fulfilledAt) : undefined
   const estimatedDeliveryAt = n.estimatedDeliveryAt ? new Date(n.estimatedDeliveryAt) : undefined
 
+  // Delivery milestone: stamp deliveredAt the first time the carrier status is
+  // `delivered` (first-detection-wins — never overwritten on later re-syncs, so
+  // the recorded delivery date is stable). Prefer the caller-supplied
+  // observation time (the webhook's `updated_at`), else `now`.
+  const isDelivered = String(n.shipmentStatus || '').toLowerCase() === 'delivered'
+  const deliveredStamp = n.deliveredAt ? new Date(n.deliveredAt) : now
+
   if (existing) {
     existing.trackingNumber = n.trackingNumber
     existing.trackingCompany = n.trackingCompany
@@ -804,6 +976,7 @@ function applyFulfillmentToOrder(localOrder, n) {
     existing.status = n.status
     if (fulfilledAt) existing.fulfilledAt = fulfilledAt
     if (estimatedDeliveryAt) existing.estimatedDeliveryAt = estimatedDeliveryAt
+    if (isDelivered && !existing.deliveredAt) existing.deliveredAt = deliveredStamp
     if (changed) existing.updatedAt = now
   } else {
     localOrder.fulfillments.push({
@@ -817,6 +990,7 @@ function applyFulfillmentToOrder(localOrder, n) {
       status: n.status,
       fulfilledAt,
       estimatedDeliveryAt,
+      deliveredAt: isDelivered ? deliveredStamp : undefined,
       createdAt: now,
       updatedAt: now,
     })
@@ -892,12 +1066,17 @@ export async function handleFulfillmentUpdate({ shop, fulfillment, webhookId, ev
     status: fulfillment.status || null,
     fulfilledAt: fulfillment.created_at || null,
     estimatedDeliveryAt: fulfillment.estimated_delivery_at || null,
+    // Best-available delivery-observation time — the fulfillment's last-updated
+    // timestamp, which Shopify bumps when the carrier reports `delivered`.
+    // applyFulfillmentToOrder only uses it when shipment_status is `delivered`.
+    deliveredAt: fulfillment.updated_at || null,
   }
   const { changed, isNew, carrierKey, trackingUrl } = applyFulfillmentToOrder(
     localOrder,
     normalized,
   )
   recomputeShipDate(localOrder)
+  recomputeDeliveredAt(localOrder)
   if (!changed) console.log(`[orders] fulfillment ${fulfillmentId} unchanged — no history row`)
 
   if (webhookId) {
@@ -947,6 +1126,17 @@ export async function handleFulfillmentUpdate({ shop, fulfillment, webhookId, ev
   // Mirror carrier + tracking onto the customer-facing QBO invoice memo.
   if (changed) await pushShippingToInvoice(localOrder)
 
+  // Mirror the fulfillment status onto the linked retail Shopify order (only
+  // for drop-ship orders; gated + deduped inside). Best-effort — never let a
+  // retail-sync failure break tracking capture.
+  if (changed) {
+    try {
+      await notifyRetailOfDropshipChange({ localOrder, event: 'fulfillment' })
+    } catch (err) {
+      log.warn('fulfillment.retail_sync_failed', { shopifyOrderId, err })
+    }
+  }
+
   return localOrder
 }
 
@@ -984,6 +1174,7 @@ export async function syncFulfillmentsFromShopify({ shop, shopifyOrderId, admin 
     }
   }
   if (recomputeShipDate(localOrder)) anyChanged = true
+  if (recomputeDeliveredAt(localOrder)) anyChanged = true
 
   if (anyChanged) {
     await localOrder.save()
@@ -1003,6 +1194,16 @@ export async function syncFulfillmentsFromShopify({ shop, shopifyOrderId, admin 
   // differs, so this doesn't write on every view once converged.
   if ((localOrder.fulfillments || []).length) {
     await pushShippingToInvoice(localOrder)
+  }
+
+  // Mirror onto the linked retail Shopify order when this pull changed
+  // anything (drop-ship only; gated + deduped inside). Best-effort.
+  if (anyChanged) {
+    try {
+      await notifyRetailOfDropshipChange({ localOrder, event: 'fulfillment' })
+    } catch (err) {
+      log.warn('fulfillment.retail_sync_failed', { shopifyOrderId, err })
+    }
   }
   return localOrder.toObject()
 }

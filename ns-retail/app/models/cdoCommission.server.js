@@ -64,5 +64,22 @@ const cdoCommissionSchema = new mongoose.Schema(
   { collection: "cdo_commissions", timestamps: true, strict: true },
 );
 
+// ONE commission per order. `orderId` is the idempotency key for
+// createCommissionForOrder, which previously only `findOne`'d before
+// inserting on an UNINDEXED field — so two webhook deliveries racing could
+// both miss the check and both insert, double-paying the practitioner. This
+// UNIQUE index closes the race: the loser's insert fails with E11000 and the
+// service treats it as "already created". Partial so any legacy/manual
+// commission without an orderId is exempt (and several such are allowed).
+//
+// NOTE: if duplicate (orderId) commissions already exist in the DB, this
+// index build will FAIL until they're de-duplicated — run
+// scripts/dedupe-cdo-commissions.js first. The index also speeds up
+// reverseOrderCommission / lookups that filter by orderId.
+cdoCommissionSchema.index(
+  { orderId: 1 },
+  { unique: true, partialFilterExpression: { orderId: { $exists: true } } },
+);
+
 export default mongoose.models.CdoCommission ||
   mongoose.model("CdoCommission", cdoCommissionSchema);

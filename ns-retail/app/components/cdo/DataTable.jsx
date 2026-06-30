@@ -68,13 +68,23 @@ export default function DataTable({
               <s-paragraph tone="subdued">{description}</s-paragraph>
             ) : null}
             {searchable ? (
-              <s-search-field
-                label="Search"
-                labelAccessibilityVisibility="exclusive"
-                placeholder={searchPlaceholder}
-                value={search}
-                onInput={(e) => setSearch(e?.currentTarget?.value ?? "")}
-              />
+              <s-stack direction="inline" gap="base" alignItems="center">
+                <s-search-field
+                  label="Search"
+                  labelAccessibilityVisibility="exclusive"
+                  placeholder={searchPlaceholder}
+                  value={search}
+                  onInput={(e) => setSearch(e?.currentTarget?.value ?? "")}
+                />
+                <s-button
+                  variant="tertiary"
+                  icon="refresh"
+                  onClick={() => revalidator.revalidate()}
+                  {...(revalidator.state !== "idle" ? { loading: true } : {})}
+                >
+                  Refresh
+                </s-button>
+              </s-stack>
             ) : null}
           </s-stack>
         </s-box>

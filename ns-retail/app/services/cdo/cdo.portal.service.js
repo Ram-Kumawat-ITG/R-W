@@ -1,5 +1,8 @@
-// Practitioner Portal service — all read-only aggregation/query logic for
-// the practitioner dashboard (Customer Account UI extension, full-page).
+// Practitioner Portal service — aggregation/query logic for the practitioner
+// dashboard (Customer Account UI extension, full-page), PLUS the practitioner
+// self-service WRITES (referral code create / pause / resume). The read paths
+// are the bulk of this file; the write paths live in the "Referral code
+// self-service" section at the bottom.
 //
 // PROJECT LAW: API handlers under app/api/portal/ are thin — they auth,
 // validate, call one of these functions, and shape the response. All
@@ -16,12 +19,17 @@
 
 import { unauthenticated } from "../../shopify.server";
 import { createLogger } from "../../utils/logger.utils";
+import { normalizeReferralCode } from "../../utils/referralCode";
 import WholesaleApplication from "../../models/wholesaleApplication.server";
 import CdoPractitionerCode from "../../models/cdoPractitionerCode.server";
 import CdoOrder from "../../models/cdoOrder.server";
 import CdoCommission from "../../models/cdoCommission.server";
 import CdoPayout from "../../models/cdoPayout.server";
 import CdoReferral from "../../models/cdoReferral.server";
+import {
+  createShopifyDiscount,
+  setShopifyDiscountActive,
+} from "./cdo.discount.service";
 
 // Revenue expression shared by aggregations: prefer pricing.total, fall
 // back to the flat `amount`, then 0. ns-retail writes both on most docs.
@@ -249,13 +257,17 @@ export async function getProfile(practitionerId, application) {
 export async function getSummary(practitionerId) {
   const [revenue, referredPatients, commissions] = await Promise.all([
     getRevenue(practitionerId),
-    CdoReferral.countDocuments({ practitionerId }),
+    // UNIQUE patients (deduped by email) — matches the Referred Customers tab.
+    // (cdo_referrals has one row per referral event, so a patient who used
+    // several codes would otherwise be over-counted here.)
+    countReferredPatients(practitionerId),
     commissionTotals(practitionerId),
   ]);
 
   return {
     referredPatients,
     lifetimeRevenue: revenue.lifetime,
+    lifetimeOrders: revenue.orderCount,
     revenueThisMonth: revenue.thisMonth,
     totalCommission: commissions.total,
     paidCommission: commissions.paid,
@@ -266,6 +278,29 @@ export async function getSummary(practitionerId) {
       status: "active",
     }),
   };
+}
+
+// Count UNIQUE referred patients (by the schema-lowercased email; emailless
+// referrals each count once). Uses the same identity key as
+// getReferredCustomers so the Overview "Referred patients" card reconciles with
+// the Referred Customers tab's row count.
+async function countReferredPatients(practitionerId) {
+  const rows = await CdoReferral.aggregate([
+    { $match: { practitionerId } },
+    {
+      $group: {
+        _id: {
+          $cond: [
+            { $gt: [{ $strLenCP: { $ifNull: ["$referredEmail", ""] } }, 0] },
+            "$referredEmail",
+            { $concat: ["ref:", { $toString: "$_id" }] },
+          ],
+        },
+      },
+    },
+    { $count: "n" },
+  ]);
+  return rows[0]?.n || 0;
 }
 
 // ── Revenue (date-bucketed) ──────────────────────────────────────────────────
@@ -280,23 +315,21 @@ function monthBoundaries(now = new Date()) {
 export async function getRevenue(practitionerId, { from, to } = {}) {
   const { thisMonth, lastMonth, thisYear } = monthBoundaries();
   const fromD = parseDate(from);
-  const toD = parseDate(to);
+  const toParsed = parseDate(to);
+  // s-date-field sends a bare YYYY-MM-DD → parsed as UTC midnight. Extend the
+  // `to` bound to the END of that day so the To date is INCLUSIVE — otherwise
+  // orders placed later the same day are silently dropped from the range.
+  const toD = toParsed ? new Date(toParsed.getTime() + 86_400_000 - 1) : null;
+  const hasRange = !!(fromD || toD);
 
-  const rangeCond =
-    fromD || toD
-      ? {
-          $cond: [
-            {
-              $and: [
-                fromD ? { $gte: ["$placedAt", fromD] } : true,
-                toD ? { $lte: ["$placedAt", toD] } : true,
-              ],
-            },
-            REVENUE_EXPR,
-            0,
-          ],
-        }
-      : { $literal: 0 };
+  const inRange = hasRange
+    ? {
+        $and: [
+          fromD ? { $gte: ["$placedAt", fromD] } : true,
+          toD ? { $lte: ["$placedAt", toD] } : true,
+        ],
+      }
+    : null;
 
   const [row] = await CdoOrder.aggregate([
     { $match: { practitionerId } },
@@ -325,7 +358,8 @@ export async function getRevenue(practitionerId, { from, to } = {}) {
         thisYear: {
           $sum: { $cond: [{ $gte: ["$placedAt", thisYear] }, REVENUE_EXPR, 0] },
         },
-        range: { $sum: rangeCond },
+        range: { $sum: inRange ? { $cond: [inRange, REVENUE_EXPR, 0] } : 0 },
+        rangeOrders: { $sum: inRange ? { $cond: [inRange, 1, 0] } : 0 },
       },
     },
   ]);
@@ -335,7 +369,8 @@ export async function getRevenue(practitionerId, { from, to } = {}) {
     thisMonth: round2(row?.thisMonth),
     lastMonth: round2(row?.lastMonth),
     thisYear: round2(row?.thisYear),
-    range: fromD || toD ? round2(row?.range) : null,
+    range: hasRange ? round2(row?.range) : null,
+    rangeOrderCount: hasRange ? row?.rangeOrders || 0 : null,
     orderCount: row?.orderCount || 0,
     currency: "USD",
   };
@@ -343,37 +378,40 @@ export async function getRevenue(practitionerId, { from, to } = {}) {
 
 // ── Commissions ──────────────────────────────────────────────────────────────
 
-// Bucket commissions into the four states the dashboard cares about:
-//   paid           → payoutStatus === 'paid'
-//   pending        → status === 'pending' (not yet earned/approved for payout)
-//   awaitingPayout → earned (status 'paid') but payout not completed
-//   failed         → payoutStatus === 'failed' (subset, surfaced separately)
+// Bucket commissions by the accrual `status` lifecycle (pending → approved →
+// paid, or reversed). This is the authoritative dimension: the payout engine
+// sets status='paid' only when a payout SETTLES, so summing status='paid'
+// matches the actual cdo_payouts disbursement ledger. (The finer-grained
+// `payoutStatus` field — processing/failed/etc. — can drift from reality on a
+// few rows, which is why an earlier payoutStatus-based "paid" undercounted.)
+// The buckets partition every NON-reversed commission into exactly one of
+// paid / pending / awaitingPayout, so the cards reconcile: total = paid +
+// awaitingPayout + pending. Kept consistent with the admin CDO Dashboard
+// (cdo.service.getDashboardMetrics).
+//
+//   paid           → status === 'paid'      (settled / disbursed)
+//   pending        → status === 'pending'   (accrued, not yet approved)
+//   awaitingPayout → status === 'approved'  (approved + owed, not yet paid)
+//   reversed       → status === 'reversed'  (clawed back; EXCLUDED from earned)
+//   failed         → payoutStatus === 'failed' (informational; a payout attempt
+//                    failed — the commission is still 'approved'/awaiting).
 async function commissionTotals(practitionerId) {
   const rows = await CdoCommission.aggregate([
     { $match: { practitionerId } },
     {
       $group: {
         _id: null,
-        total: { $sum: "$amount" },
         paid: {
-          $sum: { $cond: [{ $eq: ["$payoutStatus", "paid"] }, "$amount", 0] },
+          $sum: { $cond: [{ $eq: ["$status", "paid"] }, "$amount", 0] },
         },
         pending: {
           $sum: { $cond: [{ $eq: ["$status", "pending"] }, "$amount", 0] },
         },
         awaitingPayout: {
-          $sum: {
-            $cond: [
-              {
-                $and: [
-                  { $eq: ["$status", "paid"] },
-                  { $ne: ["$payoutStatus", "paid"] },
-                ],
-              },
-              "$amount",
-              0,
-            ],
-          },
+          $sum: { $cond: [{ $eq: ["$status", "approved"] }, "$amount", 0] },
+        },
+        reversed: {
+          $sum: { $cond: [{ $eq: ["$status", "reversed"] }, "$amount", 0] },
         },
         failed: {
           $sum: { $cond: [{ $eq: ["$payoutStatus", "failed"] }, "$amount", 0] },
@@ -383,11 +421,17 @@ async function commissionTotals(practitionerId) {
     },
   ]);
   const r = rows[0] || {};
+  const paid = round2(r.paid);
+  const pending = round2(r.pending);
+  const awaitingPayout = round2(r.awaitingPayout);
   return {
-    total: round2(r.total),
-    paid: round2(r.paid),
-    pending: round2(r.pending),
-    awaitingPayout: round2(r.awaitingPayout),
+    // "Total earned" excludes reversed clawbacks, so the cards reconcile
+    // exactly: total = paid + awaitingPayout + pending.
+    total: round2(paid + awaitingPayout + pending),
+    paid,
+    pending,
+    awaitingPayout,
+    reversed: round2(r.reversed),
     failed: round2(r.failed),
     count: r.count || 0,
   };
@@ -395,26 +439,39 @@ async function commissionTotals(practitionerId) {
 
 export async function getCommissions(
   practitionerId,
-  { status, from, to, page, pageSize, pendingOnly } = {},
+  { status, payoutStatus, patient, from, to, page, pageSize, pendingOnly } = {},
 ) {
   const match = { practitionerId };
   if (status) match.status = status;
+  if (payoutStatus) match.payoutStatus = payoutStatus;
   if (pendingOnly) {
     // "Pending commissions" view: earned-but-not-paid-out.
     match.payoutStatus = { $ne: "paid" };
   }
   const fromD = parseDate(from);
-  const toD = parseDate(to);
+  const toParsed = parseDate(to);
+  // Inclusive `to` — extend a bare YYYY-MM-DD (UTC midnight) to end-of-day.
+  const toD = toParsed ? new Date(toParsed.getTime() + 86_400_000 - 1) : null;
   if (fromD || toD) {
     match.earnedAt = {};
     if (fromD) match.earnedAt.$gte = fromD;
     if (toD) match.earnedAt.$lte = toD;
   }
 
+  // Patient filter — constrain to commissions on the chosen patient's orders
+  // (patient identity lives on the linked cdo_orders, not the commission).
+  if (patient && String(patient).trim()) {
+    const orderIds = await CdoOrder.find({
+      practitionerId,
+      customerEmail: String(patient).trim().toLowerCase(),
+    }).distinct("_id");
+    match.orderId = { $in: orderIds };
+  }
+
   const p = clampPage(page);
   const size = clampPageSize(pageSize);
 
-  const [rows, total, totals] = await Promise.all([
+  const [rows, total, totals, patients] = await Promise.all([
     CdoCommission.find(match)
       .sort({ earnedAt: -1, createdAt: -1 })
       .skip((p - 1) * size)
@@ -425,6 +482,7 @@ export async function getCommissions(
       .lean(),
     CdoCommission.countDocuments(match),
     commissionTotals(practitionerId),
+    listCommissionPatients(practitionerId),
   ]);
 
   return {
@@ -439,11 +497,43 @@ export async function getCommissions(
       earnedAt: r.earnedAt || r.createdAt || null,
     })),
     totals,
+    // Distinct patients (with commissions) for the patient-filter dropdown —
+    // unaffected by the active filters so the dropdown stays stable.
+    patients,
     page: p,
     pageSize: size,
     total,
     totalPages: Math.max(1, Math.ceil(total / size)),
   };
+}
+
+// Distinct patients (by email) who have at least one commission — powers the
+// Commission Summary "Patient" filter dropdown. Joins each commission to its
+// order for the customer email/name.
+async function listCommissionPatients(practitionerId) {
+  const rows = await CdoCommission.aggregate([
+    { $match: { practitionerId, orderId: { $ne: null } } },
+    {
+      $lookup: {
+        from: "cdo_orders",
+        localField: "orderId",
+        foreignField: "_id",
+        as: "order",
+      },
+    },
+    { $addFields: { order: { $arrayElemAt: ["$order", 0] } } },
+    {
+      $group: {
+        _id: "$order.customerEmail",
+        name: { $first: "$order.customerName" },
+      },
+    },
+    { $match: { _id: { $ne: null } } },
+    { $sort: { name: 1, _id: 1 } },
+  ]);
+  return rows
+    .filter((r) => r._id)
+    .map((r) => ({ value: r._id, label: r.name || r._id }));
 }
 
 // ── Payouts ──────────────────────────────────────────────────────────────────
@@ -512,7 +602,9 @@ export async function getPayouts(
   const match = { practitionerId };
   if (status) match.status = status;
   const fromD = parseDate(from);
-  const toD = parseDate(to);
+  const toParsed = parseDate(to);
+  // Inclusive `to` — extend a bare YYYY-MM-DD (UTC midnight) to end-of-day.
+  const toD = toParsed ? new Date(toParsed.getTime() + 86_400_000 - 1) : null;
   if (fromD || toD) {
     match.paidAt = {};
     if (fromD) match.paidAt.$gte = fromD;
@@ -578,11 +670,45 @@ export async function getReferredCustomers(
 
   const [result] = await CdoReferral.aggregate([
     { $match: match },
+    // Most-recent-first so each patient's grouped `codes` array (a `$push`)
+    // comes out newest → oldest and `$first` picks their latest name.
     { $sort: { referredAt: -1, createdAt: -1 } },
     {
+      // Collapse to ONE row per patient. Identity is the (schema-lowercased)
+      // referredEmail; a referral with no email stays separate (keyed by its
+      // own id). A patient who used several referral codes becomes a single
+      // row whose `codes` array is their referral-code history.
+      $group: {
+        _id: {
+          $cond: [
+            { $gt: [{ $strLenCP: { $ifNull: ["$referredEmail", ""] } }, 0] },
+            "$referredEmail",
+            { $concat: ["ref:", { $toString: "$_id" }] },
+          ],
+        },
+        refId: { $first: "$_id" },
+        pid: { $first: "$practitionerId" },
+        referredName: { $first: "$referredName" },
+        referredEmail: { $first: "$referredEmail" },
+        registeredAt: { $min: "$referredAt" },
+        lastReferredAt: { $max: "$referredAt" },
+        codes: {
+          $push: {
+            code: "$referralCode",
+            status: "$status",
+            usedAt: "$referredAt",
+          },
+        },
+      },
+    },
+    // Patients ordered by most recent referral activity.
+    { $sort: { lastReferredAt: -1, refId: -1 } },
+    {
+      // Per-patient order stats — same source as before, joined by email, but
+      // now computed once per patient instead of once per referral row.
       $lookup: {
         from: "cdo_orders",
-        let: { email: "$referredEmail", pid: "$practitionerId" },
+        let: { email: "$referredEmail", pid: "$pid" },
         pipeline: [
           {
             $match: {
@@ -614,20 +740,47 @@ export async function getReferredCustomers(
       },
     },
     {
+      // Join cdo_applications to get the authoritative current referral code.
+      // cdo_referral.referredAt is a first-touch timestamp that never updates
+      // on repeat code usage, so sorting by it gives a stale "latest" code.
+      // cdo_applications.referral.code is always the code resolved by the most
+      // recent order webhook (kept current by upsertCustomerApplication).
+      $lookup: {
+        from: "cdo_applications",
+        let: { email: "$referredEmail" },
+        pipeline: [
+          {
+            $match: {
+              $expr: { $eq: ["$email", "$$email"] },
+              "referral.code": { $exists: true, $ne: null },
+            },
+          },
+          { $project: { "referral.code": 1 } },
+          { $limit: 1 },
+        ],
+        as: "appData",
+      },
+    },
+    {
+      $addFields: {
+        currentCode: { $ifNull: [{ $arrayElemAt: ["$appData.referral.code", 0] }, null] },
+      },
+    },
+    {
       $facet: {
         rows: [
           { $skip: (p - 1) * size },
           { $limit: size },
           {
             $project: {
+              refId: 1,
               referredName: 1,
               referredEmail: 1,
-              referralCode: 1,
-              status: 1,
-              referredAt: 1,
-              convertedAt: 1,
+              registeredAt: 1,
               totalOrders: 1,
               lifetimeValue: 1,
+              codes: 1,
+              currentCode: 1,
             },
           },
         ],
@@ -638,17 +791,38 @@ export async function getReferredCustomers(
 
   const total = result?.total?.[0]?.n || 0;
   return {
-    rows: (result?.rows || []).map((r) => ({
-      id: String(r._id),
-      name: r.referredName || null,
-      email: r.referredEmail || null,
-      referralCode: r.referralCode || null,
-      status: r.status || null,
-      registeredAt: r.referredAt || null,
-      convertedAt: r.convertedAt || null,
-      totalOrders: r.totalOrders || 0,
-      lifetimeValue: round2(r.lifetimeValue),
-    })),
+    rows: (result?.rows || []).map((r) => {
+      // Dedup the code history by normalized code (so the SAME code recorded in
+      // different casing collapses to one entry), keeping the most-recent
+      // occurrence — the array already arrives newest-first from the $push.
+      const seen = new Set();
+      const codes = [];
+      for (const c of r.codes || []) {
+        if (!c?.code) continue;
+        const key = normalizeReferralCode(c.code) || String(c.code).toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        codes.push({
+          code: c.code,
+          status: c.status || null,
+          usedAt: c.usedAt || null,
+        });
+      }
+      // Authoritative current code: cdo_applications.referral.code (updated by the
+      // most recent order webhook). Falls back to the newest cdo_referral record
+      // for patients who pre-date the applications upgrade.
+      const currentCode = r.currentCode || codes[0]?.code || null;
+      return {
+        id: String(r.refId),
+        name: r.referredName || null,
+        email: r.referredEmail || null,
+        referralCode: currentCode,
+        codes,
+        registeredAt: r.registeredAt || null,
+        totalOrders: r.totalOrders || 0,
+        lifetimeValue: round2(r.lifetimeValue),
+      };
+    }),
     page: p,
     pageSize: size,
     total,
@@ -661,12 +835,39 @@ export async function getReferredCustomers(
 // Aggregate order-derived usage stats grouped by referral code, then merge
 // with the practitioner's code list. Commission-per-code is summed from
 // cdo_orders.commissionAmount (commissions link to orders, not codes).
-export async function getReferralCodes(practitionerId) {
+export async function getReferralCodes(practitionerId, { page, pageSize } = {}) {
+  const p = clampPage(page);
+  const size = clampPageSize(pageSize);
+
+  const [total, usedRaw] = await Promise.all([
+    CdoPractitionerCode.countDocuments({ practitionerId }),
+    // Discount tiers used by ACTIVE codes across ALL pages — drives the
+    // create-form's available-tier list independent of the current page (the
+    // table is paginated, so the page's `rows` alone can't be trusted for this).
+    CdoPractitionerCode.find({ practitionerId, status: "active" }).distinct(
+      "discountPercent",
+    ),
+  ]);
+  const usedActivePercents = usedRaw
+    .map((v) => Math.round((Number(v) || 0) * 100))
+    .filter((n) => n > 0);
+
+  const base = {
+    rows: [],
+    usedActivePercents,
+    page: p,
+    pageSize: size,
+    total,
+    totalPages: Math.max(1, Math.ceil(total / size)),
+  };
+
   const codes = await CdoPractitionerCode.find({ practitionerId })
     .sort({ isPrimary: -1, createdAt: 1 })
+    .skip((p - 1) * size)
+    .limit(size)
     .lean();
 
-  if (codes.length === 0) return { rows: [] };
+  if (codes.length === 0) return base;
 
   const [orderStats, referralStats] = await Promise.all([
     CdoOrder.aggregate([
@@ -693,29 +894,28 @@ export async function getReferralCodes(practitionerId) {
     referralStats.map((s) => [String(s._id || "").toLowerCase(), s]),
   );
 
-  return {
-    rows: codes.map((c) => {
-      const key = String(c.code || "").toLowerCase();
-      const o = byCodeOrders.get(key) || {};
-      const r = byCodeReferrals.get(key) || {};
-      return {
-        id: String(c._id),
-        code: c.code,
-        isPrimary: !!c.isPrimary,
-        status: c.status || null,
-        discountPercent: c.discountPercent || 0,
-        commissionRate: c.commissionRate ?? null,
-        referrals: r.referrals || 0,
-        orders: o.orders || 0,
-        revenue: round2(o.revenue),
-        commission: round2(o.commission),
-        // Full shareable referral link (Shopify storefront discount URL,
-        // https://<retail-shop>/discount/<code>). Populated once the matching
-        // Shopify discount is created on the retail store; null until then.
-        referralUrl: c.shopifyDiscountUrl || null,
-      };
-    }),
-  };
+  base.rows = codes.map((c) => {
+    const key = String(c.code || "").toLowerCase();
+    const o = byCodeOrders.get(key) || {};
+    const r = byCodeReferrals.get(key) || {};
+    return {
+      id: String(c._id),
+      code: c.code,
+      isPrimary: !!c.isPrimary,
+      status: c.status || null,
+      discountPercent: c.discountPercent || 0,
+      commissionRate: c.commissionRate ?? null,
+      referrals: r.referrals || 0,
+      orders: o.orders || 0,
+      revenue: round2(o.revenue),
+      commission: round2(o.commission),
+      // Full shareable referral link (Shopify storefront discount URL,
+      // https://<retail-shop>/discount/<code>). Populated once the matching
+      // Shopify discount is created on the retail store; null until then.
+      referralUrl: c.shopifyDiscountUrl || null,
+    };
+  });
+  return base;
 }
 
 // ── Discounts & promotions (derived from practitioner codes) ─────────────────
@@ -744,4 +944,312 @@ export async function getDiscounts(practitionerId) {
       expiresAt: null,
     })),
   };
+}
+
+// ── Referral code self-service (practitioner WRITE paths) ────────────────────
+//
+// The portal lets a practitioner create their own referral codes + links and
+// pause/resume them. These are the ONLY write paths in the portal. Every query
+// is still scoped by the trusted `practitionerId` (the guard's tenant key) —
+// identity is never taken from the request body. Each created code is backed
+// by a real Shopify discount (created via cdo.discount.service) so the
+// generated link works at checkout.
+
+// The discount tiers offered in the portal dropdown (integer percents). Kept in
+// sync with the extension's own DISCOUNT_PERCENTS (extensions can't import
+// server modules) — update both if this list changes.
+export const PORTAL_DISCOUNT_PERCENTS = [10, 15, 20, 25, 30, 35, 40];
+
+// 3–40 chars, lowercase alphanumeric + hyphen/underscore, starting alphanumeric.
+const CODE_RE = /^[a-z0-9][a-z0-9_-]{2,39}$/;
+
+// Strip the protocol off a session token `dest` (e.g. "https://x.myshopify.com"
+// → "x.myshopify.com") so it can drive unauthenticated.admin / discount URLs.
+export function normalizeShopDomain(dest) {
+  let domain = String(dest || "");
+  try {
+    if (/^https?:\/\//i.test(domain)) domain = new URL(domain).host;
+  } catch {
+    /* use as-is */
+  }
+  return domain;
+}
+
+// Typed error the thin route handler maps to an HTTP status:
+//   INVALID         → 400   (bad code/percent/id)
+//   CONFLICT        → 409   (code taken / tier already active)
+//   DISCOUNT_FAILED → 502   (Shopify discount write failed)
+function portalError(code, message) {
+  const e = new Error(message);
+  e.code = code;
+  return e;
+}
+
+// Shape a CdoPractitionerCode doc into the row the dashboard renders (matching
+// getReferralCodes()'s row shape). Usage stats are zeroed — the frontend
+// reloads the full list (with aggregated stats) right after a mutation.
+function shapeCodeRow(c) {
+  return {
+    id: String(c._id),
+    code: c.code,
+    isPrimary: !!c.isPrimary,
+    status: c.status || null,
+    discountPercent: c.discountPercent || 0,
+    commissionRate: c.commissionRate ?? null,
+    referrals: 0,
+    orders: 0,
+    revenue: 0,
+    commission: 0,
+    referralUrl: c.shopifyDiscountUrl || null,
+  };
+}
+
+/**
+ * Create a practitioner-owned referral code + its Shopify discount link.
+ *
+ * Rules enforced (server-side is authoritative):
+ *   - code: valid format AND unique store-wide (catalogue + Shopify).
+ *   - discountPercent: one of PORTAL_DISCOUNT_PERCENTS.
+ *   - at most ONE active code per discount tier for this practitioner.
+ *
+ * The DB row is the atomic claim (unique {shop, code} index); if the Shopify
+ * discount can't be created (real failure OR the code already exists on
+ * Shopify) the row is rolled back so a code never lingers without a live link.
+ *
+ * @param {string} practitionerId            trusted tenant key (from the guard)
+ * @param {{ code: string, discountPercent: number }} input  discountPercent = integer percent
+ * @param {{ shop: string, application: object }} ctx
+ * @returns {Promise<object>} the new code row (getReferralCodes row shape)
+ * @throws {Error & { code: 'INVALID'|'CONFLICT'|'DISCOUNT_FAILED' }}
+ */
+export async function createReferralCode(
+  practitionerId,
+  { code, discountPercent } = {},
+  { shop, application } = {},
+) {
+  const raw = normalizeReferralCode(code);
+  if (!CODE_RE.test(raw)) {
+    throw portalError(
+      "INVALID",
+      "Code must be 3–40 characters using lowercase letters, numbers, hyphens or underscores, and start with a letter or number.",
+    );
+  }
+
+  const pct = Number(discountPercent);
+  if (!PORTAL_DISCOUNT_PERCENTS.includes(pct)) {
+    throw portalError(
+      "INVALID",
+      `Discount must be one of: ${PORTAL_DISCOUNT_PERCENTS.map((p) => `${p}%`).join(", ")}.`,
+    );
+  }
+  const fraction = pct / 100;
+
+  // Rule A — one ACTIVE code per discount tier (paused/archived don't count, so
+  // a tier frees up when its code is paused).
+  const tierClash = await CdoPractitionerCode.findOne({
+    practitionerId,
+    status: "active",
+    discountPercent: fraction,
+  })
+    .select("code")
+    .lean();
+  if (tierClash) {
+    throw portalError(
+      "CONFLICT",
+      `You already have an active code at ${pct}% (${tierClash.code}). Pause it first to create another at this discount.`,
+    );
+  }
+
+  // Rule B — store-wide code uniqueness (our catalogue; Shopify is checked at
+  // discount-create time below). Case-insensitive exact match.
+  const codeClash = await CdoPractitionerCode.findOne({
+    code: { $regex: `^${escapeRegex(raw)}$`, $options: "i" },
+  })
+    .select("_id")
+    .lean();
+  if (codeClash) {
+    throw portalError("CONFLICT", `The code "${raw}" is already taken. Choose another.`);
+  }
+
+  const fullName =
+    [application?.firstName, application?.lastName].filter(Boolean).join(" ").trim() ||
+    application?.businessName ||
+    null;
+
+  // Claim the row — the unique {shop, code} index is the race net.
+  let created;
+  try {
+    created = await CdoPractitionerCode.create({
+      shop: shop || null,
+      practitionerId,
+      practitionerSource: "wholesale",
+      practitionerEmail: application?.email || null,
+      practitionerName: fullName,
+      code: raw,
+      isPrimary: false,
+      discountPercent: fraction,
+      commissionRate: null,
+      status: "active",
+      createdBy: "portal-self-service",
+      updatedBy: "portal-self-service",
+    });
+  } catch (err) {
+    if (err?.code === 11000) {
+      throw portalError("CONFLICT", `The code "${raw}" is already taken. Choose another.`);
+    }
+    throw err;
+  }
+
+  // Create the Shopify discount. Roll back the row on any failure so we never
+  // leave a code with a dead/absent storefront link.
+  const disc = await createShopifyDiscount({
+    shop,
+    code: raw,
+    discountPercent: fraction,
+    practitionerName: fullName,
+  });
+
+  if (!disc.ok || disc.duplicate) {
+    await CdoPractitionerCode.deleteOne({ _id: created._id });
+    if (disc.duplicate) {
+      // The code exists on Shopify but not in our catalogue — a foreign/manual
+      // discount. Treat as taken rather than silently adopting it.
+      throw portalError("CONFLICT", `The code "${raw}" is already taken. Choose another.`);
+    }
+    log.error("create_referral.discount_failed", {
+      practitionerId,
+      code: raw,
+      err: disc.error,
+    });
+    throw portalError(
+      "DISCOUNT_FAILED",
+      "We couldn't create the discount on the store. Please try again.",
+    );
+  }
+
+  await CdoPractitionerCode.updateOne(
+    { _id: created._id },
+    {
+      $set: {
+        shopifyDiscountId: disc.shopifyDiscountId || null,
+        shopifyDiscountUrl: disc.shopifyDiscountUrl || null,
+      },
+    },
+  );
+  created.shopifyDiscountId = disc.shopifyDiscountId || null;
+  created.shopifyDiscountUrl = disc.shopifyDiscountUrl || null;
+
+  log.info("create_referral.ok", {
+    practitionerId,
+    code: raw,
+    discountPercent: fraction,
+  });
+
+  // Archive nudge (bug 10): a practitioner can hold codes at several tiers at
+  // once, which quietly creates competing public offers. Return the practitioner's
+  // OTHER active codes alongside the new one so the portal can prompt
+  // "you now have N active codes — archive the older ones?" with a one-click
+  // archive (setReferralCodeStatus → 'paused'/archive). Extra field only — the
+  // new-code shape is otherwise unchanged, so existing callers are unaffected.
+  const otherActive = await CdoPractitionerCode.find({
+    practitionerId,
+    status: "active",
+    _id: { $ne: created._id },
+  })
+    .sort({ createdAt: -1 })
+    .lean();
+
+  const row = shapeCodeRow(created);
+  row.otherActiveCodes = otherActive.map((c) => shapeCodeRow(c));
+  return row;
+}
+
+/**
+ * Pause or resume a practitioner's referral code. Pausing deactivates the
+ * Shopify discount (the link stops applying) and frees its discount tier for
+ * re-use; resuming reactivates it. The Shopify toggle runs FIRST so the DB
+ * status and the storefront never disagree — if the store update fails the DB
+ * is left unchanged and the caller gets a 502.
+ *
+ * @param {string} practitionerId        trusted tenant key (from the guard)
+ * @param {{ codeId: string, status: 'active'|'paused' }} input
+ * @param {{ shop: string }} ctx
+ * @returns {Promise<object>} the updated code row
+ * @throws {Error & { code: 'INVALID'|'CONFLICT'|'DISCOUNT_FAILED' }}
+ */
+export async function setReferralCodeStatus(
+  practitionerId,
+  { codeId, status } = {},
+  { shop } = {},
+) {
+  if (status !== "active" && status !== "paused") {
+    throw portalError("INVALID", "Invalid status.");
+  }
+  if (!codeId) throw portalError("INVALID", "A code id is required.");
+
+  // Tenant-scoped — a practitioner can only ever touch their OWN code.
+  let doc;
+  try {
+    doc = await CdoPractitionerCode.findOne({ _id: codeId, practitionerId });
+  } catch {
+    // Malformed ObjectId etc. → treat as not found.
+    doc = null;
+  }
+  if (!doc) throw portalError("INVALID", "Referral code not found.");
+  if (doc.status === "archived") {
+    throw portalError("INVALID", "Archived codes can't be changed.");
+  }
+
+  // Idempotent — already in the requested state.
+  if (doc.status === status) return shapeCodeRow(doc);
+
+  // Resuming must not produce a second active code at the same discount tier.
+  if (status === "active") {
+    const clash = await CdoPractitionerCode.findOne({
+      practitionerId,
+      status: "active",
+      discountPercent: doc.discountPercent,
+      _id: { $ne: doc._id },
+    })
+      .select("code")
+      .lean();
+    if (clash) {
+      const pct = Math.round((doc.discountPercent || 0) * 100);
+      throw portalError(
+        "CONFLICT",
+        `You already have an active code at ${pct}% (${clash.code}). Pause it first.`,
+      );
+    }
+  }
+
+  // Toggle the storefront discount before flipping the DB status.
+  if (doc.shopifyDiscountId) {
+    const r = await setShopifyDiscountActive({
+      shop: shop || doc.shop,
+      discountId: doc.shopifyDiscountId,
+      active: status === "active",
+    });
+    if (!r.ok) {
+      log.error("set_status.discount_failed", {
+        practitionerId,
+        codeId: String(doc._id),
+        status,
+        err: r.error,
+      });
+      throw portalError(
+        "DISCOUNT_FAILED",
+        "We couldn't update the discount on the store. Please try again.",
+      );
+    }
+  }
+
+  doc.status = status;
+  doc.updatedBy = "portal-self-service";
+  await doc.save();
+  log.info("set_status.ok", {
+    practitionerId,
+    codeId: String(doc._id),
+    status,
+  });
+  return shapeCodeRow(doc);
 }

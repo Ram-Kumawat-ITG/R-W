@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import {
   useLoaderData,
   useNavigate,
+  useRevalidator,
   useFetcher,
 } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
@@ -21,7 +22,6 @@ import {
   resolveCustomerAchBillingId,
 } from "../services/customer/customer.service";
 import { syncFulfillmentsFromShopify } from "../services/order/order.service";
-import { buildPayLinkUrl } from "../services/payment/payLink.utils";
 import { invoiceConfig } from "../services/invoice/invoice.config";
 import {
   computeProcessingFee,
@@ -36,7 +36,10 @@ import {
   PaymentMethodBadge,
   OutcomeBadge,
   ShipmentStatusBadge,
+  LineItemsTable,
+  CollapsibleSection,
 } from "../components/admin-ui";
+import { BackToTop } from "../components/BackToTop";
 import { carrierDisplayName } from "../utils/shipping.constants";
 import { formatAmount, fmtDateTime } from "../utils/format.utils";
 import { PAYMENT_METHOD_LABEL } from "../utils/payment.constants";
@@ -367,20 +370,6 @@ export const loader = async ({ request, params }) => {
     }
   }
 
-  // Immediate Payment — surface the customer's self-pay link for invoices
-  // that carry a pay token. Rebuilt from the current configured base URL so
-  // the admin always sees a live link (the link baked into the QBO invoice
-  // memo is frozen at creation time).
-  let payLink = null;
-  if (invoice?.payToken) {
-    try {
-      payLink = { url: buildPayLinkUrl(invoice.payToken) };
-    } catch (e) {
-      // Misconfigured base URL — surface it instead of 500-ing the page.
-      payLink = { url: null, error: e?.message || "Pay-link base URL not configured" };
-    }
-  }
-
   // Card on file — the card captured at registration and vaulted in NMI.
   // `hasVault` (resolved cache-or-source-of-truth) gates the "Charge card
   // on file" recovery action; brand/last4 come from the stored registration
@@ -398,7 +387,6 @@ export const loader = async ({ request, params }) => {
     customerMap: customerMap ? serialize(customerMap) : null,
     businessName,
     breakdown,
-    payLink,
     cardOnFile,
     // Processing-fee rates by settlement method. Surfaced to the client
     // so confirmation modals (charge-card, mark-cheque-paid) can show the
@@ -493,16 +481,16 @@ function serialize(doc) {
 }
 
 export default function OrderDetail() {
-  const { order, invoice, attempts, customerMap, businessName, breakdown, qbo, processingFeeRates, payLink, cardOnFile } =
+  const { order, invoice, attempts, customerMap, businessName, breakdown, qbo, processingFeeRates, cardOnFile } =
     useLoaderData();
   const navigate = useNavigate();
+  const revalidator = useRevalidator();
   const shopify = useAppBridge();
   const retryFetcher = useFetcher();
   const chequeFetcher = useFetcher();
   const chargeCardFetcher = useFetcher();
   const pdfFetcher = useFetcher();
   const sendInvoiceFetcher = useFetcher();
-  const refreshPayLinkFetcher = useFetcher();
   const pauseAutoChargeFetcher = useFetcher();
   const resumeAutoChargeFetcher = useFetcher();
   const pauseRemindersFetcher = useFetcher();
@@ -533,7 +521,6 @@ export default function OrderDetail() {
   const handledChargeCardRef = useRef(null);
   const handledPdfRef = useRef(null);
   const handledSendInvoiceRef = useRef(null);
-  const handledRefreshPayLinkRef = useRef(null);
   const handledPauseAutoChargeRef = useRef(null);
   const handledResumeAutoChargeRef = useRef(null);
   const handledPauseRemindersRef = useRef(null);
@@ -570,10 +557,6 @@ export default function OrderDetail() {
   // receipt path. The "Charge card on file" fallback remains visible
   // for both cheque AND ACH (it's the cross-method override).
   const isChequeInvoice = paymentMethod === "check";
-  // Immediate Payment invoices have no auto-charge and no stored vault of
-  // their own — "Charge card on file" is the admin's payment-recovery path
-  // when the customer never paid via the link.
-  const isImmediateInvoice = paymentMethod === "immediate";
   // Immutable preference snapshot taken when this invoice was created.
   // Reads ONLY from customerPaymentPreference — never falls back to
   // paymentMethod (which is mutable via cheque → card override). Legacy
@@ -689,12 +672,12 @@ export default function OrderDetail() {
       (isAchInvoice && !!customerMap?.nmiAchBillingId));
   const canMarkChequePaid = isChequeInvoice && statusAllowsAction;
   // "Charge card on file" is the cross-method payment-recovery action:
-  // a cheque / ACH / Immediate-Payment invoice that the customer didn't
-  // settle via their preferred method, collected instead against the card
-  // captured at registration. Requires a card vault id regardless of the
-  // invoice's current paymentMethod. (Card invoices use "Retry payment",
-  // which already charges the same vault.)
-  const showChargeCard = isManualInvoice || isImmediateInvoice;
+  // a cheque / ACH invoice that the customer didn't settle via their
+  // preferred method, collected instead against the card captured at
+  // registration. Requires a card vault id regardless of the invoice's
+  // current paymentMethod. (Card invoices use "Retry payment", which
+  // already charges the same vault.)
+  const showChargeCard = isManualInvoice;
   const canChargeCard =
     showChargeCard &&
     statusAllowsAction &&
@@ -1204,35 +1187,6 @@ export default function OrderDetail() {
     sendInvoiceFetcher.state === "submitting" ||
     sendInvoiceFetcher.state === "loading";
 
-  // Refresh payment link — re-stamp the QBO invoice memo with the pay link
-  // built from the CURRENT app URL (fixes links baked to a rotated dev
-  // tunnel). Loader auto-revalidates, so the displayed link updates too.
-  const onRefreshPayLink = () => {
-    setBannerError(null);
-    setBannerSuccess(null);
-    refreshPayLinkFetcher.submit(null, {
-      method: "POST",
-      action: `/api/admin/orders/${order._id}/refresh-pay-link`,
-    });
-  };
-  useEffect(() => {
-    if (!refreshPayLinkFetcher.data) return;
-    if (refreshPayLinkFetcher.state !== "idle") return;
-    if (handledRefreshPayLinkRef.current === refreshPayLinkFetcher.data) return;
-    handledRefreshPayLinkRef.current = refreshPayLinkFetcher.data;
-    const data = refreshPayLinkFetcher.data;
-    if (data.status === "success") {
-      setBannerSuccess(data.message || "Payment link refreshed");
-      shopify?.toast?.show(data.message || "Payment link refreshed");
-    } else {
-      setBannerError(data.message || "Could not refresh payment link");
-      shopify?.toast?.show(data.message || "Refresh failed", { isError: true });
-    }
-  }, [refreshPayLinkFetcher.data, refreshPayLinkFetcher.state, shopify]);
-  const refreshPayLinkLoading =
-    refreshPayLinkFetcher.state === "submitting" ||
-    refreshPayLinkFetcher.state === "loading";
-
   const outstanding =
     invoice != null
       ? Number((invoice.amountDue - invoice.amountPaid).toFixed(2))
@@ -1313,14 +1267,6 @@ export default function OrderDetail() {
 
   return (
     <s-page inlineSize="large" heading={`Order ${orderLabel}`}>
-      <s-button
-        slot="back-action"
-        icon="arrow-left"
-        accessibilityLabel="Back to orders"
-        onClick={() => navigate("/app/orders")}
-      >
-        Back
-      </s-button>
       {invoice &&
         (isCardInvoice || isAchInvoice) &&
         invoice.paymentStatus !== "paid" &&
@@ -1424,7 +1370,25 @@ export default function OrderDetail() {
         </s-button>
       )}
 
-      <s-box paddingBlockStart="large-200" />
+      <s-box paddingBlockEnd="small-200">
+        <s-stack direction="inline" gap="base" alignItems="center">
+          <s-button
+            variant="tertiary"
+            icon="arrow-left"
+            onClick={() => navigate("/app/orders")}
+          >
+            Back to Orders
+          </s-button>
+          <s-button
+            variant="tertiary"
+            icon="refresh"
+            onClick={() => revalidator.revalidate()}
+            {...(revalidator.state !== "idle" ? { loading: true } : {})}
+          >
+            Refresh
+          </s-button>
+        </s-stack>
+      </s-box>
 
       {bannerSuccess && (
         <s-banner tone="success" heading="Retry succeeded">
@@ -1438,7 +1402,7 @@ export default function OrderDetail() {
       )}
 
       {/* ───── Status pipeline ───── */}
-      <s-section heading="Status pipeline">
+      <CollapsibleSection heading="Status pipeline" storageKey="w-ord-status" defaultOpen>
         <s-stack
           direction="inline"
           gap="base"
@@ -1452,10 +1416,10 @@ export default function OrderDetail() {
             </Fragment>
           ))}
         </s-stack>
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Overview ───── */}
-      <s-section heading="Overview">
+      <CollapsibleSection heading="Overview" storageKey="w-ord-overview">
         <s-stack direction="block" gap="base">
           <s-stack direction="inline" gap="base" alignItems="center">
             <ProcessingBadge
@@ -1521,15 +1485,16 @@ export default function OrderDetail() {
             </s-banner>
           )}
         </s-stack>
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Shipment tracking ───── */}
-      <s-section
+      <CollapsibleSection
         heading={`Shipment tracking${
           order.trackingUpdatedAt
             ? ` · updated ${new Date(order.trackingUpdatedAt).toLocaleString()}`
             : ""
         }`}
+        storageKey="w-ord-shipment"
       >
         {!order.fulfillments?.length ? (
           <s-paragraph tone="subdued">
@@ -1686,11 +1651,12 @@ export default function OrderDetail() {
             )}
           </s-stack>
         )}
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Line items + totals ───── */}
-      <s-section
+      <CollapsibleSection
         heading={`Line items (${breakdown?.lineItems?.length ?? 0})`}
+        storageKey="w-ord-lineitems"
       >
         {!breakdown?.lineItems?.length ? (
           <s-paragraph tone="subdued">
@@ -1698,47 +1664,11 @@ export default function OrderDetail() {
           </s-paragraph>
         ) : (
           <s-stack direction="block" gap="base">
-            <s-table>
-              <s-table-header-row>
-                <s-table-header>Product</s-table-header>
-                <s-table-header>SKU</s-table-header>
-                <s-table-header>Qty</s-table-header>
-                <s-table-header>Unit price</s-table-header>
-                <s-table-header>Discount</s-table-header>
-                <s-table-header>Line total</s-table-header>
-              </s-table-header-row>
-              <s-table-body>
-                {breakdown.lineItems.map((li) => (
-                  <s-table-row key={li.id || `${li.name}-${li.sku}`}>
-                    <s-table-cell>
-                      <s-stack direction="block" gap="none">
-                        <s-text>{li.name}</s-text>
-                        {li.variantTitle && (
-                          <s-text tone="subdued">{li.variantTitle}</s-text>
-                        )}
-                        {li.vendor && (
-                          <s-text tone="subdued">by {li.vendor}</s-text>
-                        )}
-                        {li.giftCard && <s-badge tone="info">Gift card</s-badge>}
-                      </s-stack>
-                    </s-table-cell>
-                    <s-table-cell>{li.sku || "—"}</s-table-cell>
-                    <s-table-cell>{li.quantity}</s-table-cell>
-                    <s-table-cell>
-                      {formatAmount(li.unitPrice, breakdown.currency)}
-                    </s-table-cell>
-                    <s-table-cell>
-                      {li.discount > 0
-                        ? `− ${formatAmount(li.discount, breakdown.currency)}`
-                        : "—"}
-                    </s-table-cell>
-                    <s-table-cell>
-                      {formatAmount(li.lineTotal, breakdown.currency)}
-                    </s-table-cell>
-                  </s-table-row>
-                ))}
-              </s-table-body>
-            </s-table>
+            <LineItemsTable
+              lineItems={breakdown.lineItems}
+              currency={breakdown.currency}
+              orderLabel={orderLabel}
+            />
 
             {invoiceCalc && (
               <s-box
@@ -1811,10 +1741,10 @@ export default function OrderDetail() {
             )}
           </s-stack>
         )}
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Customer ───── */}
-      <s-section heading="Customer">
+      <CollapsibleSection heading="Customer" storageKey="w-ord-customer">
         <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="large-100">
           <s-grid-item>
             <KV label="Email" value={order.customerEmail} />
@@ -1854,10 +1784,10 @@ export default function OrderDetail() {
             />
           </s-grid-item>
         </s-grid>
-      </s-section>
+      </CollapsibleSection>
 
       {/* ───── Invoice & payment ───── */}
-      <s-section heading="Invoice & payment">
+      <CollapsibleSection heading="Invoice & payment" storageKey="w-ord-invoice">
         {!invoice ? (
           <s-paragraph tone="subdued">
             No invoice has been created for this order yet.
@@ -2321,112 +2251,76 @@ export default function OrderDetail() {
 
           </s-stack>
         )}
-      </s-section>
-
-      {/* ───── Immediate Payment — self-pay link + QR ───── */}
-      {invoice?.paymentMethod === "immediate" && payLink && (
-        <s-section heading="Payment link (Immediate Payment)">
-          <s-stack direction="block" gap="base">
-            <s-paragraph>
-              This customer pays each invoice on demand via a secure link
-              included on the QuickBooks invoice. The link always charges the
-              current outstanding balance.
-            </s-paragraph>
-            <s-stack direction="inline" gap="base">
-              <PaymentStatusBadge status={invoice.paymentStatus} />
-            </s-stack>
-            {payLink.url ? (
-              <s-stack direction="inline" gap="base">
-                <s-link href={payLink.url} target="_blank">
-                  {payLink.url}
-                </s-link>
-                <s-button
-                  variant="secondary"
-                  onClick={() => {
-                    if (typeof navigator !== "undefined" && navigator.clipboard) {
-                      navigator.clipboard.writeText(payLink.url);
-                      shopify.toast.show("Payment link copied");
-                    }
-                  }}
-                >
-                  Copy link
-                </s-button>
-                <s-button
-                  variant="secondary"
-                  onClick={onRefreshPayLink}
-                  {...(refreshPayLinkLoading ? { loading: true } : {})}
-                >
-                  Refresh link on invoice
-                </s-button>
-              </s-stack>
-            ) : (
-              <s-banner tone="critical">
-                Can&apos;t build the payment link: {payLink.error}
-              </s-banner>
-            )}
-            <s-text tone="subdued">
-              The link is saved on the QuickBooks invoice when it&apos;s created.
-              If the app&apos;s URL has changed since then, click “Refresh link on
-              invoice” to update the emailed/QBO copy to this current link.
-            </s-text>
-          </s-stack>
-        </s-section>
-      )}
+      </CollapsibleSection>
 
       {/* ───── QuickBooks invoice (live fetch) ───── */}
-      {invoice?.qboInvoiceId && (
-        <s-section heading="QuickBooks invoice">
+      {invoice && (
+        <CollapsibleSection heading="QuickBooks invoice" storageKey="w-ord-qbo">
           <s-stack direction="block" gap="base">
-            <s-stack
-              direction="inline"
-              gap="base"
-              alignItems="center"
-              justifyContent="space-between"
-            >
-              <s-stack direction="inline" gap="base" alignItems="center">
-                {qbo?.invoice?.docNumber && (
-                  <s-badge tone="info">#{qbo.invoice.docNumber}</s-badge>
-                )}
-                <s-text tone="subdued">
-                  QBO id: {invoice.qboInvoiceId}
-                </s-text>
-                {qbo?.url && (
-                  <s-link href={qbo.url} target="_blank">
-                    Open in QuickBooks ↗
-                  </s-link>
-                )}
-              </s-stack>
-              <s-stack direction="inline" gap="base">
-                <s-button
-                  variant="secondary"
-                  onClick={onSendInvoice}
-                  {...(sendInvoiceLoading ? { loading: true } : {})}
-                >
-                  Send invoice
-                </s-button>
-                <s-button
-                  variant="secondary"
-                  onClick={onViewPdf}
-                  {...(pdfLoading ? { loading: true } : {})}
-                >
-                  View invoice PDF
-                </s-button>
-              </s-stack>
+            {/* Status header */}
+            <s-stack direction="inline" gap="base" alignItems="center">
+              {invoice.qboInvoiceId ? (
+                <>
+                  {qbo?.invoice?.docNumber && (
+                    <s-badge tone="info">#{qbo.invoice.docNumber}</s-badge>
+                  )}
+                  <s-badge tone="success">Synced to QBO</s-badge>
+                </>
+              ) : (
+                <s-badge tone="neutral">Not yet synced to QBO</s-badge>
+              )}
             </s-stack>
 
-            {qbo?.error && (
-              <s-banner
-                tone="warning"
-                heading="Could not load live QBO invoice"
-              >
-                <s-paragraph>{qbo.error}</s-paragraph>
-                <s-paragraph tone="subdued">
-                  The local mirror above still shows what we recorded at
-                  creation time. Use the QuickBooks link to view the
-                  current state.
-                </s-paragraph>
-              </s-banner>
-            )}
+            {invoice.qboInvoiceId ? (
+              <>
+                <s-stack
+                  direction="inline"
+                  gap="base"
+                  alignItems="center"
+                  justifyContent="space-between"
+                >
+                  <s-text tone="subdued">
+                    QBO id: {invoice.qboInvoiceId}
+                  </s-text>
+                  <s-stack direction="inline" gap="base">
+                    {qbo?.url && (
+                      <s-button
+                        variant="secondary"
+                        onClick={() => window.open(qbo.url, "_blank")}
+                      >
+                        View Invoice ↗
+                      </s-button>
+                    )}
+                    <s-button
+                      variant="secondary"
+                      onClick={onSendInvoice}
+                      {...(sendInvoiceLoading ? { loading: true } : {})}
+                    >
+                      Send invoice
+                    </s-button>
+                    <s-button
+                      variant="secondary"
+                      onClick={onViewPdf}
+                      {...(pdfLoading ? { loading: true } : {})}
+                    >
+                      View invoice PDF
+                    </s-button>
+                  </s-stack>
+                </s-stack>
+
+                {qbo?.error && (
+                  <s-banner
+                    tone="warning"
+                    heading="Could not load live QBO invoice"
+                  >
+                    <s-paragraph>{qbo.error}</s-paragraph>
+                    <s-paragraph tone="subdued">
+                      The local mirror above still shows what we recorded at
+                      creation time. Use the QuickBooks link to view the
+                      current state.
+                    </s-paragraph>
+                  </s-banner>
+                )}
 
             {qbo?.invoice && (
               <>
@@ -2639,14 +2533,21 @@ export default function OrderDetail() {
                 )}
               </>
             )}
+              </>
+            ) : (
+              <s-paragraph tone="subdued">
+                Invoice not yet synced to QuickBooks. Syncs automatically — check back shortly.
+              </s-paragraph>
+            )}
           </s-stack>
-        </s-section>
+        </CollapsibleSection>
       )}
 
       {/* ───── Email history ───── */}
       {invoice && (
-        <s-section
+        <CollapsibleSection
           heading={`Email history (${invoice.emailEvents?.length || 0})`}
+          storageKey="w-ord-emails"
         >
           {!invoice.emailEvents || invoice.emailEvents.length === 0 ? (
             <s-paragraph tone="subdued">
@@ -2711,12 +2612,12 @@ export default function OrderDetail() {
               </s-table-body>
             </s-table>
           )}
-        </s-section>
+        </CollapsibleSection>
       )}
 
       {/* ───── Attempt history ───── */}
       {invoice && (
-        <s-section heading={`Attempt history (${attempts.length})`}>
+        <CollapsibleSection heading={`Attempt history (${attempts.length})`} storageKey="w-ord-attempts">
           {attempts.length === 0 ? (
             <s-paragraph tone="subdued">No charge attempts yet.</s-paragraph>
           ) : (
@@ -2755,12 +2656,12 @@ export default function OrderDetail() {
               </s-table-body>
             </s-table>
           )}
-        </s-section>
+        </CollapsibleSection>
       )}
 
       {/* ───── Remarks (CRON + admin follow-up timeline) ───── */}
       {invoice && (
-        <s-section heading={`Remarks (${invoice.remarks?.length || 0})`}>
+        <CollapsibleSection heading={`Remarks (${invoice.remarks?.length || 0})`} storageKey="w-ord-remarks">
           {!invoice.remarks?.length ? (
             <s-paragraph tone="subdued">
               No remarks yet. CRON ticks and admin settlement actions
@@ -2818,7 +2719,7 @@ export default function OrderDetail() {
               </s-table-body>
             </s-table>
           )}
-        </s-section>
+        </CollapsibleSection>
       )}
 
       <s-modal
@@ -3182,6 +3083,7 @@ export default function OrderDetail() {
           Cancel
         </s-button>
       </s-modal>
+      <BackToTop />
     </s-page>
   );
 }

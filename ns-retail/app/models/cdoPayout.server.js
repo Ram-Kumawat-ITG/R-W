@@ -12,6 +12,20 @@
 
 import mongoose from "mongoose";
 
+// Check payout details — only populated for method: "check" payouts once
+// the admin marks them paid after physically issuing the check.
+const checkDetailsSchema = new mongoose.Schema(
+  {
+    checkNumber: { type: String, default: null },
+    checkDate: { type: Date, default: null },
+    mailedTo: { type: String, default: null },
+    notes: { type: String, default: null },
+    issuedBy: { type: String, default: null }, // admin email / actor
+    issuedAt: { type: Date, default: null },
+  },
+  { _id: false },
+);
+
 // Append-only audit entry for the payout timeline.
 const remarkSchema = new mongoose.Schema(
   {
@@ -31,6 +45,7 @@ const remarkSchema = new mongoose.Schema(
         "settlement_pending",
         "failed",
         "cancelled",
+        "check_issued",
         "system_note",
         "admin_action",
       ],
@@ -112,6 +127,10 @@ const cdoPayoutSchema = new mongoose.Schema(
     // fields). Cleared once a valid snapshot is captured. Lets admins filter
     // payouts blocked on banking.
     bankingError: { type: String, default: null },
+
+    // Check payout details — null for ACH payouts; populated by markCheckPayoutPaid
+    // once the admin physically issues and records a check.
+    checkDetails: { type: checkDetailsSchema, default: null },
 
     // ── Real-money disbursement + settlement ──
     // The QBO Bill records the LIABILITY at execution; the actual bank→bank

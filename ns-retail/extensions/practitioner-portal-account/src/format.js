@@ -34,3 +34,26 @@ export function titleCase(s) {
   if (!s) return '—'
   return String(s).charAt(0).toUpperCase() + String(s).slice(1)
 }
+
+// Extract a concise, human-readable message from a stored payout-failure
+// reason. Pipeline reasons are often a prefix + a raw provider JSON blob, e.g.
+//   Dwolla createTransfer failed (400): {"code":"ValidationError","message":
+//   "Validation error(s) present…","_embedded":{"errors":[{"message":
+//   "Insufficient funds."}]}}
+// Show only the most specific message (embedded error → top-level message →
+// the prefix before the JSON), never the full JSON dump.
+export function payoutReasonMessage(reason) {
+  if (!reason) return ''
+  const str = String(reason).trim()
+  const braceIdx = str.indexOf('{')
+  if (braceIdx === -1) return str
+  const prefix = str.slice(0, braceIdx).replace(/[:\s]+$/, '').trim()
+  try {
+    const obj = JSON.parse(str.slice(braceIdx))
+    const embedded = obj?._embedded?.errors?.[0]?.message
+    return embedded || obj?.message || prefix || str
+  } catch {
+    // JSON unparseable (e.g. truncated) — fall back to the human prefix.
+    return prefix || str
+  }
+}

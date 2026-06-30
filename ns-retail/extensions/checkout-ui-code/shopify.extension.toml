@@ -22,6 +22,13 @@ api_access = true
 # submission.
 network_access = true
 
+# REQUIRED so the extension can BLOCK checkout progress (buyerJourney
+# intercept) while a referral-code validation is unresolved. Without this,
+# Shopify silently downgrades `behavior: 'block'` to `allow`. Merchants can
+# toggle this under "Checkout behavior" in the checkout editor; when running
+# locally it is auto-granted.
+block_progress = true
+
 # ── App URL bridge ──────────────────────────────────────────────────
 # The admin app (app/routes/app.jsx loader) writes the current app URL
 # to a shop metafield in the $app:cdo namespace on every admin load.

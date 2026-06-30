@@ -1,6 +1,6 @@
 /* global shopify */
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks'
-import { apiGet, ApiError } from './api.js'
+import { apiGet, ApiError } from '../../services/FullPageApi.jsx'
 import { titleCase } from './format.js'
 
 // ── Data hook ────────────────────────────────────────────────────────────────
@@ -147,12 +147,40 @@ export function StatCards({ cards }) {
 }
 
 // Table built from s-grid (the sandbox has no arbitrary HTML/<table>).
-// columns: { key, label, render?(row) }
-export function Table({ columns, rows, empty = 'No data yet.' }) {
+// columns: { key, label, width?, render?(row) }
+// renderExpanded?(row): optional. When it returns content for a row, that row
+//   becomes clickable and toggles an expandable panel beneath it (a trailing
+//   ▸/▾ chevron marks which rows expand). Tables that don't pass it are
+//   rendered exactly as before.
+export function Table({ columns, rows, empty = 'No data yet.', renderExpanded }) {
+  const [open, setOpen] = useState({})
   if (!rows || rows.length === 0) {
     return <s-text color="subdued">{empty}</s-text>
   }
-  const template = columns.map((c) => c.width || '1fr').join(' ')
+  const expandable = typeof renderExpanded === 'function'
+  const baseTemplate = columns.map((c) => c.width || '1fr').join(' ')
+  // Trailing auto-width track holds the disclosure chevron when expandable.
+  const template = expandable ? `${baseTemplate} auto` : baseTemplate
+  const toggle = (id) => setOpen((prev) => ({ ...prev, [id]: !prev[id] }))
+
+  // The grid of value cells for one row (+ the chevron cell when expandable).
+  const rowGrid = (row, isOpen, hasContent) => (
+    <s-grid gridTemplateColumns={template} gap="base">
+      {columns.map((c) => (
+        <s-box key={c.key}>
+          {c.render ? c.render(row) : <s-text>{row[c.key] ?? '—'}</s-text>}
+        </s-box>
+      ))}
+      {expandable ? (
+        <s-box>
+          {hasContent ? (
+            <s-text color="subdued">{isOpen ? '▾' : '▸'}</s-text>
+          ) : null}
+        </s-box>
+      ) : null}
+    </s-grid>
+  )
+
   return (
     <s-stack direction="block" gap="small-300">
       <s-grid gridTemplateColumns={template} gap="base">
@@ -161,18 +189,50 @@ export function Table({ columns, rows, empty = 'No data yet.' }) {
             {c.label}
           </s-text>
         ))}
+        {expandable ? <s-text> </s-text> : null}
       </s-grid>
       <s-divider />
-      {rows.map((row, i) => [
-        <s-grid key={`r-${row.id || i}`} gridTemplateColumns={template} gap="base">
-          {columns.map((c) => (
-            <s-box key={c.key}>
-              {c.render ? c.render(row) : <s-text>{row[c.key] ?? '—'}</s-text>}
+      {rows.map((row, i) => {
+        const id = row.id || i
+        if (!expandable) {
+          return [
+            <s-grid key={`r-${id}`} gridTemplateColumns={template} gap="base">
+              {columns.map((c) => (
+                <s-box key={c.key}>
+                  {c.render ? c.render(row) : <s-text>{row[c.key] ?? '—'}</s-text>}
+                </s-box>
+              ))}
+            </s-grid>,
+            i < rows.length - 1 ? <s-divider key={`d-${id}`} /> : null,
+          ]
+        }
+        const expandedContent = renderExpanded(row)
+        const hasContent = !!expandedContent
+        const isOpen = hasContent && !!open[id]
+        return [
+          hasContent ? (
+            <s-clickable
+              key={`r-${id}`}
+              onClick={() => toggle(id)}
+              background="transparent"
+              paddingBlock="small-300"
+              accessibilityLabel={isOpen ? 'Hide details' : 'Show details'}
+            >
+              {rowGrid(row, isOpen, true)}
+            </s-clickable>
+          ) : (
+            <s-box key={`r-${id}`} paddingBlock="small-300">
+              {rowGrid(row, false, false)}
             </s-box>
-          ))}
-        </s-grid>,
-        i < rows.length - 1 ? <s-divider key={`d-${row.id || i}`} /> : null,
-      ])}
+          ),
+          isOpen ? (
+            <s-box key={`e-${id}`} paddingBlockEnd="base" paddingInlineStart="base">
+              {expandedContent}
+            </s-box>
+          ) : null,
+          i < rows.length - 1 ? <s-divider key={`d-${id}`} /> : null,
+        ]
+      })}
     </s-stack>
   )
 }

@@ -71,9 +71,17 @@ async function jsonPost(path, body) {
 
 const ApiService = {
   // POST /api/cdo/checkout-validate-code
-  // Returns { valid: boolean, code?, practitionerName?, discountPercent? }
-  async verifyCode(code) {
-    const data = await jsonPost('/api/cdo/checkout-validate-code', { code });
+  // `identity` carries the buyer's email + Shopify customer id so the backend
+  // can enforce the permanent patient↔practitioner binding (a patient may only
+  // use codes from the practitioner they're already associated with). Both are
+  // best-effort — omitted when not available (guest checkout / no PCD email).
+  // Returns { valid, reason?, message?, code?, practitionerName?, discountPercent? }
+  async verifyCode(code, identity = {}) {
+    const data = await jsonPost('/api/cdo/checkout-validate-code', {
+      code,
+      email: identity.email || undefined,
+      customerId: identity.customerId || undefined,
+    });
     return data?.result || { valid: false };
   },
 
@@ -92,6 +100,28 @@ const ApiService = {
       shop,
     });
     return data?.result || { found: false };
+  },
+
+  // POST /api/cdo/checkout-apply-code
+  // When a customer applies a referral code, immediately tag the Shopify
+  // customer so the code becomes the default for future orders. This is
+  // fire-and-forget (non-blocking) — tag sync failure doesn't affect checkout.
+  // Returns { ok, tagged, code?, practitionerName?, discountPercent? }
+  async applyAndTagCode(code, identity = {}, shop = '') {
+    try {
+      const data = await jsonPost('/api/cdo/checkout-apply-code', {
+        code,
+        email: identity.email || undefined,
+        customerId: identity.customerId || undefined,
+        shopifyCustomerId: identity.shopifyCustomerId || undefined,
+        shopifyShop: shop || undefined,
+      });
+      return data?.result || { ok: false, tagged: false };
+    } catch (err) {
+      console.warn('[ApiService.applyAndTagCode] failed:', err?.message);
+      // Non-blocking: return a falsy result but don't throw
+      return { ok: false, tagged: false };
+    }
   },
 };
 

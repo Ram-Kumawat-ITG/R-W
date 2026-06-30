@@ -218,6 +218,42 @@ export const dwollaProvider = {
     );
   },
 
+  // Advance provider-side pending transfers so settlement is fully automated
+  // with NO manual dashboard step.
+  //
+  // PRODUCTION: real ACH settles through the banking network on its own — this
+  // is a no-op (returns immediately, no API call).
+  //
+  // SANDBOX: Dwolla never clears transfers on its own — they stay `pending`
+  // indefinitely until processed (normally the dashboard's "Process Bank
+  // Transfers" button). The API equivalent is `POST /sandbox-simulations`
+  // (body `{}`, → 202 `{ total }`), which processes/fails the last 500 pending
+  // bank transfers on the account. A bank→bank transfer has TWO legs (debit +
+  // credit), so it can take two simulation calls to fully clear — the per-tick
+  // settlement CRON calls this each tick before polling, so transfers converge
+  // pending → processed → settled automatically. No Dwolla dashboard interaction.
+  async processPendingTransfers() {
+    const c = cfg();
+    if (c.environment !== "sandbox") return { advanced: false, skipped: true };
+    // Each call processes one clearing pass; a bank→bank transfer's debit +
+    // credit legs clear on successive passes. Loop until nothing remains
+    // pending (capped) so everything settles within ONE settlement tick.
+    let processed = 0;
+    for (let pass = 0; pass < 4; pass += 1) {
+      const { res, body } = await request("POST", "/sandbox-simulations", { body: {} });
+      if (!res.ok) {
+        throw new Error(
+          `Dwolla sandbox-simulations failed (${res.status}): ${JSON.stringify(body)?.slice(0, 300)}`,
+        );
+      }
+      const total = body && typeof body.total === "number" ? body.total : 0;
+      processed += total;
+      if (total === 0) break;
+    }
+    if (processed) log.info("sandbox.transfers_processed", { processed });
+    return { advanced: processed > 0, total: processed };
+  },
+
   async getTransferStatus(transferId) {
     const id = idFromUrl(transferId);
     const { res, body } = await request("GET", `/transfers/${id}`);

@@ -620,6 +620,9 @@ function normalizeFulfillment(f) {
     shipmentStatus: f?.shipment_status || null,
     status: f?.status || null,
     fulfilledAt: f?.created_at ? new Date(f.created_at) : null,
+    // Explicit delivery date when the caller supplies one (the wholesale sync
+    // passes `delivered_at`); otherwise derived from the delivered transition.
+    deliveredAt: f?.delivered_at ? new Date(f.delivered_at) : null,
   };
 }
 
@@ -650,6 +653,12 @@ export async function recordFulfillmentAndSync({ shop, shopifyOrderId, fulfillme
     existing.shipmentStatus !== n.shipmentStatus ||
     existing.status !== n.status;
 
+  // Delivery milestone — stamp deliveredAt the first time we see `delivered`
+  // (first-write-wins so the recorded delivery date is stable), preferring the
+  // explicit date the caller supplied (the wholesale sync's `delivered_at`).
+  const isDelivered = String(n.shipmentStatus || "").toLowerCase() === "delivered";
+  const deliveredStamp = n.deliveredAt ? new Date(n.deliveredAt) : now;
+
   if (existing) {
     existing.trackingNumber = n.trackingNumber;
     existing.trackingCompany = n.trackingCompany;
@@ -657,6 +666,7 @@ export async function recordFulfillmentAndSync({ shop, shopifyOrderId, fulfillme
     existing.shipmentStatus = n.shipmentStatus;
     existing.status = n.status;
     if (n.fulfilledAt) existing.fulfilledAt = n.fulfilledAt;
+    if (isDelivered && !existing.deliveredAt) existing.deliveredAt = deliveredStamp;
     existing.updatedAt = now;
   } else {
     order.fulfillments.push({
@@ -667,6 +677,7 @@ export async function recordFulfillmentAndSync({ shop, shopifyOrderId, fulfillme
       shipmentStatus: n.shipmentStatus,
       status: n.status,
       fulfilledAt: n.fulfilledAt,
+      deliveredAt: isDelivered ? deliveredStamp : null,
       createdAt: now,
       updatedAt: now,
     });

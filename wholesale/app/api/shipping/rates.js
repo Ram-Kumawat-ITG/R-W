@@ -14,37 +14,26 @@
 //     complete the purchase. On any error we still return 200 with
 //     { rates: [] } so Shopify can fall back gracefully.
 //
-// What this endpoint does (3-tier priority):
+// What this endpoint does:
 //   1. Verifies the Shopify HMAC header (logs mismatch in dev; reject in prod).
 //   2. Reads items + origin + destination from the Shopify payload.
+//   3. Calls USPS + UPS direct-carrier APIs in parallel:
+//        • USPS Web Tools v3 (USPS_CLIENT_ID / USPS_CLIENT_SECRET) — fans out
+//          one call per mail class (Ground Advantage / Priority / Express /
+//          First-Class Package) so each tier's required rateIndicator +
+//          processingCategory combo is sent correctly.
+//        • UPS Rating v2403 (UPS_CLIENT_ID / UPS_CLIENT_SECRET / UPS_SHIPPER_NUMBER)
+//      Dedups by (carrier, service), applies the tiered handling markup
+//      (see `tieredMarkupCents` below), sorts cheapest-first, returns to Shopify.
+//   4. If NEITHER carrier returns rates (credentials missing / both APIs
+//      unreachable) → returns an EMPTY rates list. Shopify shows "no
+//      shipping available" at checkout; the merchant must fix the
+//      credentials or the address. Static fallback was REMOVED 2026-06-22
+//      once real USPS credentials were configured in .env.
 //
-//   3a. DIRECT CARRIERS path (preferred — free, no aggregator fee):
-//        • USPS Web Tools v3 (implemented — needs USPS_CLIENT_ID/SECRET)
-//        • UPS Rating v2403 (skeleton — TODO)
-//        • FedEx Rate v1 (skeleton — TODO)
-//        • DHL Express MyDHL API (skeleton — TODO)
-//        Calls every configured carrier in parallel, dedups by (carrier,service),
-//        applies markup (totalQty × PER_ITEM_CENTS), sorts cheapest-first.
-//
-//   3b. EASYPOST path (fallback aggregator — paid, ~$0.005/call):
-//        Used when direct carriers return zero rates AND EASYPOST_API_KEY is set.
-//
-//   3c. CARRIER_SERVICES local table (last resort — fabricated qty-based prices):
-//        Guarantees checkout never breaks even if both upstream paths fail.
-//
-// SETUP — direct carriers (one-time per carrier, optional but recommended):
+// SETUP — both carriers (one-time):
 //   USPS:   registration.usps.com → APIs → OAuth credentials
-//           env: USPS_CLIENT_ID, USPS_CLIENT_SECRET
 //   UPS:    developer.ups.com → My Apps → OAuth 2.0
-//           env: UPS_CLIENT_ID, UPS_CLIENT_SECRET, UPS_SHIPPER_NUMBER
-//   FedEx:  developer.fedex.com → API Catalog → Rate API
-//           env: FEDEX_CLIENT_ID, FEDEX_CLIENT_SECRET, FEDEX_ACCOUNT_NUMBER
-//   DHL:    developer.dhl.com → DHL Express MyDHL API
-//           env: DHL_API_KEY, DHL_API_SECRET, DHL_ACCOUNT_NUMBER
-//
-// SETUP — EasyPost (alternative one-stop aggregator):
-//   easypost.com → Test API key (free) or Live key (paid for prod)
-//   env: EASYPOST_API_KEY
 //
 // Any carrier whose env vars aren't set is silently skipped — no errors.
 
@@ -52,52 +41,24 @@ import crypto from 'node:crypto'
 
 // ── Tunables ────────────────────────────────────────────────────────────
 
-// Base shipping rate per cart-item, in cents. The user's spec: 5 items → $5
-// on the cheapest carrier (UPS Ground / multiplier 1.0). Tune via env if
-// pricing ever needs to change without a redeploy.
-const PER_ITEM_CENTS = Number.parseInt(
-  process.env.SHIPPING_PER_QTY_CENTS || '100',
-  10,
-)
-
-// Carrier list shown at checkout. Order here = order shown (cheapest first
-// is also the safer default for B2B). Each entry:
-//   carrier        → real carrier name shown to the customer
-//   service        → service tier shown alongside the carrier name
-//   serviceCode    → stable identifier Shopify records on the order
-//   tierMultiplier → multiplies (totalQty × PER_ITEM_CENTS)
-//   deliveryDays   → [min, max] business days — purely cosmetic; appears
-//                    next to the price in the customer's checkout view.
-const CARRIER_SERVICES = [
-  {
-    carrier: 'cdcdc',
-    service: 'Ground Advantage',
-    serviceCode: 'USPS_GROUND',
-    tierMultiplier: 0.85,
-    deliveryDays: [4, 8],
-  },
-  {
-    carrier: 'UPS',
-    service: 'Ground',
-    serviceCode: 'UPS_GROUND',
-    tierMultiplier: 1.0,
-    deliveryDays: [3, 5],
-  },
-  {
-    carrier: 'UPS',
-    service: '2nd Day Air',
-    serviceCode: 'UPS_2DAY',
-    tierMultiplier: 1.5,
-    deliveryDays: [2, 2],
-  },
-  {
-    carrier: 'DHL',
-    service: 'Express',
-    serviceCode: 'DHL_EXPRESS',
-    tierMultiplier: 2.0,
-    deliveryDays: [1, 3],
-  },
-]
+// Wholesale handling markup, tiered by total cart quantity. The product
+// owner's spec (revised 2026-06-25 — the prior 4-item $4 tier was removed,
+// 4+ items now charges a flat $5 capped fee):
+//
+//   1–2 products → +$2
+//   3 products   → +$3
+//   4 or more    → +$5
+//
+// Cents on the wire. The same formula is mirrored in the retail handler
+// (ns-retail/app/api/shipping/rates.js) so both stores quote consistent
+// handling, and the drop-ship reverse-calc in
+// services/dropship/dropship.service.js strips this exact tier from
+// retail-cloned wholesale orders.
+function tieredMarkupCents(qty) {
+  if (qty <= 2) return 200
+  if (qty === 3) return 300
+  return 500
+}
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -133,6 +94,41 @@ function sumQuantity(items) {
   )
 }
 
+// ── Processing Fee line detection ──────────────────────────────────────
+//
+// The Checkout UI extension (extensions/checkout-ui/src/Checkout.jsx) adds
+// a "Processing Fee" cart line item (variant priced at $0.01, quantity =
+// cents-of-fee). When Shopify POSTs the carrier-service callback, this
+// line appears in `rate.items[]` alongside the real merchandise. We MUST
+// exclude it from:
+//   • totalQty   → otherwise the fee's 9095-unit quantity pushes the
+//                  handling-markup tier to "4+ items → $5" on every cart
+//   • vendor check → free-shipping rule requires every line vendor be
+//                    "Natural Solutions"; the fee product may have a
+//                    different vendor (or none) and would silently
+//                    disqualify NS-only carts
+//   • subtotalUSD → the fee adds to the $500 free-shipping threshold;
+//                   should be the customer's REAL spend, not what we
+//                   tacked on top
+//   • carrier weight calc → the fee variant should be weight=0 but
+//                           depending on Shopify Admin config it may
+//                           carry default weight that inflates carrier
+//                           quotes
+//
+// Detection: variant_id match first (fast + exact), then title regex as
+// a defensive fallback for misconfigured products / variant-id drift.
+// Keep PROCESSING_FEE_VARIANT_ID in sync with FEE_VARIANT_GID in
+// extensions/checkout-ui/src/Checkout.jsx.
+const PROCESSING_FEE_VARIANT_ID = 45231995191365
+const PROCESSING_FEE_TITLE_RE = /processing\s*fee/i
+
+function isProcessingFeeItem(it) {
+  if (!it) return false
+  if (Number(it.variant_id) === PROCESSING_FEE_VARIANT_ID) return true
+  const name = String(it.name || it.title || '').trim()
+  return PROCESSING_FEE_TITLE_RE.test(name)
+}
+
 // Add N business days from today and return an ISO date string —
 // Shopify shows this next to the price in the customer's checkout view.
 function addBusinessDaysIso(daysFromToday) {
@@ -141,10 +137,8 @@ function addBusinessDaysIso(daysFromToday) {
   return d.toISOString()
 }
 
-// Pounds + ounces from grams. USPS / UPS / FedEx APIs want LB or OZ.
-function gramsToOz(grams) {
-  return Math.max(1, Math.round((Number(grams) || 0) / 28.3495))
-}
+// USPS / UPS / FedEx APIs want pounds (LB) for weight. DHL uses kg —
+// converted inline within fetchDHLRates.
 function gramsToLb(grams) {
   return Math.max(0.1, Math.round(((Number(grams) || 0) / 453.592) * 10) / 10)
 }
@@ -228,138 +222,295 @@ async function fetchUSPSRates({ origin, destination, items }) {
     }
   }
 
-  // ── Step 2: Build rate request ─────────────────────────────────────
+  // ── Step 2: Build common rate request payload ──────────────────────
+  // USPS v3 `/prices/v3/base-rates/search` quotes ONE mail class per
+  // call. To show multiple tiers we fan out one parallel call per class.
+  //
+  // Required fields (per USPS OpenAPI schema — missing any one returns
+  // HTTP 400 "OASValidation … Object has missing required fields"):
+  //   originZIPCode, destinationZIPCode, weight, length, width, height,
+  //   mailClass, processingCategory, rateIndicator,
+  //   destinationEntryFacilityType, priceType, mailingDate.
   const totalGrams = (items || []).reduce(
     (s, it) => s + (Number(it?.grams) || 0) * (Number(it?.quantity) || 0),
     0,
   )
 
-  // USPS expects ZIP-only origin/destination for domestic. International
-  // adds country + value but we focus on domestic for now.
-  const body = {
+  const baseBody = {
     originZIPCode: origin?.postal_code || '',
     destinationZIPCode: destination?.postal_code || '',
-    weight: gramsToLb(totalGrams), // pounds (with decimal for ounces)
+    weight: gramsToLb(totalGrams),
     length: 10,
     width: 8,
     height: 4,
-    mailClasses: [
-      'USPS_GROUND_ADVANTAGE',
-      'PRIORITY_MAIL',
-      'PRIORITY_MAIL_EXPRESS',
-    ],
+    destinationEntryFacilityType: 'NONE',
     priceType: 'COMMERCIAL', // wholesale = commercial rates
     mailingDate: new Date().toISOString().slice(0, 10),
   }
 
-  // ── Step 3: Fetch rates ────────────────────────────────────────────
+  // Each mail class has its own valid (rateIndicator, processingCategory)
+  // combo. USPS rejects mismatches with "Could not find working sku from
+  // SSF ingredients" — these values come from the USPS Prices v3 product
+  // catalogue and are not interchangeable across classes.
+  //
+  //   SP / MACHINABLE  — Single Piece, machinable parcel
+  //                      (Ground Advantage, Priority Mail, First-Class Package)
+  //   PA / MACHINABLE  — Priority Alert (Priority Mail Express)
+  //
+  // If any class returns 400 with a "no sku" error, USPS doesn't sell
+  // that combo for the given weight/zone — that class is silently dropped
+  // from the response so the other classes still show.
+  const MAIL_CLASSES = [
+    {
+      code: 'USPS_GROUND_ADVANTAGE',
+      label: 'Ground Advantage',
+      rateIndicator: 'SP',
+      processingCategory: 'MACHINABLE',
+    },
+    {
+      code: 'PRIORITY_MAIL',
+      label: 'Priority Mail',
+      rateIndicator: 'SP',
+      processingCategory: 'MACHINABLE',
+    },
+    {
+      code: 'PRIORITY_MAIL_EXPRESS',
+      label: 'Priority Mail Express',
+      rateIndicator: 'PA',
+      processingCategory: 'MACHINABLE',
+    },
+    {
+      code: 'FIRST-CLASS_PACKAGE_SERVICE',
+      label: 'First-Class Package',
+      rateIndicator: 'SP',
+      processingCategory: 'MACHINABLE',
+    },
+  ]
+
+  // ── Step 3: One call per mail class, in parallel ───────────────────
+  async function fetchOne({ code, label, rateIndicator, processingCategory }) {
+    let res
+    try {
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 5000)
+      res = await fetch(`${base}/prices/v3/base-rates/search`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          ...baseBody,
+          mailClass: code,
+          rateIndicator,
+          processingCategory,
+        }),
+        signal: controller.signal,
+      })
+      clearTimeout(timeout)
+    } catch (err) {
+      console.error(`[shipping.rates] USPS ${code} network error:`, err?.message || err)
+      return null
+    }
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '')
+      console.error(`[shipping.rates] USPS ${code} non-200:`, res.status, text.slice(0, 300))
+      if (res.status === 401) tokenCache.delete('usps')
+      return null
+    }
+
+    let json
+    try {
+      json = await res.json()
+    } catch {
+      return null
+    }
+
+    // v3 base-rates/search response: { totalBasePrice: 5.50, rates: [...], ... }
+    // Top-level totalBasePrice is the cheapest match; we use that.
+    const dollars = Number.parseFloat(json?.totalBasePrice ?? json?.rates?.[0]?.price)
+    if (!Number.isFinite(dollars)) return null
+    return {
+      carrier: 'USPS',
+      service: label,
+      rateCents: Math.round(dollars * 100),
+      currency: 'USD',
+      deliveryDateMin: null,
+      deliveryDateMax: null,
+    }
+  }
+
+  const results = await Promise.all(MAIL_CLASSES.map(fetchOne))
+  return results.filter(Boolean)
+}
+
+// ── UPS Rating API v2403 ────────────────────────────────────────────────
+//
+// SIGNUP: developer.ups.com → My Apps → New App → OAuth 2.0 client credentials.
+// Env vars required:
+//   UPS_CLIENT_ID, UPS_CLIENT_SECRET — OAuth credentials
+//   UPS_SHIPPER_NUMBER              — your UPS account number (6 chars)
+//   UPS_API_BASE                    — optional override (sandbox vs prod)
+//
+// Auth: OAuth 2.0 client_credentials. Authorization header is HTTP Basic
+// (base64 of client_id:client_secret), body is form-encoded
+// `grant_type=client_credentials`. Token returns with TTL ~14400s.
+//
+// Rates: POST {base}/api/rating/v2403/Shop returns rates for ALL available
+// services in one call (vs `/Rate` which targets a single service code).
+async function fetchUPSRates({ origin, destination, items }) {
+  const clientId = process.env.UPS_CLIENT_ID
+  const clientSecret = process.env.UPS_CLIENT_SECRET
+  const shipperNumber = process.env.UPS_SHIPPER_NUMBER
+  if (!clientId || !clientSecret || !shipperNumber) return []
+
+  const base = process.env.UPS_API_BASE || 'https://onlinetools.ups.com'
+
+  // ── Step 1: OAuth token (cached) ────────────────────────────────
+  let token = getCachedToken('ups')
+  if (!token) {
+    try {
+      const basic = Buffer.from(`${clientId}:${clientSecret}`).toString('base64')
+      const tokenRes = await fetch(`${base}/security/v1/oauth/token`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Basic ${basic}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Accept: 'application/json',
+        },
+        body: 'grant_type=client_credentials',
+      })
+      if (!tokenRes.ok) {
+        console.error('[shipping.rates] UPS oauth failed:', tokenRes.status)
+        return []
+      }
+      const tokenJson = await tokenRes.json()
+      token = tokenJson.access_token
+      setCachedToken('ups', token, Number(tokenJson.expires_in) || 14400)
+    } catch (err) {
+      console.error('[shipping.rates] UPS oauth error:', err?.message || err)
+      return []
+    }
+  }
+
+  // ── Step 2: Build rate request ──────────────────────────────────
+  const totalGrams = (items || []).reduce(
+    (s, it) => s + (Number(it?.grams) || 0) * (Number(it?.quantity) || 0),
+    0,
+  )
+  const weightLb = gramsToLb(totalGrams)
+
+  const addr = (a) => ({
+    AddressLine: [a?.address1 || '', a?.address2 || ''].filter(Boolean),
+    City: a?.city || '',
+    StateProvinceCode: a?.province_code || a?.province || '',
+    PostalCode: a?.postal_code || '',
+    CountryCode: a?.country_code || a?.country || 'US',
+  })
+
+  const body = {
+    RateRequest: {
+      Request: { RequestOption: 'Shop', TransactionReference: { CustomerContext: 'NS Wholesale checkout' } },
+      Shipment: {
+        Shipper: {
+          Name: 'NS Wholesale',
+          ShipperNumber: shipperNumber,
+          Address: addr(origin),
+        },
+        ShipTo: { Name: 'Customer', Address: addr(destination) },
+        ShipFrom: { Name: 'NS Wholesale', Address: addr(origin) },
+        Package: {
+          PackagingType: { Code: '02', Description: 'Customer Supplied' },
+          Dimensions: {
+            UnitOfMeasurement: { Code: 'IN', Description: 'Inches' },
+            Length: '10', Width: '8', Height: '4',
+          },
+          PackageWeight: {
+            UnitOfMeasurement: { Code: 'LBS', Description: 'Pounds' },
+            Weight: String(weightLb),
+          },
+        },
+      },
+    },
+  }
+
+  // ── Step 3: Fetch rates ─────────────────────────────────────────
   let res
   try {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 5000)
-    res = await fetch(`${base}/prices/v3/base-rates/search`, {
+    res = await fetch(`${base}/api/rating/v2403/Shop`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
         Accept: 'application/json',
+        transId: `ns-${Date.now()}`,
+        transactionSrc: 'NS_Wholesale',
       },
       body: JSON.stringify(body),
       signal: controller.signal,
     })
     clearTimeout(timeout)
   } catch (err) {
-    console.error('[shipping.rates] USPS network error:', err?.message || err)
+    console.error('[shipping.rates] UPS network error:', err?.message || err)
     return []
   }
 
   if (!res.ok) {
     const text = await res.text().catch(() => '')
-    console.error('[shipping.rates] USPS non-200:', res.status, text.slice(0, 300))
-    // 401 → token went stale, drop cache so next call re-fetches.
-    if (res.status === 401) tokenCache.delete('usps')
+    console.error('[shipping.rates] UPS non-200:', res.status, text.slice(0, 300))
+    if (res.status === 401) tokenCache.delete('ups')
     return []
   }
 
   let json
-  try {
-    json = await res.json()
-  } catch {
-    return []
+  try { json = await res.json() } catch { return [] }
+
+  // UPS service code → human-readable label
+  const UPS_SERVICE_NAMES = {
+    '01': 'Next Day Air',
+    '02': '2nd Day Air',
+    '03': 'Ground',
+    '07': 'Worldwide Express',
+    '08': 'Worldwide Expedited',
+    '11': 'Standard',
+    '12': '3 Day Select',
+    '13': 'Next Day Air Saver',
+    '14': 'Next Day Air Early',
+    '54': 'Worldwide Express Plus',
+    '59': '2nd Day Air A.M.',
+    '65': 'Saver',
   }
 
-  // USPS response shape: { rates: [{ mailClass, totalBasePrice, ... }] }
-  const raw = Array.isArray(json?.rates) ? json.rates : []
-  return raw
-    .map((r) => {
-      const dollars = Number.parseFloat(r.totalBasePrice ?? r.price)
-      if (!Number.isFinite(dollars)) return null
-      const serviceLabel =
-        {
-          USPS_GROUND_ADVANTAGE: 'Ground Advantage',
-          PRIORITY_MAIL: 'Priority Mail',
-          PRIORITY_MAIL_EXPRESS: 'Priority Mail Express',
-        }[r.mailClass] || r.mailClass
+  // Response shape: { RateResponse: { RatedShipment: [...] } } — but
+  // RatedShipment may be a single object if only one service was returned.
+  const rsRaw = json?.RateResponse?.RatedShipment
+  const rsArr = Array.isArray(rsRaw) ? rsRaw : rsRaw ? [rsRaw] : []
+  return rsArr
+    .map((rs) => {
+      const code = rs?.Service?.Code
+      const dollars = Number.parseFloat(rs?.TotalCharges?.MonetaryValue)
+      if (!code || !Number.isFinite(dollars)) return null
       return {
-        carrier: 'USPS',
-        service: serviceLabel,
+        carrier: 'UPS',
+        service: UPS_SERVICE_NAMES[code] || rs?.Service?.Description || `Service ${code}`,
         rateCents: Math.round(dollars * 100),
-        currency: 'USD',
-        deliveryDateMin: null,
-        deliveryDateMax: null,
+        currency: rs?.TotalCharges?.CurrencyCode || 'USD',
+        deliveryDateMin: rs?.GuaranteedDelivery?.BusinessDaysInTransit
+          ? addBusinessDaysIso(Number(rs.GuaranteedDelivery.BusinessDaysInTransit))
+          : null,
+        deliveryDateMax: rs?.GuaranteedDelivery?.BusinessDaysInTransit
+          ? addBusinessDaysIso(Number(rs.GuaranteedDelivery.BusinessDaysInTransit))
+          : null,
       }
     })
     .filter(Boolean)
 }
 
-// ── UPS Rating API v2403 (skeleton — replicate USPS pattern) ────────────
-//
-// SIGNUP: developer.ups.com → My Apps → New App → OAuth 2.0
-// Env vars: UPS_CLIENT_ID, UPS_CLIENT_SECRET, UPS_SHIPPER_NUMBER, UPS_API_BASE
-//
-// Auth: OAuth client_credentials (POST {base}/security/v1/oauth/token,
-// Basic auth header = base64(client_id:client_secret), grant_type=client_credentials).
-// Rates: POST {base}/api/rating/v2403/Rate (Bearer token).
-//
-// TODO: implement after USPS verified end-to-end. Same pattern as fetchUSPSRates
-// — get token, cache it, POST rate request, normalize response.
-async function fetchUPSRates(_input) {
-  if (!process.env.UPS_CLIENT_ID || !process.env.UPS_CLIENT_SECRET) return []
-  // TODO: Implement following USPS pattern above.
-  console.log('[shipping.rates] UPS integration: TODO — env vars detected but handler not implemented yet')
-  return []
-}
-
-// ── FedEx Rate API (skeleton — replicate USPS pattern) ──────────────────
-//
-// SIGNUP: developer.fedex.com → API Catalog → Rate API → Create credentials
-// Env vars: FEDEX_CLIENT_ID, FEDEX_CLIENT_SECRET, FEDEX_ACCOUNT_NUMBER, FEDEX_API_BASE
-//
-// Auth: OAuth client_credentials (POST {base}/oauth/token,
-// form body: grant_type=client_credentials&client_id=X&client_secret=Y).
-// Rates: POST {base}/rate/v1/rates/quotes (Bearer token).
-async function fetchFedExRates(_input) {
-  if (!process.env.FEDEX_CLIENT_ID || !process.env.FEDEX_CLIENT_SECRET) return []
-  // TODO: Implement following USPS pattern above.
-  console.log('[shipping.rates] FedEx integration: TODO — env vars detected but handler not implemented yet')
-  return []
-}
-
-// ── DHL Express API (skeleton — simpler, Basic auth only) ──────────────
-//
-// SIGNUP: developer.dhl.com → DHL Express → MyDHL API → API key
-// Env vars: DHL_API_KEY, DHL_API_SECRET, DHL_ACCOUNT_NUMBER, DHL_API_BASE
-//
-// Auth: HTTP Basic (Authorization: Basic base64(api_key:api_secret)).
-// Rates: POST {base}/mydhlapi/rates with shipper/recipient/packages JSON.
-async function fetchDHLRates(_input) {
-  if (!process.env.DHL_API_KEY || !process.env.DHL_API_SECRET) return []
-  // TODO: Implement following USPS pattern above.
-  console.log('[shipping.rates] DHL integration: TODO — env vars detected but handler not implemented yet')
-  return []
-}
-
-// ── Dispatcher: call every configured direct carrier in parallel ───────
+// ── Dispatcher: USPS + UPS in parallel ─────────────────────────────────
 async function fetchDirectCarrierRates(rate) {
   const input = {
     origin: rate.origin,
@@ -375,129 +526,8 @@ async function fetchDirectCarrierRates(rate) {
       console.error('[shipping.rates] UPS failed:', e?.message || e)
       return []
     }),
-    fetchFedExRates(input).catch((e) => {
-      console.error('[shipping.rates] FedEx failed:', e?.message || e)
-      return []
-    }),
-    fetchDHLRates(input).catch((e) => {
-      console.error('[shipping.rates] DHL failed:', e?.message || e)
-      return []
-    }),
   ])
   return results.flat()
-}
-
-// Fetch live multi-carrier rates from EasyPost using a raw HTTPS call
-// (no SDK install needed — works out of the box once EASYPOST_API_KEY is set).
-//
-// EasyPost's /shipments endpoint returns rates from ALL configured carriers
-// (UPS, USPS, FedEx, DHL Express, etc.) on a single account. We map each
-// returned rate into the shape the caller's action handler expects.
-//
-// Returns [] on any failure — caller decides fallback behavior.
-async function fetchEasyPostRates(rate) {
-  if (!process.env.EASYPOST_API_KEY) return []
-
-  // EasyPost auth: HTTP Basic with the API key as username, empty password.
-  const auth = Buffer.from(`${process.env.EASYPOST_API_KEY}:`).toString('base64')
-
-  // Destination address — Shopify carrier-service payload uses snake_case.
-  const to_address = {
-    name: rate.destination?.name || 'Customer',
-    street1: rate.destination?.address1 || '',
-    street2: rate.destination?.address2 || '',
-    city: rate.destination?.city || '',
-    state: rate.destination?.province_code || rate.destination?.province || '',
-    zip: rate.destination?.postal_code || '',
-    country: rate.destination?.country_code || rate.destination?.country || 'US',
-  }
-
-  // Origin — prefer the origin Shopify provides (configured in
-  // Settings → Locations). Fall back to SHIPPING_FROM_* env vars.
-  const from_address = rate.origin
-    ? {
-        name: rate.origin.name || 'Store',
-        street1: rate.origin.address1 || '',
-        street2: rate.origin.address2 || '',
-        city: rate.origin.city || '',
-        state: rate.origin.province_code || rate.origin.province || '',
-        zip: rate.origin.postal_code || '',
-        country: rate.origin.country_code || rate.origin.country || 'US',
-      }
-    : {
-        name: process.env.SHIPPING_FROM_NAME || 'Store',
-        street1: process.env.SHIPPING_FROM_ADDRESS1 || '',
-        city: process.env.SHIPPING_FROM_CITY || '',
-        state: process.env.SHIPPING_FROM_STATE || '',
-        zip: process.env.SHIPPING_FROM_POSTAL || '',
-        country: process.env.SHIPPING_FROM_COUNTRY || 'US',
-      }
-
-  // Parcel weight: sum item.grams × item.quantity (grams → ounces for EasyPost).
-  const totalGrams = (rate.items || []).reduce(
-    (s, it) => s + (Number(it?.grams) || 0) * (Number(it?.quantity) || 0),
-    0,
-  )
-  const parcel = {
-    length: 10,
-    width: 8,
-    height: 4,
-    weight: gramsToOz(totalGrams),
-  }
-
-  let response
-  try {
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 8000) // Shopify gives ~10s
-    response = await fetch('https://api.easypost.com/v2/shipments', {
-      method: 'POST',
-      headers: {
-        Authorization: `Basic ${auth}`,
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({ shipment: { to_address, from_address, parcel } }),
-      signal: controller.signal,
-    })
-    clearTimeout(timeout)
-  } catch (err) {
-    console.error('[shipping.rates] EasyPost network error:', err?.message || err)
-    return []
-  }
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => '')
-    console.error('[shipping.rates] EasyPost non-200:', response.status, text.slice(0, 400))
-    return []
-  }
-
-  let json
-  try {
-    json = await response.json()
-  } catch {
-    console.error('[shipping.rates] EasyPost invalid JSON')
-    return []
-  }
-
-  const raw = Array.isArray(json?.rates) ? json.rates : []
-  // Normalize to a stable internal shape.
-  return raw
-    .map((r) => {
-      const dollars = Number.parseFloat(r.rate)
-      if (!Number.isFinite(dollars)) return null
-      return {
-        carrier: r.carrier || '',
-        service: r.service || '',
-        rateCents: Math.round(dollars * 100),
-        currency: r.currency || 'USD',
-        // EasyPost gives `delivery_days` (an integer) and `delivery_date` (ISO).
-        // We surface both — the action handler picks whichever is more useful.
-        deliveryDays: Number.isFinite(Number(r.delivery_days)) ? Number(r.delivery_days) : null,
-        deliveryDateMin: r.delivery_date || null,
-        deliveryDateMax: r.delivery_date || null,
-      }
-    })
-    .filter(Boolean)
 }
 
 // ── Route handlers ──────────────────────────────────────────────────────
@@ -533,7 +563,7 @@ export async function action({ request }) {
     console.error('[shipping.rates] invalid JSON body')
     return ratesResponse([])
   }
-
+console.log('[shipping.rates---------------------------------------------] payload received:', JSON.stringify(payload , null , 2))
   const rate = payload?.rate
   if (!rate || !rate.destination || !Array.isArray(rate.items)) {
     console.warn('[shipping.rates] missing rate.destination or rate.items')
@@ -541,25 +571,74 @@ export async function action({ request }) {
   }
 
   // ── 1. Aggregate cart ────────────────────────────────────────────────
-  const totalQty = sumQuantity(rate.items)
+  //
+  // Strip the Processing Fee cart line out of EVERY downstream calculation
+  // (markup tier, vendor check, subtotal threshold, carrier weight). See
+  // `isProcessingFeeItem` for detection rules. `realItems` is the items
+  // array we treat as the customer's actual merchandise; `rate.items` is
+  // the raw Shopify payload we keep around only for logging.
+  const realItems = (rate.items || []).filter((it) => !isProcessingFeeItem(it))
+  const feeLinesExcluded = rate.items.length - realItems.length
+
+  const totalQty = sumQuantity(realItems)
   if (totalQty === 0) return ratesResponse([])
 
   console.log(
-    `[shipping.rates] inbound: ${rate.items.length} line(s), totalQty=${totalQty}, dest=${rate.destination?.country}/${rate.destination?.province}/${rate.destination?.postal_code}`,
+    `[shipping.rates] inbound: ${rate.items.length} line(s) (${feeLinesExcluded} processing-fee excluded), realQty=${totalQty}, dest=${rate.destination?.country}/${rate.destination?.province}/${rate.destination?.postal_code}`,
   )
 
-  // ── 2. Priority order for live carrier rates ─────────────────────────
-  //   a. Direct carriers (USPS / UPS / FedEx / DHL) — preferred, free
-  //   b. EasyPost (aggregator, paid) — fallback for partial direct coverage
-  //   c. CARRIER_SERVICES local table — final safety net, fabricated rates
+  // ── 1a. Free-shipping rule (wholesale store) ─────────────────────────
   //
-  // Markup formula = totalQty × PER_ITEM_CENTS (added on top of every real
-  // carrier quote). Configurable via SHIPPING_PER_QTY_CENTS env var.
-  const baseCents = totalQty * PER_ITEM_CENTS
-  let rates = []
+  // Both conditions must hold:
+  //   (a) Every line item's vendor is exactly "Natural Solutions"
+  //       (case-insensitive, trimmed — guards against trailing spaces in
+  //       admin-typed vendor names)
+  //   (b) Cart subtotal (sum of items[].price * quantity, pre-discount)
+  //       is >= $500 USD.
+  //
+  // When both are met, real carrier rate + handling markup are both
+  // zeroed and the service_name is decorated so the customer sees why.
+  // The customer still picks Ground vs Priority vs Express — they're
+  // all shown at $0 with their respective delivery windows so the
+  // pick has meaning. Pre-discount subtotal is by design: Shopify's
+  // carrier-service payload doesn't expose post-discount totals.
+  const FREE_SHIPPING_VENDOR = 'Natural Solutions'
+  const FREE_SHIPPING_THRESHOLD_USD = 500
 
-  // ── 2a. Direct carriers ──────────────────────────────────────────────
-  const directRates = await fetchDirectCarrierRates(rate)
+  // Use `realItems` (Processing Fee already stripped) so the vendor +
+  // subtotal checks reflect the customer's actual purchase, not the
+  // fee line we tacked on.
+  const allItemsNaturalSolutions = realItems.every(
+    (it) =>
+      (it?.vendor || '').trim().toLowerCase() ===
+      FREE_SHIPPING_VENDOR.toLowerCase(),
+  )
+  const cartSubtotalUsd =
+    realItems.reduce(
+      (sum, it) => sum + (Number(it?.price) || 0) * (Number(it?.quantity) || 0),
+      0,
+    ) / 100
+  const isFreeShipping =
+    allItemsNaturalSolutions && cartSubtotalUsd >= FREE_SHIPPING_THRESHOLD_USD
+
+  if (isFreeShipping) {
+    console.log(
+      `[shipping.rates] FREE shipping ELIGIBLE — vendor=NS × ${rate.items.length} line(s), subtotal=$${cartSubtotalUsd.toFixed(2)}`,
+    )
+  }
+
+  // ── 2. Fetch live rates from all configured direct carriers ──────────
+  // Handling markup is TIERED by total cart quantity (see `tieredMarkupCents`):
+  //   1–2 items → +$2, 3 → +$3, 4+ → +$5.
+  // Added on top of every real carrier quote. Skipped entirely when the
+  // free-shipping rule above fires (rate total goes to $0).
+  const baseCents = tieredMarkupCents(totalQty)
+
+  // Carrier APIs (USPS/UPS) read items[] to compute package weight + box
+  // dims. Pass `realItems` so the Processing Fee line — which should be
+  // weight=0 but may be misconfigured in Shopify Admin — never inflates
+  // the quote. We clone `rate` rather than mutate the original payload.
+  const directRates = await fetchDirectCarrierRates({ ...rate, items: realItems })
   if (directRates && directRates.length) {
     // Dedup by (carrier, service) — pick cheapest variant per service.
     const dedup = new Map()
@@ -573,14 +652,22 @@ export async function action({ request }) {
       }
     }
 
-    rates = Array.from(dedup.values()).map((r) => {
-      const finalCents = r.rateCents + baseCents
+    const rates = Array.from(dedup.values()).map((r) => {
+      // Free-shipping rule wins over carrier cost + handling markup.
+      // Customer still sees per-service labels (Ground/Priority/Express)
+      // for delivery-speed choice — only the prices flatten to $0.
+      const finalCents = isFreeShipping ? 0 : r.rateCents + baseCents
+      const baseName = `${r.carrier} ${r.service}`.trim()
       return {
-        service_name: `${r.carrier} ${r.service}`.trim(),
+        service_name: isFreeShipping
+          ? `${baseName} (FREE — orders over $${FREE_SHIPPING_THRESHOLD_USD})`
+          : baseName,
         service_code: r.code,
         total_price: String(finalCents), // STRING in cents
         currency: r.currency || 'USD',
-        description: `${r.carrier} ${r.service} (incl. handling)`,
+        description: isFreeShipping
+          ? `Complimentary on Natural Solutions orders over $${FREE_SHIPPING_THRESHOLD_USD}`
+          : `${r.carrier} ${r.service} (incl. handling)`,
         ...(r.deliveryDateMin ? { min_delivery_date: r.deliveryDateMin } : {}),
         ...(r.deliveryDateMax ? { max_delivery_date: r.deliveryDateMax } : {}),
       }
@@ -593,73 +680,19 @@ export async function action({ request }) {
     )
 
     console.log(
-      `[shipping.rates] Direct carriers OK: ${rates.length} real rate(s), markup=$${baseCents / 100} on ${totalQty} item(s)`,
+      isFreeShipping
+        ? `[shipping.rates] Direct carriers OK: ${rates.length} rate(s) FREE on $${cartSubtotalUsd.toFixed(2)} NS-only cart`
+        : `[shipping.rates] Direct carriers OK: ${rates.length} real rate(s), tiered markup=$${baseCents / 100} on ${totalQty} item(s)`,
     )
     return ratesResponse(rates)
   }
 
-  // ── 2b. EasyPost aggregator (fallback) ───────────────────────────────
-  if (process.env.EASYPOST_API_KEY) {
-    const external = await fetchEasyPostRates(rate)
-    if (external && external.length) {
-      // Dedup (carrier, service) — EasyPost can return account-level variants.
-      const dedup = new Map()
-      for (const r of external) {
-        const code = `${r.carrier}_${r.service}`
-          .toUpperCase()
-          .replace(/[^A-Z0-9]+/g, '_')
-          .replace(/^_+|_+$/g, '')
-        if (!dedup.has(code) || dedup.get(code).rateCents > r.rateCents) {
-          dedup.set(code, { ...r, code })
-        }
-      }
-
-      rates = Array.from(dedup.values()).map((r) => {
-        const finalCents = r.rateCents + baseCents
-        return {
-          service_name: `${r.carrier} ${r.service}`.trim(),
-          service_code: r.code,
-          total_price: String(finalCents), // STRING in cents
-          currency: r.currency || 'USD',
-          description: `${r.carrier} ${r.service} (incl. handling)`,
-          // EasyPost gives a single delivery date or a days count — use whichever.
-          ...(r.deliveryDateMin ? { min_delivery_date: r.deliveryDateMin } : {}),
-          ...(r.deliveryDateMax ? { max_delivery_date: r.deliveryDateMax } : {}),
-        }
-      })
-
-      // Cheapest first.
-      rates.sort(
-        (a, b) =>
-          Number.parseInt(a.total_price, 10) - Number.parseInt(b.total_price, 10),
-      )
-
-      console.log(
-        `[shipping.rates] EasyPost OK: ${rates.length} real rate(s), markup=$${baseCents / 100} on ${totalQty} item(s)`,
-      )
-      return ratesResponse(rates)
-    }
-    console.warn('[shipping.rates] EasyPost returned no rates — falling back to CARRIER_SERVICES')
-  }
-
-  // ── 3. Fallback: CARRIER_SERVICES local pricing ──────────────────────
-
-  // Fallback: local quantity-based pricing (original behavior)
-  rates = CARRIER_SERVICES.map((svc) => {
-    const finalCents = Math.round(baseCents * svc.tierMultiplier)
-    return {
-      service_name: `${svc.carrier} ${svc.service}`,
-      service_code: svc.serviceCode,
-      total_price: String(finalCents), // STRING in cents
-      currency: 'USD',
-      description: `${svc.carrier} ${svc.service}`,
-      min_delivery_date: addBusinessDaysIso(svc.deliveryDays[0]),
-      max_delivery_date: addBusinessDaysIso(svc.deliveryDays[1]),
-    }
-  })
-
-  console.log(
-    `[shipping.rates] returning ${rates.length} option(s), base=$${baseCents / 100} for ${totalQty} item(s)`,
+  // No live carrier returned rates — credentials missing, API down, or
+  // destination unsupported. Return an empty list so Shopify shows "no
+  // shipping available" at checkout. We DO NOT quote placeholder prices
+  // here; the merchant should fix the credentials or the address.
+  console.warn(
+    `[shipping.rates] No live carrier rates for ${totalQty} item(s) to ${rate.destination?.postal_code} — returning empty (check USPS/UPS env vars + API status)`,
   )
-  return ratesResponse(rates)
+  return ratesResponse([])
 }

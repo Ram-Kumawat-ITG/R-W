@@ -102,6 +102,48 @@ Two principles drive the design:
 
 **Eligibility for a payout** (`getEligibleCommissions`): `status = "approved"` **AND** `payoutId = null` **AND** `earnedAt <= periodEnd`. The per-practitioner sum must be `>= cdo_settings.minimumPayoutAmount`.
 
+### 4.1 Commission amount — per-vendor, per-line (versioned + snapshotted)
+
+Commission is **vendor-driven**, configured per Shopify **product vendor** on the
+Settings → **Commission Configuration** tab and stored on
+`cdo_settings.vendorCommissions[] = { vendor, commissionPercent (fraction), updatedAt, updatedBy }`.
+
+- **Calc** (`computeOrderCommission`): for each order line,
+  `lineRevenue = price×qty − totalDiscount` and `lineCommission = lineRevenue × vendorRate`,
+  where `vendorRate` is the configured fraction for the line's `vendor` (matched
+  case-insensitively) — **0% when that vendor isn't configured** (commission is purely
+  vendor-driven; the practitioner code rate / `defaultCommissionRate` no longer set the amount).
+  `order.commissionAmount = Σ lineCommission`. The order's line items capture
+  `lineItems[].vendor` (from the Shopify `orders/create` payload) at ingest.
+- **Snapshot + immutability** (the core guarantee): commission is computed and snapshotted
+  **exactly once, at first ingest** (order creation) into `cdo_orders.commissionSnapshot =
+  { configVersion, vendorRates[], lines[{vendor,revenue,rate,amount}], effectiveRate, computedAt }`.
+  `ingestShopifyOrder` skips recomputation when the order already exists, so re-ingests
+  (`orders/updated`, `orders/paid`, replays) **never** alter an existing order's commission.
+  Config edits bump `cdo_settings.commissionConfigVersion` and apply **only to future orders**;
+  existing orders + their `cdo_commissions` are unaffected. The `cdo_commission` record's `rate`
+  is the snapshot's blended `effectiveRate` (= commissionAmount ÷ Σ line revenue).
+- **Referral-rate snapshot is authoritative** (no live re-read): a returning customer's
+  order uses the `commissionRate` / `discountPercent` frozen in their
+  `cdo_applications.referral` snapshot at signup. `resolveOrderReferral` does **not**
+  re-read the practitioner's current catalogue rate (which would silently re-rate future
+  orders with no audit trail); it only fills a *missing* rate from the live code / program
+  default. The snapshot is the audit trail of the terms in effect at signup.
+- **Legacy fallback (compute-on-read)**: orders ingested before snapshots existed have
+  `commissionSnapshot: null`. `projectCommissionSnapshot(order)` reconstructs a best-effort
+  single blended line (`commissionAmount ÷ subtotal`, flagged `reconstructed`) so the Order
+  Details "Commission breakdown" still explains the math; `scripts/backfill-cdo-commission-snapshots.js`
+  persists those reconstructed snapshots.
+- **Audit**: every vendor-rate change (set/remove) appends a row to
+  **`cdo_commission_config_history`** (`vendor, action, previousPercent, newPercent, version,
+  changedBy, changedAt`), surfaced as "Recent changes" on the Commission Configuration tab.
+- **Settings UI**: `/app/cdo-program/settings` is a layout with sub-tabs (extensible via
+  `SettingsTabs`). The only tab is **Commission Configuration** (lists Shopify product vendors
+  via the `productVendors` Admin GraphQL query + a per-vendor "Commission Setup" modal); the
+  settings index redirects there. ⚠️ Until vendors are configured, attributed orders accrue $0 —
+  the tab warns about this. (A read-only Global Configuration tab over the `cdo_settings`
+  singleton was removed; the singleton is still tuned directly per §14.)
+
 ---
 
 ## 5. QBO Integration Flow
@@ -412,7 +454,7 @@ getTransferStatus(transferId)
 Adapters MUST be idempotent on `idempotencyKey` (`cdo-payout-<payoutId>-<attempt>`) so a retried initiation never double-sends.
 
 - **`sandbox`** (default, `CDO_PAYOUT_PROVIDER=sandbox`) — in-process simulator; no real money. Encodes outcome + initiation time into the transfer id. **Magic test values:** account ending `9999` → rejected at initiation (R03); `0000` → returns (R01) after the settle delay; anything else → settles after `CDO_PAYOUT_SANDBOX_SETTLE_SECONDS`.
-- **`dwolla`** (`CDO_PAYOUT_PROVIDER=dwolla`) — **implemented** real ACH rail (`provider/dwollaProvider.js`, raw REST, no SDK). Per payout it: find-or-creates a **receive-only Customer** for the practitioner (by email), find-or-creates their bank **Funding Source** (routing/account/type — Dwolla dedupes via its duplicate-resource link), then creates a **Transfer** from the business funding source (`DWOLLA_FUNDING_SOURCE`) → the practitioner, with the `idempotencyKey` as Dwolla's `Idempotency-Key`. `getTransferStatus` maps Dwolla `processed → settled`, `failed/cancelled/reclaimed → returned` (with the ACH R-code from `/transfers/{id}/failure`), else `pending`. OAuth2 client-credentials token cached + auto-refreshed. Config: `DWOLLA_ENVIRONMENT` (sandbox|production), `DWOLLA_KEY`, `DWOLLA_SECRET`, `DWOLLA_FUNDING_SOURCE`. *Note: receive-only customers + transfers need a verified business funding source on the Dwolla account; polling is used today — a webhook handler (`customer_bank_transfer_completed/_failed`) would settle faster (future).* 
+- **`dwolla`** (`CDO_PAYOUT_PROVIDER=dwolla`) — **implemented** real ACH rail (`provider/dwollaProvider.js`, raw REST, no SDK). Per payout it: find-or-creates a **receive-only Customer** for the practitioner (by email), find-or-creates their bank **Funding Source** (routing/account/type — Dwolla dedupes via its duplicate-resource link), then creates a **Transfer** from the business funding source (`DWOLLA_FUNDING_SOURCE`) → the practitioner, with the `idempotencyKey` as Dwolla's `Idempotency-Key`. `getTransferStatus` maps Dwolla `processed → settled`, `failed/cancelled/reclaimed → returned` (with the ACH R-code from `/transfers/{id}/failure`), else `pending`. OAuth2 client-credentials token cached + auto-refreshed. Config: `DWOLLA_ENVIRONMENT` (sandbox|production), `DWOLLA_KEY`, `DWOLLA_SECRET`, `DWOLLA_FUNDING_SOURCE`. **Automated sandbox settlement (no dashboard step):** Dwolla Sandbox holds bank transfers in `pending` until "processed" — normally the dashboard's *Process Bank Transfers* button. The adapter implements the optional `processPendingTransfers()` contract method over that action's API (`POST /sandbox-simulations`, body `{}` → 202, processes/fails the last 500 pending transfers), and the settlement CRON calls it each tick **before** polling (no-op in production, where real ACH settles on its own), so transfers move pending → processed → settled fully automatically with zero Dwolla-dashboard interaction. (A bank→bank transfer has two legs, so the per-tick CRON may take two ticks to fully clear one — it converges automatically.) *Note: receive-only customers + transfers need a verified business funding source on the Dwolla account; settlement is polled today — a webhook handler (`customer_bank_transfer_completed/_failed`) would settle faster (future).* 
 - **`stripe` / `modern_treasury`** — not yet implemented; the factory throws a clear error until the adapter file + credentials are added. Dropping one in is a single new file + registering it in the factory; no changes to the payout logic.
 
 ### 8.3 Human-approval gate
@@ -421,7 +463,9 @@ Adapters MUST be idempotent on `idempotencyKey` (`cdo-payout-<payoutId>-<attempt
 
 ### 8.4 Settlement reconciliation CRON
 
-`process-payout-settlements` (Agenda) sweeps every `awaiting_settlement` payout and calls `checkPayoutSettlement`. Cadence: `CDO_SETTLEMENT_CRON` (prod, default every 6h) / `CDO_SETTLEMENT_INTERVAL` (dev). The admin **Sync settlement** button runs the same check for one payout on demand.
+`process-payout-settlements` (Agenda) first calls `advancePendingPayoutTransfers()` (provider-optional, best-effort — triggers Dwolla Sandbox's batch processing via API; no-op on production ACH), then sweeps every `awaiting_settlement` payout and calls `checkPayoutSettlement`. Cadence: `CDO_SETTLEMENT_CRON` (prod, default every 6h) / `CDO_SETTLEMENT_INTERVAL` (dev). The admin **Sync settlement** button runs the same check for one payout on demand. Net effect: from the monthly payout CRON through final settlement, the loop is fully automated end-to-end — no Dwolla-dashboard interaction in sandbox or production.
+
+On settle/return, `finalizeSettledPayout` / the return branch also call `reflectPayoutOnBatches` to update the **batch snapshot** that processed the payout — its run-time items were recorded as `processing` (ACH is async, settled later by this CRON), so without this the Payout Batches view (Paid/Failed/Skipped/**Processing**) would stay frozen on `processing` after the payout actually settled. The reflect updates the matching `items[]` + recomputes the stored counts, so the batch reflects the final outcome.
 
 > **Still to lock before real go-live** (see Commission.md §9): choose + contract a real provider, bank-account ownership verification (micro-deposit/Plaid), encrypt/tokenize stored account numbers, funding-balance pre-check + payout caps, 1099/W-9 enforcement, and the NACHA originator agreement.
 
@@ -473,7 +517,10 @@ wholesale_applications (practitioner)        cdo_qbo_tokens (singleton/realm)
 `realmId (unique), accessToken, accessTokenExpiresAt, refreshToken, refreshTokenExpiresAt, tokenType`
 
 **`cdo_settings`** — program singleton.
-`defaultCommissionRate, currency, payoutSchedule, minimumPayoutAmount, autoApproveCommissions, …`
+`defaultCommissionRate, currency, payoutSchedule, minimumPayoutAmount, autoApproveCommissions, cookieWindowDays, vendorCommissions[] (per-vendor rates), commissionConfigVersion`
+
+**`cdo_commission_config_history`** — append-only audit of per-vendor commission-rate changes
+(`vendor, action: set|remove, previousPercent, newPercent, version, changedBy, changedAt`). See §4.1.
 
 ---
 
@@ -512,6 +559,7 @@ Mutations are React Router **route actions** (embedded-admin), dispatched by a s
 
 | Risk | Guard |
 |---|---|
+| **Two commissions for one order** (concurrent webhooks) | **UNIQUE partial index on `cdo_commissions.orderId`** + `createCommissionForOrder` E11000 catch → loser treated as "already created", no second ledger entry. (Pre-existing dupes must be cleared via `scripts/dedupe-cdo-commissions.js` before the index can build.) |
 | Same commission batched twice | `payoutId` reservation + eligibility filter `payoutId: null` |
 | Two payouts for same practitioner/period | partial-unique index on open statuses + pre-check in `buildPayoutBatch` |
 | QBO create re-fired after a lost response | stable `requestid` (`cdo-bill-<id>` / `cdo-pay-<id>`) — QBO dedups |
@@ -659,6 +707,57 @@ payment), but the money record waits for payment:
 
 > **Scopes:** receiving `orders/*` requires `read_orders` and Shopify **protected customer data** approval. `shopify.app.toml` subscribes `orders/create`, `orders/paid`, `orders/updated`, `orders/cancelled`; production stores must be approved before delivery starts.
 
+### 15.1 Permanent patient↔practitioner binding + multi-point enforcement
+
+Once a patient (keyed by **email and/or Shopify customer id**) is attributed to a
+practitioner, that relationship is **permanent**: the patient may afterwards only
+use referral codes belonging to the **same** practitioner. The binding compares
+the **practitioner, not the code**, so a practitioner can rotate / re-issue codes
+and the patient may use any of them without breaking the relationship — but a
+**different** practitioner's code is always rejected.
+
+**Shared helpers** ([cdo.service.js](../app/services/cdo/cdo.service.js)):
+- `resolvePatientPractitioner({ email, customerId })` → the bound practitioner,
+  from `cdo_applications.referral.practitionerId` (primary, by email **or**
+  customerId) then `cdo_referrals` (fallback — earliest row by `referredEmail`
+  wins; the first attribution is the permanent one). `null` if no binding yet.
+- `checkPatientBinding({ email, customerId, practitionerId })` → `{ ok }`:
+  `ok:true` when there's **no binding yet** (first attribution) or the candidate
+  code's practitioner **matches** the bound one; `ok:false reason:"bound_other"`
+  when it's a different practitioner.
+
+**Four enforcement points** (every place a code can attach to a patient):
+1. **Registration** — `POST /api/signup-form` runs `checkPatientBinding` after
+   verifying the code; a different practitioner's code is rejected `409` ("You are
+   already associated with another practitioner"). Same-practitioner codes pass.
+2. **Order / referral-link attribution (server)** — `resolveOrderReferral`'s
+   catalogue-fallback path guards on the binding, so a foreign code carried on an
+   order can't re-attribute an already-bound patient (the order is left
+   unattributed rather than crediting another practitioner). This is the
+   **backstop** that holds even when the checkout extension can't run.
+3. **Checkout validation** — `POST /api/cdo/checkout-validate-code`
+   (`{ code, email?, customerId? }`) returns a specific `result.message`:
+   **"Invalid Referral Code"** (`not_found` — unknown/inactive code),
+   **"Practitioner does not exist"** (`practitioner_missing` — code's practitioner
+   no longer eligible), or **"You are already associated with another
+   practitioner"** (`bound_other`). The binding check is identity-gated and
+   skipped for a guest with no identity; code-validity checks always run.
+4. **Checkout BLOCK (extension)** — the [`checkout-ui-code`](../extensions/checkout-ui-code/src/Checkout.jsx)
+   extension declares the **`block_progress`** capability and registers a
+   `useBuyerJourneyIntercept`. While any referral validation is unresolved the
+   buyer **cannot advance** — including past the final **Pay** step, so the order
+   is never created. The single render-derived gate (`referralBlock`) blocks on:
+   an external/applied code still being validated; an invalid applied code that
+   couldn't be auto-removed (a known-bad Shopify discount stuck on the order); or
+   an invalid manually-entered code. A code that validates as valid clears the
+   gate; an invalid code is removed (clearing the `cdo_practitioner_code` cart
+   attribute) and, if removal fails, hard-blocks with a **Remove code** action.
+   If the merchant disallows `block_progress`, Shopify downgrades block→allow and
+   the extension degrades to a visible critical banner (the server backstop, #2,
+   still enforces). **Limitation:** a fully guest checkout (no PCD email, not
+   logged in) can't have its *binding* enforced at the extension — only validity —
+   but order ingest (#2) re-enforces server-side.
+
 ---
 
 ## 16. Reporting + analytics
@@ -724,18 +823,65 @@ Shopify "partial"/"restocked"). Kept in sync automatically by the subscribed
 ## 18. Practitioner Portal (Customer Account UI extension)
 
 Self-service dashboard for CDO practitioners, rendered **inside the Shopify
-customer account** as a full-page UI extension. Read-only over the `cdo_*`
-collections this app owns. Moved here from the wholesale workspace on
-**2026-06-08** (single-owner architecture — the data and the portal now live in
-the same app).
+customer account** as a full-page UI extension. Read aggregations over the
+`cdo_*` collections this app owns, plus the referral self-service **write** path
+(see below). Moved here from the wholesale workspace on **2026-06-08**
+(single-owner architecture — the data and the portal now live in the same app).
+
+> **Referral self-service (write path) — added 2026-06-18.** Practitioners can
+> now **create their own referral codes + links** and **pause/resume** them from
+> the Referrals tab (previously the portal was strictly read-only). New endpoint
+> `POST /api/portal/referrals` with `{ op: 'create' | 'pause' | 'resume', ... }`,
+> guarded by a new `portalMutation` wrapper (same JWT/tenant gate as the GET
+> loaders; the CORS preflight now allows `POST`). Rules (enforced server-side in
+> `cdo.portal.service.createReferralCode` / `setReferralCodeStatus`):
+> - **Code**: 3–40 chars, lowercase `[a-z0-9_-]` (starts alphanumeric), and
+>   **unique store-wide** — checked against `cdo_practitioner_codes` AND Shopify
+>   (a code that already exists on Shopify → conflict, not silent adoption).
+> - **Discount**: one of **10/15/20/25/30/35 %**, stored as a fraction.
+> - **One ACTIVE code per discount tier** per practitioner — pausing a code frees
+>   its tier for re-creation; resuming into an occupied tier is rejected.
+>
+> Each created code is backed by a real Shopify **basic code** percentage
+> discount (`https://<retail-shop>/discount/<code>`). The DB row is the atomic
+> claim (unique `{shop, code}` index); the row is **rolled back** if the Shopify
+> discount can't be created, so a code never lingers without a live link. Pausing
+> runs `discountCodeDeactivate` (link stops applying) and resuming
+> `discountCodeActivate`, before the DB status flips, so the catalogue and the
+> storefront never disagree. **Requires the `write_discounts` scope** (added to
+> the app's access scopes alongside `read_discounts`). The Shopify discount
+> writes live in `app/services/cdo/cdo.discount.service.js`, shared with the
+> wholesale-registration `/api/cdo-internal/create-shopify-discount` endpoint.
+>
+> **Admin CDO page: create + pause/resume (2026-06-18).** The CDO Program admin's
+> practitioner detail page (`app.cdo-program.customers.$id._index.jsx`, action in
+> `…$id.jsx`) supports **Add referral code** + **Pause/Resume** + Copy; code
+> **edit / delete / set-primary were removed**. **Add** (`createPractitionerCode`,
+> `_action: "create-code"`) takes a required Code and an **optional** Discount %
+> (blank → 0% / attribution-only); when a discount is set it also creates the
+> backing Shopify discount on the retail store (best-effort — a discount failure
+> logs but doesn't block the code row). There is **no practitioner-level
+> commission field** — commission is configured per product vendor (§4.1), so the
+> code's commission rate is always null and never drives the amount. **Pause/Resume**
+> (`setPractitionerCodeStatus`, `_action: "set-code-status"`), like the portal's
+> `setReferralCodeStatus`, calls the shared `cdo.discount.service.setShopifyDiscountActive`
+> to **deactivate/reactivate the backing Shopify discount** (not just flip the DB
+> status) before saving — so a paused code genuinely stops applying on the
+> storefront. Both create + toggle pass the retail `shop` (session.shop) so the
+> Admin API targets the store the discount lives on (a code's stored `shop` may
+> be the wholesale shop). Referral tracking + earned commissions are untouched
+> (immutable history; the status gate only affects NEW attributions). Codes
+> without a `shopifyDiscountId` (0%/attribution-only or legacy) skip the Shopify
+> call.
 
 **Pieces:**
 
 | Piece | Path |
 |---|---|
 | Extension (Preact + Polaris web components, full page) | `extensions/practitioner-portal-account/` (`customer-account.page.render` target, `network_access = true`, api_version `2025-10`) |
-| Backend service (all read-only aggregations) | `app/services/cdo/cdo.portal.service.js` |
-| API handlers (thin) + shared guard | `app/api/portal/{_guard,me,summary,revenue,customers,commissions,payouts,referrals,discounts}.js`, registered in `app/routes.js` |
+| Backend service (aggregations + referral self-service writes) | `app/services/cdo/cdo.portal.service.js` |
+| Shopify discount writes (create / activate / deactivate) | `app/services/cdo/cdo.discount.service.js` |
+| API handlers (thin) + shared guard (`portalLoader` GET / `portalMutation` POST) | `app/api/portal/{_guard,me,summary,revenue,customers,commissions,payouts,referrals,discounts}.js`, registered in `app/routes.js` |
 | Response helpers | `app/services/APIService/api.service.js` |
 | Models reused (the real ones) | `cdoOrder` · `cdoCommission` · `cdoPayout` · `cdoReferral` · `cdoPractitionerCode` · `wholesaleApplication` |
 
@@ -758,7 +904,8 @@ Either gate failing → `403`. Every aggregation in `cdo.portal.service.js` is
 scoped by `{ practitionerId }`. Auth failures map to `401` (not signed in / no
 `sub`) and `403` (signed in but not authorized — missing tags or not an approved
 practitioner). A null-origin Web Worker + the Authorization header make the
-fetch non-simple, so `portalAction` answers the CORS `OPTIONS` preflight and the
+fetch non-simple, so the guard wrappers (`portalLoader` GET / `portalMutation`
+POST) answer the CORS `OPTIONS` preflight (now allowing `GET, POST`) and the
 library `cors` helper stamps success responses. **Frontend:** the extension
 calls `me` before rendering and shows a "sign in" (`401`) or "Access restricted"
 (`403`) screen instead of the dashboard — but the backend tag gate on every
@@ -782,15 +929,19 @@ extension; the page-level gate + backend `403` are what prevent access.*
 > request; nothing is read from a MongoDB mirror). Without the email bridge, every ns-retail
 > login 403s ("Access restricted") — the regression seen right after the move.
 
-**Endpoints** (all GET, served at `${api_base_url}/api/portal/*`): `me`,
-`summary`, `revenue` (month/last/year/lifetime + range), `customers` (referred
-patients), `commissions` (+ `pendingOnly`), `payouts` (with per-payout
-commission breakdown), `referrals` (codes + usage), `discounts` (derived from
-codes). Pagination + search + date-range filters where applicable.
+**Endpoints** (served at `${api_base_url}/api/portal/*`): `me`, `summary`,
+`revenue` (month/last/year/lifetime + range), `customers` (referred patients),
+`commissions` (+ `pendingOnly`), `payouts` (with per-payout commission
+breakdown), `referrals` (GET codes + usage; **POST** create / pause / resume —
+see the self-service write path above), `discounts` (derived from codes). All
+GET except the `referrals` POST. Pagination + search + date-range filters where
+applicable.
 
 **Prerequisites (Partner dashboard, ns-retail app):** customer accounts
 enabled + protected customer data access (for the `sub` claim) + the
-`read_customers` scope (for the cross-store email bridge above). The
+`read_customers` scope (for the cross-store email bridge above) + the
+`read_discounts,write_discounts` scopes (for referral self-service — creating /
+activating / deactivating the storefront discount). The
 practitioner must have a **customer account on the ns-retail store using the
 same email** as their approved wholesale application — that email is the bridge
 key. **Merchant step after deploy:** add the page to the customer-account
@@ -803,8 +954,9 @@ wins over the merchant-set setting when non-empty); leave it `''` for production
 builds.
 
 **Out of scope (here):** commission/payout *generation* (owned by the CDO
-engine, §4/§7), live Shopify Discount API objects, charts, and CSV export (the
-sandboxed Web Worker has no DOM/Blob).
+engine, §4/§7), charts, and CSV export (the sandboxed Web Worker has no
+DOM/Blob). *(Live Shopify Discount API objects were previously out of scope but
+are now created/toggled by the referral self-service write path above.)*
 
 ## 19. Retail order QBO invoicing (`QBO_RETAIL_*`) — IMPLEMENTED
 

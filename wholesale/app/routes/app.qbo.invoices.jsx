@@ -1,4 +1,3 @@
-import { useState } from "react";
 import {
   useLoaderData,
   useNavigation,
@@ -12,6 +11,7 @@ import {
 } from "../services/qbo/qbo.service";
 import { escapeQboQuery } from "../services/qbo/qbo.utils";
 import { formatAmount, fmtDueDate } from "../utils/format.utils";
+import { AdvancedFilters } from "../components/admin-ui";
 
 const PAGE_SIZE = 50;
 
@@ -45,12 +45,38 @@ const FILTER_CHIPS = [
   { id: "voided", label: "Voided" },
 ];
 
+// Config for the shared <AdvancedFilters> card. Status options mirror
+// FILTER_CHIPS so the loader's where-clause mapping stays the source of truth.
+const FILTER_FIELDS = [
+  { key: "q", label: "Invoice number", type: "text", placeholder: "#1142" },
+  {
+    key: "filter",
+    label: "Payment status",
+    type: "select",
+    options: FILTER_CHIPS.map((f) => ({ value: f.id, label: f.label })),
+  },
+  { key: "dateFrom", label: "From date", type: "date" },
+  { key: "dateTo", label: "To date", type: "date" },
+];
+const FILTER_DEFAULTS = { filter: "all" };
+
 function buildSearchWhere(q) {
   const trimmed = q.trim();
   if (!trimmed) return null;
   const v = escapeQboQuery(trimmed);
   // DocNumber LIKE for partial invoice-number matches.
   return `DocNumber LIKE '%${v}%'`;
+}
+
+const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+// Explicit From/To range on the invoice TxnDate. Each bound is applied only
+// when it is a well-formed YYYY-MM-DD (the s-date-field always emits that
+// shape; the regex guards against hand-edited URLs from being injected raw).
+function buildDateRangeWhere(from, to) {
+  const parts = [];
+  if (YMD_RE.test(from)) parts.push(`TxnDate >= '${from}'`);
+  if (YMD_RE.test(to)) parts.push(`TxnDate <= '${to}'`);
+  return parts.length ? parts.join(" AND ") : null;
 }
 
 function combineWhere(...parts) {
@@ -65,12 +91,15 @@ export const loader = async ({ request }) => {
   const url = new URL(request.url);
   const q = (url.searchParams.get("q") || "").trim();
   const filter = url.searchParams.get("filter") || "all";
+  const dateFrom = (url.searchParams.get("dateFrom") || "").trim();
+  const dateTo = (url.searchParams.get("dateTo") || "").trim();
   const page = Math.max(1, Number(url.searchParams.get("page") || 1));
   const startPosition = (page - 1) * PAGE_SIZE + 1;
   const now = new Date();
 
   const where = combineWhere(
     buildFilterWhere(filter, now),
+    buildDateRangeWhere(dateFrom, dateTo),
     buildSearchWhere(q),
   );
 
@@ -87,6 +116,8 @@ export const loader = async ({ request }) => {
       pageSize: PAGE_SIZE,
       q,
       filter,
+      dateFrom,
+      dateTo,
       error: null,
     };
   } catch (e) {
@@ -98,6 +129,8 @@ export const loader = async ({ request }) => {
       pageSize: PAGE_SIZE,
       q,
       filter,
+      dateFrom,
+      dateTo,
       error: e?.message || "Failed to load QBO invoices",
     };
   }
@@ -164,11 +197,11 @@ const EMAIL_TONE = {
 };
 
 export default function QboInvoices() {
-  const { rows, total, page, pageSize, q, filter, error } = useLoaderData();
+  const { rows, total, page, pageSize, q, filter, dateFrom, dateTo, error } =
+    useLoaderData();
   const navigation = useNavigation();
   const revalidator = useRevalidator();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [searchInput, setSearchInput] = useState(q);
 
   const tableLoading = navigation.state === "loading";
   const refreshing = revalidator.state !== "idle";
@@ -186,63 +219,18 @@ export default function QboInvoices() {
     setSearchParams(merged);
   };
 
-  const onFilterChip = (id) =>
-    updateParams({ filter: id === "all" ? null : id });
-  const onSearchSubmit = (e) => {
-    e?.preventDefault?.();
-    updateParams({ q: searchInput.trim() || null });
-  };
-  const onSearchClear = () => {
-    setSearchInput("");
-    updateParams({ q: null });
-  };
-
   return (
-    <s-section heading={`Invoices (${total})`}>
-      <s-stack direction="block" gap="base">
-        <form onSubmit={onSearchSubmit}>
-          <s-stack direction="inline" gap="small-200" alignItems="end">
-            <s-search-field
-              label="Search"
-              labelAccessibilityVisibility="exclusive"
-              placeholder="Search by invoice number"
-              value={searchInput}
-              onInput={(e) => setSearchInput(e?.currentTarget?.value ?? "")}
-            />
-            <s-button variant="primary" type="submit">
-              Search
-            </s-button>
-            {q && (
-              <s-button variant="tertiary" onClick={onSearchClear}>
-                Clear
-              </s-button>
-            )}
-            <s-button
-              variant="secondary"
-              onClick={() => revalidator.revalidate()}
-              {...(refreshing ? { loading: true } : {})}
-            >
-              Refresh
-            </s-button>
-          </s-stack>
-        </form>
-
-        <s-stack direction="inline" gap="small-200">
-          {FILTER_CHIPS.map((f) => {
-            const active = filter === f.id;
-            return (
-              <s-clickable-chip
-                key={f.id}
-                color={active ? "strong" : "base"}
-                accessibilityLabel={`Filter by ${f.label}`}
-                onClick={() => onFilterChip(f.id)}
-              >
-                {f.label}
-              </s-clickable-chip>
-            );
-          })}
-        </s-stack>
-
+    <>
+      <AdvancedFilters
+        fields={FILTER_FIELDS}
+        values={{ q, filter, dateFrom, dateTo }}
+        defaults={FILTER_DEFAULTS}
+        onRefresh={() => revalidator.revalidate()}
+        refreshing={refreshing}
+        applying={tableLoading}
+      />
+      <s-section heading={`Invoices (${total})`}>
+        <s-stack direction="block" gap="base">
         {error && (
           <s-banner tone="critical" heading="Could not load invoices">
             <s-paragraph>{error}</s-paragraph>
@@ -382,7 +370,8 @@ export default function QboInvoices() {
             </s-stack>
           </s-stack>
         )}
-      </s-stack>
-    </s-section>
+        </s-stack>
+      </s-section>
+    </>
   );
 }

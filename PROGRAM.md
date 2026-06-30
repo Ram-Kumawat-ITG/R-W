@@ -201,6 +201,1000 @@ Active session storage is **MongoDB** via `@shopify/shopify-app-session-storage-
 
 ## Changelog
 
+### 2026-06-30 — Processing fee now compensates for discounts applied to the fee line (qty-inflation pattern)
+
+**Why** — Shopify's native cart-wide / order-wide discounts (code or automatic) apply to EVERY cart line including our Processing Fee line. There is no native "non-discountable" line flag, no eligibility filter exposed to Functions, and Discount Functions cannot intercept native discounts (they only GENERATE additional discounts, not modify incoming ones). Cart Transform Function's `lineUpdate` operation is Shopify Plus-only — unavailable on the Grow plan. After exhaustive research the only code-only solution that works on Grow is to detect the discount Shopify pulled out of our fee line and inflate the fee quantity to compensate, so the customer's NET fee post-discount equals exactly N% of the real cart.
+
+**Files modified:**
+
+- [wholesale/extensions/checkout-ui/src/Checkout.jsx](wholesale/extensions/checkout-ui/src/Checkout.jsx)
+- [ns-retail/extensions/processing-fee/src/Checkout.jsx](ns-retail/extensions/processing-fee/src/Checkout.jsx)
+
+**The math:**
+
+```
+realCartTotal       = totalAmount − feeLine.cost.totalAmount         (layer 1 — self-comp)
+feeSubtotalPre      = feeLine.quantity × $0.01                       (we KNOW the unit price)
+discountRateOnFee   = (feeSubtotalPre − feeLine.cost.totalAmount) / feeSubtotalPre   (clamped 0–0.95)
+desiredFeeNet       = realCartTotal × N%
+inflationFactor     = 1 / (1 − discountRateOnFee)
+targetQty           = round(desiredFeeNet × inflationFactor × 100)
+```
+
+**Convergence** — two iterations:
+
+| Round | Fee qty | Fee subtotal | Fee net (post-discount) | realCartTotal | targetQty next |
+|---|---|---|---|---|---|
+| 1 (no fee) | 0 | $0.00 | $0.00 | $115.00 | 345 |
+| 2 (fee added) | 345 | $3.45 | $3.105 | $115.00 | 383 |
+| 3 (compensated) | 383 | $3.83 | $3.447 | $115.00 | 383 ✓ stable |
+
+Customer sees `Processing Fee × 383 = $3.83 → discounted to $3.45`. The displayed-discounted amount equals 3% of `realCartTotal` exactly.
+
+**Why qty × $0.01 instead of `line.cost.subtotalAmount`** — the Checkout UI `CartLineCost` API surface does NOT expose a `subtotalAmount` field (TypeScript flagged this). Only `totalAmount` (post-discount) is available on the line. Since our fee variant is REQUIRED to be priced at $0.01/unit (the safety guard refuses to touch any line whose per-unit price differs — see the existing `candidatePerUnit <= 0.011` check), the pre-discount subtotal is deterministically `quantity × $0.01` without needing a separate API field.
+
+**Coverage:**
+- ✅ Percentage discounts (10% off, 20% off)
+- ✅ Fixed-amount discounts ($5 off cart — Shopify allocates pro-rata; rate detected per line)
+- ✅ Stacked discounts (compounded rate read directly)
+- ✅ Free shipping codes — affect shipping not items, fee unaffected
+- ✅ Product-level vs order-level discounts — both reduce `line.cost.totalAmount`, detected uniformly
+
+**Edge cases handled:**
+- Discount rate clamped to `[0, 0.95]` — prevents divide-by-zero on hypothetical 100% discounts.
+- Round-1 case (no fee yet, no discount to measure) — `existingFeeSubtotalDollars = 0` → discount rate stays 0 → no inflation; round 2 sees the actual rate and rewrites.
+
+**Diagnostic log line:**
+
+```
+[processing-fee] 💵 totalAmount=$X · realCartTotal=$Y · discountOnFee=Z%
+                  · desiredNet=$A · inflated=$B · targetQty=N · existingQty=M
+```
+
+Look at `discountOnFee` in the console to verify Shopify is actually pulling a discount out of our line; if it's `0.00%` despite an active code, the discount is configured to skip our variant (no inflation needed).
+
+---
+
+### 2026-06-30 — ns-retail: 3% processing fee added at checkout (mirrors wholesale extension)
+
+**Why** — The wholesale store already adds a 3% processing fee at checkout via [wholesale/extensions/checkout-ui](wholesale/extensions/checkout-ui). The retail store needs the same surcharge — 3% on the cart **grand total** (items + shipping + tax) — so retail customers (whether self-checkout patients or drop-ship retail orders) carry the same processing margin.
+
+**Approach** — Standalone Checkout UI extension `ns-retail/extensions/processing-fee/`, separate from the existing `checkout-ui-code` extension (which is the CDO referral-code flow). Two extensions CAN target the same `purchase.checkout.block.render` slot — they render side by side in the checkout editor. Keeping fee logic isolated means CDO + fee can be debugged / deployed independently.
+
+**Files created** (mirror of wholesale equivalents):
+
+| File | Notes |
+|---|---|
+| `ns-retail/extensions/processing-fee/shopify.extension.toml` | Fresh `uid` generated via `crypto.randomUUID()` (the CLI's auto-generated UIDs occasionally have a 20-char last segment that Shopify silently rejects). `api_access = false` (extension reads no Storefront API). |
+| `ns-retail/extensions/processing-fee/package.json` | Same deps as wholesale (`preact`, `@preact/signals`, `@shopify/ui-extensions@2026.4.x`). |
+| `ns-retail/extensions/processing-fee/tsconfig.json` | Preact JSX runtime. |
+| `ns-retail/extensions/processing-fee/src/Checkout.jsx` | Byte-for-byte mirror of wholesale Checkout.jsx — same self-compensation, totalAmount basis, safety guards, $0.01 variant detection. Only differences: file-path comment, log tag (`processing-fee:retail`), and a placeholder `FEE_VARIANT_GID = 'gid://shopify/ProductVariant/REPLACE_ME'` that the operator MUST update after creating the retail-store Processing Fee product. |
+
+**Files modified:**
+
+- `ns-retail/app/api/shipping/rates.js` — Added `isProcessingFeeItem(item)` helper + `realItems` filter (mirrors the wholesale fix from earlier today). The retail carrier-service callback now excludes the Processing Fee line from `sumQuantity` (markup tier) and from `fetchDirectCarrierRates` (USPS/UPS weight calculation). `PROCESSING_FEE_VARIANT_ID` is `null` until the operator pastes the retail variant's numeric id — the title-regex fallback (`/processing\s*fee/i`) carries the detection until then.
+
+**Operator handoff — required setup in the retail Shopify store:**
+
+1. **Create the Processing Fee product** in retail Shopify Admin:
+   - Title: `Processing Fee`
+   - Variant price: **$0.01** (one cent — the quantity-as-cents trick relies on this exactly)
+   - Track inventory: **OFF**
+   - Requires shipping: **OFF** (digital — keeps it out of the carrier-service payload + zero weight)
+   - Charge tax on this product: **OFF**
+   - Sales channels: uncheck all (hide from the storefront catalog)
+2. **Paste the variant GID** into `FEE_VARIANT_GID` in [ns-retail/extensions/processing-fee/src/Checkout.jsx](ns-retail/extensions/processing-fee/src/Checkout.jsx) — format `gid://shopify/ProductVariant/<numeric_id>`.
+3. **Paste the numeric variant id** into `PROCESSING_FEE_VARIANT_ID` in [ns-retail/app/api/shipping/rates.js](ns-retail/app/api/shipping/rates.js) — same number, no `gid://...` prefix. The title-regex fallback covers the brief drift window but the variant-id match is the faster + safer primary path.
+4. `shopify app deploy` from `ns-retail/` to publish the extension.
+5. Merchant adds the "Processing Fee" block to the Checkout editor (Shopify Admin → Settings → Checkout → Customize) — same step the wholesale operator already did.
+
+**Lifecycle** — Cart-line mutations require `instructions.value.lines.canAddCartLine`, which Shopify only sets to `true` AFTER the buyer has entered a shipping address. So the fee appears at the shipping step (after address, before payment) — exactly when the totals update — matching the wholesale flow.
+
+**3% basis** — `shopify.cost.totalAmount` (items + shipping + tax). Self-compensation `realBase = totalAmount - existingFeeDollars` prevents the fee from compounding when the cart re-evaluates. Console log: `[processing-fee:retail] 💵 totalAmount=$X · realBase=$Y · ...`.
+
+**Cross-reference** — When you change the fee math in one Checkout.jsx, change it in the other too. The tier table in [wholesale/app/api/shipping/rates.js](wholesale/app/api/shipping/rates.js) and [ns-retail/app/api/shipping/rates.js](ns-retail/app/api/shipping/rates.js) is also a 1:1 mirror — keep both in lockstep.
+
+---
+
+### 2026-06-30 — Carrier shipping handler now excludes the Processing Fee cart line from markup + free-shipping calculations
+
+**Why** — The Checkout UI extension (`extensions/checkout-ui/src/Checkout.jsx`) adds a "Processing Fee" cart line item (variant @ $0.01, quantity = cents-of-fee, typically 9000+) to apply the 3% surcharge. When the carrier-service callback at `app/api/shipping/rates.js` fires, Shopify includes that line in `rate.items[]` alongside real merchandise. Three downstream calculations were silently corrupted:
+
+1. **Tiered handling markup** — `tieredMarkupCents(totalQty)` is based on `sumQuantity(rate.items)`. The fee's 9000+ qty always pushed the tier to "4+ items → $5" regardless of real product count.
+2. **Free-shipping vendor check** — `realItems.every(it => vendor === 'Natural Solutions')`. The Processing Fee product may have a different (or unset) vendor, silently disqualifying NS-only carts from the free-shipping rule.
+3. **Free-shipping subtotal threshold** — `cartSubtotalUsd` was summing the fee's ($0.01 × qty) into the $500 threshold, slightly inflating it.
+
+**Change** — [app/api/shipping/rates.js](wholesale/app/api/shipping/rates.js):
+
+- New helper `isProcessingFeeItem(item)` — detects the fee line by `variant_id === PROCESSING_FEE_VARIANT_ID` (matches `FEE_VARIANT_GID` in [extensions/checkout-ui/src/Checkout.jsx](wholesale/extensions/checkout-ui/src/Checkout.jsx)) with a `/processing\s*fee/i` title-regex fallback for misconfigured products / variant-id drift between environments.
+- At the top of the handler, derive `realItems = rate.items.filter(it => !isProcessingFeeItem(it))` and use that everywhere downstream: `sumQuantity`, vendor check, subtotal threshold, and the items array passed to `fetchDirectCarrierRates` (so USPS/UPS weight + box-dim math also ignores the fee).
+- Log line surfaces how many fee lines were stripped: `"X line(s) (1 processing-fee excluded), realQty=Y"`.
+
+**Keep in sync** — `PROCESSING_FEE_VARIANT_ID` in [rates.js](wholesale/app/api/shipping/rates.js) must match `FEE_VARIANT_GID` in [Checkout.jsx](wholesale/extensions/checkout-ui/src/Checkout.jsx). If the merchant ever recreates the Processing Fee product, both constants need updating. The title-regex fallback covers the brief drift window.
+
+**3% fee basis confirmation** (no code change, just verification): The 3% surcharge in `Checkout.jsx` is computed on **`shopify.cost.totalAmount` (items + shipping + tax)** — not subtotal. Self-compensation (`realBase = totalAmount - existingFeeDollars`) prevents the fee from compounding on itself when the cart re-evaluates. Live trace at line 130 logs `totalAmount=$X · realBase=$Y` for diagnostics — if the console still shows `subtotal=$X`, the extension hasn't been rebuilt and the dev server needs a restart.
+
+**ns-retail mirror** — Not patched. The retail store doesn't add a Processing Fee via Checkout UI extension (that's wholesale-only), so the retail `app/api/shipping/rates.js` doesn't see fee lines. If retail ever adds a similar fee mechanism, mirror this filter there too.
+
+---
+
+### 2026-06-30 — Profile-update extension: commission payout now supports ACH + Check (mirrors registration form)
+
+**Why** — Registration form already lets practitioners pick ACH or Check for commission payouts ([Step3Payment.jsx CommissionBankSection](wholesale/registration-form/src/components/Step3Payment.jsx#L189)) and persists both branches via [app/api/registration-form.js:216-282](wholesale/app/api/registration-form.js#L216-L282) (AES-256-GCM bank-account encryption for ACH; `payableTo` + mailing address for Check; non-selected branch wiped). The profile-update extension's `CommissionSection` had only the ACH form and **`app/api/update-profile.js` did not handle commission at all** — so once a practitioner registered, they could never change their payout method or update bank/check details.
+
+**Changes**:
+
+1. **API — [app/api/update-profile.js](wholesale/app/api/update-profile.js)**
+   - Destructure `commission` from request body.
+   - New branch (mirrors `registration-form.js`):
+     - `payoutMethod === 'ach'` → write bank fields; if `bankAccountNumber` non-empty, AES-256-GCM `encryptField` it + store `bankAccountLast4`. Empty `bankAccountNumber` means "no change" — existing encrypted value preserved (UX-friendly edit; user doesn't re-enter the full number every save). `$unset` wipes `commission.check`.
+     - `payoutMethod === 'check'` → save `check.payableTo` + `check.useBillingAddress` + `check.mailingAddress`. When `useBillingAddress=true`, mailing is copied from the in-flight `address` body (or the doc's saved `billingAddress`). `payableTo` defaults to `firstName + lastName` when blank (matches registration default). `$unset` wipes all ACH fields.
+   - Both branches set `commission.payoutMethod` + `commission.enabled` + `commission.updatedAt`.
+   - Combined `$set` + `$unset` Mongo update; response merges $unset into projected `updatedDoc` and strips `bankAccountEncrypted` before echoing.
+   - `commission` added to response payload.
+   - Shopify note resync now also triggers on commission updates (`hasCommissionUpdate`).
+
+2. **UI — [extensions/profile-update/src/profile-sections.jsx](wholesale/extensions/profile-update/src/profile-sections.jsx)**
+   - **`initialForm`**: added `payoutMethod` (default `'ach'`) and `check` subobject (`payableTo`, `useBillingAddress` default `true`, `mailingAddress` with line1/line2/city/state/zip/country).
+   - **`CommissionSection`**: replaced ACH-only form with:
+     - Payout-method `<s-select>` (ACH / Check)
+     - ACH branch unchanged from prior cut (uses `bankAccountLast4` placeholder, optional "Use my ACH payment account" mirror checkbox).
+     - Check branch — new — `payableTo` text field, `useBillingAddress` checkbox, conditional mailing address (state dropdown from `US_STATES`, country dropdown from `COUNTRIES`). All fields get `id="field-commission..."` so the existing scroll-to-error behavior works.
+     - Error map plumbed in (`errorMap` prop) for inline field errors.
+   - **`buildPayload`**: branched per `payoutMethod` — ACH payload omits `bankAccountNumber` when blank; Check payload sends nested `check` object.
+   - **`validate()`**: when `payoutMethod === 'check'`, requires `payableTo`; when `useBillingAddress === false`, requires all mailing-address fields. ACH branch validation unchanged (ABA checksum + 4-17 digit account length when retyped).
+
+3. **Mongoose model** — no change. `WholesaleApplication.commission` already has the `payoutMethod` enum + `check` subdoc + `addressSchema` mailing address from the registration-form rollout.
+
+**Confirmed behaviors (per Q&A with operator):**
+- Branch switch wipes old method's data (matches registration form).
+- Mailing default is `useBillingAddress=true` when first picking Check.
+- Account number edit is "empty = no change, value = overwrite".
+- Existing customers without `commission.payoutMethod` will see ACH as default (will re-register if needed per operator).
+
+**Build step** — after editing, restart `shopify app dev` (or run `shopify app deploy`) so the Customer Account UI extension re-bundles. Browser-side hard refresh of the customer account page is required after the rebuild (extension bundles are cached by the customer-account host).
+
+**Files touched:**
+- `wholesale/app/api/update-profile.js` — +commission block (~80 lines), $unset support, response shape
+- `wholesale/extensions/profile-update/src/profile-sections.jsx` — `initialForm` (+check subobject), `CommissionSection` rewrite (~+115 lines), `buildPayload` (~+25 lines), `validate()` (~+30 lines)
+
+**Post-review fixes (same day, addressing reviewer findings):**
+
+| # | Severity | Fix |
+|---|---|---|
+| 3 | high | Mailing address: when `useBillingAddress=true` AND the incoming `address` body is **partial** (only line1 changed), `update-profile.js` now merges `doc.billingAddress` (baseline) with incoming `address` (overlay) before snapshotting into `commission.check.mailingAddress`. Prevents lossy mailing addresses on partial-address updates. |
+| 5 | high | `validate()` (client) now requires `bankAccountName` + valid ABA `bankRoutingNumber` when `payoutMethod === 'ach'`. `bankAccountNumber` required ONLY when `bankAccountLast4` is empty (no encrypted value on file) — preserves the "edit only what changed" UX for already-saved accounts. Skip-all when `sourcedFromPaymentAch=true` (those fields are server-derived from `payment.ach.*`). Mirrors `step3.schema.js` rules. |
+| 7 | high | `update-profile.js` now blocks the ACH save with **400 — "Bank account number is required when switching to ACH for the first time"** when `bankAccountNumber` is empty AND no existing `bankAccountEncrypted` exists AND `sourcedFromPaymentAch=false`. Catches the Check→ACH switch flow where the prior `$unset` wiped the encrypted value, so the user MUST resupply it. |
+| 2 | high | `update-profile.js` Check branch now rejects with **400 — "Check payout details are required"** when `commission.check` is missing or not an object. Prevents silent doc mutation via inferred defaults (firstName+lastName + billing address) when the user didn't supply check details. |
+| 11 | medium | Removed `hasCommissionUpdate` from the Shopify-note-resync gate. `buildShopifyNote` doesn't write commission fields, so a commission-only update would have burned a Shopify Admin API call to re-push the same note. |
+| 15 | medium | When `sourcedFromPaymentAch=true`, the server now **re-derives** `bankAccountName/RoutingNumber/Type` from the doc's `payment.ach.*` instead of trusting the client (defense in depth — client mirrors on tick, server is source of truth). Note: the existing payment-update flow doesn't accept `payment.ach.*` edits yet, so the "stale mirror after payment edit" case can't trigger today; this is forward-looking hardening for when ACH editing lands. |
+| 8 | low | Defensive optional chaining in `setCheck`/`setMailing` — guards against external mutation that drops `check` from form state (`...(form.commission.check \|\| {})`). |
+| 13 | n/a | Verified `commission.updatedAt` is in the Mongoose schema (`wholesaleApplication.server.js:152`). No write loss. |
+
+**Critical follow-up — wrong endpoint was patched initially:**
+
+The profile-update Customer Account UI extension hits **`POST /api/portal/profile`** (JWT auth) which orchestrates through `updateProfileApplication` in [services/profile/profile.service.js](wholesale/app/services/profile/profile.service.js) — NOT `/api/update-profile` (App Proxy, used by the storefront SPA). My initial commission edits only landed on `update-profile.js`; the extension's actual path was missed. Discovered when the user noticed Check-branch fields couldn't autofill (the read projection was incomplete) and a Check save would lose data (the write path only knew the ACH branch).
+
+**Additional fixes applied:**
+
+| File | Change |
+|---|---|
+| [profile.service.js](wholesale/app/services/profile/profile.service.js) `maskedProfileForRead` | Added `payoutMethod` (default `'ach'` for legacy rows) + full `check` subobject projection (`payableTo`, `useBillingAddress`, full `mailingAddress`). Without these, Check-branch customers opening the profile would see ACH fields with no data AND silently lose their mailing address on save. |
+| [profile.service.js](wholesale/app/services/profile/profile.service.js) `updateProfileApplication` | Rewrote the commission block to handle both ACH + Check branches with full registration-parity logic: AES-256-GCM `encryptField` on new account number (empty = keep current), `sourcedFromPaymentAch` server-side re-derivation from `payment.ach.*`, Check→ACH integrity guard (400 when no encrypted on file), `$unset` branch wipe so only the selected method's data lives on the doc. |
+| [profile.service.js](wholesale/app/services/profile/profile.service.js) top-level | Hoisted `const $unset = {}` to the top of `updateProfileApplication` so the commission branch wipe + the W-9 classification clear can both contribute paths into the same single `updateOne({_id}, {$set, $unset})` call. Removed the duplicate `$unset` declaration that previously lived inside the W-9 block. |
+| [profile-sections.jsx](wholesale/extensions/profile-update/src/profile-sections.jsx) | Card section now renders ONLY when `payment.method === 'card'`. ACH section ONLY when `payment.method === 'ach'`. Commission section always renders (it's independent — how WE pay THEM, not how they pay us). Stored card/ACH data is preserved across method switches; the corresponding section reappears with autofill when the method is re-selected. |
+
+**Other reviewer findings deliberately NOT fixed** (documented for future reference):
+- **#4** `commission.enabled` defaults differ from registration (registration always sets `true`; profile-update preserves the checkbox value). Intentional — the profile UI exposes an Enable toggle that lets the practitioner pause commission, which is a legitimate post-registration action.
+- **#6** `payableTo` server-side fallback to `firstName + lastName` when blank. Matches registration. Client-side `validate()` requires `payableTo`, so the fallback only fires for legacy/edge requests.
+- **#12** Routing number returned unmasked in the response. Routing numbers are printed on every check and are not classified PII; leaving unmasked for diagnostics.
+- **#14** No CSRF beyond App Proxy HMAC — same posture as every other endpoint in the app.
+
+---
+
+### 2026-06-29 — Checkout UI extension: variant GID + fee rate switched from settings to hardcoded constants
+
+Follow-up simplification to the regeneration entry below. The first cut read the variant GID + fee rate from `shopify.settings.value` so the merchant could configure them per install in the checkout customization editor. In practice for a single-store wholesale app the merchant-paste step was friction with no upside — the variant is the same on every deploy.
+
+**Change** — [wholesale/extensions/checkout-ui/src/Checkout.jsx](wholesale/extensions/checkout-ui/src/Checkout.jsx):
+
+| Before | After |
+|---|---|
+| `shopify.settings.value.fee_variant_gid` | `const FEE_VARIANT_GID = 'gid://shopify/ProductVariant/REPLACE_ME'` at top of file |
+| `shopify.settings.value.fee_rate_percent` (default 3) | `const FEE_PERCENT = 3` at top of file |
+| `[extensions.settings]` block in toml | Commented out with re-enable instructions |
+| `readString` / `readFeeRate` helpers | Removed — no longer needed |
+| "Settings empty" warning log | Replaced with "`FEE_VARIANT_GID still placeholder`" guard so a forgotten paste still produces a loud log |
+
+**Operator step now is literally one paste** — open `src/Checkout.jsx`, replace `REPLACE_ME` with the real variant GID, rebuild. The block still needs to be added to the checkout customization layout in admin (block has no settings panel any more — just drag it in).
+
+**Trade-off accepted:** changing the variant or rate requires a code change + rebuild. Acceptable for the wholesale app's single-store deploy model.
+
+---
+
+### 2026-06-29 — Checkout UI extension regenerated — 3% processing fee via cart line
+
+Re-scaffolded the `wholesale/extensions/checkout-ui/` extension (we'd deleted it earlier in the week when the storefront-token 401 made dev preview unusable). This time the lessons from the first attempt are baked in, the storefront API path is avoided entirely, and the fee logic is consolidated.
+
+**Generation:**
+
+```
+shopify app generate extension --template=checkout_ui --name=checkout-ui
+```
+
+CLI created the standard scaffold + ran `npm install` for `@shopify/ui-extensions@2026.4.x` + `preact` + `@preact/signals`.
+
+**Files in the extension** ([wholesale/extensions/checkout-ui/](wholesale/extensions/checkout-ui/)):
+
+| File | Purpose |
+|---|---|
+| `package.json` | Deps: `preact`, `@preact/signals`, `@shopify/ui-extensions@2026.4.x` |
+| `tsconfig.json` | Preact JSX routing (`jsx: react-jsx` + `jsxImportSource: preact`). This file's absence in our previous attempt caused JSX to bind to React, the bundle to load silently, and the page to render blank — fixed in scaffold this time. |
+| `shopify.extension.toml` | Target = `purchase.checkout.block.render`, `api_access = false`, two merchant settings: `fee_variant_gid` + `fee_rate_percent` |
+| `src/Checkout.jsx` | The fee logic |
+| `shopify.d.ts` | TS ambient types (CLI default) |
+| `locales/` | Empty — extension is headless |
+
+**Three lessons from the first attempt are encoded in the scaffold:**
+
+1. **`uid` is a real UUID** — the CLI's auto-generated value had a malformed 20-character last segment (`fddfc370-27c7-c30f-4ee0-a927194e2accadefd40c`) which the Shopify app-config validator silently rejects. Replaced with a well-formed UUIDv4.
+2. **`api_access = false`** — even though Storefront API is not used in the code, leaving `api_access = true` causes Shopify to proactively fetch a private storefront token at extension boot, which 401s in dev preview before the customer authenticates and floods the console. Disabled.
+3. **Variant GID from settings, not a Storefront API lookup** — earlier prototype tried `shopify.query` to resolve the variant from a product handle at runtime; the lookup 401'd in dev. Replaced with synchronous read from `shopify.settings.value.fee_variant_gid`.
+
+**Logic in `Checkout.jsx`:**
+
+| Step | Code |
+|---|---|
+| Read settings | `shopify.settings.value.fee_variant_gid` + `fee_rate_percent` (default 3%) |
+| Capability gate | `shopify.instructions.value.lines.canAddCartLine` — true only after shipping address entered, which IS the moment the operator wants (totals update at the shipping step) |
+| Compute base | `subtotal − existingFeeLineTotal` (self-compensation — fee never compounds on itself when the cart re-renders) |
+| Quantity-as-cents trick | Variant priced at $0.01, `quantity = round(base × rate × 100)`. Cart shows `Processing Fee × 24056 — $240.56`. |
+| Diff | `addCartLine` first time, `updateCartLine` when quantity changes, `removeCartLine` when target falls to zero |
+| Signal subscription | `useSignalEffect` — auto-fires on every `subtotalAmount` / `lines` / `instructions` mutation |
+
+**Merchant operator setup (one-time, all in Shopify admin):**
+
+1. Products → Add product
+   - Title: `Processing Fee`
+   - Variant price: $0.01
+   - Track inventory: OFF
+   - Charge tax on this product: OFF
+   - Sales channels: unchecked (hide from storefront catalog)
+2. Open the variant → copy GID from URL (format `gid://shopify/ProductVariant/X`)
+3. Settings → Checkout → Customize → add the `checkout-ui` block to the checkout layout → in its settings paste the variant GID into "Processing Fee variant GID" (and optionally override the rate).
+
+**What customer sees** on an NS-only $8,000 cart (free shipping eligible per the existing rule):
+
+```
+Subtotal              $8,000.00
+Processing Fee × 24000  $240.00
+Shipping  USPS Ground (FREE)  $0.00
+Tax                       —
+─────────────────────────────────
+Total                 $8,240.00
+```
+
+The fee appears as a real cart line. Total reflects it correctly. No surprise at payment time.
+
+**Out of scope:**
+- Self-service profile update / customer account portal (doesn't touch checkout)
+- Retail (ns-retail) — wholesale-only per scope
+- Removing the QBO invoice 3% fee — kept active for QA. Once shipping-baked QBO fee is verified redundant with this checkout-side fee, set `INVOICE_FEE_RATE_CARD=0` in wholesale `.env` to avoid double-charge.
+- Production deploy — needs `shopify app deploy` after testing in dev preview.
+
+---
+
+### 2026-06-29 — Reverted: 3% processing fee removed from shipping rate (will move to Checkout UI extension)
+
+The two same-day entries that baked a 3% processing fee into the carrier-service rate (and the follow-up that kept the fee firing under free-shipping) have been **reverted in full**. Reason: the fee was bleeding into the shipping line in a way the customer could not parse — at $8,000 NS-only carts the rate showed `USPS Ground Advantage — $240.00` and the customer reads that as a $240 shipping cost, not a $0 free shipping + $240 processing fee.
+
+The fee logic is being moved to a **Checkout UI extension** (separate ticket — extension was deleted earlier this week and will be rebuilt). At checkout the fee will appear as its own clearly-labeled line item, not hidden in shipping.
+
+**Reverted to** — the state from the "free shipping on NS cart ≥ $500" entry below (still active):
+
+| Cart | Shipping rate composition | Customer sees |
+|---|---|---|
+| Mixed vendor | `carrier_real + tiered_handling` | e.g. `USPS Ground Advantage — $15.00` |
+| NS-only, $501+ | `0` | `USPS Ground Advantage (FREE — orders over $500) — $0.00` |
+| NS-only, $400 | `carrier_real + tiered_handling` (below threshold) | normal carrier price |
+
+**Files touched:** only [wholesale/app/api/shipping/rates.js](wholesale/app/api/shipping/rates.js) — removed the `PROCESSING_FEE_RATE` block, `processingFeeCents` calc, `subtotalCents` source, and the description/service-name decorations that referenced "3% processing fee". Free-shipping detection (vendor=NS + subtotal≥$500) + tiered handling markup (`tieredMarkupCents`) are untouched.
+
+**QBO invoice 3% fee:** still active per `INVOICE_FEE_RATE_CARD=0.03`. No `.env` change is needed any more during QA (no double-charge risk since shipping is fee-free again).
+
+---
+
+### 2026-06-29 — Wholesale shipping: free shipping on Natural Solutions cart ≥ $500
+
+**Why:** Wholesale storefront customers buying $500+ of Natural Solutions products should get free shipping. Drop-ship / mixed-vendor carts continue paying USPS rate + tiered handling markup.
+
+**Rule (both conditions required):**
+1. **Every line item's vendor is `"Natural Solutions"`** (case-insensitive, trimmed) — even one third-party item disqualifies the entire cart
+2. **Cart subtotal ≥ $500** (sum of `items[].price × quantity`, pre-discount — Shopify's carrier-service payload does not expose post-discount totals)
+
+When both fire: real carrier rate + tiered handling markup both go to **$0**. Customer still picks Ground vs Priority vs Express (each shown at $0 with its own delivery window) so the choice still has meaning.
+
+**Change** — [wholesale/app/api/shipping/rates.js](wholesale/app/api/shipping/rates.js) action handler:
+
+| Block | What |
+|---|---|
+| New constants | `FREE_SHIPPING_VENDOR = 'Natural Solutions'`, `FREE_SHIPPING_THRESHOLD_USD = 500` (hardcoded — env knob deliberately not added per product owner) |
+| Detection | `rate.items.every((it) => (it?.vendor||'').trim().toLowerCase() === FREE_SHIPPING_VENDOR.toLowerCase())` + subtotal sum |
+| Response | `finalCents = isFreeShipping ? 0 : r.rateCents + baseCents`; service name decorated with `(FREE — orders over $500)`; description switched |
+| Log | "FREE shipping ELIGIBLE — vendor=NS × N line(s), subtotal=$X" diagnostic line so operators can confirm the rule is firing |
+
+**Decision matrix:**
+
+| Cart | All items NS? | Subtotal | Free shipping? |
+|---|---|---|---|
+| 1 NS product · $400 | ✅ | $400 | ❌ (below threshold) |
+| 1 NS product · $501 | ✅ | $501 | ✅ |
+| NS + 3rd-party mix · $700 | ❌ | $700 | ❌ (vendor mismatch) |
+| 5 NS products · $1200 | ✅ | $1200 | ✅ |
+
+**Out of scope:**
+- Retail (ns-retail) — wholesale-only per product owner. Retail rates handler unchanged.
+- Post-discount subtotal — would require reading `rate.subtotal_price` if Shopify sends it (not always present). Pre-discount accepted as accurate enough — customers using discount codes on $500+ carts is rare in wholesale.
+- Partial free shipping (NS portion of mixed cart goes free) — strict mode chosen for predictable invoicing.
+- Per-vendor configurable list — `FREE_SHIPPING_VENDOR` is a single constant. Adding a second vendor requires a code change.
+
+**Drop-ship interaction:** wholesale `buildShippingLine` passes through the retail order's shipping price as-is (no reverse calc) — so when a retail order with NS-only cart ≥ $500 triggers free shipping on retail's carrier-service callback, the wholesale clone draft order's shipping line will also be $0. Acceptable — supplier gets the same shipping value the customer paid.
+
+**Test plan:**
+1. Add 1 NS product worth $501 to wholesale cart → checkout shows USPS rates all at $0 with "(FREE — orders over $500)" labels
+2. Add a third-party-vendor item alongside → all rates revert to real carrier + markup
+3. Cart with $499 NS only → real carrier + markup (below threshold)
+4. Empty / no NS items → existing flow
+
+**Verification log to watch:**
+- `[shipping.rates] FREE shipping ELIGIBLE — vendor=NS × N line(s), subtotal=$X.XX`
+- Followed by `[shipping.rates] Direct carriers OK: N rate(s) FREE on $X.XX NS-only cart`
+
+---
+
+### 2026-06-29 — Check-payout mailing address source switched from Shipping → Billing
+
+Follow-up to the same-day commission-payout entry below. The first cut used the **shipping** address as the "Mail checks here" default. Per the program owner, checks are financial documents and should route to the **billing** address (where invoices + 1099s already go) — shipping is for product parcels and may differ (clinic / warehouse / drop-ship destination).
+
+**Renames** (consistent across all 6 touched files):
+
+| Old | New |
+|---|---|
+| `commission.check.useShippingAddress` (Mongoose + form values + Yup + API + admin display) | `commission.check.useBillingAddress` |
+| Form checkbox label: "Mail checks to my shipping address (from Step 2)" | "Mail checks to my billing address (from Step 2)" |
+| API copy-from source: `payload.shippingAddress` | `payload.billingAddress` |
+| Admin detail label: "Shipping address (Step 2)" | "Billing address (Step 2)" |
+
+**Side benefit** — `billingAddress` is **always populated** in this app (Step 2 makes it required), so the edge case where `shippingAddress = null` (because `shippingSameAsBilling: true`) — which would have left `check.mailingAddress` unset under the old shipping-source code — is no longer a concern.
+
+**Theme bundle rebuilt** via `npm run build:theme`. Confirmed via grep on the built `react-app-bundle.js`: `useBillingAddress` × 8, `useShippingAddress` × 0.
+
+---
+
+### 2026-06-29 — Commission payout method (ACH vs Check) at registration
+
+**Why:** The wholesale registration form previously forced every practitioner to submit a bank account for commission payouts — there was no path to receive payouts by paper check. Per the program owner, practitioners need to choose at signup: **ACH bank transfer** *or* **paper check**, with full address validation on the check side.
+
+**Change:**
+
+| File | Change |
+|---|---|
+| [wholesale/app/models/wholesaleApplication.server.js](wholesale/app/models/wholesaleApplication.server.js) | New `commission.payoutMethod` enum (`'ach'` / `'check'`, default `'ach'` for legacy back-compat). New `commission.check` sub-document with `payableTo` + `useShippingAddress` + `mailingAddress` (reuses the existing `addressSchema`). Bank fields stay where they were. |
+| [wholesale/registration-form/src/schema/step3.schema.js](wholesale/registration-form/src/schema/step3.schema.js) | Yup schema: existing bank-field requireds gated on `payoutMethod === 'ach'` via new `reqWhenPayoutAch` helper. Check fields validated via a parent-level `.test('commission-check-required')` that emits per-field `ValidationError`s — yup's `.when` can't traverse parent boundaries cleanly so the test handles it. ZIP regex stays soft (only validates *shape* when a value is present; required-ness comes from the parent test). |
+| [wholesale/registration-form/src/components/Step3Payment.jsx](wholesale/registration-form/src/components/Step3Payment.jsx) | New `PAYOUT_METHODS` constant + selector card UI (reuses the `rf-pay-card` CSS already used by payment method). `CommissionBankSection` rewritten to gate the ACH form on `payoutMethod === 'ach'` and render a new Check form (Payable to + "Use shipping address" checkbox + conditional mailing address with country/state dropdowns). "Use same as ACH payment" checkbox now gated on **both** payment AND payout being ACH. |
+| [wholesale/app/api/registration-form.js](wholesale/app/api/registration-form.js) | Persistence branched on `payoutMethod`. ACH path: encrypts `bankAccountNumber` via `encryptField` (AES-256-GCM keyed by `SHOPIFY_API_SECRET`) + saves `bankAccountLast4` + strips the legacy plaintext field — **also fixes a pre-existing bug** where this handler was storing the bank account number in plaintext (the customer-self-service `profile.service` path was already doing the encryption; this handler wasn't). Check path: defaults `payableTo` to `${firstName} ${lastName}` when blank, copies `shippingAddress` into `mailingAddress` when `useShippingAddress` is true. Server wipes the non-selected branch's fields so the doc never carries stale ACH data when a check practitioner switches their mind on the form. |
+| [wholesale/app/routes/app.customers.$id.jsx](wholesale/app/routes/app.customers.$id.jsx) | Admin "Commission payout" section renders the right view per method: a "Bank transfer (ACH)" badge + bank fields for ACH, a "Paper check" badge + `payableTo` + resolved mailing address for check. |
+| Theme bundle | Rebuilt via `npm run build:theme` — `extensions/theme-extension/assets/react-app-bundle.{css,js}` regenerated. |
+
+**Schema invariants** (worth keeping straight when reading the doc later):
+- `commission.enabled` always `true` after submit (back-compat — opt-out was removed earlier; this entry doesn't bring it back).
+- Bank account number is **encrypted at rest** going forward; legacy rows pre-dating this change still carry plaintext `bankAccountNumber` until the next save. `bankAccountLast4` is the only plaintext component the admin UI surfaces.
+- `payoutMethod = 'check'` rows never carry bank fields at all (server wipes them); `payoutMethod = 'ach'` rows never carry `check.*`. Lookups can branch on `payoutMethod` without defensive coalescing.
+
+**Out of scope:**
+- Self-service profile update (`profile.service.js`) — does not yet allow toggling between ACH/Check or editing check fields. Practitioners who registered before this change still have only ACH fields in the profile editor. Separate ticket.
+- Payout execution — when commissions actually move money to a check-method practitioner, the operator workflow (print check, mail, mark sent) needs UI. CDO payout orchestrator path unchanged.
+- Validation of US-only ZIP format — current regex `[A-Za-z0-9 -]{3,10}` is permissive to accept international postal codes; the country dropdown lists every entry from `countries.json`.
+
+**Operator test plan:**
+1. Submit a new registration with **Bank Transfer** selected — confirm `wholesale_applications.commission.payoutMethod === 'ach'`, `bankAccountEncrypted` populated, `bankAccountLast4` correct, no `check.*` fields, plaintext `bankAccountNumber` absent.
+2. Submit one with **Paper Check + "Use shipping address"** — confirm `check.useShippingAddress = true`, `mailingAddress` matches shipping, no bank fields present.
+3. Submit one with **Paper Check + custom address** — confirm mailing address persisted exactly as entered; verify ZIP regex rejects garbage like "??".
+4. Verify admin Customer detail page renders the right view per method.
+5. Edge case — submit with **invalid routing number** while ACH selected — yup ABA-checksum rejects before submit.
+
+---
+
+### 2026-06-25 — Drop-ship `buildShippingLine` reverse-calc removed · wholesale carries full retail shipping price
+
+**Why:** Earlier the wholesale clone of a retail order had its shipping line **reverse-calculated** — the tiered markup ($2/$3/$5) was subtracted so the wholesale draft order only carried the real carrier cost. The product owner has reversed this policy: the wholesale order should carry the **exact** shipping price the customer paid at retail checkout, markup and all.
+
+**Change** — [wholesale/app/services/dropship/dropship.service.js](wholesale/app/services/dropship/dropship.service.js) `buildShippingLine`:
+
+```js
+// Before
+const markupDollars = tieredMarkupCents(totalQty) / 100
+const realCostDollars = Math.max(0, retailPriceDollars - markupDollars)
+return { title: first?.title || 'Shipping', price: realCostDollars.toFixed(2) }
+
+// After
+return { title: first?.title || 'Shipping', price: Math.max(0, retailPriceDollars).toFixed(2) }
+```
+
+The local `tieredMarkupCents` helper inside this file is removed (no longer needed here). The tier function still lives in the two carrier-service callbacks ([wholesale/app/api/shipping/rates.js](wholesale/app/api/shipping/rates.js), [ns-retail/app/api/shipping/rates.js](ns-retail/app/api/shipping/rates.js)) where it actually computes the customer-facing rate at checkout.
+
+**End-to-end after this change** (retail order, 5 items, USPS Ground real $8):
+1. Retail checkout — customer pays Ground = $8 + $5 markup = **$13 shipping**.
+2. Retail webhook forwards order to wholesale `/api/sync/retail-order`.
+3. `processRetailOrderForDropShip` → `buildShippingLine` → wholesale draft order shipping line = **$13** (no subtraction).
+
+**Out of scope:** the tiered markup in the two carrier-service callbacks is unchanged. The reverse-calc was the only thing removed.
+
+---
+
+### 2026-06-25 — Shipping markup unified across both stores · tier table revised · 4-item tier merged into 5+
+
+**Why:** Three independent locations were quoting / reversing the shipping handling markup with **three different formulas**:
+
+| Location | Old formula | Symptom |
+|---|---|---|
+| Wholesale `app/api/shipping/rates.js` | Tiered (`$2/$3/$4/$5`) | Wholesale checkout charged a different per-qty curve than retail's |
+| ns-retail `app/api/shipping/rates.js` | Linear (`qty × $1`) | Retail checkout's markup scaled forever — 20-item cart added $20 handling |
+| Wholesale `services/dropship/dropship.service.buildShippingLine` | Linear reverse-calc (`qty × $1`) | Stripped the WRONG amount from drop-ship cloned orders once retail switched curves |
+
+These three had to drift apart silently because the env var `SHIPPING_PER_QTY_CENTS` was the only "shared" knob and it only modelled the linear shape. The product owner also revised the wholesale tier table — the 4-item $4 row was merged into the $5 row, so the final spec is:
+
+```
+1–2 items → +$2
+3 items   → +$3
+4 or more → +$5
+```
+
+**Change** — same `tieredMarkupCents(qty)` function copied into three places (single tier table; three implementations are intentional because each file needs to be readable standalone — no cross-package import for the tier values):
+
+| File | What changed |
+|---|---|
+| [wholesale/app/api/shipping/rates.js](wholesale/app/api/shipping/rates.js) | `tieredMarkupCents`: removed the `qty === 4 → 400` branch; comments updated |
+| [ns-retail/app/api/shipping/rates.js](ns-retail/app/api/shipping/rates.js) | Linear `totalQty × PER_ITEM_CENTS` removed; new `tieredMarkupCents` matching wholesale's exactly; success log says "tiered markup" |
+| [wholesale/app/services/dropship/dropship.service.js](wholesale/app/services/dropship/dropship.service.js) | `buildShippingLine` reverse-calc switched from `dropshipConfig.shippingMarkupPerQtyCents` × qty to a private `tieredMarkupCents` clone; jsdoc updated to spell out the tier table + the three-location lock-step contract |
+| [wholesale/app/services/dropship/dropship.config.js](wholesale/app/services/dropship/dropship.config.js) | `shippingMarkupPerQtyCents` config key removed (now unused); unused `readInt` import dropped; note left explaining the new tier table lives in the three handlers |
+
+**Env var status — `SHIPPING_PER_QTY_CENTS` is now dead.** No file reads it any more. Safe to remove from `.env` files on both apps.
+
+**End-to-end example** (retail order, 5 items, USPS Ground real cost $8):
+
+1. Retail checkout: customer sees Ground = $8 + $5 tiered handling = **$13 shipping**.
+2. ns-retail `webhooks.orders.create` forwards the order to wholesale `/api/sync/retail-order`.
+3. Wholesale `processRetailOrderForDropShip` → `buildShippingLine`: `$13 − tieredMarkup(5) = $13 − $5 = $8` real carrier cost.
+4. Wholesale draft order's shipping line = **$8** (real cost only, no markup propagated to the supplier ledger).
+
+**Test plan:**
+1. Wholesale store checkout — 1 / 2 / 3 / 4 / 5 / 10 items → expect markup `+$2 / +$2 / +$3 / +$5 / +$5 / +$5` on each USPS rate.
+2. Retail store checkout — same quantities → expect identical markup amounts (the carrier real rate may differ; the markup will not).
+3. Place a retail order through to a drop-ship clone → confirm wholesale draft order's shipping line equals retail's shipping price **minus** the appropriate tier (e.g. $5 for a 4+ item order).
+
+**Risks / follow-up:**
+- Three copies of the tier table — drift is the obvious failure mode. A future refactor could lift this into `wholesale/app/utils/shippingMarkup.utils.js` and `ns-retail/app/utils/shippingMarkup.utils.js` (one per app — can't cross-import). Not done now because the inline shape is small and self-documenting.
+- The carrier-service callbacks on each Shopify store must actually be registered to point at these handlers. Verify in each store's admin → Settings → Shipping & delivery → Custom carrier services.
+
+---
+
+### 2026-06-22 — ns-retail `webhooks.orders.create` handler: loud diagnostic logging
+
+**Why:** To verify the migration from the manual store-admin webhook to the declarative subscription, an operator needs to see exactly where a Shopify-fired webhook lands and how far it gets — entry, HMAC verify, dispatch, forward target, response status. Existing logs were minimal and easy to miss in a busy terminal.
+
+**Change** — [ns-retail/app/routes/webhooks.orders.create.jsx](ns-retail/app/routes/webhooks.orders.create.jsx):
+
+| Step | New log |
+|---|---|
+| Entry (before HMAC) | `🔔 WEBHOOK RECEIVED at <iso>` with banner separators |
+| HMAC verified | `✅ HMAC verified · shop=… · webhookId=… · orderId=… · orderName=…` |
+| Duplicate skip | `⏭️ duplicate webhook id … — skipping` |
+| Dispatching downstream | `🚀 dispatching processOrder + forwardToWholesale` |
+| Forward starting | `▶️ starting forward · apiBase=… · wholesaleShop=… · secretSet=…` |
+| POST target | `🌐 POST <full URL>` |
+| 200 returned | `✅ 200 returned to Shopify` |
+| Errors | `❌ HMAC auth failed`, `❌ processing failed`, `❌ forward-to-wholesale failed` |
+| Missing env | `⚠️ missing env (WHOLESALE_API_BASE/WHOLESALE_SHOP/RETAIL_SYNC_SECRET)` |
+
+**Diagnostic value:**
+- Only `🔔` with nothing after → HMAC fail (wrong signature, wrong secret pair)
+- `🔔` + `✅` but no `▶️` → forward block not reached (rare; only on dead code path)
+- `▶️ apiBase=(missing)` → env not loaded; restart dev server
+- `🌐 POST …` but no "forwarded (status 200)" → wholesale tunnel dead / URL stale
+
+No behaviour change; logging only. HMR-safe; no restart required to pick up the new logs.
+
+---
+
+### 2026-06-22 — Wholesale shipping: tiered markup + USPS schema fix + static fallback removed
+
+**Why:** The wholesale handler [wholesale/app/api/shipping/rates.js](wholesale/app/api/shipping/rates.js) had three problems carried over from the older retail handler:
+
+1. The USPS call used the wrong request shape (`mailClasses` plural array, missing `processingCategory` / `rateIndicator` / `destinationEntryFacilityType`) — USPS v3 rejected every request with HTTP 400 "OASValidation … Object has missing required fields", so live USPS rates never reached wholesale checkout.
+2. The handling markup was a flat `totalQty × PER_ITEM_CENTS` (default $1/item), which the product owner wanted replaced with a tiered scheme that caps at $5 regardless of order size.
+3. A six-row `STATIC_CARRIER_RATES` table backed the handler when real APIs failed — but now that USPS credentials are valid, falling back to placeholder prices is worse than returning "no shipping available" (it hides credential drift and lets the merchant ship at the wrong price).
+
+**Changes** in [wholesale/app/api/shipping/rates.js](wholesale/app/api/shipping/rates.js):
+
+| Area | Before | After |
+|---|---|---|
+| Markup formula | `totalQty × PER_ITEM_CENTS` (linear, env-tunable) | `tieredMarkupCents(qty)` — 1-2 items → +$2, 3 → +$3, 4 → +$4, 5+ → +$5 |
+| USPS request | One call, `mailClasses: [...]` array, missing required fields | Per-class fan-out (parallel Promise.all), each with its own `mailClass` / `rateIndicator` / `processingCategory` |
+| USPS mail classes | Ground Advantage + Priority + Priority Express | Ground Advantage + Priority + **Priority Express (rateIndicator `PA`)** + **First-Class Package** |
+| Empty-rates path | Returned 6-row `STATIC_CARRIER_RATES` placeholder table | Returns empty rates `[]` → Shopify shows "no shipping available" |
+| Constants | `PER_ITEM_CENTS` (env-backed) + `STATIC_CARRIER_RATES` array | Both removed; markup is the inline tier function |
+
+**Drop-ship reverse-calc — intentionally untouched.** [wholesale/app/services/dropship/dropship.service.js](wholesale/app/services/dropship/dropship.service.js) `buildShippingLine()` strips **retail's** markup from cloned orders, and retail still uses the linear `totalQty × PER_ITEM_CENTS` formula via its own [ns-retail/app/api/shipping/rates.js](ns-retail/app/api/shipping/rates.js). Wholesale's new tiered markup applies only to wholesale-store checkout; the drop-ship clone path reads retail's markup config and reverses that one.
+
+**Behavior at checkout (wholesale store):**
+- 1 item, USPS Ground Advantage real $4.50 → customer pays $6.50 ($4.50 + $2)
+- 3 items, USPS Priority real $8.20 → customer pays $11.20 ($8.20 + $3)
+- 5 items, USPS Express real $24.00 → customer pays $29.00 ($24.00 + $5)
+- 20 items, USPS Priority real $11.50 → customer pays $16.50 ($11.50 + $5, capped)
+
+**Test plan:**
+1. Restart wholesale dev server (the file edit is fine on HMR, but a restart confirms no stale env state).
+2. Wholesale store checkout with a 1-item cart → expect 2-4 USPS rates with $2 handling added.
+3. Repeat with cart sizes 3, 4, 5, 10 → expect markup tier $3 / $4 / $5 / $5 respectively.
+4. Check wholesale server logs for `[shipping.rates] Direct carriers OK: N real rate(s), tiered markup=$X on Y item(s)`.
+
+**Out of scope:**
+- Retail rates handler — unchanged.
+- UPS — `fetchUPSRates` already correct; will return rates once real UPS creds are configured (current 401s confirmed invalid credentials, not code).
+- Carrier-service registration on the wholesale store — must be a one-time `carrierServiceCreate` GraphQL mutation pointing at `https://<wholesale-tunnel>/api/shipping/rates`. Confirm registered.
+
+---
+
+### 2026-06-22 — Variant cross-store pairing changed from position to SKU
+
+**Why:** [product.sync.js](wholesale/app/services/sync/product.sync.js) was pairing wholesale↔retail variants by **array index** in two places — `upsertVariantMappings` (writes `sync_id_maps`) and `setRetailInventoryForProduct` (writes retail inventory levels). The moment a merchant reorders or edits variants in either Shopify admin, the two arrays diverge and **every downstream write lands on the wrong row** (wrong retail variant id mapped, wholesale price snapshot written against wrong retail variant, inventory set on wrong location target).
+
+This was a latent bug before, but the new price-snapshot fields (`wholesalePrice`/`retailPrice`/`*CompareAtPrice`) amplify the impact: silent data corruption in price audits and drop-ship cost math instead of a visible inventory bug.
+
+**Change:** New `pairVariantsBySku(wholesaleVariants, retailVariants)` helper. SKUs are the only stable cross-store identifier (retail variants are created FROM wholesale variants via `buildRetailPayload`, which copies the SKU). The helper:
+1. Builds a `Map<sku, retailVariant>` for O(1) lookup.
+2. Iterates wholesale variants; skips any with no SKU (warn `variant_pair.wholesale_no_sku`) or no matching retail SKU (warn `variant_pair.no_retail_match`).
+3. Returns `[[wv, rv], ...]` so callers can `for…of` cleanly.
+
+Both `upsertVariantMappings` and `setRetailInventoryForProduct` now consume this helper instead of the `for (let i; …)` index loop.
+
+**Safety properties:**
+- Variants without SKUs on either side are skipped, not silently mispaired.
+- Reordering in either admin no longer breaks the mapping.
+- Existing rows stay intact — re-running sync writes the same `(entityType, wholesaleId)` doc by query key.
+
+**Out of scope (still positional):** None of the other sync paths in this repo pair variants by position; this was the only place.
+
+---
+
+### 2026-06-22 — Retail `orders/create` webhook moved from store-admin UI into ns-retail's declarative subscriptions
+
+**Why:** The retail Shopify store had a **manually-configured webhook** (admin → Settings → Notifications → Webhooks) firing directly at wholesale's `/api/sync/retail-order?secret=...`. This bypassed ns-retail, so CDO ingestion + retail-QBO invoice + customer-code tagging never ran. The URL also broke on every tunnel rotation and was invisible to git.
+
+**Change:** Added `orders/create` to [ns-retail/shopify.app.toml](ns-retail/shopify.app.toml) so the ns-retail app owns the subscription. Handler [ns-retail/app/routes/webhooks.orders.create.jsx](ns-retail/app/routes/webhooks.orders.create.jsx) already implements the full pipeline (HMAC verify → dedup → CDO ingest → QBO invoice → customer tag → forward payload to wholesale `/api/sync/retail-order` with `x-sync-secret` header).
+
+**Env vars required in `ns-retail/.env`** (handler line 94-99): `WHOLESALE_API_BASE`, `WHOLESALE_SHOP`, `RETAIL_SYNC_SECRET`.
+
+**Rollout steps (operator):**
+1. `cd ns-retail && shopify app deploy` — registers the new subscription on the retail store.
+2. Retail Shopify admin → delete the manual "Order creation" webhook.
+3. Place a test order → confirm ns-retail log `[forward-to-wholesale] order <id> forwarded (status 200)` and wholesale receives `/api/sync/retail-order`.
+
+**Why it's better:** HMAC-verified (manual webhook had only a query-param secret); tunnel URL auto-refreshes via `automatically_update_urls_on_dev`; CDO + QBO pipelines now run on every retail order.
+
+---
+
+### 2026-06-22 — `IdMap.productVariant` rows now capture wholesale + retail prices at sync time
+
+**Context:** The wholesale↔retail product mapping in `sync_id_maps` (Mongoose model [wholesale/app/services/sync/idMap.model.js](wholesale/app/services/sync/idMap.model.js)) only stored IDs + inventory quantities. The two stores can have **different per-variant prices** (wholesale = supplier cost, retail = marked-up consumer price), and downstream services (drop-ship orchestration, commission math, price-divergence audits) had to hit Shopify Admin GraphQL or re-parse the webhook each time they needed a price. Caching both prices on the variant mapping row removes that round-trip.
+
+**Decision Q&A:**
+
+| Question | Answer |
+|---|---|
+| Where do prices live? | On `productVariant` rows only (Shopify pricing is per-variant, not per-product). Other `entityType` values (`product`, `inventoryItem`, `location`) keep the same shape. |
+| Which fields? | `wholesalePrice`, `retailPrice`, `wholesaleCompareAtPrice`, `retailCompareAtPrice` — capturing the regular variant.price + the optional sale-from compare_at_price on BOTH stores. |
+| Storage type? | `Number, default: null` — direct compare/arithmetic, no Decimal128 overhead (single-currency USD). |
+| Backfill existing rows? | Not needed — user cleared mongo data; next sync run repopulates. |
+
+**Files touched:**
+
+| File | Change |
+|---|---|
+| [wholesale/app/services/sync/idMap.model.js](wholesale/app/services/sync/idMap.model.js) | Added 4 new Number fields with `default: null`, documented in schema header that they only apply to `productVariant` rows. |
+| [wholesale/app/services/sync/product.sync.js](wholesale/app/services/sync/product.sync.js) | New `variantPriceToNumber(raw)` helper — converts Shopify's string price (`"9.99"`) to Number, returns null for missing/blank values (`null`/`undefined`/`""`) so they don't masquerade as `$0`. `upsertVariantMappings` now writes all four price fields on every create + update sync. |
+
+**Behaviour:**
+- `syncProductCreate` → creates retail product via REST → `upsertVariantMappings(wholesaleVariants, retailVariants)` runs → both prices captured.
+- `syncProductUpdate` → re-runs `upsertVariantMappings` → both prices refreshed (acts as a snapshot at every sync).
+- Note: `buildRetailPayload` still defaults `includePrice: false`, so a freshly-created retail variant starts at `$0.00` until the retail admin manually re-prices it. The mapping will then capture the actual marked-up retail price on the next sync.
+
+**Single source of truth — clarification for future:** these are **snapshots**, not authoritative pricing. Shopify variants remain the source of truth; the mapping holds a cached copy useful for:
+1. Drop-ship pipeline (real-cost calculations on retail→wholesale order forwarding).
+2. Admin reports comparing wholesale-vs-retail price divergence.
+3. Commission math (when a referral code earns a % of retail vs wholesale price).
+
+If a Shopify variant price changes between sync ticks, the mapping is stale until the next `syncProductUpdate` runs.
+
+**Open follow-ups:**
+- If drift-detection becomes important, add a `webhooks/products.update` handler that calls `syncProductUpdate` immediately on the wholesale side (currently triggered by the wholesale-app's existing product sync flow).
+- Currency field could be added later if multi-currency ever lands; for now USD is implicit.
+
+---
+
+### 2026-06-18 — Drop-ship: wholesale order shipping line stripped of retail's per-qty markup
+
+**Context:** The retail-→-wholesale drop-ship pipeline (introduced 2026-06-04, see existing changelog) takes a retail Shopify order, forwards it to the wholesale app, and creates a parallel wholesale draft order via Admin GraphQL. Until now `buildShippingLine()` in [wholesale/app/services/dropship/dropship.service.js](wholesale/app/services/dropship/dropship.service.js) mirrored retail's shipping line 1:1 — meaning the marked-up retail price ($10 carrier + $2 qty-markup = $12) flowed through to the wholesale order verbatim.
+
+**User-locked behavior:** the wholesale (supplier-side) order should carry ONLY the real carrier cost — the per-qty markup is retail's margin and must not appear on the wholesale side.
+
+**Decision Q&A:**
+
+| Question | Answer |
+|---|---|
+| How to recover real carrier cost? | Reverse-calculate: `real = retail_shipping − (totalQty × SHIPPING_PER_QTY_CENTS)`. No extra API call, no checkout changes. |
+| Static fallback edge case (no real carrier was called)? | Leave reverse-calc as-is; floor at $0. Proper handling deferred until real-rates path is live. |
+| Free shipping on retail (no shipping_lines)? | Both retail + wholesale require a shipping line. Existing null-return behavior kept — if retail had no shipping line, wholesale also gets none. |
+
+**Implementation:**
+
+| File | Change |
+|---|---|
+| [wholesale/app/services/dropship/dropship.config.js](wholesale/app/services/dropship/dropship.config.js) | Added `shippingMarkupPerQtyCents` to the config, reading the same `SHIPPING_PER_QTY_CENTS` env that the carrier-service callback at `rates.js` uses (single source of truth, default 100 cents = $1/item). |
+| [wholesale/app/services/dropship/dropship.service.js](wholesale/app/services/dropship/dropship.service.js#L527) | Rewrote `buildShippingLine()` to strip the markup. Math: `real = max(0, retail_shipping − totalQty × perItemCents)`. Title preserved from retail's shipping line. |
+
+**Math walkthrough (user's example):**
+
+```
+Retail customer:    USPS Ground × 2 items
+  carrier real:     $10.00
+  markup:           $2.00  ($1/item × 2)
+  retail charged:   $12.00  ← appears as order.shipping_lines[0].price
+
+Drop-ship pipeline:
+  totalQty:         2
+  perItemCents:     100
+  markup dollars:   (2 × 100) / 100 = $2.00
+  real cost:        $12.00 − $2.00 = $10.00
+  wholesale line:   { title: "USPS Ground", price: "10.00" } ✅
+```
+
+**Files NOT touched:** the `buildShippingLine` call site (still called once from the wholesale draft-order builder, line 371) — only the function body changed. No model, scheduler, or admin endpoint changes.
+
+**Edge cases handled in code:**
+- `shipping_lines` absent → returns `null` (no shipping on wholesale draft).
+- Markup > retail shipping (rare; happens with static-fallback rates where the formula directly produces qty × $1 × multiplier instead of carrier_cost + markup) → floors at `$0.00`. Wholesale order gets a $0 shipping line, not a negative one.
+- `SHIPPING_PER_QTY_CENTS` env diverging between rates.js (the carrier-service callback) and dropship.config.js — they read the SAME env var, so single env file = consistent math.
+
+**Single source of truth rule:** `SHIPPING_PER_QTY_CENTS` is used in TWO places:
+1. `app/api/shipping/rates.js` — applies the markup ON the retail charge.
+2. `app/services/dropship/dropship.config.js` → `dropship.service.js` — STRIPS the same markup OFF for the wholesale order.
+
+If you change one, the other rebalances automatically because they both read the same env. **Never hard-code two values.**
+
+**Open follow-ups:**
+- Once real USPS / UPS credentials replace placeholder env vars, verify the reverse-calc produces sane wholesale-side prices on production orders.
+- If product-level shipping cost overrides ever land (per-item metafield), `buildShippingLine` needs to read them too — currently assumes uniform per-qty markup.
+- Static-fallback rates (placeholder phase) make the reverse-calc produce $0 wholesale shipping. Acceptable for dev; properly modeling fallback markup is deferred.
+
+---
+
+### 2026-06-18 — ns-retail: shipping rates endpoint cloned from wholesale (USPS + UPS + static fallback)
+
+**Context:** User wanted the same carrier-service shipping endpoint that's live in the wholesale app to also exist in the retail app (ns-retail). Both Shopify stores have separate checkouts, and each carrier service must be registered per-store with its own callback URL.
+
+**Decision locked (user Q&A):** Same env var NAMES across both apps, but each app's own `.env` file holds the actual values. This lets retail use a different USPS/UPS account (or the same one) without any code change. Zero code differences in the rate-fetch logic.
+
+**What was added:**
+
+| File | Action |
+|---|---|
+| [ns-retail/app/api/shipping/rates.js](ns-retail/app/api/shipping/rates.js) | NEW — copied 1:1 from `wholesale/app/api/shipping/rates.js` |
+| [ns-retail/app/routes.js](ns-retail/app/routes.js) | Registered `/api/shipping/rates` route |
+
+**Differences from wholesale's version** (post-copy edits):
+
+| What | Where |
+|---|---|
+| File header comment | Updated to identify retail vs wholesale + sync-reminder ("when you change one of these two files, update the other to match") |
+| `'NS Wholesale'` shipper name strings | Replaced with `'NS Retail'` (5 occurrences) — affects UPS RateRequest `Shipper.Name` / `ShipFrom.Name` and the `CustomerContext` / `transactionSrc` audit identifiers |
+
+Everything else is byte-for-byte identical: USPS + UPS handlers, OAuth flow, token cache, `STATIC_CARRIER_RATES` fallback (3 USPS + 3 UPS tiers), `fetchDirectCarrierRates` dispatcher, action handler with HMAC verify + markup + sort + return.
+
+**Same env var list applies to ns-retail's `.env`:**
+
+```bash
+USPS_CLIENT_ID=xxxx
+USPS_CLIENT_SECRET=xxxx
+UPS_CLIENT_ID=xxxx
+UPS_CLIENT_SECRET=xxxx
+UPS_SHIPPER_NUMBER=xxxx
+SHIPPING_PER_QTY_CENTS=100   # optional
+```
+
+**Carrier service registration — per-store, run separately:**
+
+The Shopify retail store's checkout needs its OWN `carrierServiceCreate` mutation pointing at the retail app's URL. Wholesale's existing carrier service registration is on the wholesale Shopify store — completely independent.
+
+```graphql
+mutation {
+  carrierServiceCreate(input: {
+    name: "NS Retail Live Rates"
+    callbackUrl: "<retail-app-tunnel>/api/shipping/rates"
+    supportsServiceDiscovery: true
+    active: true
+  }) {
+    carrierService { id callbackUrl active }
+    userErrors { field message }
+  }
+}
+```
+
+Save the returned `carrierService.id` for `carrierServiceUpdate` later (e.g., when the cloudflare tunnel rotates in dev).
+
+**Keep-in-sync rule:** the two `rates.js` files are 1:1 by design. The header comment in each calls out the sync responsibility. If future logic diverges (different markup formula for retail, different carrier tiers, etc.), break this 1:1 expectation explicitly with a comment.
+
+**Open follow-ups:**
+- Register carrier service on the retail Shopify store via GraphQL.
+- If retail uses different OAuth credentials, set them in `ns-retail/.env`.
+- Test retail checkout end-to-end once registered.
+
+---
+
+### 2026-06-18 — Shipping: scope narrowed to USPS + UPS only; static fallback restored as placeholder (multi-service)
+
+**Context:** Earlier flow had USPS + UPS + FedEx + DHL all wired plus a static fallback. User narrowed scope to just **USPS and UPS** for the wholesale store. Credentials aren't ready yet — they need a static placeholder so checkout shows options today, then auto-switches to live rates once env vars are real.
+
+**Decisions locked (user Q&A):**
+
+| Question | Answer |
+|---|---|
+| FedEx + DHL handlers? | **Delete entirely** — code, env vars, all references gone |
+| Static fallback format? | **Multiple services per carrier** (3 USPS tiers + 3 UPS tiers) |
+
+**What was removed:**
+
+| Item | Where |
+|---|---|
+| `fetchFedExRates` function (~145 lines) | Deleted from [rates.js](wholesale/app/api/shipping/rates.js) |
+| `fetchDHLRates` function (~120 lines) | Deleted |
+| FedEx + DHL calls in `fetchDirectCarrierRates` dispatcher | Deleted (dispatcher now USPS + UPS only) |
+| FedEx + DHL signup links in header comment | Deleted |
+| FEDEX_* / DHL_* env var documentation | Removed from header comment |
+
+**What was added:**
+
+`STATIC_CARRIER_RATES` constant near the top of the file — 6 entries (3 USPS + 3 UPS), each with `{ carrier, service, serviceCode, multiplier, days }`. Formula: `totalQty × PER_ITEM_CENTS × multiplier` (same per-quantity scaling as real-rate markup).
+
+| Carrier | Service | Multiplier | Delivery days |
+|---|---|---|---|
+| USPS | Ground Advantage | × 0.85 | 4–8 |
+| USPS | Priority Mail | × 1.2 | 2–5 |
+| USPS | Priority Mail Express | × 2.5 | 1–2 |
+| UPS | Ground | × 1.0 | 3–5 |
+| UPS | 2nd Day Air | × 1.6 | 2 |
+| UPS | Next Day Air | × 3.0 | 1 |
+
+For 5 items at default `PER_ITEM_CENTS=100`:
+- USPS Ground Advantage: $4.25
+- USPS Priority Mail: $6.00
+- UPS Ground: $5.00
+- UPS 2nd Day Air: $8.00
+- USPS Priority Mail Express: $12.50
+- UPS Next Day Air: $15.00
+
+**Action handler flow now:**
+
+```
+1. HMAC + parse payload
+2. fetchDirectCarrierRates() → Promise.all([USPS, UPS])
+3a. Any rates returned → markup + sort + return  (REAL RATES path)
+3b. Zero rates returned → STATIC_CARRIER_RATES fallback (PLACEHOLDER path)
+```
+
+**Auto-switch behavior:** when env vars hold real credentials AND the APIs return rates, the dispatcher returns non-empty; the static fallback is bypassed. No code change needed — same file, same flow, just real data flowing through.
+
+**Final env var list (this file):**
+
+```bash
+# USPS (registration.usps.com → APIs → OAuth)
+USPS_CLIENT_ID=xxxx
+USPS_CLIENT_SECRET=xxxx
+
+# UPS (developer.ups.com → My Apps → OAuth 2.0)
+UPS_CLIENT_ID=xxxx
+UPS_CLIENT_SECRET=xxxx
+UPS_SHIPPER_NUMBER=xxxx
+
+# Optional — markup per cart-item ($1 default)
+SHIPPING_PER_QTY_CENTS=100
+
+# Optional — sandbox base URLs for dev
+# USPS_API_BASE=https://apis.usps.com
+# UPS_API_BASE=https://wwwcie.ups.com
+```
+
+`FEDEX_*` and `DHL_*` env vars are no longer read by this file — safe to remove from `.env`.
+
+**File touched:** [wholesale/app/api/shipping/rates.js](wholesale/app/api/shipping/rates.js) — deleted FedEx + DHL handlers (~265 lines), trimmed dispatcher to 2 carriers, restored `STATIC_CARRIER_RATES` (6 entries), updated header comment to 2-carrier scope, added fallback path in action handler.
+
+**Stats:**
+
+| | Before | After |
+|---|---|---|
+| Total lines | ~865 | ~570 |
+| Carriers wired | 4 (USPS / UPS / FedEx / DHL) | 2 (USPS / UPS) |
+| Static fallback entries | 0 (none) | 6 (3 USPS + 3 UPS tiers) |
+| Required env vars | 11 (UPS + USPS + FedEx + DHL all required) | 5 (USPS + UPS) |
+
+**Open follow-ups:**
+- User adds real USPS + UPS OAuth credentials → static fallback auto-deactivates.
+- If real FedEx / DHL are ever needed, the deleted handlers can be re-added from git history.
+
+---
+
+### 2026-06-15 (late night) — Shipping: CARRIER_SERVICES fabricated fallback removed (single source of truth = direct carrier APIs)
+
+**Context:** `CARRIER_SERVICES` was a hardcoded table of fabricated carrier names + qty-based price multipliers (originally added as "safety net" when no real carrier integration existed). Now that all 4 direct carriers (USPS / UPS / FedEx / DHL) are fully implemented and return REAL rates, the fabricated table is dead weight — worse, it could mislead customers by showing made-up "UPS Ground $5" prices that don't reflect actual UPS quotes.
+
+**What was removed:**
+
+| Item | Where |
+|---|---|
+| `CARRIER_SERVICES` constant (~30 lines) | Deleted from top of file |
+| Fallback block in action handler (~17 lines) | Deleted — was the only consumer |
+| `CARRIER_SERVICES` references in header comment | Updated to reflect new behavior |
+| `let rates = []` outer scope | Changed to `const rates = …` inside the direct-rates `if` block (no longer needed outside) |
+| The `cdcdc` carrier-name typo | Gone with the table 🎉 |
+
+**New behavior when no direct carrier returns rates:**
+
+```js
+console.warn('[shipping.rates] No rates returned by any carrier for N item(s) to <zip>')
+return ratesResponse([])   // empty array → Shopify shows "No shipping options available"
+```
+
+**Why this is better than the fabricated fallback:**
+
+1. **No misleading prices.** Customer never sees "UPS Ground $5" unless UPS actually quoted that.
+2. **Real failures surface.** A misconfigured credential or carrier outage produces a clear server log + visible "no shipping" at checkout — operators investigate, no silent fake fallback.
+3. **Less code.** ~50 lines deleted; one less concept to maintain.
+4. **Removes the embarrassing `cdcdc` placeholder** that was a test typo.
+
+**Tradeoff accepted:** if ALL 4 carrier APIs fail simultaneously (extremely rare — Promise.all isolates failures), customer can't complete checkout until one comes back. That's the correct behavior — better than charging the wrong price.
+
+**File touched:** [wholesale/app/api/shipping/rates.js](wholesale/app/api/shipping/rates.js) — removed `CARRIER_SERVICES`, fallback block, related comments; tightened `rates` variable scope.
+
+**Final shipping file structure:**
+
+```
+rates.js
+├─ Header comment (purpose, setup, env vars per carrier)
+├─ Helpers (HMAC, sumQuantity, gramsToLb, addBusinessDaysIso, tokenCache)
+├─ fetchUSPSRates()      — OAuth2 + Prices V3 API
+├─ fetchUPSRates()       — OAuth2 + Rating v2403 Shop
+├─ fetchFedExRates()     — OAuth2 + Rate v1 quotes
+├─ fetchDHLRates()       — Basic auth + MyDHL rates
+├─ fetchDirectCarrierRates()  — Promise.all dispatcher
+└─ action handler
+   ├─ HMAC verify
+   ├─ Parse payload (origin, destination, items)
+   ├─ Sum qty + compute baseCents
+   ├─ Call fetchDirectCarrierRates
+   ├─ Dedup + apply markup + sort + return
+   └─ If zero rates → log warning + return { rates: [] }
+```
+
+Clean, single source of truth.
+
+---
+
+### 2026-06-15 (late night) — Shipping: EasyPost code path removed (direct carriers cover the use case)
+
+**Context:** EasyPost was added earlier today as an aggregator fallback when direct carrier credentials weren't set. Now that USPS / UPS / FedEx / DHL Express are all fully implemented directly, the EasyPost path is dead code — it would only fire if every direct carrier was misconfigured AND `EASYPOST_API_KEY` was set, which is a contradictory state.
+
+**What was removed:**
+
+| Item | Where |
+|---|---|
+| `fetchEasyPostRates` function | Deleted (~115 lines) |
+| EasyPost fallback block in action handler | Deleted (~45 lines) |
+| `gramsToOz` helper (only consumer was EasyPost) | Deleted |
+| EasyPost references in header comment | Updated to 2-tier flow (direct → CARRIER_SERVICES) |
+| `EASYPOST_API_KEY` env var | No longer read by this file. Safe to remove from `.env`. |
+
+**Why now:** Lean code is easier to debug. Direct carriers all return same normalized shape, so the dispatcher (`fetchDirectCarrierRates`) already handles aggregation. EasyPost-as-aggregator was only useful before direct integrations existed.
+
+**File flow after this change:**
+
+```
+Shopify checkout → /api/shipping/rates
+  ↓
+1. HMAC verify + parse payload
+  ↓
+2. fetchDirectCarrierRates → Promise.all([
+     fetchUSPSRates,
+     fetchUPSRates,
+     fetchFedExRates,
+     fetchDHLRates,
+   ])
+   → if any returned rates, merge + dedup + markup + sort + return
+  ↓ (zero direct rates returned)
+3. CARRIER_SERVICES local table (fabricated last-resort)
+```
+
+**Files touched:** [wholesale/app/api/shipping/rates.js](wholesale/app/api/shipping/rates.js) — removed `fetchEasyPostRates`, EasyPost fallback block, `gramsToOz` helper, EasyPost references in header.
+
+**Env var cleanup:** `EASYPOST_API_KEY` is no longer used. If it was added to `.env` earlier, it can be deleted (or left — it's just unused).
+
+---
+
+### 2026-06-15 (late night) — Shipping: UPS, FedEx, DHL Express full implementations (all 4 direct carriers live)
+
+**Context:** USPS was the only direct-carrier implementation. UPS/FedEx/DHL were stubs returning `[]` with TODO comments. This round completes all 3 stubs with production-grade implementations following the same architectural pattern as USPS.
+
+**Files touched:** [wholesale/app/api/shipping/rates.js](wholesale/app/api/shipping/rates.js) — `fetchUPSRates`, `fetchFedExRates`, `fetchDHLRates` all rewritten from skeleton to full working code.
+
+**Per-carrier implementation summary:**
+
+| Carrier | Auth | Endpoint | Notes |
+|---|---|---|---|
+| **UPS** | OAuth 2.0 (Basic header for token) | `/api/rating/v2403/Shop` | `Shop` request returns all available services in one call. 12 service codes mapped to friendly names (Ground, 2nd Day Air, Next Day Air, etc.). Token TTL ~14400s, cached. |
+| **FedEx** | OAuth 2.0 (form-body for token) | `/rate/v1/rates/quotes` | Returns all `serviceType` variants. Picks ACCOUNT (negotiated) rate when available, falls back to LIST. 11 common service types labeled. Token TTL ~3600s, cached. |
+| **DHL Express** | HTTP Basic (no OAuth) | `/rates` | Simpler — no token cache needed. Metric system (kg + cm), default parcel 25×20×10 cm. `plannedShippingDateAndTime` defaults to tomorrow 13:00 GMT to avoid same-day pickup cutoff rejection. |
+
+**Common implementation details (all 3 carriers):**
+
+- 5-second `AbortController` timeout per fetch (Shopify carrier-service callback total budget is ~10s).
+- 401 response → drop cached token so next request re-fetches (handles stale tokens).
+- All errors return `[]` — never throw. Carrier failure is silently absorbed by the dispatcher; checkout sees zero rates from that one carrier but others continue.
+- Normalized response shape: `{ carrier, service, rateCents, currency, deliveryDateMin, deliveryDateMax }` — joined into a single `rates` array by `fetchDirectCarrierRates`.
+- Default parcel size: 10×8×4 in (UPS/FedEx) or 25×20×10 cm (DHL — metric).
+- Default weight aggregated from `items[].grams × items[].quantity`, converted to LB (UPS/FedEx/USPS) or KG (DHL).
+
+**Dispatcher path:** No change needed — `fetchDirectCarrierRates` already calls all 4 in parallel via `Promise.all` with per-carrier try/catch isolation. Any carrier whose env vars aren't set silently returns `[]` and is skipped.
+
+**Markup applied unchanged:** `totalQty × SHIPPING_PER_QTY_CENTS` (default 100 = $1/item) added on top of every real rate from every carrier before returning to Shopify.
+
+**Complete env-var list (signup-by-signup):**
+
+| Var | Source | Required? | Sandbox URL hint |
+|---|---|---|---|
+| `USPS_CLIENT_ID` | [registration.usps.com](https://registration.usps.com) → APIs | for USPS | n/a — single endpoint |
+| `USPS_CLIENT_SECRET` | same | for USPS | n/a |
+| `USPS_API_BASE` | optional override | optional | default `https://apis.usps.com` |
+| `UPS_CLIENT_ID` | [developer.ups.com](https://developer.ups.com) → My Apps | for UPS | n/a |
+| `UPS_CLIENT_SECRET` | same | for UPS | n/a |
+| `UPS_SHIPPER_NUMBER` | your UPS account number | for UPS | n/a |
+| `UPS_API_BASE` | optional override | optional | sandbox: `https://wwwcie.ups.com` / prod: `https://onlinetools.ups.com` (default) |
+| `FEDEX_CLIENT_ID` | [developer.fedex.com](https://developer.fedex.com) → API Catalog → Rate API | for FedEx | n/a |
+| `FEDEX_CLIENT_SECRET` | same | for FedEx | n/a |
+| `FEDEX_ACCOUNT_NUMBER` | your FedEx account | for FedEx | n/a |
+| `FEDEX_API_BASE` | optional override | optional | sandbox: `https://apis-sandbox.fedex.com` / prod: `https://apis.fedex.com` (default) |
+| `DHL_API_KEY` | [developer.dhl.com](https://developer.dhl.com) → DHL Express MyDHL API | for DHL | n/a |
+| `DHL_API_SECRET` | same | for DHL | n/a |
+| `DHL_ACCOUNT_NUMBER` | your DHL Express account | for DHL | n/a |
+| `DHL_API_BASE` | optional override | optional | test: `https://express.api.dhl.com/mydhlapi/test` / prod: `https://express.api.dhl.com/mydhlapi` (default) |
+| `SHIPPING_PER_QTY_CENTS` | markup formula | optional | default `100` ($1/item) |
+| `SHIPPING_FROM_NAME/_ADDRESS1/_CITY/_STATE/_POSTAL/_COUNTRY` | origin fallback when Shopify's `rate.origin` is missing | optional | n/a |
+
+**Limitations to know:**
+
+- **UPS** v2403 default URL is `https://onlinetools.ups.com` (production). For testing without real shipments, swap to `UPS_API_BASE=https://wwwcie.ups.com`.
+- **FedEx** production access requires a SEPARATE approval step in the developer portal (sandbox keys won't fetch live rates). Use sandbox URL until approved.
+- **DHL** approval is manual (~1-2 business days after API key request). DHL also has both Test and Production base URLs — use Test until activated.
+- **Default parcel dimensions** hardcoded (10×8×4 in / 25×20×10 cm) — refine with product metafields if shipping costs feel off.
+- **International shipping**: USPS implementation is US-domestic only; UPS/FedEx/DHL natively support international via the `countryCode` in addresses, but customs declarations are NOT included — would need additional `customsDetails` fields for international.
+
+**Open follow-ups:**
+- Real-world test once user adds env vars for at least one carrier.
+- Add product-level parcel dimensions via metafields.
+- International customs declarations (out of scope for this round).
+- Possibly add an in-memory rate cache by `(originZip, destZip, weight_bucket)` if EasyPost/direct carrier call volume becomes hot.
+
+---
+
 ### 2026-06-15 (late night) — Profile-update QA retest: BUG-07/08/09/14 closed + BUG-04 verified
 
 **Context:** QA re-tested the profile-update form after the morning's 11-fix batch. 7 fixed, 6 confirmed in code (BUG-04 cache-blocked, BUG-07/08/09/14 needed deeper changes). This round closes those.

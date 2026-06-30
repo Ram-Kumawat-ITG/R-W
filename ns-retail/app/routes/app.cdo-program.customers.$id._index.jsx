@@ -1,13 +1,11 @@
 /* eslint-disable react/prop-types */
-// This file defines two self-contained modal sub-components
-// (`CreateCodeModal`, `EditCodeModal`) plus a small `DetailRow` helper,
-// each with multiple props referenced inside their JSX. The project
-// doesn't ship PropTypes anywhere — adding them just to satisfy the
-// linter would be more boilerplate than signal. File-scope disable
-// is consistent with how the wholesale workspace handles similar
-// internal components.
+// This file defines a `CreateCodeModal` sub-component plus a small `DetailRow`
+// helper, each with props referenced inside their JSX. The project doesn't
+// ship PropTypes anywhere — adding them just to satisfy the linter would be
+// more boilerplate than signal. File-scope disable is consistent with how the
+// wholesale workspace handles similar internal components.
 
-import { useEffect, useRef, useState } from "react";
+import { forwardRef, useEffect, useRef, useState } from "react";
 import { useFetcher, useLoaderData, useRevalidator } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
@@ -32,10 +30,12 @@ import {
 // when opening a CDO Customer. Shows:
 //   1. Statistics grid (orders, revenue, commissions, payouts, referrals,
 //      conversion rate) — driven by getPractitionerKpis().
-//   2. Referral codes section — the practitioner's owned codes with
-//      create / edit / delete / set-primary actions. Mutations submit
-//      to the parent layout's action handler, which auto-revalidates
-//      this loader on settle.
+//   2. Referral codes section — the practitioner's owned codes with a
+//      Pause/Resume action (+ Copy). Pause/Resume submits to the parent
+//      layout's action handler, which deactivates/reactivates the backing
+//      Shopify discount and auto-revalidates this loader on settle. Code
+//      create / edit / delete / set-primary were removed — codes are now
+//      created by practitioners in the Practitioner Portal.
 //   3. Profile reference card — name, email, status, customer id,
 //      country, joined date.
 //
@@ -100,9 +100,7 @@ export default function CdoCustomerDetails() {
   const revalidator = useRevalidator();
   const codeFetcher = useFetcher();
 
-  const [editingCode, setEditingCode] = useState(null); // null | code row
   const [showCreateModal, setShowCreateModal] = useState(false);
-  const editModalRef = useRef(null);
   const createModalRef = useRef(null);
   const handledResultRef = useRef(null);
 
@@ -118,10 +116,8 @@ export default function CdoCustomerDetails() {
     const d = codeFetcher.data;
     if (d.status === "success") {
       shopify?.toast?.show(d.message || "Saved");
-      // Close any open modal — the change has landed.
-      editModalRef.current?.hideOverlay?.();
+      // Close the create modal — the change has landed.
       createModalRef.current?.hideOverlay?.();
-      setEditingCode(null);
       setShowCreateModal(false);
     } else {
       shopify?.toast?.show(d.message || "Action failed", { isError: true });
@@ -151,13 +147,6 @@ export default function CdoCustomerDetails() {
     ? `https://nsdirectorder.com/${encodeURIComponent(primaryCode.code.toLowerCase())}`
     : null;
 
-  // Effective commission rate — primary code's override, else the
-  // program default. Shown in the Profile card so admins know what
-  // future orders will earn this practitioner.
-  const effectiveCommissionRate =
-    primaryCode?.commissionRate != null
-      ? primaryCode.commissionRate
-      : settings.defaultCommissionRate;
 
   const onCopyReferralLink = async () => {
     if (!referralLink) return;
@@ -169,23 +158,6 @@ export default function CdoCustomerDetails() {
     }
   };
 
-  const onDelete = (codeRow) => {
-    if (!confirm(`Delete code "${codeRow.code}"? This cannot be undone.`)) {
-      return;
-    }
-    codeFetcher.submit(
-      { _action: "delete-code", codeId: codeRow.id },
-      { method: "POST" },
-    );
-  };
-
-  const onSetPrimary = (codeRow) => {
-    codeFetcher.submit(
-      { _action: "set-primary-code", codeId: codeRow.id },
-      { method: "POST" },
-    );
-  };
-
   const onCopyCode = async (codeRow) => {
     try {
       await navigator.clipboard.writeText(codeRow.code);
@@ -195,14 +167,20 @@ export default function CdoCustomerDetails() {
     }
   };
 
-  const onEdit = (codeRow) => {
-    setEditingCode(codeRow);
-    editModalRef.current?.showOverlay?.();
-  };
-
   const onOpenCreate = () => {
     setShowCreateModal(true);
     createModalRef.current?.showOverlay?.();
+  };
+
+  // Pause / resume. Pausing deactivates the backing Shopify discount (the code
+  // stops applying on the storefront) AND flips the DB status; resuming
+  // reactivates it. The layout action owns the Shopify toggle.
+  const onToggleStatus = (codeRow) => {
+    const nextStatus = codeRow.status === "active" ? "paused" : "active";
+    codeFetcher.submit(
+      { _action: "set-code-status", codeId: codeRow.id, status: nextStatus },
+      { method: "POST" },
+    );
   };
 
   const mutating =
@@ -225,10 +203,7 @@ export default function CdoCustomerDetails() {
             ))}
           </s-stack>
 
-          <s-grid
-            gap="base"
-            gridTemplateColumns="repeat(4, minmax(0, 1fr))"
-          >
+          <s-grid gap="base" gridTemplateColumns="repeat(4, minmax(0, 1fr))">
             <MetricCard
               label="Total orders"
               value={formatNumber(kpis.totalOrders)}
@@ -238,37 +213,14 @@ export default function CdoCustomerDetails() {
               value={formatCurrency(kpis.totalRevenue, settings.currency)}
             />
             <MetricCard
-              label="Total commissions"
+              label="Commissions"
               value={formatCurrency(kpis.totalCommissions, settings.currency)}
               tone="success"
             />
             <MetricCard
-              label="Referral customers"
+              label="Referred patients"
               value={formatNumber(kpis.totalReferrals)}
               sublabel={`${formatNumber(kpis.convertedReferrals)} converted`}
-            />
-            <MetricCard
-              label="Conversion rate"
-              value={formatPercent(kpis.conversionRate)}
-              sublabel="Converted / total referrals"
-            />
-            <MetricCard
-              label="Pending payout"
-              value={formatCurrency(kpis.pendingPayout, settings.currency)}
-            />
-            <MetricCard
-              label="Paid to date"
-              value={formatCurrency(kpis.paidPayout, settings.currency)}
-              tone="success"
-            />
-            <MetricCard
-              label="Active codes"
-              value={formatNumber(kpis.activeCodes)}
-              sublabel={
-                primaryCode
-                  ? `Primary: ${primaryCode.code}`
-                  : "No primary set"
-              }
             />
           </s-grid>
         </s-stack>
@@ -289,7 +241,7 @@ export default function CdoCustomerDetails() {
           <MetricCard
             label="Pending commissions"
             value={formatCurrency(kpis.pendingCommissions, settings.currency)}
-            tone="critical"
+            tone={kpis.pendingCommissions > 0 ? "critical" : undefined}
             sublabel="Earned, not yet paid"
           />
           <MetricCard
@@ -298,25 +250,10 @@ export default function CdoCustomerDetails() {
             sublabel={
               kpis.upcomingPayoutAmount > 0
                 ? `Est. ${formatDate(kpis.nextPayoutDate)}`
-                : `Below ${formatCurrency(kpis.minimumPayoutAmount, settings.currency)} minimum`
+                : kpis.lastPayoutDate
+                  ? `Last paid ${formatDate(kpis.lastPayoutDate)}`
+                  : `Below ${formatCurrency(kpis.minimumPayoutAmount, settings.currency)} minimum`
             }
-          />
-          <MetricCard
-            label="Referred customers"
-            value={formatNumber(kpis.referredCustomers)}
-          />
-          <MetricCard
-            label="Referral orders"
-            value={formatNumber(kpis.totalReferralOrders)}
-          />
-          <MetricCard
-            label="Lifetime referral revenue"
-            value={formatCurrency(kpis.lifetimeReferralRevenue, settings.currency)}
-          />
-          <MetricCard
-            label="Last payout"
-            value={kpis.lastPayoutDate ? formatDate(kpis.lastPayoutDate) : "—"}
-            sublabel={kpis.lastPayoutDate ? "Most recent paid payout" : "No payouts yet"}
           />
         </s-grid>
       </s-section>
@@ -381,15 +318,6 @@ export default function CdoCustomerDetails() {
             value={formatDateTime(profile.submittedAt)}
           />
           <DetailRow
-            label="Effective commission rate"
-            value={formatPercent(effectiveCommissionRate)}
-            hint={
-              primaryCode?.commissionRate != null
-                ? "Override on primary code"
-                : "Program default (cdo_settings.defaultCommissionRate)"
-            }
-          />
-          <DetailRow
             label="Primary discount"
             value={
               primaryCode
@@ -424,9 +352,9 @@ export default function CdoCustomerDetails() {
             justifyContent="space-between"
           >
             <s-paragraph tone="subdued">
-              Codes are normalised to uppercase. Discount + commission edits
-              affect ONLY future orders — historical commissions stay locked
-              at the rate captured at attribution time.
+              Pausing a code deactivates its discount on the storefront and stops
+              new attributions; resuming re-enables it. Historical commissions
+              stay locked at the rate captured at attribution time.
             </s-paragraph>
             <s-button
               variant="primary"
@@ -447,8 +375,8 @@ export default function CdoCustomerDetails() {
               >
                 <s-heading>No referral codes yet</s-heading>
                 <s-paragraph tone="subdued">
-                  Create a code to give this practitioner a shareable link +
-                  start earning commissions on attributed orders.
+                  Add a code to give this practitioner a shareable link, or let
+                  them create their own from the Practitioner Portal.
                 </s-paragraph>
                 <s-button variant="primary" onClick={onOpenCreate}>
                   Add referral code
@@ -460,9 +388,9 @@ export default function CdoCustomerDetails() {
               <s-table-header-row>
                 <s-table-header>Code</s-table-header>
                 <s-table-header>Discount</s-table-header>
-                <s-table-header>Commission</s-table-header>
                 <s-table-header>Status</s-table-header>
                 <s-table-header>Created</s-table-header>
+                <s-table-header>Referral link</s-table-header>
                 <s-table-header>Actions</s-table-header>
               </s-table-header-row>
               <s-table-body>
@@ -470,26 +398,12 @@ export default function CdoCustomerDetails() {
                   <s-table-row key={c.id}>
                     <s-table-cell>
                       <s-stack direction="block" gap="none">
-                        <s-stack
-                          direction="inline"
-                          gap="small-200"
-                          alignItems="center"
-                        >
-                          <s-text>{c.code}</s-text>
-                          {c.isPrimary && (
-                            <s-badge tone="info">Primary</s-badge>
-                          )}
-                        </s-stack>
+                        <s-text>{c.code}</s-text>
                         {c.note && <s-text tone="subdued">{c.note}</s-text>}
                       </s-stack>
                     </s-table-cell>
                     <s-table-cell>
                       {formatPercent(c.discountPercent)}
-                    </s-table-cell>
-                    <s-table-cell>
-                      {c.commissionRate != null
-                        ? formatPercent(c.commissionRate)
-                        : `${formatPercent(settings.defaultCommissionRate)} (default)`}
                     </s-table-cell>
                     <s-table-cell>
                       <s-badge
@@ -506,6 +420,15 @@ export default function CdoCustomerDetails() {
                     </s-table-cell>
                     <s-table-cell>{formatDateTime(c.createdAt)}</s-table-cell>
                     <s-table-cell>
+                      {c.referralUrl ? (
+                        <s-link href={c.referralUrl} target="_blank">
+                          {c.referralUrl}
+                        </s-link>
+                      ) : (
+                        <s-text tone="subdued">Not generated yet</s-text>
+                      )}
+                    </s-table-cell>
+                    <s-table-cell>
                       <s-stack direction="inline" gap="small-200">
                         <s-button
                           variant="tertiary"
@@ -513,27 +436,18 @@ export default function CdoCustomerDetails() {
                         >
                           Copy
                         </s-button>
-                        <s-button
-                          variant="tertiary"
-                          onClick={() => onEdit(c)}
-                        >
-                          Edit
-                        </s-button>
-                        {!c.isPrimary && c.status === "active" && (
+                        {/* Pause (active) / Resume (paused). Archived codes
+                            can't be toggled. Shows a loading state while a
+                            mutation is in flight. */}
+                        {c.status !== "archived" && (
                           <s-button
                             variant="tertiary"
-                            onClick={() => onSetPrimary(c)}
+                            onClick={() => onToggleStatus(c)}
+                            {...(mutating ? { loading: true } : {})}
                           >
-                            Set primary
+                            {c.status === "active" ? "Pause" : "Resume"}
                           </s-button>
                         )}
-                        <s-button
-                          variant="tertiary"
-                          tone="critical"
-                          onClick={() => onDelete(c)}
-                        >
-                          Delete
-                        </s-button>
                       </s-stack>
                     </s-table-cell>
                   </s-table-row>
@@ -552,17 +466,6 @@ export default function CdoCustomerDetails() {
           setShowCreateModal(false);
         }}
         fetcher={codeFetcher}
-        defaultCommissionRate={settings.defaultCommissionRate}
-      />
-      <EditCodeModal
-        ref={editModalRef}
-        code={editingCode}
-        onClose={() => {
-          editModalRef.current?.hideOverlay?.();
-          setEditingCode(null);
-        }}
-        fetcher={codeFetcher}
-        defaultCommissionRate={settings.defaultCommissionRate}
       />
     </>
   );
@@ -586,35 +489,24 @@ function DetailRow({ label, value, hint, actions }) {
   );
 }
 
-// Create + Edit modals share most of the form shape; the difference is
-// (a) Create has the code field free-form, Edit hands it back disabled
-// because admins generally shouldn't rename live codes (storefront
-// links would break); and (b) Edit also exposes status switching.
-//
-// Both submit to the parent layout's action via the same fetcher.
-
-import { forwardRef } from "react";
-
+// Admin "Add referral code" modal. Code is required; Discount % is optional
+// (blank = a 0% / attribution-only code with no storefront discount; a discount
+// creates the backing Shopify discount on the retail store). There is NO
+// commission field — commission is configured per product VENDOR (Settings →
+// Commission Configuration), never per practitioner.
 // eslint-disable-next-line react/display-name
 const CreateCodeModal = forwardRef(function CreateCodeModal(
-  // eslint-disable-next-line react/prop-types
-  { open, onClose, fetcher, defaultCommissionRate },
+  { open, onClose, fetcher },
   ref,
 ) {
   const [code, setCode] = useState("");
-  const [discountPercent, setDiscountPercent] = useState("");
-  const [commissionRate, setCommissionRate] = useState("");
-  const [isPrimary, setIsPrimary] = useState(false);
-  const [note, setNote] = useState("");
+  const [discountPercent, setDiscountPercent] = useState("20");
 
   // Reset on open so a previous draft doesn't leak into the next create.
   useEffect(() => {
     if (open) {
       setCode("");
       setDiscountPercent("");
-      setCommissionRate("");
-      setIsPrimary(false);
-      setNote("");
     }
   }, [open]);
 
@@ -623,10 +515,9 @@ const CreateCodeModal = forwardRef(function CreateCodeModal(
       {
         _action: "create-code",
         code,
+        // Optional — send "" when blank so the action's parseFractionField
+        // resolves it to null (discount → 0%, attribution only).
         discountPercent: discountPercent === "" ? "" : String(discountPercent),
-        commissionRate: commissionRate === "" ? "" : String(commissionRate),
-        isPrimary: isPrimary ? "true" : "false",
-        note,
       },
       { method: "POST" },
     );
@@ -645,7 +536,7 @@ const CreateCodeModal = forwardRef(function CreateCodeModal(
       <s-stack direction="block" gap="base">
         <s-text-field
           label="Code"
-          placeholder="e.g. WELCOME15"
+          placeholder="e.g. WELCOME20"
           value={code}
           required
           onChange={(e) => setCode(e.currentTarget.value)}
@@ -659,30 +550,7 @@ const CreateCodeModal = forwardRef(function CreateCodeModal(
           step="0.01"
           value={discountPercent}
           onChange={(e) => setDiscountPercent(e.currentTarget.value)}
-          details="Customer-facing discount at checkout. Leave blank for 0%."
-        />
-        <s-text-field
-          label="Commission %"
-          type="number"
-          min="0"
-          max="100"
-          step="0.01"
-          value={commissionRate}
-          onChange={(e) => setCommissionRate(e.currentTarget.value)}
-          details={`Practitioner share. Blank inherits the program default (${(defaultCommissionRate * 100).toFixed(0)}%).`}
-        />
-        <s-checkbox
-          label="Set as primary code"
-          details="Replaces this practitioner's existing primary, if any."
-          checked={isPrimary}
-          onChange={(e) => setIsPrimary(Boolean(e.currentTarget.checked))}
-        />
-        <s-text-area
-          label="Note (optional)"
-          value={note}
-          rows={2}
-          onChange={(e) => setNote(e.currentTarget.value)}
-          maxLength={500}
+          details="Optional. Customer-facing discount at checkout — creates a matching Shopify discount. Blank = no discount (attribution only)."
         />
       </s-stack>
       <s-button
@@ -692,123 +560,6 @@ const CreateCodeModal = forwardRef(function CreateCodeModal(
         {...(submitting ? { loading: true } : {})}
       >
         Create code
-      </s-button>
-      <s-button slot="secondary-actions" onClick={onClose}>
-        Cancel
-      </s-button>
-    </s-modal>
-  );
-});
-
-// eslint-disable-next-line react/display-name
-const EditCodeModal = forwardRef(function EditCodeModal(
-  // eslint-disable-next-line react/prop-types
-  { code: codeRow, onClose, fetcher, defaultCommissionRate },
-  ref,
-) {
-  const [discountPercent, setDiscountPercent] = useState("");
-  const [commissionRate, setCommissionRate] = useState("");
-  const [status, setStatus] = useState("active");
-  const [note, setNote] = useState("");
-
-  // Sync local state when the row passed in changes (admin clicked
-  // Edit on a different row).
-  useEffect(() => {
-    if (!codeRow) return;
-    setDiscountPercent(
-      codeRow.discountPercent != null
-        ? String((codeRow.discountPercent * 100).toFixed(2)).replace(/\.?0+$/, "") || "0"
-        : "",
-    );
-    setCommissionRate(
-      codeRow.commissionRate != null
-        ? String((codeRow.commissionRate * 100).toFixed(2)).replace(/\.?0+$/, "") || "0"
-        : "",
-    );
-    setStatus(codeRow.status || "active");
-    setNote(codeRow.note || "");
-  }, [codeRow]);
-
-  const submit = () => {
-    fetcher.submit(
-      {
-        _action: "update-code",
-        codeId: codeRow.id,
-        discountPercent: discountPercent === "" ? "0" : String(discountPercent),
-        commissionRate: commissionRate === "" ? "" : String(commissionRate),
-        status,
-        note,
-      },
-      { method: "POST" },
-    );
-  };
-
-  const submitting =
-    fetcher.state === "submitting" || fetcher.state === "loading";
-
-  return (
-    <s-modal
-      ref={ref}
-      id="cdo-edit-code-modal"
-      heading={codeRow ? `Edit code ${codeRow.code}` : "Edit code"}
-      accessibilityLabel="Edit referral code"
-    >
-      {codeRow ? (
-        <s-stack direction="block" gap="base">
-          <s-paragraph tone="subdued">
-            Renaming a code would break existing storefront links. Discount +
-            commission changes apply to future orders only.
-          </s-paragraph>
-          <s-text-field
-            label="Code"
-            value={codeRow.code}
-            disabled
-            details="Code names are immutable. Archive + create a new code instead."
-          />
-          <s-text-field
-            label="Discount %"
-            type="number"
-            min="0"
-            max="100"
-            step="0.01"
-            value={discountPercent}
-            onChange={(e) => setDiscountPercent(e.currentTarget.value)}
-          />
-          <s-text-field
-            label="Commission %"
-            type="number"
-            min="0"
-            max="100"
-            step="0.01"
-            value={commissionRate}
-            onChange={(e) => setCommissionRate(e.currentTarget.value)}
-            details={`Blank inherits the program default (${(defaultCommissionRate * 100).toFixed(0)}%).`}
-          />
-          <s-select
-            label="Status"
-            value={status}
-            onChange={(e) => setStatus(e.currentTarget.value)}
-          >
-            <s-option value="active">Active</s-option>
-            <s-option value="paused">Paused</s-option>
-            <s-option value="archived">Archived</s-option>
-          </s-select>
-          <s-text-area
-            label="Note"
-            value={note}
-            rows={2}
-            onChange={(e) => setNote(e.currentTarget.value)}
-            maxLength={500}
-          />
-        </s-stack>
-      ) : null}
-      <s-button
-        slot="primary-action"
-        variant="primary"
-        onClick={submit}
-        {...(submitting ? { loading: true } : {})}
-      >
-        Save changes
       </s-button>
       <s-button slot="secondary-actions" onClick={onClose}>
         Cancel

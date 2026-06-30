@@ -1,4 +1,5 @@
 import "@shopify/ui-extensions/preact";
+import { useBuyerJourneyIntercept } from "@shopify/ui-extensions/checkout/preact";
 import { render } from "preact";
 import { useEffect } from "preact/hooks";
 import { useSignal } from "@preact/signals";
@@ -29,6 +30,24 @@ function Extension() {
   // retry in the same checkout session — even if the apply failed.
   const autoApplyAttempted = useSignal(false);
 
+  // Referral-link / externally-applied code validation. A referral link
+  // (https://<shop>/discount/<code>) auto-applies a practitioner code BEFORE
+  // this extension mounts; these track validating that code against the
+  // patient's permanent binding. `linkChecked` is the one-shot run guard;
+  // `linkChecking` is true during the async check; `linkRejected` +
+  // `linkMessage` hold a binding-conflict result after the code is removed.
+  const linkChecked = useSignal(false);
+  const linkChecking = useSignal(false);
+  const linkRejected = useSignal(false);
+  const linkMessage = useSignal(/** @type {string | null} */ (null));
+
+  // Hard checkout block. Set when a referral code that is INVALID for this
+  // buyer is applied to the order and we could NOT auto-remove it (e.g. the
+  // removeDiscountCode call failed). While non-null, the buyer-journey
+  // interceptor blocks all forward progress — including the final "Pay" step
+  // — until the buyer clears the code. Holds the buyer-facing reason string.
+  const referralBlockMessage = useSignal(/** @type {string | null} */ (null));
+
   // ── Shopify state we depend on ─────────────────────────────────────
   const canUpdateDiscounts =
     shopify?.instructions?.value?.discounts?.canUpdateDiscountCodes;
@@ -49,6 +68,17 @@ function Extension() {
     shopifyAny?.shop?.value?.myshopifyDomain ||
     "";
 
+  // Buyer email — used to enforce the permanent patient↔practitioner binding
+  // server-side. `buyerIdentity.email` needs PCD level-2 access; the
+  // logged-in customer's id (level 1) is the reliable fallback the backend
+  // also accepts. Both are passed best-effort; an empty identity just skips
+  // the checkout-time binding check (order ingest still enforces it).
+  const buyerEmail =
+    shopifyAny?.buyerIdentity?.email?.value ||
+    customer?.email ||
+    "";
+  const identity = { email: buyerEmail, customerId: customer?.id };
+
   // Read appMetafields REACTIVELY in render so this component re-renders
   // (and the effect below re-fires) when Shopify finishes loading the
   // shop metafield list. Both `customer` and `appMetafields` are async
@@ -68,12 +98,64 @@ function Extension() {
     );
   });
 
+  // A practitioner code already on the checkout that we did NOT apply
+  // ourselves this session — it arrived via a referral link
+  // (https://<shop>/discount/<code>) or Shopify's native discount box. The
+  // referral-link effect below validates it against the patient's permanent
+  // binding before letting it stand.
+  const externalCode =
+    previouslyAppliedCode &&
+    (!verifiedCode.value ||
+      String(verifiedCode.value).toLowerCase() !==
+        String(previouslyAppliedCode).toLowerCase())
+      ? previouslyAppliedCode
+      : null;
+
+  // We can validate an externally-applied code whenever we can reach the
+  // backend and modify discounts — buyer identity is NOT required for the
+  // code-validity checks (unknown / inactive / missing-practitioner). The
+  // permanent-binding check additionally needs identity, but that is enforced
+  // server-side and simply skipped when identity is absent (e.g. a guest).
+  // `linkPending` is true from the FIRST render an external code is seen until
+  // the effect fires (derived, so there's no "applied" flash); `linkChecking`
+  // covers the async window afterwards. Both keep checkout blocked meanwhile.
+  const canValidate = canUpdateDiscounts !== false && hasAppUrl;
+  const linkPending =
+    Boolean(externalCode) && canValidate && !linkChecked.value;
+  const showValidating =
+    !linkRejected.value && (linkPending || linkChecking.value);
+
   const isApplied =
-    applyState.value === "applied" || Boolean(previouslyAppliedCode);
+    !linkRejected.value &&
+    !showValidating &&
+    !referralBlockMessage.value &&
+    (applyState.value === "applied" || Boolean(previouslyAppliedCode));
   const appliedCodeDisplay =
     applyState.value === "applied"
       ? verifiedCode.value
       : previouslyAppliedCode || "";
+
+  // ── Checkout gate (single source of truth) ─────────────────────────
+  // Non-null ⇒ checkout must be blocked and the string is the buyer-facing
+  // reason. Recomputed every render so the interceptor (which reads the
+  // latest closure via a ref) always reflects current state. Covers:
+  //   1. a bad applied code we couldn't auto-remove (referralBlockMessage);
+  //   2. an external/applied code still being validated (showValidating);
+  //   3. an invalid code left in the manual-entry box.
+  let referralBlock = null;
+  if (referralBlockMessage.value) {
+    referralBlock = referralBlockMessage.value;
+  } else if (showValidating) {
+    referralBlock =
+      "Please wait while we validate your referral code, then try again.";
+  } else if (
+    verifyState.value === "invalid" &&
+    String(inputCode.value || "").trim()
+  ) {
+    referralBlock = `${
+      verifyMessage.value || "Invalid referral code."
+    } Please enter a valid code or clear the field to continue.`;
+  }
 
   // ── Auto-apply for logged-in customers (PATH 1 only) ───────────────
   //
@@ -89,6 +171,9 @@ function Extension() {
   useEffect(() => {
     if (autoApplyAttempted.value) return;
     if (isApplied) return;
+    // A referral-link / native discount code is present — the referral-link
+    // validation effect owns it; don't race it with the saved-code apply.
+    if (externalCode) return;
     if (canUpdateDiscounts === false) return;
 
     const customerId = customer?.id;
@@ -113,6 +198,53 @@ function Extension() {
     // the app-url metafield finishes loading after the customer signal.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [customer?.id, hasAppUrl]);
+
+  // ── Referral-link / external-code validation (permanent binding) ────
+  //
+  // A referral link applies the practitioner's discount code to the checkout
+  // before this extension mounts; Shopify's native discount box can do the
+  // same. We enforce the SAME permanent binding on that code: if the patient
+  // is already associated with a DIFFERENT practitioner, the code is removed
+  // from the order and a validation message is shown — an existing
+  // relationship is never overwritten by a foreign link. A code matching the
+  // bound practitioner (or a brand-new patient with no binding yet) is left
+  // applied; the relationship is created / kept at order ingest server-side.
+  useEffect(() => {
+    if (linkChecked.value) return;
+    if (!externalCode) return;
+    if (canUpdateDiscounts === false) return;
+    if (!hasAppUrl) return;
+    // NOTE: identity is intentionally NOT required here. Code-validity checks
+    // (unknown / inactive / missing-practitioner) run for everyone, including
+    // guests; the permanent-binding check inside the endpoint is skipped when
+    // no identity is supplied (and re-enforced at order ingest server-side).
+
+    linkChecked.value = true;
+    validateLinkCode(String(externalCode)).catch((err) => {
+      console.warn("[checkout-ui-code] referral-link validation error:", err);
+      linkChecking.value = false;
+    });
+    // Re-evaluates as the external code, app-url, or customer identity load.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [externalCode, hasAppUrl, customer?.id]);
+
+  // ── Block checkout while any referral validation is unresolved ──────
+  // The order may only be created when every referral check passes. The
+  // interceptor reads `referralBlock` (recomputed each render; the hook keeps
+  // the latest closure in a ref) and prevents the buyer from advancing past
+  // the current step — including the final "Pay" step — until it clears. If
+  // the merchant hasn't granted the block_progress capability, Shopify treats
+  // `block` as `allow`; our in-extension banners still surface the reason.
+  useBuyerJourneyIntercept(({ canBlockProgress }) => {
+    if (canBlockProgress && referralBlock) {
+      return {
+        behavior: "block",
+        reason: "Referral code validation failed",
+        errors: [{ message: referralBlock }],
+      };
+    }
+    return { behavior: "allow" };
+  });
 
   /**
    * PATH 1 helper — call our backend to read the customer's `code:*` tag
@@ -146,7 +278,7 @@ function Extension() {
 
     let result;
     try {
-      result = await ApiService.verifyCode(code);
+      result = await ApiService.verifyCode(code, identity);
     } catch (err) {
       console.warn("[checkout-ui-code] auto-verify failed:", err);
       verifyState.value = "idle";
@@ -186,6 +318,7 @@ function Extension() {
       if (applyResult?.type === "success") {
         applyState.value = "applied";
         applyMessage.value = `${confirmedCode} applied`;
+        // Customer tagging happens AFTER order is placed via the orders/create webhook.
       } else {
         applyState.value = "error";
         applyMessage.value =
@@ -195,6 +328,100 @@ function Extension() {
       console.warn("[checkout-ui-code] auto-apply failed:", err);
       applyState.value = "error";
       applyMessage.value = "Auto-apply failed. Please try the Verify button.";
+    }
+  }
+
+  // Validate a referral-link / externally-applied code. A code that is valid
+  // for this buyer (active, practitioner exists, and either matching the
+  // existing binding or a first-time patient) is left applied. ANY invalid
+  // result — unknown/inactive code, missing practitioner, or a binding
+  // conflict — is removed and a message shown; if it can't be removed, the
+  // checkout is hard-blocked via `referralBlockMessage` until the buyer clears it.
+  async function validateLinkCode(code) {
+    linkChecking.value = true;
+    let result;
+    try {
+      result = await ApiService.verifyCode(code, identity);
+    } catch (err) {
+      console.warn("[checkout-ui-code] referral-link verify failed:", err);
+      // Network / transient error — don't trap the buyer at checkout; the
+      // orders/create ingest re-validates and corrects attribution server-side.
+      referralBlockMessage.value = null;
+      linkChecking.value = false;
+      return;
+    }
+
+    // Valid for THIS buyer: same practitioner as an existing binding, or a
+    // first-time / no-binding patient, AND the code is active + its
+    // practitioner exists. Leave the discount applied; checkout proceeds.
+    // Stamp the cart attribute so the webhook extracts this code from
+    // note_attributes instead of falling back to the customer's saved tag.
+    if (result?.valid) {
+      const confirmedCode = result.code || code;
+      try {
+        await shopify.applyAttributeChange({
+          type: "updateAttribute",
+          key: CART_ATTR_KEY,
+          value: confirmedCode,
+        });
+      } catch (err) {
+        console.warn("[checkout-ui-code] cart-attr stamp failed for referral link:", err);
+      }
+      referralBlockMessage.value = null;
+      linkChecking.value = false;
+      return;
+    }
+
+    // Invalid for this buyer/order — covers every failure mode: unknown or
+    // inactive/paused code (not_found), missing practitioner
+    // (practitioner_missing), and permanent-binding conflict (bound_other).
+    // Surface the specific reason and try to clear the offending code +
+    // attribute so checkout can complete cleanly (no foreign/invalid
+    // attribution). If we can't remove it, hard-block until the buyer does.
+    const message = result?.message || referralMessageForReason(result?.reason);
+
+    let removed = false;
+    try {
+      const removeResult = await shopify.applyDiscountCodeChange({
+        type: "removeDiscountCode",
+        code,
+      });
+      removed = removeResult?.type === "success";
+      await shopify.applyAttributeChange({
+        type: "updateAttribute",
+        key: CART_ATTR_KEY,
+        value: "",
+      });
+    } catch (err) {
+      console.warn("[checkout-ui-code] referral-link remove failed:", err);
+      removed = false;
+    }
+
+    linkRejected.value = true;
+    linkMessage.value = message;
+
+    if (removed) {
+      // Resolved automatically — the bad code is gone, checkout may proceed.
+      referralBlockMessage.value = null;
+    } else {
+      // Still applied — HARD BLOCK until the buyer removes it themselves.
+      referralBlockMessage.value = `${message} Please remove the code "${code}" to continue.`;
+    }
+    linkChecking.value = false;
+  }
+
+  // Fallback buyer-facing message for a validation reason. The backend
+  // normally sends an explicit `message`; this only fills gaps.
+  function referralMessageForReason(/** @type {string | undefined} */ reason) {
+    switch (reason) {
+      case "not_found":
+        return "This referral code is invalid.";
+      case "practitioner_missing":
+        return "The practitioner for this referral code no longer exists.";
+      case "bound_other":
+        return "You are already associated with another practitioner.";
+      default:
+        return "This referral code can't be used.";
     }
   }
 
@@ -208,7 +435,7 @@ function Extension() {
     verifyState.value = "verifying";
     verifyMessage.value = null;
     try {
-      const result = await ApiService.verifyCode(code);
+      const result = await ApiService.verifyCode(code, identity);
       if (result?.valid) {
         verifyState.value = "verified";
         verifiedCode.value = result.code || code;
@@ -217,7 +444,10 @@ function Extension() {
           : "Verified";
       } else {
         verifyState.value = "invalid";
-        verifyMessage.value = "Code not found.";
+        // Surface the backend's specific reason — "Invalid Referral Code",
+        // "Practitioner does not exist", or "You are already associated with
+        // another practitioner" (permanent-binding block).
+        verifyMessage.value = result?.message || "Invalid Referral Code";
       }
     } catch (err) {
       console.warn("[checkout-ui-code] verify failed:", err);
@@ -246,6 +476,7 @@ function Extension() {
       if (result?.type === "success") {
         applyState.value = "applied";
         applyMessage.value = `${code} applied`;
+        // Customer tagging happens AFTER order is placed via the orders/create webhook.
       } else {
         applyState.value = "error";
         applyMessage.value =
@@ -261,11 +492,13 @@ function Extension() {
   async function handleRemove() {
     const code = verifiedCode.value || appliedCodeDisplay;
     if (!code) return;
+    let removed = false;
     try {
-      await shopify.applyDiscountCodeChange({
+      const removeResult = await shopify.applyDiscountCodeChange({
         type: "removeDiscountCode",
         code,
       });
+      removed = removeResult?.type === "success";
       await shopify.applyAttributeChange({
         type: "updateAttribute",
         key: CART_ATTR_KEY,
@@ -273,6 +506,13 @@ function Extension() {
       });
     } catch (err) {
       console.warn("[checkout-ui-code] remove failed:", err);
+      removed = false;
+    }
+    if (!removed) {
+      // Couldn't remove the code — keep checkout blocked and tell the buyer
+      // how to clear it (Shopify's native discount field).
+      referralBlockMessage.value = `We couldn't remove the code "${code}". Please remove it from the discount field to continue.`;
+      return;
     }
     inputCode.value = "";
     verifyState.value = "idle";
@@ -280,6 +520,9 @@ function Extension() {
     verifiedCode.value = null;
     applyState.value = "idle";
     applyMessage.value = null;
+    referralBlockMessage.value = null;
+    linkRejected.value = false;
+    linkMessage.value = null;
   }
 
   function handleInputChange(/** @type {Event} */ e) {
@@ -291,6 +534,33 @@ function Extension() {
       verifyMessage.value = null;
       verifiedCode.value = null;
     }
+  }
+
+  // ── Render: validating a referral-link / external code ────────────
+  if (showValidating) {
+    return (
+      <s-banner heading="Practitioner discount">
+        <s-stack direction="inline" gap="small-200">
+          <s-text>Validating your referral link…</s-text> <s-spinner />
+        </s-stack>
+      </s-banner>
+    );
+  }
+
+  // ── Render: blocked — an invalid code is still applied and couldn't be
+  // auto-removed. Checkout is blocked (via the interceptor) until the buyer
+  // removes it here. ────────────────────────────────────────────────
+  if (referralBlockMessage.value) {
+    return (
+      <s-banner heading="Practitioner discount" tone="critical">
+        <s-stack gap="base">
+          <s-text>{referralBlockMessage.value}</s-text>
+          <s-button variant="primary" onClick={handleRemove}>
+            Remove code
+          </s-button>
+        </s-stack>
+      </s-banner>
+    );
   }
 
   // ── Render: applied state (success, with Remove button) ───────────
@@ -342,6 +612,14 @@ function Extension() {
         <s-text>
           Enter your practitioner's referral code to apply your discount.
         </s-text>
+
+        {/* Referral-link rejection — the link belonged to a different
+            practitioner than the one this patient is permanently associated
+            with, so it was removed. They can still enter a code from their
+            own practitioner below. */}
+        {linkRejected.value && linkMessage.value && (
+          <s-text tone="critical">{linkMessage.value}</s-text>
+        )}
 
         <s-grid gridTemplateColumns="1fr auto" gap="small-200" alignItems="end">
           <s-text-field

@@ -46,9 +46,42 @@ const lineItemSchema = new mongoose.Schema(
     sku: String,
     title: String,
     variantTitle: String,
+    // Product vendor (Shopify line_item.vendor) — drives per-line commission.
+    vendor: { type: String, default: null },
     quantity: { type: Number, default: 0 },
     price: { type: Number, default: 0 },
     totalDiscount: { type: Number, default: 0 },
+  },
+  { _id: false },
+);
+
+// Immutable snapshot of the per-vendor commission config USED to compute this
+// order's commission, captured at ingest. Config edits bump
+// cdo_settings.commissionConfigVersion but NEVER touch an already-ingested
+// order — this snapshot is the source of truth for the order's commission.
+//   vendorRates — the configured fractional rate per vendor at order time
+//   lines       — per-line breakdown (vendor / revenue / rate / amount)
+//   effectiveRate — commissionAmount ÷ Σ line revenue (blended, for display)
+const commissionSnapshotSchema = new mongoose.Schema(
+  {
+    configVersion: { type: Number, default: null },
+    vendorRates: {
+      type: [{ vendor: String, rate: Number }],
+      default: [],
+    },
+    lines: {
+      type: [
+        {
+          vendor: { type: String, default: null },
+          revenue: { type: Number, default: 0 },
+          rate: { type: Number, default: 0 },
+          amount: { type: Number, default: 0 },
+        },
+      ],
+      default: [],
+    },
+    effectiveRate: { type: Number, default: 0 },
+    computedAt: { type: Date, default: Date.now },
   },
   { _id: false },
 );
@@ -65,6 +98,11 @@ const fulfillmentSchema = new mongoose.Schema(
     shipmentStatus: String, // carrier-driven shipment_status
     status: String, // fulfillment.status (pending/open/success/cancelled)
     fulfilledAt: Date,
+    // When this shipment was delivered. For drop-ship orders this is mirrored
+    // from the wholesale order's delivery date (§5.7); otherwise it's stamped
+    // when our own carrier webhook first reports `delivered`. First-write-wins.
+    // Preferred over `updatedAt` by deriveDeliveredAt for the order's delivery date.
+    deliveredAt: Date,
     createdAt: { type: Date, default: Date.now },
     updatedAt: { type: Date, default: Date.now },
   },
@@ -252,8 +290,12 @@ const cdoOrderSchema = new mongoose.Schema(
     // revenue figure read by the dashboards + payout flow.
     amount: { type: Number, default: 0 },
     // Commission accrued to the practitioner on this order (0 when not
-    // attributed). Computed from the order subtotal × commissionRate.
+    // attributed). Computed per line from the line's product vendor rate
+    // (see commissionSnapshot). 0 for products from unconfigured vendors.
     commissionAmount: { type: Number, default: 0 },
+    // Immutable per-vendor commission config snapshot used to compute
+    // commissionAmount at ingest (versioned). null for legacy/unattributed.
+    commissionSnapshot: { type: commissionSnapshotSchema, default: null },
     pricing: {
       subtotal: { type: Number, default: 0 },
       totalDiscounts: { type: Number, default: 0 },

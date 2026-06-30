@@ -1,8 +1,30 @@
 import { useEffect, useState } from 'react'
 import { Controller, useWatch } from 'react-hook-form'
-import { getStatesForCountry, PAYMENT_METHODS } from '../constants'
+import {
+  COUNTRIES,
+  getStatesForCountry,
+  PAYMENT_METHODS,
+} from '../constants'
 import PaymentCardForm from './PaymentCardForm'
 import SignaturePad from './SignaturePad'
+
+// Two-card selector for how the practitioner wants to RECEIVE
+// commission payouts. Mirrors the PAYMENT_METHODS data shape so the
+// existing `rf-pay-card` CSS can render it without changes.
+const PAYOUT_METHODS = [
+  {
+    id: 'ach',
+    name: 'Bank Transfer (ACH)',
+    desc: 'Commissions deposited directly into your bank account.',
+    feeLabel: 'Fast',
+  },
+  {
+    id: 'check',
+    name: 'Paper Check',
+    desc: 'Mailed to the address you choose below.',
+    feeLabel: 'Standard',
+  },
+]
 
 function BillingSummary({ control, onEdit }) {
   const firstName = useWatch({ control, name: 'firstName' }) || ''
@@ -157,168 +179,404 @@ function AchForm({ control, errors }) {
 
 const COMMISSION_ACCOUNT_TYPES = ['Checking', 'Savings', 'Business Checking']
 
-// Commission bank details — ALWAYS visible + required for every practitioner.
-// (Previously gated behind an opt-in button; the gating was removed per
-// owner direction so every practitioner provides a payout account at signup.)
-// If payment method is ACH, a "Use same account" checkbox auto-fills the
-// commission fields to save typing.
+// Commission payout — ALWAYS visible + required for every practitioner.
+// Practitioner chooses either ACH (bank transfer) or Check (mailed to
+// an address). Bank fields and check fields are mutually exclusive:
+// only the fields for the selected method are rendered + validated.
+//
+// When payment method AND payout method are both ACH, a "Use same
+// account" checkbox auto-fills the commission bank fields.
 function CommissionBankSection({ control, errors, setValue }) {
+  const payoutMethod = useWatch({ control, name: 'commission.payoutMethod' }) || 'ach'
   const useSame = useWatch({ control, name: 'commission.useSamePaymentAccount' })
   const paymentMethod = useWatch({ control, name: 'payment.method' })
   const achAccountName = useWatch({ control, name: 'payment.achAccountName' })
   const achRoutingNumber = useWatch({ control, name: 'payment.achRoutingNumber' })
   const achAccountNumber = useWatch({ control, name: 'payment.achAccountNumber' })
   const achAccountType = useWatch({ control, name: 'payment.achAccountType' })
+  const useBilling = useWatch({ control, name: 'commission.check.useBillingAddress' })
+  const mailingCountry = useWatch({ control, name: 'commission.check.mailingAddress.country' })
   const [showAccountNumber, setShowAccountNumber] = useState(false)
   const e = errors?.commission || {}
+  const eCheck = e?.check || {}
+  const eMail = eCheck?.mailingAddress || {}
+  const mailingStates = getStatesForCountry(mailingCountry) || []
 
   // When user ticks "use same as payment ACH", copy values forward.
   // When they untick, leave whatever is there so they can edit freely.
   useEffect(() => {
-    if (!useSame || paymentMethod !== 'ach') return
+    if (!useSame || paymentMethod !== 'ach' || payoutMethod !== 'ach') return
     setValue('commission.bankAccountName', achAccountName || '', { shouldValidate: true })
     setValue('commission.bankRoutingNumber', achRoutingNumber || '', { shouldValidate: true })
     setValue('commission.bankAccountNumber', achAccountNumber || '', { shouldValidate: true })
     setValue('commission.bankAccountType', achAccountType || '', { shouldValidate: true })
-  }, [useSame, paymentMethod, achAccountName, achRoutingNumber, achAccountNumber, achAccountType, setValue])
+  }, [
+    useSame,
+    paymentMethod,
+    payoutMethod,
+    achAccountName,
+    achRoutingNumber,
+    achAccountNumber,
+    achAccountType,
+    setValue,
+  ])
 
-  const fieldsLocked = useSame && paymentMethod === 'ach'
+  const fieldsLocked = useSame && paymentMethod === 'ach' && payoutMethod === 'ach'
 
   return (
     <>
       <div className="rf-divider">
         <h2 className="rf-section-label">Commission payouts</h2>
         <p className="rf-section-hint">
-          Bank account that will receive commission deposits when patients you
-          refer place orders. Stored separately from your payment method.
+          How you'd like to receive commission earnings when patients you
+          refer place orders.
         </p>
       </div>
 
-      {paymentMethod === 'ach' && (
-        <label className="rf-tc-row" style={{ marginTop: 8 }}>
-          <Controller
-            name="commission.useSamePaymentAccount"
-            control={control}
-            render={({ field }) => (
-              <input
-                type="checkbox"
-                checked={Boolean(field.value)}
-                onChange={(ev) => field.onChange(ev.target.checked)}
-              />
-            )}
-          />
-          <span>Use the same ACH account I entered for payments above.</span>
-        </label>
-      )}
-
-      <div className="rf-field" style={{ marginTop: 12 }}>
+      {/* Payout method selector */}
+      <div className="rf-field">
         <label className="rf-label">
-          Account holder name <span className="rf-req">*</span>
+          Payout method <span className="rf-req">*</span>
         </label>
         <Controller
-          name="commission.bankAccountName"
+          name="commission.payoutMethod"
           control={control}
+          defaultValue="ach"
           render={({ field }) => (
-            <input
-              {...field}
-              type="text"
-              placeholder="Name on bank account"
-              disabled={fieldsLocked}
-              className={`rf-input ${e.bankAccountName ? 'error' : ''}`}
-            />
+            <div className="rf-pay-options">
+              {PAYOUT_METHODS.map((pm) => (
+                <label
+                  key={pm.id}
+                  className={`rf-pay-card ${field.value === pm.id ? 'selected' : ''}`}
+                >
+                  <input
+                    type="radio"
+                    name="payoutMethod"
+                    checked={field.value === pm.id}
+                    onChange={() => field.onChange(pm.id)}
+                  />
+                  <div style={{ flex: 1 }}>
+                    <div className="rf-pay-card-title">
+                      {pm.name}
+                      <span className="rf-fee-tag free">{pm.feeLabel}</span>
+                    </div>
+                    <p className="rf-pay-card-desc">{pm.desc}</p>
+                  </div>
+                </label>
+              ))}
+            </div>
           )}
         />
-        {e.bankAccountName && <p className="rf-help error">{e.bankAccountName.message}</p>}
+        {e.payoutMethod && <p className="rf-help error">{e.payoutMethod.message}</p>}
       </div>
 
-      <div className="rf-field rf-row rf-row-2">
-        <div>
-          <label className="rf-label">
-            Routing number <span className="rf-req">*</span>
-          </label>
-          <Controller
-            name="commission.bankRoutingNumber"
-            control={control}
-            render={({ field }) => (
-              <input
-                {...field}
-                type="text"
-                placeholder="9-digit ABA routing number"
-                maxLength={9}
-                disabled={fieldsLocked}
-                className={`rf-input ${e.bankRoutingNumber ? 'error' : ''}`}
+      {/* ── ACH (Bank Transfer) form ─────────────────────────────── */}
+      {payoutMethod === 'ach' && (
+        <>
+          {paymentMethod === 'ach' && (
+            <label className="rf-tc-row" style={{ marginTop: 8 }}>
+              <Controller
+                name="commission.useSamePaymentAccount"
+                control={control}
+                render={({ field }) => (
+                  <input
+                    type="checkbox"
+                    checked={Boolean(field.value)}
+                    onChange={(ev) => field.onChange(ev.target.checked)}
+                  />
+                )}
               />
-            )}
-          />
-          {e.bankRoutingNumber && <p className="rf-help error">{e.bankRoutingNumber.message}</p>}
-        </div>
-        <div>
-          <label className="rf-label">
-            Account number <span className="rf-req">*</span>
-          </label>
-          <div className="rf-password-wrap">
+              <span>Use the same ACH account I entered for payments above.</span>
+            </label>
+          )}
+
+          <div className="rf-field" style={{ marginTop: 12 }}>
+            <label className="rf-label">
+              Account holder name <span className="rf-req">*</span>
+            </label>
             <Controller
-              name="commission.bankAccountNumber"
+              name="commission.bankAccountName"
               control={control}
               render={({ field }) => (
                 <input
                   {...field}
-                  type={showAccountNumber ? 'text' : 'password'}
-                  placeholder="Bank account number"
-                  maxLength={17}
-                  autoComplete="off"
+                  type="text"
+                  placeholder="Name on bank account"
                   disabled={fieldsLocked}
-                  className={`rf-input ${e.bankAccountNumber ? 'error' : ''}`}
+                  className={`rf-input ${e.bankAccountName ? 'error' : ''}`}
                 />
               )}
             />
-            <button
-              type="button"
-              className="rf-password-toggle"
-              onClick={() => setShowAccountNumber((s) => !s)}
-              aria-label={showAccountNumber ? 'Hide account number' : 'Show account number'}
-            >
-              {showAccountNumber ? (
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
-                  <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24" />
-                  <line x1="1" y1="1" x2="23" y2="23" />
-                </svg>
-              ) : (
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
-                  <circle cx="12" cy="12" r="3" />
-                </svg>
-              )}
-            </button>
+            {e.bankAccountName && <p className="rf-help error">{e.bankAccountName.message}</p>}
           </div>
-          {e.bankAccountNumber && <p className="rf-help error">{e.bankAccountNumber.message}</p>}
-        </div>
-      </div>
 
-      <div className="rf-field">
-        <label className="rf-label">
-          Account type <span className="rf-req">*</span>
-        </label>
-        <Controller
-          name="commission.bankAccountType"
-          control={control}
-          render={({ field }) => (
-            <select
-              {...field}
-              disabled={fieldsLocked}
-              className={`rf-select ${e.bankAccountType ? 'error' : ''}`}
-            >
-              <option value="">Select account type</option>
-              {COMMISSION_ACCOUNT_TYPES.map((t) => (
-                <option key={t} value={t}>{t}</option>
-              ))}
-            </select>
+          <div className="rf-field rf-row rf-row-2">
+            <div>
+              <label className="rf-label">
+                Routing number <span className="rf-req">*</span>
+              </label>
+              <Controller
+                name="commission.bankRoutingNumber"
+                control={control}
+                render={({ field }) => (
+                  <input
+                    {...field}
+                    type="text"
+                    placeholder="9-digit ABA routing number"
+                    maxLength={9}
+                    disabled={fieldsLocked}
+                    className={`rf-input ${e.bankRoutingNumber ? 'error' : ''}`}
+                  />
+                )}
+              />
+              {e.bankRoutingNumber && <p className="rf-help error">{e.bankRoutingNumber.message}</p>}
+            </div>
+            <div>
+              <label className="rf-label">
+                Account number <span className="rf-req">*</span>
+              </label>
+              <div className="rf-password-wrap">
+                <Controller
+                  name="commission.bankAccountNumber"
+                  control={control}
+                  render={({ field }) => (
+                    <input
+                      {...field}
+                      type={showAccountNumber ? 'text' : 'password'}
+                      placeholder="Bank account number"
+                      maxLength={17}
+                      autoComplete="off"
+                      disabled={fieldsLocked}
+                      className={`rf-input ${e.bankAccountNumber ? 'error' : ''}`}
+                    />
+                  )}
+                />
+                <button
+                  type="button"
+                  className="rf-password-toggle"
+                  onClick={() => setShowAccountNumber((s) => !s)}
+                  aria-label={showAccountNumber ? 'Hide account number' : 'Show account number'}
+                >
+                  {showAccountNumber ? (
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
+                      <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24" />
+                      <line x1="1" y1="1" x2="23" y2="23" />
+                    </svg>
+                  ) : (
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                      <circle cx="12" cy="12" r="3" />
+                    </svg>
+                  )}
+                </button>
+              </div>
+              {e.bankAccountNumber && <p className="rf-help error">{e.bankAccountNumber.message}</p>}
+            </div>
+          </div>
+
+          <div className="rf-field">
+            <label className="rf-label">
+              Account type <span className="rf-req">*</span>
+            </label>
+            <Controller
+              name="commission.bankAccountType"
+              control={control}
+              render={({ field }) => (
+                <select
+                  {...field}
+                  disabled={fieldsLocked}
+                  className={`rf-select ${e.bankAccountType ? 'error' : ''}`}
+                >
+                  <option value="">Select account type</option>
+                  {COMMISSION_ACCOUNT_TYPES.map((t) => (
+                    <option key={t} value={t}>{t}</option>
+                  ))}
+                </select>
+              )}
+            />
+            {e.bankAccountType && <p className="rf-help error">{e.bankAccountType.message}</p>}
+          </div>
+        </>
+      )}
+
+      {/* ── Check (paper check) form ─────────────────────────────── */}
+      {payoutMethod === 'check' && (
+        <>
+          <div className="rf-field" style={{ marginTop: 12 }}>
+            <label className="rf-label">
+              Payable to <span className="rf-req">*</span>
+            </label>
+            <Controller
+              name="commission.check.payableTo"
+              control={control}
+              render={({ field }) => (
+                <input
+                  {...field}
+                  type="text"
+                  placeholder="Name or business name printed on the check"
+                  className={`rf-input ${eCheck.payableTo ? 'error' : ''}`}
+                />
+              )}
+            />
+            {eCheck.payableTo && <p className="rf-help error">{eCheck.payableTo.message}</p>}
+          </div>
+
+          <label className="rf-tc-row" style={{ marginTop: 4 }}>
+            <Controller
+              name="commission.check.useBillingAddress"
+              control={control}
+              defaultValue
+              render={({ field }) => (
+                <input
+                  type="checkbox"
+                  checked={Boolean(field.value)}
+                  onChange={(ev) => field.onChange(ev.target.checked)}
+                />
+              )}
+            />
+            <span>Mail checks to my billing address (from Step 2).</span>
+          </label>
+
+          {!useBilling && (
+            <>
+              <p
+                className="rf-section-hint"
+                style={{ marginTop: 8, marginBottom: 8 }}
+              >
+                Mailing address for checks
+              </p>
+
+              <div className="rf-field">
+                <label className="rf-label">
+                  Address line 1 <span className="rf-req">*</span>
+                </label>
+                <Controller
+                  name="commission.check.mailingAddress.line1"
+                  control={control}
+                  render={({ field }) => (
+                    <input
+                      {...field}
+                      type="text"
+                      className={`rf-input ${eMail.line1 ? 'error' : ''}`}
+                      placeholder="Street address"
+                    />
+                  )}
+                />
+                {eMail.line1 && <p className="rf-help error">{eMail.line1.message}</p>}
+              </div>
+
+              <div className="rf-field">
+                <label className="rf-label">Address line 2</label>
+                <Controller
+                  name="commission.check.mailingAddress.line2"
+                  control={control}
+                  render={({ field }) => (
+                    <input
+                      {...field}
+                      type="text"
+                      className="rf-input"
+                      placeholder="Apartment, suite, etc. (optional)"
+                    />
+                  )}
+                />
+              </div>
+
+              <div className="rf-field rf-row rf-row-2">
+                <div>
+                  <label className="rf-label">
+                    City <span className="rf-req">*</span>
+                  </label>
+                  <Controller
+                    name="commission.check.mailingAddress.city"
+                    control={control}
+                    render={({ field }) => (
+                      <input
+                        {...field}
+                        type="text"
+                        className={`rf-input ${eMail.city ? 'error' : ''}`}
+                      />
+                    )}
+                  />
+                  {eMail.city && <p className="rf-help error">{eMail.city.message}</p>}
+                </div>
+                <div>
+                  <label className="rf-label">
+                    {mailingStates.length ? 'State' : 'State / Province'}{' '}
+                    <span className="rf-req">*</span>
+                  </label>
+                  <Controller
+                    name="commission.check.mailingAddress.state"
+                    control={control}
+                    render={({ field }) =>
+                      mailingStates.length ? (
+                        <select
+                          {...field}
+                          className={`rf-select ${eMail.state ? 'error' : ''}`}
+                        >
+                          <option value="">Select state</option>
+                          {mailingStates.map((s) => (
+                            <option key={s.code} value={s.code}>{s.name}</option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input
+                          {...field}
+                          type="text"
+                          className={`rf-input ${eMail.state ? 'error' : ''}`}
+                        />
+                      )
+                    }
+                  />
+                  {eMail.state && <p className="rf-help error">{eMail.state.message}</p>}
+                </div>
+              </div>
+
+              <div className="rf-field rf-row rf-row-2">
+                <div>
+                  <label className="rf-label">
+                    ZIP / Postal code <span className="rf-req">*</span>
+                  </label>
+                  <Controller
+                    name="commission.check.mailingAddress.zip"
+                    control={control}
+                    render={({ field }) => (
+                      <input
+                        {...field}
+                        type="text"
+                        maxLength={10}
+                        className={`rf-input ${eMail.zip ? 'error' : ''}`}
+                      />
+                    )}
+                  />
+                  {eMail.zip && <p className="rf-help error">{eMail.zip.message}</p>}
+                </div>
+                <div>
+                  <label className="rf-label">
+                    Country <span className="rf-req">*</span>
+                  </label>
+                  <Controller
+                    name="commission.check.mailingAddress.country"
+                    control={control}
+                    render={({ field }) => (
+                      <select
+                        {...field}
+                        className={`rf-select ${eMail.country ? 'error' : ''}`}
+                      >
+                        <option value="">Select country</option>
+                        {COUNTRIES.map((c) => (
+                          <option key={c.code} value={c.name}>{c.name}</option>
+                        ))}
+                      </select>
+                    )}
+                  />
+                  {eMail.country && <p className="rf-help error">{eMail.country.message}</p>}
+                </div>
+              </div>
+            </>
           )}
-        />
-        {e.bankAccountType && <p className="rf-help error">{e.bankAccountType.message}</p>}
-      </div>
-
+        </>
+      )}
     </>
   )
 }
@@ -372,32 +630,6 @@ export default function Step3Payment({ control, errors, onEditBilling, isSubmitt
             <p className="rf-section-hint">Your bank account information for ACH transfers.</p>
           </div>
           <AchForm control={control} errors={errors} />
-        </div>
-      )}
-
-      {paymentMethod === 'immediate' && (
-        <div className="rf-immediate-info">
-          <div className="rf-immediate-info-head">
-            <svg
-              className="rf-icon-svg"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              style={{ width: 18, height: 18, flexShrink: 0 }}
-            >
-              <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z" />
-              <polyline points="22,6 12,13 2,6" />
-            </svg>
-            <strong>How Immediate billing works</strong>
-          </div>
-          <p>
-            You&apos;ll get an email with a secure payment link for every
-            invoice. Click the link to pay immediately when you receive it
-            — no auto-charge, no card stored.
-          </p>
         </div>
       )}
 

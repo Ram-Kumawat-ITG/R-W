@@ -1,57 +1,35 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
-
+ 
 client_id = "79f6038c639d31f8da67ad5d6a036fb4"
 name = "NS-Retail"
 application_url = "https://9113-14-195-73-179.ngrok-free.app"
 embedded = true
-
+ 
 [build]
 automatically_update_urls_on_dev = true
-
+ 
 [webhooks]
 api_version = "2026-07"
-
+ 
   [[webhooks.subscriptions]]
   topics = [ "app/uninstalled" ]
   uri = "/webhooks/app/uninstalled"
-
+ 
   [[webhooks.subscriptions]]
   topics = [ "app/scopes_update" ]
   uri = "/webhooks/app/scopes_update"
-
+ 
   [[webhooks.subscriptions]]
   topics = [ "orders/create" ]
   uri = "/webhooks/orders/create"
-
-  [[webhooks.subscriptions]]
-  topics = [ "orders/paid" ]
-  uri = "/webhooks/orders/paid"
-
-  [[webhooks.subscriptions]]
-  topics = [ "orders/updated" ]
-  uri = "/webhooks/orders/updated"
-
-  [[webhooks.subscriptions]]
-  topics = [ "orders/cancelled" ]
-  uri = "/webhooks/orders/cancelled"
-
-  [[webhooks.subscriptions]]
-  topics = [ "fulfillments/create" ]
-  uri = "/webhooks/fulfillments/create"
-
-  [[webhooks.subscriptions]]
-  topics = [ "fulfillments/update" ]
-  uri = "/webhooks/fulfillments/update"
-
+ 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-# NOTE: orders/* webhooks deliver protected customer data — the app needs
-# Shopify's protected-customer-data approval for `read_orders` in production.
-scopes = "read_customers,write_customers,read_orders,write_metaobject_definitions,write_metaobjects,write_products"
-
+scopes = "customer_read_customers,customer_read_orders,customer_write_orders,read_assigned_fulfillment_orders,read_cart_transforms,read_customers,read_discounts,read_files,read_fulfillments,read_gift_cards,read_inventory,read_locations,read_markets,read_product_listings,read_products,read_publications,read_shipping,read_third_party_fulfillment_orders,unauthenticated_read_checkouts,unauthenticated_read_customers,unauthenticated_read_product_inventory,unauthenticated_read_product_listings,write_cart_transforms,write_checkouts,write_customers,write_discounts,write_draft_orders,write_files,write_gift_cards,write_merchant_managed_fulfillment_orders,write_order_edits,write_orders,write_products,write_publications,write_shipping,write_third_party_fulfillment_orders"
+ 
 [auth]
 redirect_urls = [ "https://9113-14-195-73-179.ngrok-free.app/api/auth" ]
-
+ 
 [app_proxy]
 url = "https://9113-14-195-73-179.ngrok-free.app"
 subpath = "retail-signup"

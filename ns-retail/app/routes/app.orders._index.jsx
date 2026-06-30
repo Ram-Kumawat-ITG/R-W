@@ -1,6 +1,6 @@
 /* eslint-disable react/prop-types */
 import { useEffect, useRef, useState } from "react";
-import { useLoaderData, useNavigate, useNavigation, useFetcher } from "react-router";
+import { useLoaderData, useNavigate, useNavigation, useRevalidator, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import { listCdoOrders } from "../services/cdo/cdo.service";
 import { getRetailInvoicePdf } from "../services/retailQbo/retailOrderInvoice.service";
@@ -20,6 +20,44 @@ const FILTER_KEYS = [
   "dateFrom",
   "dateTo",
 ];
+
+// Human-readable label per filter key (matches the form control labels) — used
+// to render the active-filter chips.
+const FILTER_LABELS = {
+  orderNumber: "Order number",
+  customer: "Customer",
+  practitioner: "Practitioner",
+  referralCode: "Referral code",
+  status: "Order status",
+  financialStatus: "Payment status",
+  commissionStatus: "Commission status",
+  dateFrom: "From date",
+  dateTo: "To date",
+};
+
+// For select-backed filters, map the stored value → its display label so a chip
+// reads "Payment status: Partially paid" (not "partially_paid"). Text/date
+// fields fall back to the raw value.
+const OPTION_LABELS = {
+  status: {
+    pending: "Pending",
+    approved: "Approved",
+    paid: "Paid",
+    cancelled: "Cancelled",
+  },
+  financialStatus: {
+    paid: "Paid",
+    pending: "Pending",
+    partially_paid: "Partially paid",
+    refunded: "Refunded",
+    partially_refunded: "Partially refunded",
+    voided: "Voided",
+  },
+  commissionStatus: {
+    attributed: "Attributed",
+    unattributed: "Unattributed",
+  },
+};
 
 // Project the active (URL) filters into a full draft shape (every key present,
 // defaulting to "").
@@ -69,7 +107,9 @@ export default function OrdersList() {
   const { result, filters, sort, dir } = useLoaderData();
   const navigate = useNavigate();
   const navigation = useNavigation();
-  const loading = navigation.state === "loading";
+  const revalidator = useRevalidator();
+  const loading = navigation.state === "loading" || revalidator.state !== "idle";
+  const refreshLoading = revalidator.state !== "idle";
 
   const EMPTY_DRAFT = {
     orderNumber: "", customer: "", practitioner: "", referralCode: "",
@@ -108,6 +148,25 @@ export default function OrdersList() {
     draftRef.current = { ...EMPTY_DRAFT };
     setDraft({ ...EMPTY_DRAFT });
     navigate("?");
+  };
+
+  // Active-filter chips — one per applied (URL) filter, label resolved from the
+  // select option map where available. Removing a chip re-navigates with that
+  // one filter dropped (the others, sort + dir preserved; page reset to 1).
+  const activeChips = FILTER_KEYS.filter((k) => filters?.[k]).map((k) => {
+    const v = filters[k];
+    const display = OPTION_LABELS[k]?.[v] ?? v;
+    return { key: k, text: `${FILTER_LABELS[k] || k}: ${display}` };
+  });
+
+  const removeChip = (key) => {
+    draftRef.current = { ...draftRef.current, [key]: "" };
+    setDraft((d) => ({ ...d, [key]: "" }));
+    const next = {};
+    for (const k of FILTER_KEYS) {
+      if (k !== key && filters?.[k]) next[k] = filters[k];
+    }
+    goto({ ...next, sort, dir, page: "1" });
   };
 
   const setSort = (field) => {
@@ -204,12 +263,41 @@ export default function OrdersList() {
             <s-date-field label="From date" {...bind("dateFrom")} />
             <s-date-field label="To date" {...bind("dateTo")} />
           </s-grid>
-          <s-stack direction="inline" gap="base">
+          <s-stack direction="inline" gap="base" alignItems="center" wrap>
             <s-button variant="primary" onClick={applyFilters} {...(loading ? { loading: true } : {})}>
               Apply filters
             </s-button>
             <s-button variant="tertiary" onClick={resetFilters}>Reset</s-button>
+            <s-button
+              variant="tertiary"
+              icon="refresh"
+              onClick={() => revalidator.revalidate()}
+              {...(refreshLoading ? { loading: true } : {})}
+            >
+              Refresh
+            </s-button>
+            {activeChips.length > 0 && (
+              <s-text tone="subdued">
+                {activeChips.length} filter{activeChips.length === 1 ? "" : "s"} applied
+              </s-text>
+            )}
           </s-stack>
+
+          {activeChips.length > 0 && (
+            <s-stack direction="inline" gap="small-200" alignItems="center" wrap>
+              {activeChips.map((c) => (
+                <s-clickable-chip
+                  key={c.key}
+                  removable
+                  accessibilityLabel={`Remove filter ${c.text}`}
+                  onClick={() => removeChip(c.key)}
+                  onRemove={() => removeChip(c.key)}
+                >
+                  {c.text}
+                </s-clickable-chip>
+              ))}
+            </s-stack>
+          )}
         </s-stack>
       </s-section>
 
@@ -245,6 +333,7 @@ export default function OrdersList() {
               <s-table-header>Shipping status</s-table-header>
               <s-table-header>Delivery status</s-table-header>
               <s-table-header>QBO Invoice</s-table-header>
+              <s-table-header>Vendor Bills</s-table-header>
               <s-table-header>Actions</s-table-header>
             </s-table-header-row>
             <s-table-body>
@@ -285,6 +374,9 @@ export default function OrdersList() {
                       previewing={previewingId === o.shopifyOrderId}
                       onPreview={() => onPreviewInvoice(o.shopifyOrderId)}
                     />
+                  </s-table-cell>
+                  <s-table-cell>
+                    <VendorBillCell qbo={o.qbo} />
                   </s-table-cell>
                   <s-table-cell>
                     <s-button
@@ -364,6 +456,38 @@ function QboInvoiceCell({ qbo, onPreview, previewing }) {
           </s-link>
         ) : null}
       </s-stack>
+    </s-stack>
+  );
+}
+
+// Vendor-bill (A/P) summary cell: the dropship cost owed to the wholesale
+// supplier. Mirrors the QBO Invoice column but for the Bill side — a
+// settlement badge (Paid once the wholesale dropship invoice reconciles, else
+// Unpaid / Error) plus a deep link into QuickBooks. Vendor bills have no
+// customer-facing PDF, so there is no in-app Preview. Renders "—" until a bill
+// exists for the order.
+function VendorBillCell({ qbo }) {
+  if (!qbo?.billId) return <s-text tone="subdued">—</s-text>;
+  let badge;
+  if (qbo.billPaymentStatus === "paid") {
+    badge = <s-badge tone="success">Paid</s-badge>;
+  } else if (qbo.billReconcileStatus === "error") {
+    badge = <s-badge tone="critical">Reconcile error</s-badge>;
+  } else if (qbo.billStatus === "error") {
+    badge = <s-badge tone="critical">Error</s-badge>;
+  } else if (qbo.billStatus === "created") {
+    badge = <s-badge tone="neutral">Unpaid</s-badge>;
+  } else {
+    badge = <s-badge tone="neutral">{qbo.billStatus || "Pending"}</s-badge>;
+  }
+  return (
+    <s-stack direction="block" gap="small-200">
+      {badge}
+      {qbo.billUrl ? (
+        <s-link href={qbo.billUrl} target="_blank">
+          Open in QBO {qbo.billDocNumber ? `${qbo.billDocNumber}` : qbo.billId} ↗
+        </s-link>
+      ) : null}
     </s-stack>
   );
 }

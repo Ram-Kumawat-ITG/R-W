@@ -1,4 +1,3 @@
-import { useState } from "react";
 import {
   useLoaderData,
   useNavigation,
@@ -10,6 +9,7 @@ import { listNmiTransactions } from "../services/nmi/nmi.service";
 // Pure helpers come from nmi.utils.js — see that file for why.
 import { latestAction, fromNmiDate } from "../services/nmi/nmi.utils";
 import { formatAmount } from "../utils/format.utils";
+import { AdvancedFilters } from "../components/admin-ui";
 
 const PAGE_SIZE = 50;
 
@@ -34,6 +34,50 @@ const METHOD_FILTERS = [
   { id: "ck", label: "ACH", transactionType: "ck" },
 ];
 
+// Config for the shared <AdvancedFilters> card.
+const FILTER_FIELDS = [
+  { key: "q", label: "Search", type: "text", placeholder: "Name / email / txn / response" },
+  {
+    key: "outcome",
+    label: "Failure scope",
+    type: "select",
+    options: OUTCOME_FILTERS.map((o) => ({ value: o.id, label: o.label })),
+  },
+  {
+    key: "method",
+    label: "Payment method",
+    type: "select",
+    options: METHOD_FILTERS.map((m) => ({ value: m.id, label: m.label })),
+  },
+  {
+    key: "period",
+    label: "Period",
+    type: "select",
+    options: PERIOD_OPTIONS.map((p) => ({ value: p.id, label: p.label })),
+  },
+  { key: "dateFrom", label: "From date", type: "date" },
+  { key: "dateTo", label: "To date", type: "date" },
+];
+const FILTER_DEFAULTS = { outcome: "latest", method: "all", period: "30" };
+
+const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+// Resolve the NMI fetch window. Explicit From/To dates win; else fall back to
+// the relative period (default 30 days). NMI has no pagination, so a bounded
+// window is mandatory.
+function resolveWindow({ dateFrom, dateTo, period }) {
+  if (YMD_RE.test(dateFrom) || YMD_RE.test(dateTo)) {
+    return {
+      start: YMD_RE.test(dateFrom) ? new Date(`${dateFrom}T00:00:00`) : new Date(0),
+      end: YMD_RE.test(dateTo) ? new Date(`${dateTo}T23:59:59`) : new Date(),
+    };
+  }
+  const days = PERIOD_OPTIONS.find((p) => p.id === period)?.days || 30;
+  const end = new Date();
+  const start = new Date(end);
+  start.setDate(start.getDate() - days);
+  return { start, end };
+}
+
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
   const url = new URL(request.url);
@@ -41,13 +85,11 @@ export const loader = async ({ request }) => {
   const period = url.searchParams.get("period") || "30";
   const outcome = url.searchParams.get("outcome") || "latest";
   const method = url.searchParams.get("method") || "all";
+  const dateFrom = (url.searchParams.get("dateFrom") || "").trim();
+  const dateTo = (url.searchParams.get("dateTo") || "").trim();
   const page = Math.max(1, Number(url.searchParams.get("page") || 1));
 
-  const periodDays =
-    PERIOD_OPTIONS.find((p) => p.id === period)?.days || 30;
-  const end = new Date();
-  const start = new Date(end);
-  start.setDate(start.getDate() - periodDays);
+  const { start, end } = resolveWindow({ dateFrom, dateTo, period });
 
   const transactionType =
     METHOD_FILTERS.find((m) => m.id === method)?.transactionType || null;
@@ -99,6 +141,8 @@ export const loader = async ({ request }) => {
       period,
       outcome,
       method,
+      dateFrom,
+      dateTo,
       error: null,
     };
   } catch (e) {
@@ -112,6 +156,8 @@ export const loader = async ({ request }) => {
       period,
       outcome,
       method,
+      dateFrom,
+      dateTo,
       error: e?.message || "Failed to load NMI failed payments",
     };
   }
@@ -158,12 +204,22 @@ function projectFailure(tx) {
 }
 
 export default function NmiFailed() {
-  const { rows, total, page, pageSize, q, period, outcome, method, error } =
-    useLoaderData();
+  const {
+    rows,
+    total,
+    page,
+    pageSize,
+    q,
+    period,
+    outcome,
+    method,
+    dateFrom,
+    dateTo,
+    error,
+  } = useLoaderData();
   const navigation = useNavigation();
   const revalidator = useRevalidator();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [searchInput, setSearchInput] = useState(q);
 
   const tableLoading = navigation.state === "loading";
   const refreshing = revalidator.state !== "idle";
@@ -181,86 +237,18 @@ export default function NmiFailed() {
     setSearchParams(merged);
   };
 
-  const onSearchSubmit = (e) => {
-    e?.preventDefault?.();
-    updateParams({ q: searchInput.trim() || null });
-  };
-  const onSearchClear = () => {
-    setSearchInput("");
-    updateParams({ q: null });
-  };
-
   return (
-    <s-section heading={`Failed payments (${total})`}>
-      <s-stack direction="block" gap="base">
-        <form onSubmit={onSearchSubmit}>
-          <s-stack direction="inline" gap="small-200" alignItems="end">
-            <s-search-field
-              label="Search"
-              labelAccessibilityVisibility="exclusive"
-              placeholder="Search by name, email, txn id, or response text"
-              value={searchInput}
-              onInput={(e) => setSearchInput(e?.currentTarget?.value ?? "")}
-            />
-            <s-button variant="primary" type="submit">
-              Search
-            </s-button>
-            {q && (
-              <s-button variant="tertiary" onClick={onSearchClear}>
-                Clear
-              </s-button>
-            )}
-            <s-button
-              variant="secondary"
-              onClick={() => revalidator.revalidate()}
-              {...(refreshing ? { loading: true } : {})}
-            >
-              Refresh
-            </s-button>
-          </s-stack>
-        </form>
-
-        <s-stack direction="inline" gap="small-200" wrap>
-          {PERIOD_OPTIONS.map((p) => (
-            <s-clickable-chip
-              key={p.id}
-              color={period === p.id ? "strong" : "base"}
-              accessibilityLabel={`Period: ${p.label}`}
-              onClick={() =>
-                updateParams({ period: p.id === "30" ? null : p.id })
-              }
-            >
-              {p.label}
-            </s-clickable-chip>
-          ))}
-          <s-text tone="subdued">·</s-text>
-          {OUTCOME_FILTERS.map((o) => (
-            <s-clickable-chip
-              key={o.id}
-              color={outcome === o.id ? "strong" : "base"}
-              accessibilityLabel={o.label}
-              onClick={() =>
-                updateParams({ outcome: o.id === "latest" ? null : o.id })
-              }
-            >
-              {o.label}
-            </s-clickable-chip>
-          ))}
-          <s-text tone="subdued">·</s-text>
-          {METHOD_FILTERS.map((m) => (
-            <s-clickable-chip
-              key={m.id}
-              color={method === m.id ? "strong" : "base"}
-              accessibilityLabel={`Method: ${m.label}`}
-              onClick={() =>
-                updateParams({ method: m.id === "all" ? null : m.id })
-              }
-            >
-              {m.label}
-            </s-clickable-chip>
-          ))}
-        </s-stack>
-
+    <>
+      <AdvancedFilters
+        fields={FILTER_FIELDS}
+        values={{ q, outcome, method, period, dateFrom, dateTo }}
+        defaults={FILTER_DEFAULTS}
+        onRefresh={() => revalidator.revalidate()}
+        refreshing={refreshing}
+        applying={tableLoading}
+      />
+      <s-section heading={`Failed payments (${total})`}>
+        <s-stack direction="block" gap="base">
         {error && (
           <s-banner tone="critical" heading="Could not load failed payments">
             <s-paragraph>{error}</s-paragraph>
@@ -419,7 +407,8 @@ export default function NmiFailed() {
             </s-stack>
           </s-stack>
         )}
-      </s-stack>
-    </s-section>
+        </s-stack>
+      </s-section>
+    </>
   );
 }

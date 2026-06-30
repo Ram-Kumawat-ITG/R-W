@@ -31,6 +31,9 @@ export const CARRIER_LABEL = Object.freeze({
 // Shopify `shipment_status` (carrier-driven) + `status` (fulfillment-level)
 // values we render. Anything unmapped falls back to the raw value.
 export const SHIPMENT_STATUS_LABEL = Object.freeze({
+  // synthetic order-level rollup keys (deriveDeliveryStatus)
+  not_shipped: 'Not shipped',
+  shipped: 'Shipped',
   // carrier shipment_status
   label_printed: 'Label printed',
   label_purchased: 'Label purchased',
@@ -78,6 +81,55 @@ export function carrierDisplayName(carrierKey, rawCompany) {
 export function shipmentStatusLabel(status) {
   if (!status) return null
   return SHIPMENT_STATUS_LABEL[status] || status
+}
+
+// Carrier shipment_status → progress rank (higher = closer to the customer's
+// hands). `shipped` is the synthetic value for a fulfillment with no carrier
+// scan yet. `failure` is handled out-of-band (an exception, not a progress
+// point).
+export const SHIPMENT_STATUS_RANK = Object.freeze({
+  shipped: 0.5,
+  label_printed: 1,
+  label_purchased: 1,
+  confirmed: 1,
+  ready_for_pickup: 2,
+  in_transit: 3,
+  attempted_delivery: 3,
+  out_for_delivery: 4,
+  delivered: 5,
+})
+
+// Roll the per-shipment carrier statuses up into ONE order-level delivery
+// status for a list column. Returns:
+//   'not_shipped'  — no active (non-cancelled) fulfillment yet
+//   'failure'      — any active shipment failed delivery (surfaced first)
+//   'delivered'    — EVERY active shipment is delivered
+//   else           — the LEAST-progressed active shipment (so the still-in-
+//                    flight part stays visible); a shipment with no carrier
+//                    event yet counts as 'shipped'.
+// Pure + isomorphic — safe to call from a loader or a render path.
+export function deriveDeliveryStatus(fulfillments) {
+  const active = (Array.isArray(fulfillments) ? fulfillments : []).filter(
+    (f) => String(f?.status || '').toLowerCase() !== 'cancelled',
+  )
+  if (!active.length) return 'not_shipped'
+  const keys = active.map((f) => {
+    const v = String(f?.shipmentStatus || '').toLowerCase().trim()
+    return v || null
+  })
+  if (keys.includes('failure')) return 'failure'
+  if (keys.every((k) => k === 'delivered')) return 'delivered'
+  let lowestKey = 'shipped'
+  let lowestRank = Infinity
+  for (const k of keys) {
+    const eff = k || 'shipped'
+    const rank = SHIPMENT_STATUS_RANK[eff] ?? 0.5
+    if (rank < lowestRank) {
+      lowestRank = rank
+      lowestKey = eff
+    }
+  }
+  return lowestKey
 }
 
 // Resolve the customer-facing tracking link:

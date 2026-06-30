@@ -3,11 +3,13 @@ import { authenticate } from "../shopify.server";
 import { getDashboardMetrics } from "../services/cdo/cdo.service";
 import MetricCard from "../components/cdo/MetricCard";
 import StatusBadge from "../components/cdo/StatusBadge";
+import PayoutCountdown from "../components/cdo/PayoutCountdown";
 import {
   formatCurrency,
   formatNumber,
   formatPercent,
   formatDate,
+  formatDateTime,
 } from "../utils/format";
 
 export const loader = async ({ request }) => {
@@ -22,6 +24,8 @@ const MONTH_LABEL = (key) => {
   return d.toLocaleDateString("en-US", { month: "short", year: "numeric" });
 };
 
+// ── Page ──────────────────────────────────────────────────────────────────────
+
 export default function CdoDashboard() {
   const { metrics } = useLoaderData();
   const { kpis, upcoming, monthlyPerformance, topPractitioners, recentOrders } = metrics;
@@ -29,99 +33,94 @@ export default function CdoDashboard() {
   return (
     <s-stack direction="block" gap="base">
       <s-section heading="Commission overview">
-        <s-grid
-          gap="base"
-          gridTemplateColumns="repeat(auto-fill, minmax(220px, 1fr))"
-        >
+        <s-grid gap="base" gridTemplateColumns="repeat(3, minmax(0, 1fr))">
           <MetricCard
-            label="Total Commission Earned"
+            label="Total Earned"
             value={formatCurrency(kpis.totalCommissionEarned)}
-            sublabel="Excludes reversed"
+            sublabel="Lifetime, excl. reversed"
           />
           <MetricCard
-            label="Total Commission Paid"
+            label="Total Paid"
             value={formatCurrency(kpis.totalCommissionPaid)}
             tone="success"
           />
           <MetricCard
-            label="Outstanding Liability"
+            label="Outstanding"
             value={formatCurrency(kpis.outstandingLiability)}
-            tone="critical"
-            sublabel="Earned, not yet paid"
-          />
-          <MetricCard
-            label="Pending Payouts"
-            value={formatCurrency(kpis.pendingPayoutTotal)}
-            sublabel="Awaiting approval / in flight"
-          />
-          <MetricCard
-            label="Paid Out"
-            value={formatCurrency(kpis.paidPayoutTotal)}
-            tone="success"
-          />
-          <MetricCard
-            label="Failed Payouts"
-            value={formatCurrency(kpis.failedPayoutTotal)}
-            tone={kpis.failedPayoutCount ? "critical" : "neutral"}
-            sublabel={`${formatNumber(kpis.failedPayoutCount)} payout(s)`}
+            tone={kpis.outstandingLiability > 0 ? "critical" : undefined}
+            sublabel={
+              kpis.failedPayoutCount > 0
+                ? `${formatNumber(kpis.failedPayoutCount)} failed payout(s)`
+                : "Earned, not yet paid"
+            }
           />
         </s-grid>
       </s-section>
 
       <s-section heading="Program overview">
-        <s-grid
-          gap="base"
-          gridTemplateColumns="repeat(auto-fill, minmax(220px, 1fr))"
-        >
+        <s-grid gap="base" gridTemplateColumns="repeat(3, minmax(0, 1fr))">
           <MetricCard
             label="Total Revenue"
             value={formatCurrency(kpis.totalRevenue)}
             sublabel={`${formatNumber(kpis.totalOrders)} attributed orders`}
           />
           <MetricCard
-            label="Avg Order Value"
-            value={formatCurrency(kpis.avgOrderValue)}
-          />
-          <MetricCard
-            label="Total Referrals"
-            value={formatNumber(kpis.totalReferrals)}
-            sublabel={`${formatNumber(kpis.convertedReferrals)} converted`}
-          />
-          <MetricCard
             label="Active Practitioners"
             value={formatNumber(kpis.activePractitioners)}
           />
           <MetricCard
-            label="Conversion Rate"
-            value={formatPercent(kpis.conversionRate)}
-            sublabel="Referrals → orders"
+            label="Total Referrals"
+            value={formatNumber(kpis.totalReferrals)}
+            sublabel={`${formatNumber(kpis.convertedReferrals)} converted · ${formatPercent(kpis.conversionRate)} rate`}
           />
         </s-grid>
       </s-section>
 
+      {/* ── Upcoming payout ───────────────────────────────────────────── */}
       <s-section heading="Upcoming payout (next cycle)">
         <s-stack direction="block" gap="base">
-          <s-grid gap="base" gridTemplateColumns="repeat(auto-fill, minmax(220px, 1fr))">
+
+          {/* Countdown banner */}
+          <s-box
+            padding="base"
+            background="bg-surface-secondary"
+            border-radius="base"
+          >
+            <s-stack direction="block" gap="small-200">
+              <s-text variant="headingSm">Time until next payout run</s-text>
+              <PayoutCountdown payoutRunAt={upcoming.payoutRunAt} />
+            </s-stack>
+          </s-box>
+
+          {/* Summary cards */}
+          <s-grid gap="base" gridTemplateColumns="repeat(3, minmax(0, 1fr))">
             <MetricCard
               label="Scheduled total"
               value={formatCurrency(upcoming.totalAmount)}
-              tone="success"
+              tone={upcoming.totalAmount > 0 ? "success" : undefined}
+              sublabel={`${formatNumber(upcoming.practitionerCount)} practitioner(s) · ${formatNumber(upcoming.commissionCount)} commission(s)`}
             />
             <MetricCard
-              label="Estimated payout date"
+              label="Payout date"
               value={formatDate(upcoming.estimatedDate)}
-            />
-            <MetricCard
-              label="Practitioners"
-              value={formatNumber(upcoming.practitionerCount)}
-              sublabel={`${formatNumber(upcoming.commissionCount)} commissions`}
+              sublabel={new Date(upcoming.payoutRunAt).toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+                timeZoneName: "short",
+              })}
             />
             <MetricCard
               label="Min payout threshold"
               value={formatCurrency(upcoming.minimumPayoutAmount)}
-              sublabel={`${formatNumber(upcoming.belowMinimumCount)} below minimum (rolls over)`}
+              sublabel={
+                upcoming.belowMinimumCount > 0
+                  ? `${formatNumber(upcoming.belowMinimumCount)} practitioner(s) below minimum`
+                  : "All practitioners qualify"
+              }
             />
           </s-grid>
+
+          {/* Breakdown table */}
           {upcoming.breakdown.length === 0 ? (
             <s-paragraph tone="subdued">
               No practitioner clears the minimum payout this cycle yet. Commissions accrue until

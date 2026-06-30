@@ -26,6 +26,16 @@
 //     returnCode?, returnReason?, settledAt?,
 //   }
 //
+//   processPendingTransfers?() → { advanced: boolean, skipped?: boolean }   (OPTIONAL)
+//     Advance any provider-side transfers that need an explicit processing
+//     trigger before they can settle. A no-op on real rails (production ACH
+//     settles via the banking network). Implemented for TEST/sandbox envs that
+//     require an API call to simulate settlement (Dwolla Sandbox's
+//     `POST /sandbox-simulations` — the API form of the dashboard's
+//     "Process Bank Transfers"), so the settlement CRON closes the loop with NO
+//     manual dashboard step. The settlement sweep calls it once per tick before
+//     polling; omit it and the sweep just polls.
+//
 // A real adapter (Dwolla / Stripe / Modern Treasury) implements exactly this
 // surface — initiate an ACH credit, then report settlement. It MUST be
 // idempotent on idempotencyKey so a retried initiation never double-sends.

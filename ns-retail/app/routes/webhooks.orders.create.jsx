@@ -1,7 +1,11 @@
 import { authenticate, unauthenticated } from "../shopify.server";
 import { ingestShopifyOrder } from "../services/cdo/cdo.service";
 import { ensureRetailInvoiceFromPayload } from "../services/retailQbo/retailOrderInvoice.service";
-import { extractPractitionerCode, extractCodeFromTags } from "../utils/orderCode";
+import {
+  extractPractitionerCode,
+  extractCodeFromTags,
+} from "../utils/orderCode";
+import { syncCustomerCodeTag } from "../utils/customerTags";
 
 // In-memory dedup of webhook ids — Shopify delivers at-least-once and
 // can fire the same payload multiple times in a short window. 5 min TTL
@@ -26,15 +30,25 @@ const SEEN_TTL_MS = 5 * 60 * 1000;
 //      referral / commission / ledger / customer-mapping records
 //   6. Tag the customer with `code:<the-code>` when attributed
 export async function action({ request }) {
+  // Loud entry banner — fires on EVERY inbound POST to /webhooks/orders/create,
+  // before HMAC verify. Lets you confirm Shopify is hitting the route at all
+  // (vs. the request silently 404'ing or the subscription never being registered).
+  console.log(
+    `\n========================================\n[webhooks.orders.create] 🔔 WEBHOOK RECEIVED at ${new Date().toISOString()}\n========================================`,
+  );
+
   let shop, payload, webhookId;
   try {
     const res = await authenticate.webhook(request);
     shop = res.shop;
     payload = res.payload;
     webhookId = request.headers.get("x-shopify-webhook-id");
+    console.log(
+      `[webhooks.orders.create] ✅ HMAC verified · shop=${shop} · webhookId=${webhookId} · orderId=${payload?.id} · orderName=${payload?.name}`,
+    );
   } catch (err) {
     console.error(
-      "[webhooks.orders.create] HMAC auth failed:",
+      "[webhooks.orders.create] ❌ HMAC auth failed:",
       err?.message || err,
     );
     return new Response(null, { status: 401 });
@@ -42,18 +56,24 @@ export async function action({ request }) {
 
   if (webhookId) {
     if (_seenWebhookIds.has(webhookId)) {
-      console.log(`[webhooks.orders.create] duplicate webhook id ${webhookId}, skipping`);
+      console.log(
+        `[webhooks.orders.create] ⏭️  duplicate webhook id ${webhookId} — skipping (returning 200)`,
+      );
       return new Response(null, { status: 200 });
     }
     _seenWebhookIds.add(webhookId);
     setTimeout(() => _seenWebhookIds.delete(webhookId), SEEN_TTL_MS).unref?.();
   }
 
+  console.log(
+    `[webhooks.orders.create] 🚀 dispatching processOrder + forwardToWholesale (fire-and-forget) for order ${payload?.id}`,
+  );
+
   // Fire-and-forget so Shopify gets 200 fast. Errors inside the
   // promise are logged but don't affect the webhook response.
   processOrder({ shop, payload }).catch((err) => {
     console.error(
-      `[webhooks.orders.create] processing order ${payload?.id} failed:`,
+      `[webhooks.orders.create] ❌ processing order ${payload?.id} failed:`,
       err?.message || err,
     );
   });
@@ -68,11 +88,14 @@ export async function action({ request }) {
   // webhook 200 response.
   forwardToWholesaleDropship({ payload, retailShop: shop }).catch((err) => {
     console.error(
-      `[webhooks.orders.create] forward-to-wholesale failed for order ${payload?.id}:`,
+      `[webhooks.orders.create] ❌ forward-to-wholesale failed for order ${payload?.id}:`,
       err?.message || err,
     );
   });
 
+  console.log(
+    `[webhooks.orders.create] ✅ 200 returned to Shopify (downstream work continues in background) · order=${payload?.id}\n`,
+  );
   return new Response(null, { status: 200 });
 }
 
@@ -92,15 +115,19 @@ export async function action({ request }) {
 // devs run ns-retail standalone without the wholesale app booted.
 async function forwardToWholesaleDropship({ payload, retailShop }) {
   // eslint-disable-next-line no-undef
-  const apiBase = process.env.WHOLESALE_API_BASE;
+  const apiBase ="https://buzz-wherever-screw-partnerships.trycloudflare.com"||  process.env.WHOLESALE_API_BASE;
   // eslint-disable-next-line no-undef
   const wholesaleShop = process.env.WHOLESALE_SHOP;
   // eslint-disable-next-line no-undef
   const syncSecret = process.env.RETAIL_SYNC_SECRET;
 
+  console.log(
+    `[forward-to-wholesale] ▶️  starting forward for order ${payload?.id} · apiBase=${apiBase || "(missing)"} · wholesaleShop=${wholesaleShop || "(missing)"} · secretSet=${Boolean(syncSecret)}`,
+  );
+
   if (!apiBase || !wholesaleShop || !syncSecret) {
     console.warn(
-      "[forward-to-wholesale] missing env (WHOLESALE_API_BASE/WHOLESALE_SHOP/RETAIL_SYNC_SECRET) — skipping forward",
+      "[forward-to-wholesale] ⚠️  missing env (WHOLESALE_API_BASE/WHOLESALE_SHOP/RETAIL_SYNC_SECRET) — skipping forward",
     );
     return;
   }
@@ -109,11 +136,19 @@ async function forwardToWholesaleDropship({ payload, retailShop }) {
   url.searchParams.set("shop", wholesaleShop);
   if (retailShop) url.searchParams.set("retail_shop", retailShop);
 
+  console.log(`[forward-to-wholesale] 🌐 POST ${url.toString()}`);
+
   const res = await fetch(url.toString(), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "x-sync-secret": syncSecret,
+      // ngrok free-tier serves an HTML interstitial ("You are about to
+      // visit…") with HTTP 200 on first POST unless this header is set.
+      // Without it the wholesale app never sees the request — Shopify
+      // CLI tunnels add this header automatically for embedded admin
+      // requests, but our server-to-server fetch must add it manually.
+      "ngrok-skip-browser-warning": "true",
     },
     body: JSON.stringify(payload),
   });
@@ -170,13 +205,21 @@ async function processOrder({ shop, payload }) {
   // The helper logs the outcome (success / reason it was skipped / error), and
   // the orders/paid + orders/updated handlers retry the same idempotent call,
   // so a transient QBO failure here self-heals on the next order event.
-  await ensureRetailInvoiceFromPayload({ shop, payload, trigger: "orders/create" });
+  await ensureRetailInvoiceFromPayload({
+    shop,
+    payload,
+    trigger: "orders/create",
+  });
 
   // Tag the customer with the canonical code when the order attributed and
   // we have a linked customer. Guest checkouts may have no customer — the
   // cdo_application mapping (by email) still happened inside the service.
   if (result?.attributed && result.customerGid && result.referralCode) {
-    await tagCustomerWithCode(shop, result.customerGid, result.referralCode).catch((err) => {
+    await tagCustomerWithCode(
+      shop,
+      result.customerGid,
+      result.referralCode,
+    ).catch((err) => {
       console.error(
         `[webhooks.orders.create] tag customer ${result.customerGid} failed:`,
         err?.message || err,
@@ -203,53 +246,13 @@ async function fetchCustomerTags(shop, customerGid) {
 }
 
 async function tagCustomerWithCode(shop, customerGid, code, practitionerEmail) {
-  const codeTag = `code:${code}`;
-  // Bare email as a tag (no prefix) per locked decision 2026-06-04 — lets
-  // the admin filter "all patients referred by drjohn@example.com" in
-  // Shopify admin's customer list.
-  const emailTag = practitionerEmail
-    ? String(practitionerEmail).toLowerCase().trim()
-    : null;
-
-  const { admin } = await unauthenticated.admin(shop);
-
-  // Fetch existing tags so we don't clobber other tags
-  const existing = await fetchCustomerTags(shop, customerGid);
-
-  // Determine which tags are missing — skip the whole update if both
-  // are already present.
-  const toAdd = [];
-  if (!existing.includes(codeTag)) toAdd.push(codeTag);
-  if (emailTag && !existing.includes(emailTag)) toAdd.push(emailTag);
-
-  if (!toAdd.length) {
-    console.log(`[webhooks.orders.create] tags already on ${customerGid}`);
-    return;
+  // Use the shared utility for tagging — it handles adding/removing code:*
+  // tags and preserves existing tags. Logs outcome internally.
+  try {
+    await syncCustomerCodeTag(shop, customerGid, code, practitionerEmail);
+  } catch (err) {
+    throw new Error(`Failed to tag customer ${customerGid}: ${err?.message || err}`);
   }
-
-  const updRes = await admin.graphql(
-    `mutation TagCustomer($input: CustomerInput!) {
-      customerUpdate(input: $input) {
-        customer { id tags }
-        userErrors { field message }
-      }
-    }`,
-    {
-      variables: {
-        input: { id: customerGid, tags: [...existing, ...toAdd] },
-      },
-    },
-  );
-  const updData = await updRes.json();
-  const errs = updData?.data?.customerUpdate?.userErrors || [];
-  if (errs.length) {
-    throw new Error(
-      `customerUpdate userErrors: ${errs.map((e) => e.message).join("; ")}`,
-    );
-  }
-  console.log(
-    `[webhooks.orders.create] tagged ${customerGid} with ${toAdd.map((t) => `"${t}"`).join(", ")}`,
-  );
 }
 
 export async function loader() {

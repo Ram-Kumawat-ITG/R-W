@@ -37,7 +37,10 @@ const dropshipMappingSchema = new mongoose.Schema(
     // ── Amounts (locked at creation, for traceability) ────────────────
     // Sum of retail BASE prices × qty (before patient discount/shipping/tax)
     retailBaseSubtotal: { type: Number, default: 0 },
-    // ½ of retailBaseSubtotal — what wholesale invoices retail for
+    // Sum of the WHOLESALE product prices × qty (sync_id_maps.wholesalePrice;
+    // falls back to ½ of retail when a variant's snapshot isn't populated) —
+    // what wholesale invoices retail for. Informational/audit only; the
+    // invoiced amount is the QBO invoice total built from the order lines.
     wholesaleSubtotal: { type: Number, default: 0 },
     currency: { type: String, default: 'USD' },
 
@@ -65,6 +68,24 @@ const dropshipMappingSchema = new mongoose.Schema(
     cancelledAt: { type: Date, default: null },
     cancelledReason: { type: String, default: null },
     paidAt: { type: Date, default: null }, // when the weekly batch closed it
+
+    // ── Retail fulfillment sync (Wholesale → Retail status mirror) ──────
+    // When the wholesale drop-ship order is fulfilled / shipped / delivered /
+    // cancelled, we POST that status to the ns-retail app so it mirrors it
+    // onto the linked retail Shopify order. This block is the status-tracking
+    // + dedup record for that push: `lastSignature` is a content hash of the
+    // last successfully-synced fulfillment state, so a re-delivered webhook or
+    // a repeated Order-Details live-pull never re-POSTs an unchanged update
+    // (duplicate / conflict prevention). See services/sync/fulfillmentSync.
+    retailFulfillmentSync: {
+      lastSignature: { type: String, default: null }, // hash of last synced state
+      lastEvent: { type: String, default: null }, // 'fulfillment' | 'cancelled'
+      lastStatus: { type: String, default: null }, // 'ok' | 'error'
+      lastSyncedAt: { type: Date, default: null }, // last attempt (success OR failure)
+      lastError: { type: String, default: null },
+      lastErrorAt: { type: Date, default: null },
+      attempts: { type: Number, default: 0 }, // total push attempts
+    },
   },
   { collection: 'dropship_mappings', timestamps: true, strict: true },
 )

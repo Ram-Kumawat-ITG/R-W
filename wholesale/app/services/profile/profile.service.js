@@ -97,11 +97,42 @@ export function maskedProfileForRead(application) {
     commission: doc.commission
       ? {
           enabled: !!doc.commission.enabled,
+          // Payout method selector (ach | check). Default to 'ach' for
+          // legacy rows pre-dating the field — every legacy commission
+          // record has bank fields populated, no check fields. Without
+          // projecting this, the profile-update UI couldn't pre-select
+          // the user's actual choice when they picked Check.
+          payoutMethod:
+            doc.commission.payoutMethod === 'check' ? 'check' : 'ach',
+          // ── ACH branch (used when payoutMethod === 'ach') ──────────
           bankAccountName: doc.commission.bankAccountName || '',
           bankRoutingNumber: doc.commission.bankRoutingNumber || '',
           bankAccountLast4: doc.commission.bankAccountLast4 || '',
           bankAccountType: doc.commission.bankAccountType || '',
           sourcedFromPaymentAch: !!doc.commission.sourcedFromPaymentAch,
+          // ── Check branch (used when payoutMethod === 'check') ──────
+          // Without this block, Check-payout customers opening their
+          // profile would see ACH fields with no data, AND silently lose
+          // their payableTo + mailing address on save (the client would
+          // re-send empty defaults). Project the full check subdoc so the
+          // UI can autofill all of it.
+          check: doc.commission.check
+            ? {
+                payableTo: doc.commission.check.payableTo || '',
+                useBillingAddress:
+                  doc.commission.check.useBillingAddress !== false,
+                mailingAddress: doc.commission.check.mailingAddress
+                  ? {
+                      line1: doc.commission.check.mailingAddress.line1 || '',
+                      line2: doc.commission.check.mailingAddress.line2 || '',
+                      city: doc.commission.check.mailingAddress.city || '',
+                      state: doc.commission.check.mailingAddress.state || '',
+                      zip: doc.commission.check.mailingAddress.zip || '',
+                      country: doc.commission.check.mailingAddress.country || '',
+                    }
+                  : null,
+              }
+            : null,
         }
       : null,
     w9: doc.w9
@@ -144,6 +175,10 @@ export async function updateProfileApplication({
   const warnings = []
   const fileUploads = {}
   const $set = {}
+  // $unset hoisted to the top so multiple sections (commission branch-wipe
+  // + W-9 classification clear) can contribute paths. Mongo accepts a
+  // single $unset object combining all paths in one updateOne.
+  const $unset = {}
   let paymentMethodRealign = null
   let addressChangedForShopify = null
   let personalChangedForShopify = null
@@ -498,14 +533,69 @@ export async function updateProfileApplication({
   // AES-256-GCM via `encryptField` — only an admin with access to
   // SHOPIFY_API_SECRET (and the new bankAccountEncrypted field) can
   // recover it for payout instructions.
+  //
+  // Two payout branches (mirrors app/api/registration-form.js lines
+  // 216–282 — keep the two in lockstep):
+  //   • payoutMethod === 'ach'   → save bank fields; encrypt new account
+  //                                 number when supplied (empty = keep
+  //                                 existing encrypted). $unset wipes
+  //                                 commission.check.
+  //   • payoutMethod === 'check' → save check.payableTo + mailing address
+  //                                 (resolved against billingAddress when
+  //                                 useBillingAddress=true). $unset wipes
+  //                                 the ACH fields.
+  // Branch wipe is essential: without it, switching payout method would
+  // leave stale fields from the previous branch on the doc.
   if (payload.commission && typeof payload.commission === 'object') {
     const c = payload.commission
+    const method = c.payoutMethod === 'check' ? 'check' : 'ach'
+
+    $set['commission.payoutMethod'] = method
     if (typeof c.enabled === 'boolean') $set['commission.enabled'] = c.enabled
-    if (c.bankAccountName) $set['commission.bankAccountName'] = c.bankAccountName
-    if (c.bankRoutingNumber) $set['commission.bankRoutingNumber'] = c.bankRoutingNumber
-    if (c.bankAccountNumber) {
-      const rawAccount = String(c.bankAccountNumber).replace(/\D/g, '')
-      if (rawAccount) {
+    $set['commission.updatedAt'] = new Date()
+
+    if (method === 'ach') {
+      // ── ACH branch ──────────────────────────────────────────────────
+      // When sourcedFromPaymentAch=true, derive bank* from the doc's
+      // payment.ach.* (defense in depth — client mirrors them on tick,
+      // server is source of truth).
+      const useSourceFromPayment = !!c.sourcedFromPaymentAch
+      const paymentAch =
+        application.payment?.ach?.toObject?.() ?? application.payment?.ach ?? {}
+
+      if (useSourceFromPayment) {
+        $set['commission.bankAccountName'] =
+          paymentAch.achAccountName || c.bankAccountName || ''
+        $set['commission.bankRoutingNumber'] =
+          paymentAch.achRoutingNumber || c.bankRoutingNumber || ''
+        $set['commission.bankAccountType'] =
+          paymentAch.achAccountType || c.bankAccountType || ''
+      } else {
+        if (c.bankAccountName && String(c.bankAccountName).trim()) {
+          $set['commission.bankAccountName'] = c.bankAccountName
+        }
+        if (c.bankRoutingNumber && String(c.bankRoutingNumber).trim()) {
+          $set['commission.bankRoutingNumber'] = c.bankRoutingNumber
+        }
+        if (c.bankAccountType && String(c.bankAccountType).trim()) {
+          $set['commission.bankAccountType'] = c.bankAccountType
+        }
+      }
+      $set['commission.sourcedFromPaymentAch'] = useSourceFromPayment
+
+      const rawAccount = String(c.bankAccountNumber || '').replace(/\D/g, '')
+      const hasExistingEncrypted = !!application.commission?.bankAccountEncrypted
+
+      // Integrity guard — block ACH save with no encrypted account on
+      // file AND no new account number. Catches Check→ACH switch where
+      // prior $unset wiped the encrypted value.
+      if (!rawAccount && !hasExistingEncrypted && !useSourceFromPayment) {
+        errors.push({
+          section: 'commission',
+          message:
+            'Bank account number is required when switching to ACH for the first time. Please enter your bank account number.',
+        })
+      } else if (rawAccount) {
         $set['commission.bankAccountLast4'] = rawAccount.slice(-4)
         try {
           $set['commission.bankAccountEncrypted'] = encryptField(rawAccount)
@@ -517,16 +607,79 @@ export async function updateProfileApplication({
           })
         }
       }
+      // Empty bankAccountNumber + existing encrypted → keep existing.
+
+      // Wipe the Check branch — only the selected method's data remains.
+      $unset['commission.check'] = ''
+    } else {
+      // ── Check branch ────────────────────────────────────────────────
+      if (!c.check || typeof c.check !== 'object') {
+        errors.push({
+          section: 'commission',
+          message: 'Check payout details are required (payableTo + mailing address).',
+        })
+      } else {
+        const chk = c.check
+        const useBilling = chk.useBillingAddress !== false // default true
+
+        // When useBillingAddress=true, copy from incoming address (if
+        // any) merged over the doc's billingAddress baseline so partial
+        // address edits don't blank out the mailing snapshot. Billing —
+        // not shipping — is the financial-mail address.
+        let mailing
+        if (useBilling) {
+          const billingBaseline =
+            application.billingAddress?.toObject?.() ?? application.billingAddress ?? {}
+          const billingIncoming =
+            payload.address?.billingAddress && typeof payload.address.billingAddress === 'object'
+              ? payload.address.billingAddress
+              : {}
+          const billingSource = { ...billingBaseline, ...billingIncoming }
+          mailing = {
+            line1: billingSource.line1 || '',
+            line2: billingSource.line2 || '',
+            city: billingSource.city || '',
+            state: billingSource.state || '',
+            zip: billingSource.zip || '',
+            country: billingSource.country || '',
+          }
+        } else {
+          const m = chk.mailingAddress || {}
+          mailing = {
+            line1: m.line1 || '',
+            line2: m.line2 || '',
+            city: m.city || '',
+            state: m.state || '',
+            zip: m.zip || '',
+            country: m.country || '',
+          }
+        }
+
+        const payableTo =
+          chk.payableTo && String(chk.payableTo).trim()
+            ? String(chk.payableTo).trim()
+            : `${application.firstName || ''} ${application.lastName || ''}`.trim()
+
+        $set['commission.check'] = {
+          payableTo,
+          useBillingAddress: useBilling,
+          mailingAddress: mailing,
+        }
+
+        // Wipe the ACH branch — only the selected method's data remains.
+        $unset['commission.bankAccountName'] = ''
+        $unset['commission.bankRoutingNumber'] = ''
+        $unset['commission.bankAccountEncrypted'] = ''
+        $unset['commission.bankAccountLast4'] = ''
+        $unset['commission.bankAccountType'] = ''
+        $unset['commission.sourcedFromPaymentAch'] = ''
+      }
     }
-    if (c.bankAccountType) $set['commission.bankAccountType'] = c.bankAccountType
-    if (typeof c.sourcedFromPaymentAch === 'boolean') {
-      $set['commission.sourcedFromPaymentAch'] = c.sourcedFromPaymentAch
-    }
-    $set['commission.updatedAt'] = new Date()
   }
 
   // ── W-9 form (signature REQUIRED on every save) ──────────────────────
-  const $unset = {}
+  // ($unset is hoisted at the top of this function — the commission
+  //  branch-wipe and W-9 classification clear both contribute paths.)
   if (payload.w9 && typeof payload.w9 === 'object') {
     const w9 = stripEmptyEnums(payload.w9, W9_ENUM_KEYS)
 
