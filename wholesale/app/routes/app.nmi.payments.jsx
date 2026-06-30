@@ -185,8 +185,8 @@ export default function NmiPayments() {
   const revalidator = useRevalidator();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const tableLoading = navigation.state === "loading";
   const refreshing = revalidator.state !== "idle";
+  const tableLoading = navigation.state === "loading" || refreshing;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const firstShown = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const lastShown = Math.min(page * pageSize, total);

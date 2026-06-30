@@ -199,6 +199,17 @@ const CONDITION_TONE = {
   unknown: "default",
 };
 
+const CONDITION_LABEL = {
+  complete: "Settled",
+  pendingsettlement: "Awaiting settlement",
+  pending: "Pending",
+  in_progress: "In progress",
+  failed: "Failed",
+  canceled: "Canceled",
+  abandoned: "Abandoned",
+  unknown: "Unknown",
+};
+
 export default function NmiTransactions() {
   const { rows, total, page, pageSize, q, period, condition, dateFrom, dateTo, error } =
     useLoaderData();
@@ -206,8 +217,8 @@ export default function NmiTransactions() {
   const revalidator = useRevalidator();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const tableLoading = navigation.state === "loading";
   const refreshing = revalidator.state !== "idle";
+  const tableLoading = navigation.state === "loading" || refreshing;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const firstShown = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const lastShown = Math.min(page * pageSize, total);
@@ -326,7 +337,7 @@ export default function NmiTransactions() {
                   </s-table-cell>
                   <s-table-cell>
                     <s-badge tone={CONDITION_TONE[tx.condition] || "default"}>
-                      {tx.condition || "—"}
+                      {CONDITION_LABEL[tx.condition] || tx.condition || "—"}
                     </s-badge>
                   </s-table-cell>
                   <s-table-cell>
