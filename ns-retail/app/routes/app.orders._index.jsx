@@ -1,6 +1,6 @@
 /* eslint-disable react/prop-types */
 import { useEffect, useRef, useState } from "react";
-import { useLoaderData, useNavigate, useNavigation, useFetcher } from "react-router";
+import { useLoaderData, useNavigate, useNavigation, useRevalidator, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import { listCdoOrders } from "../services/cdo/cdo.service";
 import { getRetailInvoicePdf } from "../services/retailQbo/retailOrderInvoice.service";
@@ -107,7 +107,9 @@ export default function OrdersList() {
   const { result, filters, sort, dir } = useLoaderData();
   const navigate = useNavigate();
   const navigation = useNavigation();
-  const loading = navigation.state === "loading";
+  const revalidator = useRevalidator();
+  const loading = navigation.state === "loading" || revalidator.state !== "idle";
+  const refreshLoading = revalidator.state !== "idle";
 
   const EMPTY_DRAFT = {
     orderNumber: "", customer: "", practitioner: "", referralCode: "",
@@ -266,6 +268,14 @@ export default function OrdersList() {
               Apply filters
             </s-button>
             <s-button variant="tertiary" onClick={resetFilters}>Reset</s-button>
+            <s-button
+              variant="tertiary"
+              icon="refresh"
+              onClick={() => revalidator.revalidate()}
+              {...(refreshLoading ? { loading: true } : {})}
+            >
+              Refresh
+            </s-button>
             {activeChips.length > 0 && (
               <s-text tone="subdued">
                 {activeChips.length} filter{activeChips.length === 1 ? "" : "s"} applied

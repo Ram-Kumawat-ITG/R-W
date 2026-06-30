@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import mongoose from "mongoose";
-import { useLoaderData, useNavigate, useFetcher } from "react-router";
+import { useLoaderData, useNavigate, useRevalidator, useFetcher } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import connectDB from "../services/APIService/mongo.service";
@@ -403,6 +403,7 @@ export default function AdminOrderDetail() {
   const { order, details, retailCustomerEmail, invoice, attempts, qbo, vendorBill, dropshipVaultConfigured } =
     useLoaderData();
   const navigate = useNavigate();
+  const revalidator = useRevalidator();
   const shopify = useAppBridge();
 
   const [bannerError, setBannerError] = useState(null);
@@ -557,6 +558,15 @@ export default function AdminOrderDetail() {
 
   return (
     <s-page inlineSize="large" heading={`Admin Order ${orderLabel}`}>
+      <s-button
+        slot="primary-action"
+        variant="tertiary"
+        icon="refresh"
+        onClick={() => revalidator.revalidate()}
+        {...(revalidator.state !== "idle" ? { loading: true } : {})}
+      >
+        Refresh
+      </s-button>
       <s-box padding="base">
         <s-stack direction="inline" gap="base" alignItems="center">
           <s-button

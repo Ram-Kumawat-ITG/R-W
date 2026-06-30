@@ -380,7 +380,8 @@ export function AdvancedFilters({
           </s-button>
           {onRefresh && (
             <s-button
-              variant="secondary"
+              variant="tertiary"
+              icon="refresh"
               onClick={onRefresh}
               {...(refreshing ? { loading: true } : {})}
             >

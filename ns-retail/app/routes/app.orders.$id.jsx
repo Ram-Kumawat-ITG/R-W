@@ -1,6 +1,6 @@
 /* eslint-disable react/prop-types */
 import { useEffect, useRef } from "react";
-import { useLoaderData, useNavigate, useFetcher } from "react-router";
+import { useLoaderData, useNavigate, useRevalidator, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import { getCdoOrderDetail } from "../services/cdo/cdo.service";
 import {
@@ -240,6 +240,7 @@ function BillPaymentBadge({ paymentStatus, reconcileStatus }) {
 export default function OrderDetail() {
   const { order } = useLoaderData();
   const navigate = useNavigate();
+  const revalidator = useRevalidator();
   const qboFetcher = useFetcher();
   const qboBusy = qboFetcher.state !== "idle";
   const pdfFetcher = useFetcher();
@@ -304,9 +305,19 @@ export default function OrderDetail() {
   return (
     <s-stack direction="block" gap="small-200">
       <s-box paddingBlockEnd="small-200">
-        <s-button variant="tertiary" icon="arrow-left" onClick={() => navigate("/app/orders")}>
-          Back to Orders
-        </s-button>
+        <s-stack direction="inline" gap="base" alignItems="center">
+          <s-button variant="tertiary" icon="arrow-left" onClick={() => navigate("/app/orders")}>
+            Back to Orders
+          </s-button>
+          <s-button
+            variant="tertiary"
+            icon="refresh"
+            onClick={() => revalidator.revalidate()}
+            {...(revalidator.state !== "idle" ? { loading: true } : {})}
+          >
+            Refresh
+          </s-button>
+        </s-stack>
       </s-box>
 
       <CollapsibleSection heading={order.orderName} storageKey="r-ord-header" defaultOpen>

@@ -3,6 +3,7 @@ import {
   useLoaderData,
   useNavigate,
   useNavigation,
+  useRevalidator,
 } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
@@ -404,6 +405,7 @@ export default function OrdersList() {
   const { rows, total, page, pageSize, filters, sort, dir } = useLoaderData();
   const navigate = useNavigate();
   const navigation = useNavigation();
+  const revalidator = useRevalidator();
   const shopify = useAppBridge();
   const loadedToastShown = useRef(false);
 
@@ -414,7 +416,8 @@ export default function OrdersList() {
     shopify?.toast?.show(`Loaded ${total} ${total === 1 ? "order" : "orders"}`);
   }, [total, shopify]);
 
-  const tableLoading = navigation.state === "loading";
+  const tableLoading = navigation.state === "loading" || revalidator.state !== "idle";
+  const refreshLoading = revalidator.state !== "idle";
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const firstShown = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const lastShown = Math.min(page * pageSize, total);
@@ -569,6 +572,14 @@ export default function OrdersList() {
             </s-button>
             <s-button variant="tertiary" onClick={resetFilters}>
               Reset
+            </s-button>
+            <s-button
+              variant="tertiary"
+              icon="refresh"
+              onClick={() => revalidator.revalidate()}
+              {...(refreshLoading ? { loading: true } : {})}
+            >
+              Refresh
             </s-button>
             {hasActiveFilter && (
               <s-text tone="subdued">

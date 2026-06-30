@@ -3,6 +3,7 @@ import {
   useLoaderData,
   useNavigate,
   useNavigation,
+  useRevalidator,
   useSearchParams,
   useFetcher,
 } from "react-router";
@@ -521,6 +522,7 @@ export default function AdminOrdersList() {
   } = useLoaderData();
   const navigate = useNavigate();
   const navigation = useNavigation();
+  const revalidator = useRevalidator();
   const shopify = useAppBridge();
   const [searchParams, setSearchParams] = useSearchParams();
   const loadedToastShown = useRef(false);
@@ -606,7 +608,7 @@ export default function AdminOrdersList() {
   const sortParams =
     sort !== DEFAULT_SORT || dir !== "desc" ? { sort, dir } : {};
 
-  const tableLoading = navigation.state === "loading";
+  const tableLoading = navigation.state === "loading" || revalidator.state !== "idle";
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const firstShown = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const lastShown = Math.min(page * pageSize, total);
@@ -647,6 +649,8 @@ export default function AdminOrdersList() {
         defaults={FILTER_DEFAULTS}
         extraParams={sortParams}
         applying={tableLoading}
+        onRefresh={() => revalidator.revalidate()}
+        refreshing={revalidator.state !== "idle"}
         description={`Orders placed by the retail drop-ship customer${
           customerEmail ? ` (${customerEmail})` : ""
         }. Each new order gets an unpaid QBO invoice on creation. Use the Batch Payment button above to mark multiple invoices paid at once with a single payment reference.`}

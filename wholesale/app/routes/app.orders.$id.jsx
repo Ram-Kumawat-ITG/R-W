@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 import {
   useLoaderData,
   useNavigate,
+  useRevalidator,
   useFetcher,
 } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
@@ -482,6 +483,7 @@ export default function OrderDetail() {
   const { order, invoice, attempts, customerMap, businessName, breakdown, qbo, processingFeeRates, cardOnFile } =
     useLoaderData();
   const navigate = useNavigate();
+  const revalidator = useRevalidator();
   const shopify = useAppBridge();
   const retryFetcher = useFetcher();
   const chequeFetcher = useFetcher();
@@ -1271,6 +1273,15 @@ export default function OrderDetail() {
         onClick={() => navigate("/app/orders")}
       >
         Back
+      </s-button>
+      <s-button
+        slot="primary-action"
+        variant="tertiary"
+        icon="refresh"
+        onClick={() => revalidator.revalidate()}
+        {...(revalidator.state !== "idle" ? { loading: true } : {})}
+      >
+        Refresh
       </s-button>
       {invoice &&
         (isCardInvoice || isAchInvoice) &&
