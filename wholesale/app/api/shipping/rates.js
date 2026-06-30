@@ -94,6 +94,41 @@ function sumQuantity(items) {
   )
 }
 
+// ── Processing Fee line detection ──────────────────────────────────────
+//
+// The Checkout UI extension (extensions/checkout-ui/src/Checkout.jsx) adds
+// a "Processing Fee" cart line item (variant priced at $0.01, quantity =
+// cents-of-fee). When Shopify POSTs the carrier-service callback, this
+// line appears in `rate.items[]` alongside the real merchandise. We MUST
+// exclude it from:
+//   • totalQty   → otherwise the fee's 9095-unit quantity pushes the
+//                  handling-markup tier to "4+ items → $5" on every cart
+//   • vendor check → free-shipping rule requires every line vendor be
+//                    "Natural Solutions"; the fee product may have a
+//                    different vendor (or none) and would silently
+//                    disqualify NS-only carts
+//   • subtotalUSD → the fee adds to the $500 free-shipping threshold;
+//                   should be the customer's REAL spend, not what we
+//                   tacked on top
+//   • carrier weight calc → the fee variant should be weight=0 but
+//                           depending on Shopify Admin config it may
+//                           carry default weight that inflates carrier
+//                           quotes
+//
+// Detection: variant_id match first (fast + exact), then title regex as
+// a defensive fallback for misconfigured products / variant-id drift.
+// Keep PROCESSING_FEE_VARIANT_ID in sync with FEE_VARIANT_GID in
+// extensions/checkout-ui/src/Checkout.jsx.
+const PROCESSING_FEE_VARIANT_ID = 45231995191365
+const PROCESSING_FEE_TITLE_RE = /processing\s*fee/i
+
+function isProcessingFeeItem(it) {
+  if (!it) return false
+  if (Number(it.variant_id) === PROCESSING_FEE_VARIANT_ID) return true
+  const name = String(it.name || it.title || '').trim()
+  return PROCESSING_FEE_TITLE_RE.test(name)
+}
+
 // Add N business days from today and return an ISO date string —
 // Shopify shows this next to the price in the customer's checkout view.
 function addBusinessDaysIso(daysFromToday) {
@@ -536,11 +571,20 @@ console.log('[shipping.rates---------------------------------------------] paylo
   }
 
   // ── 1. Aggregate cart ────────────────────────────────────────────────
-  const totalQty = sumQuantity(rate.items)
+  //
+  // Strip the Processing Fee cart line out of EVERY downstream calculation
+  // (markup tier, vendor check, subtotal threshold, carrier weight). See
+  // `isProcessingFeeItem` for detection rules. `realItems` is the items
+  // array we treat as the customer's actual merchandise; `rate.items` is
+  // the raw Shopify payload we keep around only for logging.
+  const realItems = (rate.items || []).filter((it) => !isProcessingFeeItem(it))
+  const feeLinesExcluded = rate.items.length - realItems.length
+
+  const totalQty = sumQuantity(realItems)
   if (totalQty === 0) return ratesResponse([])
 
   console.log(
-    `[shipping.rates] inbound: ${rate.items.length} line(s), totalQty=${totalQty}, dest=${rate.destination?.country}/${rate.destination?.province}/${rate.destination?.postal_code}`,
+    `[shipping.rates] inbound: ${rate.items.length} line(s) (${feeLinesExcluded} processing-fee excluded), realQty=${totalQty}, dest=${rate.destination?.country}/${rate.destination?.province}/${rate.destination?.postal_code}`,
   )
 
   // ── 1a. Free-shipping rule (wholesale store) ─────────────────────────
@@ -561,13 +605,16 @@ console.log('[shipping.rates---------------------------------------------] paylo
   const FREE_SHIPPING_VENDOR = 'Natural Solutions'
   const FREE_SHIPPING_THRESHOLD_USD = 500
 
-  const allItemsNaturalSolutions = rate.items.every(
+  // Use `realItems` (Processing Fee already stripped) so the vendor +
+  // subtotal checks reflect the customer's actual purchase, not the
+  // fee line we tacked on.
+  const allItemsNaturalSolutions = realItems.every(
     (it) =>
       (it?.vendor || '').trim().toLowerCase() ===
       FREE_SHIPPING_VENDOR.toLowerCase(),
   )
   const cartSubtotalUsd =
-    rate.items.reduce(
+    realItems.reduce(
       (sum, it) => sum + (Number(it?.price) || 0) * (Number(it?.quantity) || 0),
       0,
     ) / 100
@@ -587,7 +634,11 @@ console.log('[shipping.rates---------------------------------------------] paylo
   // free-shipping rule above fires (rate total goes to $0).
   const baseCents = tieredMarkupCents(totalQty)
 
-  const directRates = await fetchDirectCarrierRates(rate)
+  // Carrier APIs (USPS/UPS) read items[] to compute package weight + box
+  // dims. Pass `realItems` so the Processing Fee line — which should be
+  // weight=0 but may be misconfigured in Shopify Admin — never inflates
+  // the quote. We clone `rate` rather than mutate the original payload.
+  const directRates = await fetchDirectCarrierRates({ ...rate, items: realItems })
   if (directRates && directRates.length) {
     // Dedup by (carrier, service) — pick cheapest variant per service.
     const dedup = new Map()

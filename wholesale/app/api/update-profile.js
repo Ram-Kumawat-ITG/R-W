@@ -6,6 +6,7 @@ import { buildShopifyNote } from '../services/shopify/shopify.utils'
 import { customerUpdateNote, customerUpdateDefaultAddress } from '../utils/shopifyCustomer'
 import { normalizePaymentMethod } from '../services/customer/customer.utils'
 import { applyPaymentPreferenceToOpenInvoices } from '../services/invoice/paymentPreference.service'
+import { encryptField } from '../utils/crypto.utils'
 
 // POST /api/update-profile  (Shopify App Proxy)
 // Content-Type: application/json
@@ -51,6 +52,7 @@ export async function action({ request }) {
     address,
     payment = {},
     tax = {},
+    commission,
   } = body
 
   if (!email) {
@@ -65,10 +67,12 @@ export async function action({ request }) {
   }
 
   const $set = {}
+  const $unset = {}
   let hasProfileUpdate = false
   let hasAddressUpdate = false
   let hasPaymentUpdate = false
   let hasTaxUpdate = false
+  let hasCommissionUpdate = false
 
   // ── Profile fields ────────────────────────────────────────────────────────
   const profileKeys = ['firstName', 'lastName', 'phone', 'businessName']
@@ -120,19 +124,187 @@ export async function action({ request }) {
     }
   }
 
-  if (!hasProfileUpdate && !hasAddressUpdate && !hasPaymentUpdate && !hasTaxUpdate) {
+  // ── Commission payout (ACH | Check) ──────────────────────────────────────
+  //
+  // Mirrors `app/api/registration-form.js` lines 216–282. Two branches:
+  //   • payoutMethod === 'ach'   → save bank fields; if a new account
+  //                                 number is included, AES-256-GCM encrypt
+  //                                 it and store last4. Empty bankAccountNumber
+  //                                 means "no change" → existing encrypted
+  //                                 account is preserved.
+  //   • payoutMethod === 'check' → save check.payableTo + mailing address
+  //                                 (resolved against billingAddress when
+  //                                 useBillingAddress=true).
+  // Whichever branch the client picks, the OTHER branch's stored fields
+  // are wiped via $unset so the doc only carries the selected method's
+  // data (matches registration-form's branch-wipe behavior).
+  if (commission && typeof commission === 'object') {
+    const c = commission
+    const method = c.payoutMethod === 'check' ? 'check' : 'ach'
+
+    $set['commission.payoutMethod'] = method
+    $set['commission.enabled'] = c.enabled !== false
+    $set['commission.updatedAt'] = new Date()
+    hasCommissionUpdate = true
+
+    if (method === 'ach') {
+      // ── ACH branch — write bank fields, encrypt new account number ──
+      //
+      // sourcedFromPaymentAch: when true, derive bank* from the doc's
+      // payment.ach.* instead of trusting the client (defense in depth —
+      // client mirrors them on tick, but server is the source of truth).
+      const useSourceFromPayment = !!c.sourcedFromPaymentAch
+      const paymentAch = doc.payment?.ach?.toObject?.() ?? doc.payment?.ach ?? {}
+
+      if (useSourceFromPayment) {
+        $set['commission.bankAccountName'] = paymentAch.achAccountName || c.bankAccountName || ''
+        $set['commission.bankRoutingNumber'] = paymentAch.achRoutingNumber || c.bankRoutingNumber || ''
+        $set['commission.bankAccountType'] = paymentAch.achAccountType || c.bankAccountType || ''
+      } else {
+        // Treat blank submit as "no change" — preserves existing fields
+        // when the user only updates one piece. Empty-string overwrite
+        // requires the user to send a NULL (explicit clear) instead.
+        if (c.bankAccountName && String(c.bankAccountName).trim()) {
+          $set['commission.bankAccountName'] = c.bankAccountName
+        }
+        if (c.bankRoutingNumber && String(c.bankRoutingNumber).trim()) {
+          $set['commission.bankRoutingNumber'] = c.bankRoutingNumber
+        }
+        if (c.bankAccountType && String(c.bankAccountType).trim()) {
+          $set['commission.bankAccountType'] = c.bankAccountType
+        }
+      }
+      $set['commission.sourcedFromPaymentAch'] = useSourceFromPayment
+
+      const rawAccount = String(c.bankAccountNumber || '').replace(/\D/g, '')
+      const hasExistingEncrypted = !!doc.commission?.bankAccountEncrypted
+
+      // Integrity guard — block ACH save with no encrypted account on
+      // file AND no new account number. Otherwise the doc would carry
+      // payoutMethod='ach' with no decryptable account → payout failures.
+      // This typically catches the Check→ACH switch flow (the prior $unset
+      // wiped the encrypted value, so the user MUST resupply it).
+      if (!rawAccount && !hasExistingEncrypted && !useSourceFromPayment) {
+        return sendResponse(
+          400,
+          'error',
+          'Bank account number is required when switching to ACH for the first time. ' +
+            'Please enter your bank account number.',
+          null,
+        )
+      }
+
+      if (rawAccount) {
+        $set['commission.bankAccountLast4'] = rawAccount.slice(-4)
+        try {
+          $set['commission.bankAccountEncrypted'] = encryptField(rawAccount)
+        } catch (err) {
+          console.error('[proxy/update-profile] commission.encrypt_failed:', err?.message || err)
+          return sendResponse(
+            500,
+            'error',
+            'Could not securely save your commission bank account.',
+            null,
+          )
+        }
+      }
+      // Empty bankAccountNumber → keep existing encrypted account.
+
+      // Wipe the Check branch — only the selected method's data remains.
+      $unset['commission.check'] = ''
+    } else {
+      // ── Check branch — payableTo + mailing address ──────────────────
+      // Require an explicit `check` object — otherwise the doc would
+      // be mutated using inferred defaults (firstName+lastName as payableTo,
+      // billing address as mailing) without the user opting in.
+      if (!c.check || typeof c.check !== 'object') {
+        return sendResponse(
+          400,
+          'error',
+          'Check payout details are required (payableTo + mailing address).',
+          null,
+        )
+      }
+      const chk = c.check
+      const useBilling = chk.useBillingAddress !== false // default true
+
+      // Mailing address: when useBillingAddress=true, copy the billing
+      // address that's about to be saved. The incoming `address` body
+      // may be PARTIAL (only the fields the user touched), so merge it
+      // over the doc's existing billingAddress — the doc is the baseline
+      // and any in-flight changes overlay on top. Billing — NOT shipping
+      // — is the financial-mail address, matching where 1099s + check
+      // stubs go (registration-form precedent).
+      let mailing
+      if (useBilling) {
+        const billingBaseline = doc.billingAddress?.toObject?.() ?? doc.billingAddress ?? {}
+        const billingIncoming = address && typeof address === 'object' ? address : {}
+        const billingSource = { ...billingBaseline, ...billingIncoming }
+        mailing = {
+          line1: billingSource.line1 || '',
+          line2: billingSource.line2 || '',
+          city: billingSource.city || '',
+          state: billingSource.state || '',
+          zip: billingSource.zip || '',
+          country: billingSource.country || '',
+        }
+      } else {
+        const m = chk.mailingAddress || {}
+        mailing = {
+          line1: m.line1 || '',
+          line2: m.line2 || '',
+          city: m.city || '',
+          state: m.state || '',
+          zip: m.zip || '',
+          country: m.country || '',
+        }
+      }
+
+      const payableTo =
+        chk.payableTo && String(chk.payableTo).trim()
+          ? String(chk.payableTo).trim()
+          : `${doc.firstName || ''} ${doc.lastName || ''}`.trim()
+
+      $set['commission.check'] = {
+        payableTo,
+        useBillingAddress: useBilling,
+        mailingAddress: mailing,
+      }
+
+      // Wipe the ACH branch — only the selected method's data remains.
+      $unset['commission.bankAccountName'] = ''
+      $unset['commission.bankRoutingNumber'] = ''
+      $unset['commission.bankAccountEncrypted'] = ''
+      $unset['commission.bankAccountLast4'] = ''
+      $unset['commission.bankAccountType'] = ''
+      $unset['commission.sourcedFromPaymentAch'] = ''
+    }
+  }
+
+  if (
+    !hasProfileUpdate &&
+    !hasAddressUpdate &&
+    !hasPaymentUpdate &&
+    !hasTaxUpdate &&
+    !hasCommissionUpdate
+  ) {
     return sendResponse(400, 'error', 'No fields to update', null)
   }
 
   // ── Persist to MongoDB ────────────────────────────────────────────────────
   try {
-    await WholesaleApplication.updateOne({ _id: doc._id }, { $set })
+    const update = { $set }
+    if (Object.keys($unset).length > 0) update.$unset = $unset
+    await WholesaleApplication.updateOne({ _id: doc._id }, update)
   } catch (e) {
     console.error('[proxy/update-profile] mongo update failed:', e)
     return sendResponse(500, 'error', 'Failed to save update', { detail: e.message })
   }
 
   // ── Sync to Shopify (address + note) ─────────────────────────────────────
+  // NOTE: hasCommissionUpdate is intentionally NOT included — buildShopifyNote
+  // doesn't write commission fields, so a commission-only update would burn
+  // a Shopify Admin API call to re-push the same note.
   if (hasTaxUpdate || hasAddressUpdate || hasProfileUpdate) {
     const customerId = shopifyGid || doc.customerId
     if (customerId) {
@@ -203,8 +375,20 @@ export async function action({ request }) {
       updatedDoc[parts[0]] = { ...(updatedDoc[parts[0]] ?? {}), [parts[1]]: val }
     }
   }
+  // Reflect $unset in the projected response so the client sees the same
+  // post-save shape Mongo now holds (avoids stale branch leaking into UI).
+  for (const key of Object.keys($unset)) {
+    const parts = key.split('.')
+    if (parts.length === 1) {
+      delete updatedDoc[key]
+    } else if (updatedDoc[parts[0]]) {
+      delete updatedDoc[parts[0]][parts[1]]
+    }
+  }
   delete updatedDoc.passwordHash
   if (updatedDoc.payment) delete updatedDoc.payment.cardNumber
+  // Never echo the encrypted account back to the client.
+  if (updatedDoc.commission) delete updatedDoc.commission.bankAccountEncrypted
 
   return sendResponse(200, 'success', 'Profile updated', {
     profile: {
@@ -216,6 +400,7 @@ export async function action({ request }) {
     address: updatedDoc.billingAddress ?? null,
     payment: updatedDoc.payment ?? null,
     tax: updatedDoc.tax ?? null,
+    commission: updatedDoc.commission ?? null,
     paymentMethodRealign,
   })
 }

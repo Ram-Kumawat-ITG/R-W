@@ -44,10 +44,14 @@ const ENV_FILE = path.join(ROOT, ".env");
 
 const TAG = "[sync-extension-app-url]";
 
-/** Read a single key from a .env file without pulling in a dotenv dependency. */
+/** Read a single key from a .env file without pulling in a dotenv dependency.
+ * Returns the LAST occurrence so the result matches what `dotenv` does at
+ * server boot — Shopify CLI sometimes appends new SHOPIFY_APP_URL lines on
+ * tunnel rotation instead of overwriting, leaving stale entries in place. */
 function readEnvFile(key) {
   if (!fs.existsSync(ENV_FILE)) return null;
   const text = fs.readFileSync(ENV_FILE, "utf8");
+  let lastValue = null;
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
@@ -62,9 +66,9 @@ function readEnvFile(key) {
     ) {
       value = value.slice(1, -1);
     }
-    return value || null;
+    if (value) lastValue = value;
   }
-  return null;
+  return lastValue;
 }
 
 /** Pull `application_url` out of the active shopify.app*.toml (default config first). */

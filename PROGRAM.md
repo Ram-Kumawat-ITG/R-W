@@ -201,6 +201,102 @@ Active session storage is **MongoDB** via `@shopify/shopify-app-session-storage-
 
 ## Changelog
 
+### 2026-06-30 — Carrier shipping handler now excludes the Processing Fee cart line from markup + free-shipping calculations
+
+**Why** — The Checkout UI extension (`extensions/checkout-ui/src/Checkout.jsx`) adds a "Processing Fee" cart line item (variant @ $0.01, quantity = cents-of-fee, typically 9000+) to apply the 3% surcharge. When the carrier-service callback at `app/api/shipping/rates.js` fires, Shopify includes that line in `rate.items[]` alongside real merchandise. Three downstream calculations were silently corrupted:
+
+1. **Tiered handling markup** — `tieredMarkupCents(totalQty)` is based on `sumQuantity(rate.items)`. The fee's 9000+ qty always pushed the tier to "4+ items → $5" regardless of real product count.
+2. **Free-shipping vendor check** — `realItems.every(it => vendor === 'Natural Solutions')`. The Processing Fee product may have a different (or unset) vendor, silently disqualifying NS-only carts from the free-shipping rule.
+3. **Free-shipping subtotal threshold** — `cartSubtotalUsd` was summing the fee's ($0.01 × qty) into the $500 threshold, slightly inflating it.
+
+**Change** — [app/api/shipping/rates.js](wholesale/app/api/shipping/rates.js):
+
+- New helper `isProcessingFeeItem(item)` — detects the fee line by `variant_id === PROCESSING_FEE_VARIANT_ID` (matches `FEE_VARIANT_GID` in [extensions/checkout-ui/src/Checkout.jsx](wholesale/extensions/checkout-ui/src/Checkout.jsx)) with a `/processing\s*fee/i` title-regex fallback for misconfigured products / variant-id drift between environments.
+- At the top of the handler, derive `realItems = rate.items.filter(it => !isProcessingFeeItem(it))` and use that everywhere downstream: `sumQuantity`, vendor check, subtotal threshold, and the items array passed to `fetchDirectCarrierRates` (so USPS/UPS weight + box-dim math also ignores the fee).
+- Log line surfaces how many fee lines were stripped: `"X line(s) (1 processing-fee excluded), realQty=Y"`.
+
+**Keep in sync** — `PROCESSING_FEE_VARIANT_ID` in [rates.js](wholesale/app/api/shipping/rates.js) must match `FEE_VARIANT_GID` in [Checkout.jsx](wholesale/extensions/checkout-ui/src/Checkout.jsx). If the merchant ever recreates the Processing Fee product, both constants need updating. The title-regex fallback covers the brief drift window.
+
+**3% fee basis confirmation** (no code change, just verification): The 3% surcharge in `Checkout.jsx` is computed on **`shopify.cost.totalAmount` (items + shipping + tax)** — not subtotal. Self-compensation (`realBase = totalAmount - existingFeeDollars`) prevents the fee from compounding on itself when the cart re-evaluates. Live trace at line 130 logs `totalAmount=$X · realBase=$Y` for diagnostics — if the console still shows `subtotal=$X`, the extension hasn't been rebuilt and the dev server needs a restart.
+
+**ns-retail mirror** — Not patched. The retail store doesn't add a Processing Fee via Checkout UI extension (that's wholesale-only), so the retail `app/api/shipping/rates.js` doesn't see fee lines. If retail ever adds a similar fee mechanism, mirror this filter there too.
+
+---
+
+### 2026-06-30 — Profile-update extension: commission payout now supports ACH + Check (mirrors registration form)
+
+**Why** — Registration form already lets practitioners pick ACH or Check for commission payouts ([Step3Payment.jsx CommissionBankSection](wholesale/registration-form/src/components/Step3Payment.jsx#L189)) and persists both branches via [app/api/registration-form.js:216-282](wholesale/app/api/registration-form.js#L216-L282) (AES-256-GCM bank-account encryption for ACH; `payableTo` + mailing address for Check; non-selected branch wiped). The profile-update extension's `CommissionSection` had only the ACH form and **`app/api/update-profile.js` did not handle commission at all** — so once a practitioner registered, they could never change their payout method or update bank/check details.
+
+**Changes**:
+
+1. **API — [app/api/update-profile.js](wholesale/app/api/update-profile.js)**
+   - Destructure `commission` from request body.
+   - New branch (mirrors `registration-form.js`):
+     - `payoutMethod === 'ach'` → write bank fields; if `bankAccountNumber` non-empty, AES-256-GCM `encryptField` it + store `bankAccountLast4`. Empty `bankAccountNumber` means "no change" — existing encrypted value preserved (UX-friendly edit; user doesn't re-enter the full number every save). `$unset` wipes `commission.check`.
+     - `payoutMethod === 'check'` → save `check.payableTo` + `check.useBillingAddress` + `check.mailingAddress`. When `useBillingAddress=true`, mailing is copied from the in-flight `address` body (or the doc's saved `billingAddress`). `payableTo` defaults to `firstName + lastName` when blank (matches registration default). `$unset` wipes all ACH fields.
+   - Both branches set `commission.payoutMethod` + `commission.enabled` + `commission.updatedAt`.
+   - Combined `$set` + `$unset` Mongo update; response merges $unset into projected `updatedDoc` and strips `bankAccountEncrypted` before echoing.
+   - `commission` added to response payload.
+   - Shopify note resync now also triggers on commission updates (`hasCommissionUpdate`).
+
+2. **UI — [extensions/profile-update/src/profile-sections.jsx](wholesale/extensions/profile-update/src/profile-sections.jsx)**
+   - **`initialForm`**: added `payoutMethod` (default `'ach'`) and `check` subobject (`payableTo`, `useBillingAddress` default `true`, `mailingAddress` with line1/line2/city/state/zip/country).
+   - **`CommissionSection`**: replaced ACH-only form with:
+     - Payout-method `<s-select>` (ACH / Check)
+     - ACH branch unchanged from prior cut (uses `bankAccountLast4` placeholder, optional "Use my ACH payment account" mirror checkbox).
+     - Check branch — new — `payableTo` text field, `useBillingAddress` checkbox, conditional mailing address (state dropdown from `US_STATES`, country dropdown from `COUNTRIES`). All fields get `id="field-commission..."` so the existing scroll-to-error behavior works.
+     - Error map plumbed in (`errorMap` prop) for inline field errors.
+   - **`buildPayload`**: branched per `payoutMethod` — ACH payload omits `bankAccountNumber` when blank; Check payload sends nested `check` object.
+   - **`validate()`**: when `payoutMethod === 'check'`, requires `payableTo`; when `useBillingAddress === false`, requires all mailing-address fields. ACH branch validation unchanged (ABA checksum + 4-17 digit account length when retyped).
+
+3. **Mongoose model** — no change. `WholesaleApplication.commission` already has the `payoutMethod` enum + `check` subdoc + `addressSchema` mailing address from the registration-form rollout.
+
+**Confirmed behaviors (per Q&A with operator):**
+- Branch switch wipes old method's data (matches registration form).
+- Mailing default is `useBillingAddress=true` when first picking Check.
+- Account number edit is "empty = no change, value = overwrite".
+- Existing customers without `commission.payoutMethod` will see ACH as default (will re-register if needed per operator).
+
+**Build step** — after editing, restart `shopify app dev` (or run `shopify app deploy`) so the Customer Account UI extension re-bundles. Browser-side hard refresh of the customer account page is required after the rebuild (extension bundles are cached by the customer-account host).
+
+**Files touched:**
+- `wholesale/app/api/update-profile.js` — +commission block (~80 lines), $unset support, response shape
+- `wholesale/extensions/profile-update/src/profile-sections.jsx` — `initialForm` (+check subobject), `CommissionSection` rewrite (~+115 lines), `buildPayload` (~+25 lines), `validate()` (~+30 lines)
+
+**Post-review fixes (same day, addressing reviewer findings):**
+
+| # | Severity | Fix |
+|---|---|---|
+| 3 | high | Mailing address: when `useBillingAddress=true` AND the incoming `address` body is **partial** (only line1 changed), `update-profile.js` now merges `doc.billingAddress` (baseline) with incoming `address` (overlay) before snapshotting into `commission.check.mailingAddress`. Prevents lossy mailing addresses on partial-address updates. |
+| 5 | high | `validate()` (client) now requires `bankAccountName` + valid ABA `bankRoutingNumber` when `payoutMethod === 'ach'`. `bankAccountNumber` required ONLY when `bankAccountLast4` is empty (no encrypted value on file) — preserves the "edit only what changed" UX for already-saved accounts. Skip-all when `sourcedFromPaymentAch=true` (those fields are server-derived from `payment.ach.*`). Mirrors `step3.schema.js` rules. |
+| 7 | high | `update-profile.js` now blocks the ACH save with **400 — "Bank account number is required when switching to ACH for the first time"** when `bankAccountNumber` is empty AND no existing `bankAccountEncrypted` exists AND `sourcedFromPaymentAch=false`. Catches the Check→ACH switch flow where the prior `$unset` wiped the encrypted value, so the user MUST resupply it. |
+| 2 | high | `update-profile.js` Check branch now rejects with **400 — "Check payout details are required"** when `commission.check` is missing or not an object. Prevents silent doc mutation via inferred defaults (firstName+lastName + billing address) when the user didn't supply check details. |
+| 11 | medium | Removed `hasCommissionUpdate` from the Shopify-note-resync gate. `buildShopifyNote` doesn't write commission fields, so a commission-only update would have burned a Shopify Admin API call to re-push the same note. |
+| 15 | medium | When `sourcedFromPaymentAch=true`, the server now **re-derives** `bankAccountName/RoutingNumber/Type` from the doc's `payment.ach.*` instead of trusting the client (defense in depth — client mirrors on tick, server is source of truth). Note: the existing payment-update flow doesn't accept `payment.ach.*` edits yet, so the "stale mirror after payment edit" case can't trigger today; this is forward-looking hardening for when ACH editing lands. |
+| 8 | low | Defensive optional chaining in `setCheck`/`setMailing` — guards against external mutation that drops `check` from form state (`...(form.commission.check \|\| {})`). |
+| 13 | n/a | Verified `commission.updatedAt` is in the Mongoose schema (`wholesaleApplication.server.js:152`). No write loss. |
+
+**Critical follow-up — wrong endpoint was patched initially:**
+
+The profile-update Customer Account UI extension hits **`POST /api/portal/profile`** (JWT auth) which orchestrates through `updateProfileApplication` in [services/profile/profile.service.js](wholesale/app/services/profile/profile.service.js) — NOT `/api/update-profile` (App Proxy, used by the storefront SPA). My initial commission edits only landed on `update-profile.js`; the extension's actual path was missed. Discovered when the user noticed Check-branch fields couldn't autofill (the read projection was incomplete) and a Check save would lose data (the write path only knew the ACH branch).
+
+**Additional fixes applied:**
+
+| File | Change |
+|---|---|
+| [profile.service.js](wholesale/app/services/profile/profile.service.js) `maskedProfileForRead` | Added `payoutMethod` (default `'ach'` for legacy rows) + full `check` subobject projection (`payableTo`, `useBillingAddress`, full `mailingAddress`). Without these, Check-branch customers opening the profile would see ACH fields with no data AND silently lose their mailing address on save. |
+| [profile.service.js](wholesale/app/services/profile/profile.service.js) `updateProfileApplication` | Rewrote the commission block to handle both ACH + Check branches with full registration-parity logic: AES-256-GCM `encryptField` on new account number (empty = keep current), `sourcedFromPaymentAch` server-side re-derivation from `payment.ach.*`, Check→ACH integrity guard (400 when no encrypted on file), `$unset` branch wipe so only the selected method's data lives on the doc. |
+| [profile.service.js](wholesale/app/services/profile/profile.service.js) top-level | Hoisted `const $unset = {}` to the top of `updateProfileApplication` so the commission branch wipe + the W-9 classification clear can both contribute paths into the same single `updateOne({_id}, {$set, $unset})` call. Removed the duplicate `$unset` declaration that previously lived inside the W-9 block. |
+| [profile-sections.jsx](wholesale/extensions/profile-update/src/profile-sections.jsx) | Card section now renders ONLY when `payment.method === 'card'`. ACH section ONLY when `payment.method === 'ach'`. Commission section always renders (it's independent — how WE pay THEM, not how they pay us). Stored card/ACH data is preserved across method switches; the corresponding section reappears with autofill when the method is re-selected. |
+
+**Other reviewer findings deliberately NOT fixed** (documented for future reference):
+- **#4** `commission.enabled` defaults differ from registration (registration always sets `true`; profile-update preserves the checkbox value). Intentional — the profile UI exposes an Enable toggle that lets the practitioner pause commission, which is a legitimate post-registration action.
+- **#6** `payableTo` server-side fallback to `firstName + lastName` when blank. Matches registration. Client-side `validate()` requires `payableTo`, so the fallback only fires for legacy/edge requests.
+- **#12** Routing number returned unmasked in the response. Routing numbers are printed on every check and are not classified PII; leaving unmasked for diagnostics.
+- **#14** No CSRF beyond App Proxy HMAC — same posture as every other endpoint in the app.
+
+---
+
 ### 2026-06-29 — Checkout UI extension: variant GID + fee rate switched from settings to hardcoded constants
 
 Follow-up simplification to the regeneration entry below. The first cut read the variant GID + fee rate from `shopify.settings.value` so the merchant could configure them per install in the checkout customization editor. In practice for a single-store wholesale app the merchant-paste step was friction with no upside — the variant is the same on every deploy.
