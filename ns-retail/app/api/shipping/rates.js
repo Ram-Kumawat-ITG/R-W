@@ -98,6 +98,40 @@ function sumQuantity(items) {
   );
 }
 
+// ── Processing Fee line detection ──────────────────────────────────────
+//
+// Mirrors wholesale/app/api/shipping/rates.js. The Checkout UI extension
+// (extensions/processing-fee/src/Checkout.jsx) adds a "Processing Fee"
+// cart line item (variant priced at $0.01, quantity = cents-of-fee).
+// When Shopify POSTs the carrier-service callback, this line appears in
+// `rate.items[]` alongside real merchandise. We MUST exclude it from:
+//   • totalQty   → otherwise the fee's high quantity pushes the handling-
+//                  markup tier to "4+ items → $5" on every cart
+//   • carrier weight calc → the fee variant should be weight=0 but
+//                           depending on Shopify Admin config it may
+//                           carry default weight that inflates carrier
+//                           quotes
+//
+// Detection: variant_id match first (fast + exact), then title regex as
+// a defensive fallback for misconfigured products / variant-id drift.
+// Keep PROCESSING_FEE_VARIANT_ID in sync with FEE_VARIANT_GID in
+// extensions/processing-fee/src/Checkout.jsx — different value from
+// the wholesale store (separate product per store).
+const PROCESSING_FEE_VARIANT_ID = null; // TODO: replace with retail Processing Fee variant numeric id
+const PROCESSING_FEE_TITLE_RE = /processing\s*fee/i;
+
+function isProcessingFeeItem(it) {
+  if (!it) return false;
+  if (
+    PROCESSING_FEE_VARIANT_ID != null &&
+    Number(it.variant_id) === PROCESSING_FEE_VARIANT_ID
+  ) {
+    return true;
+  }
+  const name = String(it.name || it.title || '').trim();
+  return PROCESSING_FEE_TITLE_RE.test(name);
+}
+
 // Add N business days from today and return an ISO date string —
 // Shopify shows this next to the price in the customer's checkout view.
 function addBusinessDaysIso(daysFromToday) {
@@ -579,11 +613,22 @@ export async function action({ request }) {
   }
 
   // ── 1. Aggregate cart ────────────────────────────────────────────────
-  const totalQty = sumQuantity(rate.items);
+  //
+  // Strip the Processing Fee cart line out of EVERY downstream calculation
+  // (markup tier, carrier weight). See `isProcessingFeeItem` for detection
+  // rules. `realItems` is the items array we treat as the customer's
+  // actual merchandise; `rate.items` is the raw Shopify payload we keep
+  // around only for logging.
+  const realItems = (rate.items || []).filter(
+    (it) => !isProcessingFeeItem(it),
+  );
+  const feeLinesExcluded = rate.items.length - realItems.length;
+
+  const totalQty = sumQuantity(realItems);
   if (totalQty === 0) return ratesResponse([]);
 
   console.log(
-    `[shipping.rates] inbound: ${rate.items.length} line(s), totalQty=${totalQty}, dest=${rate.destination?.country}/${rate.destination?.province}/${rate.destination?.postal_code}`,
+    `[shipping.rates] inbound: ${rate.items.length} line(s) (${feeLinesExcluded} processing-fee excluded), realQty=${totalQty}, dest=${rate.destination?.country}/${rate.destination?.province}/${rate.destination?.postal_code}`,
   );
 
   // ── 2. Fetch live rates from all configured direct carriers ──────────
@@ -592,7 +637,14 @@ export async function action({ request }) {
   // Added on top of every real carrier quote.
   const baseCents = tieredMarkupCents(totalQty);
 
-  const directRates = await fetchDirectCarrierRates(rate);
+  // Carrier APIs (USPS/UPS) read items[] to compute package weight + box
+  // dims. Pass `realItems` so the Processing Fee line — which should be
+  // weight=0 but may be misconfigured in Shopify Admin — never inflates
+  // the quote. We clone `rate` rather than mutate the original payload.
+  const directRates = await fetchDirectCarrierRates({
+    ...rate,
+    items: realItems,
+  });
   if (directRates && directRates.length) {
     // Dedup by (carrier, service) — pick cheapest variant per service.
     const dedup = new Map();

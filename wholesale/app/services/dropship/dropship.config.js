@@ -22,10 +22,17 @@ export const dropshipConfig = {
   }),
   // NOTE: the shipping markup is no longer configurable here. As of
   // 2026-06-25 it is a tiered table (1-2 items → $2, 3 → $3, 4+ → $5)
-  // hard-coded inside the carrier-service callbacks and inside the
-  // drop-ship reverse-calc (dropship.service.buildShippingLine).
-  // Three locations, one tier table — keep them in lock-step on any
-  // change. The legacy `SHIPPING_PER_QTY_CENTS` env var is no longer read.
+  // hard-coded inside the carrier-service callbacks
+  // (app/api/shipping/rates.js + ns-retail/app/api/shipping/rates.js).
+  // Two locations, one tier table — keep them in lock-step on any change.
+  //
+  // The drop-ship `buildShippingLine` is now PASS-THROUGH — the wholesale
+  // order carries the EXACT retail shipping price (carrier + tiered
+  // handling markup) the customer paid. The earlier reverse-calc that
+  // subtracted the markup was removed at product-owner request — the
+  // supplier-side order should reflect what the customer paid, not the
+  // carrier-only portion. The legacy `SHIPPING_PER_QTY_CENTS` env var is
+  // no longer read.
 }
 
 // Pre-normalized (trimmed + lowercased) anchor email. The orchestrator and

@@ -201,6 +201,47 @@ Active session storage is **MongoDB** via `@shopify/shopify-app-session-storage-
 
 ## Changelog
 
+### 2026-06-30 — ns-retail: 3% processing fee added at checkout (mirrors wholesale extension)
+
+**Why** — The wholesale store already adds a 3% processing fee at checkout via [wholesale/extensions/checkout-ui](wholesale/extensions/checkout-ui). The retail store needs the same surcharge — 3% on the cart **grand total** (items + shipping + tax) — so retail customers (whether self-checkout patients or drop-ship retail orders) carry the same processing margin.
+
+**Approach** — Standalone Checkout UI extension `ns-retail/extensions/processing-fee/`, separate from the existing `checkout-ui-code` extension (which is the CDO referral-code flow). Two extensions CAN target the same `purchase.checkout.block.render` slot — they render side by side in the checkout editor. Keeping fee logic isolated means CDO + fee can be debugged / deployed independently.
+
+**Files created** (mirror of wholesale equivalents):
+
+| File | Notes |
+|---|---|
+| `ns-retail/extensions/processing-fee/shopify.extension.toml` | Fresh `uid` generated via `crypto.randomUUID()` (the CLI's auto-generated UIDs occasionally have a 20-char last segment that Shopify silently rejects). `api_access = false` (extension reads no Storefront API). |
+| `ns-retail/extensions/processing-fee/package.json` | Same deps as wholesale (`preact`, `@preact/signals`, `@shopify/ui-extensions@2026.4.x`). |
+| `ns-retail/extensions/processing-fee/tsconfig.json` | Preact JSX runtime. |
+| `ns-retail/extensions/processing-fee/src/Checkout.jsx` | Byte-for-byte mirror of wholesale Checkout.jsx — same self-compensation, totalAmount basis, safety guards, $0.01 variant detection. Only differences: file-path comment, log tag (`processing-fee:retail`), and a placeholder `FEE_VARIANT_GID = 'gid://shopify/ProductVariant/REPLACE_ME'` that the operator MUST update after creating the retail-store Processing Fee product. |
+
+**Files modified:**
+
+- `ns-retail/app/api/shipping/rates.js` — Added `isProcessingFeeItem(item)` helper + `realItems` filter (mirrors the wholesale fix from earlier today). The retail carrier-service callback now excludes the Processing Fee line from `sumQuantity` (markup tier) and from `fetchDirectCarrierRates` (USPS/UPS weight calculation). `PROCESSING_FEE_VARIANT_ID` is `null` until the operator pastes the retail variant's numeric id — the title-regex fallback (`/processing\s*fee/i`) carries the detection until then.
+
+**Operator handoff — required setup in the retail Shopify store:**
+
+1. **Create the Processing Fee product** in retail Shopify Admin:
+   - Title: `Processing Fee`
+   - Variant price: **$0.01** (one cent — the quantity-as-cents trick relies on this exactly)
+   - Track inventory: **OFF**
+   - Requires shipping: **OFF** (digital — keeps it out of the carrier-service payload + zero weight)
+   - Charge tax on this product: **OFF**
+   - Sales channels: uncheck all (hide from the storefront catalog)
+2. **Paste the variant GID** into `FEE_VARIANT_GID` in [ns-retail/extensions/processing-fee/src/Checkout.jsx](ns-retail/extensions/processing-fee/src/Checkout.jsx) — format `gid://shopify/ProductVariant/<numeric_id>`.
+3. **Paste the numeric variant id** into `PROCESSING_FEE_VARIANT_ID` in [ns-retail/app/api/shipping/rates.js](ns-retail/app/api/shipping/rates.js) — same number, no `gid://...` prefix. The title-regex fallback covers the brief drift window but the variant-id match is the faster + safer primary path.
+4. `shopify app deploy` from `ns-retail/` to publish the extension.
+5. Merchant adds the "Processing Fee" block to the Checkout editor (Shopify Admin → Settings → Checkout → Customize) — same step the wholesale operator already did.
+
+**Lifecycle** — Cart-line mutations require `instructions.value.lines.canAddCartLine`, which Shopify only sets to `true` AFTER the buyer has entered a shipping address. So the fee appears at the shipping step (after address, before payment) — exactly when the totals update — matching the wholesale flow.
+
+**3% basis** — `shopify.cost.totalAmount` (items + shipping + tax). Self-compensation `realBase = totalAmount - existingFeeDollars` prevents the fee from compounding when the cart re-evaluates. Console log: `[processing-fee:retail] 💵 totalAmount=$X · realBase=$Y · ...`.
+
+**Cross-reference** — When you change the fee math in one Checkout.jsx, change it in the other too. The tier table in [wholesale/app/api/shipping/rates.js](wholesale/app/api/shipping/rates.js) and [ns-retail/app/api/shipping/rates.js](ns-retail/app/api/shipping/rates.js) is also a 1:1 mirror — keep both in lockstep.
+
+---
+
 ### 2026-06-30 — Carrier shipping handler now excludes the Processing Fee cart line from markup + free-shipping calculations
 
 **Why** — The Checkout UI extension (`extensions/checkout-ui/src/Checkout.jsx`) adds a "Processing Fee" cart line item (variant @ $0.01, quantity = cents-of-fee, typically 9000+) to apply the 3% surcharge. When the carrier-service callback at `app/api/shipping/rates.js` fires, Shopify includes that line in `rate.items[]` alongside real merchandise. Three downstream calculations were silently corrupted:
