@@ -85,7 +85,6 @@ const METHOD_OPTIONS = [
   { value: "card", label: "Card" },
   { value: "ach", label: "ACH" },
   { value: "check", label: "Cheque" },
-  { value: "immediate", label: "Immediate (pay link)" },
 ];
 
 // Quick invoice flags — composite predicates that don't map to a single

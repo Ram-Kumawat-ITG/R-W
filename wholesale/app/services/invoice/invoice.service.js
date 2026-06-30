@@ -24,7 +24,6 @@ import {
   getInvoice as getQboInvoice,
   sendInvoiceEmail as sendQboInvoiceEmail,
 } from '../qbo/qbo.service'
-import { mintPayToken, buildPayLinkUrl, appendPayLinkToMemo } from '../payment/payLink.utils'
 import {
   markShopifyOrderPaid,
   recordOrderTransaction as recordShopifyOrderTransaction,
@@ -177,25 +176,7 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
   const shipAddr = buildProfileFromShopifyOrder(order).shippingAddress
   console.log(`[invoice] shipAddr = ${shipAddr ? 'present' : '(none)'}`)
 
-  // Immediate Payment — mint the durable pay-link token NOW so the public
-  // /pay/<token> URL can be baked into the QBO invoice's CustomerMemo.
-  // Stamped on the in-memory doc; persisted in the single save() in Phase 4.
-  // The token is opaque (no amount) — outstanding is recomputed server-side
-  // at click time. For non-immediate invoices payLinkUrl stays null and the
-  // memo is unchanged. The URL is appended as its own full-width line (see
-  // buildPayLinkMemoSuffix) so QBO's auto-linkifier can't truncate it.
-  const isImmediate = invoice.paymentMethod === 'immediate'
-  let payLinkUrl = null
-  if (isImmediate) {
-    invoice.payToken = mintPayToken()
-    invoice.payTokenCreatedAt = new Date()
-    payLinkUrl = buildPayLinkUrl(invoice.payToken)
-    console.log(`[invoice] immediate payment — pay link ${payLinkUrl}`)
-  }
-  const baseMemo = `Shopify order ${order.name || order.id}`
-  const memo = isImmediate && payLinkUrl
-    ? appendPayLinkToMemo(baseMemo, payLinkUrl)
-    : baseMemo
+  const memo = `Shopify order ${order.name || order.id}`
 
   let qboInvoice
   try {

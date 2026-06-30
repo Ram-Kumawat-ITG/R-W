@@ -457,19 +457,26 @@ on change) to **backfill** these onto invoices synced before the fields
 existed, then converge.
 `order.service.pushShippingToInvoice` composes the lines + ship date from
 the order's fulfillments and is called best-effort from both fulfillment
-paths on any tracking change (never breaks tracking capture). The customer
-sees it on the next invoice view / PDF; the invoice email is **not**
-auto-resent on tracking changes (avoids spam across the
-label→in-transit→delivered status sequence — admins use the "Send invoice"
-button to push an updated copy).
+paths on any tracking change (never breaks tracking capture). After a
+successful QBO shipping update, `pushShippingToInvoice` also **resends the
+invoice email** to the customer via `dispatchInvoiceLifecycleEmails` (event
+`'fulfillment'`) — but only when the `ShipDate` or `TrackingNum` value
+differs from the last-emailed snapshot (`Invoice.invoiceEmailedShipDate` /
+`invoiceEmailedTrackingNum`). This means the customer receives one resend
+when tracking first arrives and another if the tracking number changes later;
+repeated syncs with the same data are no-ops. The dedup snapshot fields and
+the `'fulfillment_updated'` source enum are persisted via `invoice.save()`
+inside `pushShippingToInvoice` after a successful QBO write.
 
 **Ship Date (Shopify-sourced).** The official Ship Date is the Shopify
 fulfillment date, not the order-creation date. `ShopifyOrder.shippedAt` is
 denormalized as the **earliest** `fulfillments[].fulfilledAt`
 (`order.service.recomputeShipDate`, run in both fulfillment paths) and fed
-to the QBO invoice `ShipDate` (above), overwriting the order-date `ShipDate`
-set at invoice creation (§7.3 / §18.3). Shown as "Ship date" on Order
-Details (Overview), the invoice Shipping block, and per-shipment in the
+to the QBO invoice `ShipDate` (above) via `pushShippingToInvoice`. The QBO
+invoice **starts with `ShipDate` blank** at creation (§7.3 / §18.3) —
+`orders/create` fires pre-fulfillment so there is no real ship timestamp yet;
+the field is populated once a fulfillment arrives. Shown as "Ship date" on
+Order Details (Overview), the invoice Shipping block, and per-shipment in the
 tracking section (so partially-fulfilled orders show each shipment's own
 date).
 
@@ -628,6 +635,61 @@ Returns `{ total, processed, failed, skipped }` logged to console + structured l
 does not need to re-fetch from Shopify. If an order's `rawPayload` is
 missing (legacy data, schema migration), it's recorded as skipped and the
 admin must re-trigger via another mechanism.
+
+### 5.5a Practitioner prepaid orders (paid at Shopify checkout)
+
+Approved wholesale customers (Practitioners) can pay for their orders directly
+at Shopify checkout instead of being billed later via the NMI vault / monthly
+CRON. These orders arrive at the `orders/create` webhook with
+`order.financial_status === 'paid'` — Shopify has already collected the full
+payment via its own payment processor.
+
+**Detection.** After the approval gate succeeds and `createInvoiceForOrder`
+has created the QBO invoice + fired the initial customer email, the orchestrator
+checks:
+
+```js
+if (order.financial_status === 'paid') {
+  return await settlePrepaidOrder({ invoice, customerMap, order, local })
+}
+```
+
+This check is intentionally placed **after** the approval gate (so drop-ship
+and non-approved customers are handled first) and **after** invoice creation
+(so the customer always receives their QBO invoice email regardless of how
+payment was collected).
+
+**`settlePrepaidOrder` behaviour.** The helper:
+
+1. Sets `Invoice.amountPaid = amountDue` + `paidAt = now`.
+2. Pre-marks `shopifyMarkedPaid = true` + `shopifyMarkedPaidAt` +
+   `shopifyRecordedTotal = amountDue` — this prevents `propagateSuccessfulPayment`
+   from posting a manual SALE transaction to the already-paid Shopify order
+   (which would over-count the balance). The QBO payment record is still
+   created normally.
+3. Appends a `system_note` remark: `"Order paid at Shopify checkout
+   (financial_status=paid) — no NMI charge required; invoice closed
+   automatically"`.
+4. Calls `propagateSuccessfulPayment({ transactionId: undefined })`, which:
+   - Derives `paymentStatus = 'paid'` (self-heal from amountPaid/amountDue).
+   - Records the QBO Payment against the invoice (closing its open balance).
+   - Skips the Shopify SALE transaction write (shopifyRecordedTotal already
+     covers the amount).
+   - Updates `ShopifyOrder.processingStatus → 'completed'` via findOneAndUpdate.
+   - Fires the lifecycle email re-send (invoice shows balance = $0.00).
+5. Returns the updated local ShopifyOrder.
+
+**CRON exclusion.** No CRON-side changes are required:
+- PASS 1 filters `paymentStatus: 'pending'` — a `paid` invoice is not matched.
+- PASS 1.5 filters `paymentStatus: 'failed'` — not applicable.
+- PASS 2 (sync retry) backstops any partial QBO sync failure (e.g. a QBO
+  timeout between recording the payment and setting `qboPaymentRecorded`): on
+  the next CRON tick it would re-call `propagateSuccessfulPayment`, which
+  detects the missing `qboRecordedTotal` and records only the diff — idempotent.
+
+**Fulfillment, tracking, and cancellation** work identically to regular
+wholesale orders — those paths key on the ShopifyOrder doc and are unaffected
+by how the invoice was settled.
 
 ### 5.6 Drop-ship orders (retail drop-ship customer)
 
@@ -1233,13 +1295,13 @@ which `BillAddr` on the customer payload also uses. If no address is
 on file at all, `ShipAddr` is omitted from the payload (QBO rejects
 empty address objects).
 
-`ShipDate` uses `order.created_at` (falling back to
-`localOrder.receivedAt`) formatted to `YYYY-MM-DD` via
-`invoice.utils.toYmd`. Shopify's `orders/create` webhook fires before
-fulfillment, so there's no real ship timestamp on the order yet — the
-order date is the closest meaningful "ship on or after" marker.
-Unparseable → omitted (QBO leaves the field blank on the rendered
-invoice).
+`ShipDate` is **omitted at invoice creation** — `orders/create` fires
+pre-fulfillment and there is no real ship timestamp yet. QBO leaves the
+field blank on the rendered invoice until a fulfillment arrives.
+`pushShippingToInvoice` populates it later from `ShopifyOrder.shippedAt`
+(the earliest fulfillment date, formatted `YYYY-MM-DD` via
+`invoice.utils.toYmd`) when a `fulfillments/create` or
+`fulfillments/update` webhook is received (§4.6).
 
 **Per-product Items (SKU column).** QBO sources an invoice's SKU column
 from the referenced **`Item.Sku`** — there is no per-line SKU field. So
@@ -3326,7 +3388,7 @@ POST /v3/company/{realmId}/invoice?minorversion=73
               "SalesItemLineDetail": { "ItemRef": { "value": "1" },
                                        "Qty": 4, "UnitPrice": 5.79 } } ],
   "DocNumber": "1021", "CustomerMemo": { "value": "Shopify order #1021" },
-  "DueDate": "2026-06-05", "ShipDate": "2026-05-21",
+  "DueDate": "2026-06-05",
   "ShipAddr": { "Line1": "123 Main St", "City": "Austin",
                 "CountrySubDivisionCode": "TX", "PostalCode": "78701",
                 "Country": "US" } }

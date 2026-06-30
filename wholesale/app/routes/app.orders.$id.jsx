@@ -21,7 +21,6 @@ import {
   resolveCustomerAchBillingId,
 } from "../services/customer/customer.service";
 import { syncFulfillmentsFromShopify } from "../services/order/order.service";
-import { buildPayLinkUrl } from "../services/payment/payLink.utils";
 import { invoiceConfig } from "../services/invoice/invoice.config";
 import {
   computeProcessingFee,
@@ -369,20 +368,6 @@ export const loader = async ({ request, params }) => {
     }
   }
 
-  // Immediate Payment — surface the customer's self-pay link for invoices
-  // that carry a pay token. Rebuilt from the current configured base URL so
-  // the admin always sees a live link (the link baked into the QBO invoice
-  // memo is frozen at creation time).
-  let payLink = null;
-  if (invoice?.payToken) {
-    try {
-      payLink = { url: buildPayLinkUrl(invoice.payToken) };
-    } catch (e) {
-      // Misconfigured base URL — surface it instead of 500-ing the page.
-      payLink = { url: null, error: e?.message || "Pay-link base URL not configured" };
-    }
-  }
-
   // Card on file — the card captured at registration and vaulted in NMI.
   // `hasVault` (resolved cache-or-source-of-truth) gates the "Charge card
   // on file" recovery action; brand/last4 come from the stored registration
@@ -400,7 +385,6 @@ export const loader = async ({ request, params }) => {
     customerMap: customerMap ? serialize(customerMap) : null,
     businessName,
     breakdown,
-    payLink,
     cardOnFile,
     // Processing-fee rates by settlement method. Surfaced to the client
     // so confirmation modals (charge-card, mark-cheque-paid) can show the
@@ -495,7 +479,7 @@ function serialize(doc) {
 }
 
 export default function OrderDetail() {
-  const { order, invoice, attempts, customerMap, businessName, breakdown, qbo, processingFeeRates, payLink, cardOnFile } =
+  const { order, invoice, attempts, customerMap, businessName, breakdown, qbo, processingFeeRates, cardOnFile } =
     useLoaderData();
   const navigate = useNavigate();
   const shopify = useAppBridge();
@@ -504,7 +488,6 @@ export default function OrderDetail() {
   const chargeCardFetcher = useFetcher();
   const pdfFetcher = useFetcher();
   const sendInvoiceFetcher = useFetcher();
-  const refreshPayLinkFetcher = useFetcher();
   const pauseAutoChargeFetcher = useFetcher();
   const resumeAutoChargeFetcher = useFetcher();
   const pauseRemindersFetcher = useFetcher();
@@ -535,7 +518,6 @@ export default function OrderDetail() {
   const handledChargeCardRef = useRef(null);
   const handledPdfRef = useRef(null);
   const handledSendInvoiceRef = useRef(null);
-  const handledRefreshPayLinkRef = useRef(null);
   const handledPauseAutoChargeRef = useRef(null);
   const handledResumeAutoChargeRef = useRef(null);
   const handledPauseRemindersRef = useRef(null);
@@ -572,10 +554,6 @@ export default function OrderDetail() {
   // receipt path. The "Charge card on file" fallback remains visible
   // for both cheque AND ACH (it's the cross-method override).
   const isChequeInvoice = paymentMethod === "check";
-  // Immediate Payment invoices have no auto-charge and no stored vault of
-  // their own — "Charge card on file" is the admin's payment-recovery path
-  // when the customer never paid via the link.
-  const isImmediateInvoice = paymentMethod === "immediate";
   // Immutable preference snapshot taken when this invoice was created.
   // Reads ONLY from customerPaymentPreference — never falls back to
   // paymentMethod (which is mutable via cheque → card override). Legacy
@@ -691,12 +669,12 @@ export default function OrderDetail() {
       (isAchInvoice && !!customerMap?.nmiAchBillingId));
   const canMarkChequePaid = isChequeInvoice && statusAllowsAction;
   // "Charge card on file" is the cross-method payment-recovery action:
-  // a cheque / ACH / Immediate-Payment invoice that the customer didn't
-  // settle via their preferred method, collected instead against the card
-  // captured at registration. Requires a card vault id regardless of the
-  // invoice's current paymentMethod. (Card invoices use "Retry payment",
-  // which already charges the same vault.)
-  const showChargeCard = isManualInvoice || isImmediateInvoice;
+  // a cheque / ACH invoice that the customer didn't settle via their
+  // preferred method, collected instead against the card captured at
+  // registration. Requires a card vault id regardless of the invoice's
+  // current paymentMethod. (Card invoices use "Retry payment", which
+  // already charges the same vault.)
+  const showChargeCard = isManualInvoice;
   const canChargeCard =
     showChargeCard &&
     statusAllowsAction &&
@@ -1205,35 +1183,6 @@ export default function OrderDetail() {
   const sendInvoiceLoading =
     sendInvoiceFetcher.state === "submitting" ||
     sendInvoiceFetcher.state === "loading";
-
-  // Refresh payment link — re-stamp the QBO invoice memo with the pay link
-  // built from the CURRENT app URL (fixes links baked to a rotated dev
-  // tunnel). Loader auto-revalidates, so the displayed link updates too.
-  const onRefreshPayLink = () => {
-    setBannerError(null);
-    setBannerSuccess(null);
-    refreshPayLinkFetcher.submit(null, {
-      method: "POST",
-      action: `/api/admin/orders/${order._id}/refresh-pay-link`,
-    });
-  };
-  useEffect(() => {
-    if (!refreshPayLinkFetcher.data) return;
-    if (refreshPayLinkFetcher.state !== "idle") return;
-    if (handledRefreshPayLinkRef.current === refreshPayLinkFetcher.data) return;
-    handledRefreshPayLinkRef.current = refreshPayLinkFetcher.data;
-    const data = refreshPayLinkFetcher.data;
-    if (data.status === "success") {
-      setBannerSuccess(data.message || "Payment link refreshed");
-      shopify?.toast?.show(data.message || "Payment link refreshed");
-    } else {
-      setBannerError(data.message || "Could not refresh payment link");
-      shopify?.toast?.show(data.message || "Refresh failed", { isError: true });
-    }
-  }, [refreshPayLinkFetcher.data, refreshPayLinkFetcher.state, shopify]);
-  const refreshPayLinkLoading =
-    refreshPayLinkFetcher.state === "submitting" ||
-    refreshPayLinkFetcher.state === "loading";
 
   const outstanding =
     invoice != null
@@ -2290,56 +2239,6 @@ export default function OrderDetail() {
           </s-stack>
         )}
       </CollapsibleSection>
-
-      {/* ───── Immediate Payment — self-pay link + QR ───── */}
-      {invoice?.paymentMethod === "immediate" && payLink && (
-        <CollapsibleSection heading="Payment link (Immediate Payment)" storageKey="w-ord-paylink">
-          <s-stack direction="block" gap="base">
-            <s-paragraph>
-              This customer pays each invoice on demand via a secure link
-              included on the QuickBooks invoice. The link always charges the
-              current outstanding balance.
-            </s-paragraph>
-            <s-stack direction="inline" gap="base">
-              <PaymentStatusBadge status={invoice.paymentStatus} />
-            </s-stack>
-            {payLink.url ? (
-              <s-stack direction="inline" gap="base">
-                <s-link href={payLink.url} target="_blank">
-                  {payLink.url}
-                </s-link>
-                <s-button
-                  variant="secondary"
-                  onClick={() => {
-                    if (typeof navigator !== "undefined" && navigator.clipboard) {
-                      navigator.clipboard.writeText(payLink.url);
-                      shopify.toast.show("Payment link copied");
-                    }
-                  }}
-                >
-                  Copy link
-                </s-button>
-                <s-button
-                  variant="secondary"
-                  onClick={onRefreshPayLink}
-                  {...(refreshPayLinkLoading ? { loading: true } : {})}
-                >
-                  Refresh link on invoice
-                </s-button>
-              </s-stack>
-            ) : (
-              <s-banner tone="critical">
-                Can&apos;t build the payment link: {payLink.error}
-              </s-banner>
-            )}
-            <s-text tone="subdued">
-              The link is saved on the QuickBooks invoice when it&apos;s created.
-              If the app&apos;s URL has changed since then, click “Refresh link on
-              invoice” to update the emailed/QBO copy to this current link.
-            </s-text>
-          </s-stack>
-        </CollapsibleSection>
-      )}
 
       {/* ───── QuickBooks invoice (live fetch) ───── */}
       {invoice && (

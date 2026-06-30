@@ -50,7 +50,7 @@ export const step3Schema = yup.object({
     method: yup
       .string()
       .required('Required')
-      .oneOf(['check', 'ach', 'card', 'immediate']),
+      .oneOf(['check', 'ach', 'card']),
     cardholderName: yup.string().trim().required('Required'),
     achAccountName: reqWhenAch('Required'),
     achRoutingNumber: yup.string().when('method', {
