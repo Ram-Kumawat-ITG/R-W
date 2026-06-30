@@ -8,6 +8,7 @@
     "predeploy": "npm run sync:extension-app-url && npm run build:theme",
     "predev": "npm run sync:extension-app-url",
     "dev": "shopify app dev",
+    "dev:local": "shopify app dev --config localhost --use-localhost",
     "config:link": "shopify app config link",
     "generate": "shopify app generate",
     "deploy": "shopify app deploy",
