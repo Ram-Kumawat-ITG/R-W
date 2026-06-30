@@ -1,4 +1,4 @@
-const proxy = import.meta.env.VITE_PROXY;
+const proxy = import.meta.env.REACT_APP_PROXY;
 const PROXY_BASE = proxy || 'wholesale-application'
 
 console.log('PROXY_BASE:', PROXY_BASE)

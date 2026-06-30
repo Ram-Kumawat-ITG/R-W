@@ -115,7 +115,7 @@ export async function action({ request }) {
 // devs run ns-retail standalone without the wholesale app booted.
 async function forwardToWholesaleDropship({ payload, retailShop }) {
   // eslint-disable-next-line no-undef
-  const apiBase ="https://buzz-wherever-screw-partnerships.trycloudflare.com"||  process.env.WHOLESALE_API_BASE;
+  const apiBase ="https://fine-albums-excited-weights.trycloudflare.com" || process.env.WHOLESALE_API_BASE ;
   // eslint-disable-next-line no-undef
   const wholesaleShop = process.env.WHOLESALE_SHOP;
   // eslint-disable-next-line no-undef
