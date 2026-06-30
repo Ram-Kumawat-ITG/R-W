@@ -175,7 +175,7 @@ function projectInvoice(inv, now) {
     txnDate: inv.TxnDate || null,
     dueDate: inv.DueDate || null,
     paymentStatus,
-    invoiceStatus: total === 0 ? "Voided" : "Open",
+    invoiceStatus: total === 0 ? "Voided" : balance === 0 ? "Closed" : "Open",
     emailStatus: inv.EmailStatus || null,
     billEmail: inv.BillEmail?.Address || null,
     privateNote: inv.PrivateNote || null,
@@ -203,8 +203,8 @@ export default function QboInvoices() {
   const revalidator = useRevalidator();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const tableLoading = navigation.state === "loading";
   const refreshing = revalidator.state !== "idle";
+  const tableLoading = navigation.state === "loading" || refreshing;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const firstShown = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const lastShown = Math.min(page * pageSize, total);
@@ -314,7 +314,11 @@ export default function QboInvoices() {
                   </s-table-cell>
                   <s-table-cell>
                     <s-badge
-                      tone={inv.invoiceStatus === "Voided" ? "default" : "info"}
+                      tone={
+                        inv.invoiceStatus === "Voided" ? "default"
+                        : inv.invoiceStatus === "Closed" ? "success"
+                        : "info"
+                      }
                     >
                       {inv.invoiceStatus}
                     </s-badge>
