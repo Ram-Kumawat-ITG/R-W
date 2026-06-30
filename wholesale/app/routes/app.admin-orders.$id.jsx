@@ -558,15 +558,6 @@ export default function AdminOrderDetail() {
 
   return (
     <s-page inlineSize="large" heading={`Admin Order ${orderLabel}`}>
-      <s-button
-        slot="primary-action"
-        variant="tertiary"
-        icon="refresh"
-        onClick={() => revalidator.revalidate()}
-        {...(revalidator.state !== "idle" ? { loading: true } : {})}
-      >
-        Refresh
-      </s-button>
       <s-box padding="base">
         <s-stack direction="inline" gap="base" alignItems="center">
           <s-button
@@ -575,6 +566,14 @@ export default function AdminOrderDetail() {
             onClick={() => navigate("/app/admin-orders")}
           >
             Admin Orders
+          </s-button>
+          <s-button
+            variant="tertiary"
+            icon="refresh"
+            onClick={() => revalidator.revalidate()}
+            {...(revalidator.state !== "idle" ? { loading: true } : {})}
+          >
+            Refresh
           </s-button>
           <ProcessingBadge status={order.processingStatus} />
         </s-stack>

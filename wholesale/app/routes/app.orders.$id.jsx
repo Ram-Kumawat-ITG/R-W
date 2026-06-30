@@ -1266,23 +1266,6 @@ export default function OrderDetail() {
 
   return (
     <s-page inlineSize="large" heading={`Order ${orderLabel}`}>
-      <s-button
-        slot="back-action"
-        icon="arrow-left"
-        accessibilityLabel="Back to orders"
-        onClick={() => navigate("/app/orders")}
-      >
-        Back
-      </s-button>
-      <s-button
-        slot="primary-action"
-        variant="tertiary"
-        icon="refresh"
-        onClick={() => revalidator.revalidate()}
-        {...(revalidator.state !== "idle" ? { loading: true } : {})}
-      >
-        Refresh
-      </s-button>
       {invoice &&
         (isCardInvoice || isAchInvoice) &&
         invoice.paymentStatus !== "paid" &&
@@ -1386,7 +1369,25 @@ export default function OrderDetail() {
         </s-button>
       )}
 
-      <s-box paddingBlockStart="large-200" />
+      <s-box paddingBlockEnd="small-200">
+        <s-stack direction="inline" gap="base" alignItems="center">
+          <s-button
+            variant="tertiary"
+            icon="arrow-left"
+            onClick={() => navigate("/app/orders")}
+          >
+            Back to Orders
+          </s-button>
+          <s-button
+            variant="tertiary"
+            icon="refresh"
+            onClick={() => revalidator.revalidate()}
+            {...(revalidator.state !== "idle" ? { loading: true } : {})}
+          >
+            Refresh
+          </s-button>
+        </s-stack>
+      </s-box>
 
       {bannerSuccess && (
         <s-banner tone="success" heading="Retry succeeded">
