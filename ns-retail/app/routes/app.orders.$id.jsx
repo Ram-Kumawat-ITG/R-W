@@ -15,7 +15,7 @@ import { reconcileRetailVendorBillForOrder } from "../services/retailQbo/retailB
 import StatusBadge from "../components/cdo/StatusBadge";
 import { ShippingBadge, DeliveryBadge } from "../components/cdo/StatusBadges";
 import { formatCurrency, formatDate, formatDateTime, formatPercent } from "../utils/format";
-import { CollapsibleSection } from "../components/ui";
+import { CollapsibleSection, BackToTop } from "../components/ui";
 
 export const loader = async ({ request, params }) => {
   await authenticate.admin(request);
@@ -1007,6 +1007,7 @@ export default function OrderDetail() {
           <s-paragraph tone="subdued">No shipment updates yet.</s-paragraph>
         )}
       </CollapsibleSection>
+      <BackToTop />
     </s-stack>
   );
 }

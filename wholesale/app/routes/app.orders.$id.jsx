@@ -39,6 +39,7 @@ import {
   LineItemsTable,
   CollapsibleSection,
 } from "../components/admin-ui";
+import { BackToTop } from "../components/BackToTop";
 import { carrierDisplayName } from "../utils/shipping.constants";
 import { formatAmount, fmtDateTime } from "../utils/format.utils";
 import { PAYMENT_METHOD_LABEL } from "../utils/payment.constants";
@@ -3082,6 +3083,7 @@ export default function OrderDetail() {
           Cancel
         </s-button>
       </s-modal>
+      <BackToTop />
     </s-page>
   );
 }

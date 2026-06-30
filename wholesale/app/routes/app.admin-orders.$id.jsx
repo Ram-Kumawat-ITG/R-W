@@ -29,6 +29,7 @@ import {
   LineItemsTable,
   CollapsibleSection,
 } from "../components/admin-ui";
+import { BackToTop } from "../components/BackToTop";
 import { carrierDisplayName } from "../utils/shipping.constants";
 import { formatAmount, fmtDateTime } from "../utils/format.utils";
 
@@ -1587,6 +1588,7 @@ export default function AdminOrderDetail() {
           )}
         </CollapsibleSection>
       )}
+      <BackToTop />
     </s-page>
   );
 }
