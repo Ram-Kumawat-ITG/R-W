@@ -201,6 +201,60 @@ Active session storage is **MongoDB** via `@shopify/shopify-app-session-storage-
 
 ## Changelog
 
+### 2026-06-30 — Processing fee now compensates for discounts applied to the fee line (qty-inflation pattern)
+
+**Why** — Shopify's native cart-wide / order-wide discounts (code or automatic) apply to EVERY cart line including our Processing Fee line. There is no native "non-discountable" line flag, no eligibility filter exposed to Functions, and Discount Functions cannot intercept native discounts (they only GENERATE additional discounts, not modify incoming ones). Cart Transform Function's `lineUpdate` operation is Shopify Plus-only — unavailable on the Grow plan. After exhaustive research the only code-only solution that works on Grow is to detect the discount Shopify pulled out of our fee line and inflate the fee quantity to compensate, so the customer's NET fee post-discount equals exactly N% of the real cart.
+
+**Files modified:**
+
+- [wholesale/extensions/checkout-ui/src/Checkout.jsx](wholesale/extensions/checkout-ui/src/Checkout.jsx)
+- [ns-retail/extensions/processing-fee/src/Checkout.jsx](ns-retail/extensions/processing-fee/src/Checkout.jsx)
+
+**The math:**
+
+```
+realCartTotal       = totalAmount − feeLine.cost.totalAmount         (layer 1 — self-comp)
+feeSubtotalPre      = feeLine.quantity × $0.01                       (we KNOW the unit price)
+discountRateOnFee   = (feeSubtotalPre − feeLine.cost.totalAmount) / feeSubtotalPre   (clamped 0–0.95)
+desiredFeeNet       = realCartTotal × N%
+inflationFactor     = 1 / (1 − discountRateOnFee)
+targetQty           = round(desiredFeeNet × inflationFactor × 100)
+```
+
+**Convergence** — two iterations:
+
+| Round | Fee qty | Fee subtotal | Fee net (post-discount) | realCartTotal | targetQty next |
+|---|---|---|---|---|---|
+| 1 (no fee) | 0 | $0.00 | $0.00 | $115.00 | 345 |
+| 2 (fee added) | 345 | $3.45 | $3.105 | $115.00 | 383 |
+| 3 (compensated) | 383 | $3.83 | $3.447 | $115.00 | 383 ✓ stable |
+
+Customer sees `Processing Fee × 383 = $3.83 → discounted to $3.45`. The displayed-discounted amount equals 3% of `realCartTotal` exactly.
+
+**Why qty × $0.01 instead of `line.cost.subtotalAmount`** — the Checkout UI `CartLineCost` API surface does NOT expose a `subtotalAmount` field (TypeScript flagged this). Only `totalAmount` (post-discount) is available on the line. Since our fee variant is REQUIRED to be priced at $0.01/unit (the safety guard refuses to touch any line whose per-unit price differs — see the existing `candidatePerUnit <= 0.011` check), the pre-discount subtotal is deterministically `quantity × $0.01` without needing a separate API field.
+
+**Coverage:**
+- ✅ Percentage discounts (10% off, 20% off)
+- ✅ Fixed-amount discounts ($5 off cart — Shopify allocates pro-rata; rate detected per line)
+- ✅ Stacked discounts (compounded rate read directly)
+- ✅ Free shipping codes — affect shipping not items, fee unaffected
+- ✅ Product-level vs order-level discounts — both reduce `line.cost.totalAmount`, detected uniformly
+
+**Edge cases handled:**
+- Discount rate clamped to `[0, 0.95]` — prevents divide-by-zero on hypothetical 100% discounts.
+- Round-1 case (no fee yet, no discount to measure) — `existingFeeSubtotalDollars = 0` → discount rate stays 0 → no inflation; round 2 sees the actual rate and rewrites.
+
+**Diagnostic log line:**
+
+```
+[processing-fee] 💵 totalAmount=$X · realCartTotal=$Y · discountOnFee=Z%
+                  · desiredNet=$A · inflated=$B · targetQty=N · existingQty=M
+```
+
+Look at `discountOnFee` in the console to verify Shopify is actually pulling a discount out of our line; if it's `0.00%` despite an active code, the discount is configured to skip our variant (no inflation needed).
+
+---
+
 ### 2026-06-30 — ns-retail: 3% processing fee added at checkout (mirrors wholesale extension)
 
 **Why** — The wholesale store already adds a 3% processing fee at checkout via [wholesale/extensions/checkout-ui](wholesale/extensions/checkout-ui). The retail store needs the same surcharge — 3% on the cart **grand total** (items + shipping + tax) — so retail customers (whether self-checkout patients or drop-ship retail orders) carry the same processing margin.

@@ -7,8 +7,28 @@
 // `applyCartLinesChange({type:'addCartLine', ...})` referencing a
 // real ProductVariant.
 //
-// Base = totalAmount - existingFee (self-compensation so the fee
-// doesn't compound on itself when the cart re-renders).
+// ── Two compensation layers ──────────────────────────────────────────
+//
+//  1. Self-compensation (fee-on-fee):
+//     realCartTotal = totalAmount − feeTotal
+//     Prevents the fee from compounding on itself when the cart
+//     re-evaluates (the fee line's totalAmount is already inside
+//     `cost.totalAmount`).
+//
+//  2. Discount-on-fee compensation (qty inflation):
+//     Shopify applies cart-wide / order-wide discounts to EVERY cart
+//     line including ours. There is no native "non-discountable" line
+//     flag and Discount Functions cannot intercept native code /
+//     automatic discounts. So we INFLATE the fee quantity so that
+//     AFTER Shopify applies the discount to our fee line, the customer's
+//     NET fee equals exactly N% of `realCartTotal`.
+//
+//        discountRateOnFee = (feeSubtotal − feeTotal) / feeSubtotal
+//        desiredFeeNet     = realCartTotal × N%
+//        targetQty         = desiredFeeNet ÷ (1 − discountRateOnFee) × 100
+//
+//     Converges in 2 iterations: round 1 adds the base qty, round 2 sees
+//     the actual discount allocation and rewrites qty up.
 //
 // VARIANT GID + FEE RATE are HARDCODED below.
 //   • Edit the two constants and rebuild — no merchant setup needed.
@@ -114,20 +134,54 @@ function ProcessingFee() {
     }
 
     const existingFeeLine = candidateLooksLikeFee ? candidate : null
+    // POST-discount fee line total (= what the cart summary displays).
     const existingFeeDollars = existingFeeLine
       ? Number(existingFeeLine.cost?.totalAmount?.amount) || 0
       : 0
+    // PRE-discount fee line total. The Checkout UI cart-line cost API
+    // does NOT expose `subtotalAmount` directly, but we KNOW the variant
+    // is priced at exactly $0.01/unit (the safety guard above refuses
+    // to touch any line whose per-unit price differs), so the pre-
+    // discount subtotal is just qty × $0.01. This equals
+    // `existingFeeDollars` when no discount touches our line, and is
+    // larger than it when Shopify pulls a discount out of the fee.
+    const existingFeeQty = existingFeeLine
+      ? Number(existingFeeLine.quantity) || 0
+      : 0
+    const existingFeeSubtotalDollars = existingFeeQty * 0.01
 
-    // Subtract the fee we already added so the percentage doesn't
-    // compound on itself when the cart re-renders.
-    const realBase = totalAmount - existingFeeDollars
+    // Layer 1 — self-compensation: strip our existing fee out of the
+    // grand total so the percentage doesn't compound on itself.
+    const realCartTotal = totalAmount - existingFeeDollars
 
-    // Variant price = $0.01 → quantity = cents-of-fee.
-    const targetQty = Math.max(0, Math.round(realBase * feeRate * 100))
+    // Layer 2 — discount-on-fee detection: what fraction of the fee
+    // subtotal is being absorbed by an active cart discount? 0 means
+    // no discount, 0.10 means 10% off, etc. Pro-rata fixed-amount
+    // discounts ($5 off cart) show up here as a non-zero rate as well.
+    // Cap at 95% to avoid divide-by-near-zero blowups.
+    const discountRateOnFeeRaw =
+      existingFeeSubtotalDollars > 0
+        ? (existingFeeSubtotalDollars - existingFeeDollars) / existingFeeSubtotalDollars
+        : 0
+    const discountRateOnFee = Math.min(Math.max(discountRateOnFeeRaw, 0), 0.95)
+
+    // Desired NET fee — what the customer actually pays in fee after
+    // discounts. N% of the real cart (excludes our fee, includes
+    // shipping + tax, already post-discount on the real items).
+    const desiredFeeNet = realCartTotal * feeRate
+
+    // Inflate qty so that AFTER Shopify applies its discount to our
+    // fee line, the net amount equals `desiredFeeNet`. Variant priced
+    // at $0.01 → quantity is cents-of-pre-discount-fee.
+    const inflationFactor = 1 / (1 - discountRateOnFee)
+    const targetQty = Math.max(
+      0,
+      Math.round(desiredFeeNet * inflationFactor * 100),
+    )
 
     // eslint-disable-next-line no-console
     console.log(
-      `[processing-fee] 💵 totalAmount=$${totalAmount.toFixed(2)} · realBase=$${realBase.toFixed(2)} · rate=${FEE_PERCENT}% · targetQty=${targetQty} (= $${(targetQty / 100).toFixed(2)}) · existingQty=${existingFeeLine?.quantity ?? 0}`,
+      `[processing-fee] 💵 totalAmount=$${totalAmount.toFixed(2)} · realCartTotal=$${realCartTotal.toFixed(2)} · discountOnFee=${(discountRateOnFee * 100).toFixed(2)}% · desiredNet=$${desiredFeeNet.toFixed(2)} · inflated=$${(desiredFeeNet * inflationFactor).toFixed(2)} · targetQty=${targetQty} · existingQty=${existingFeeLine?.quantity ?? 0}`,
     )
 
     if (targetQty <= 0) {
