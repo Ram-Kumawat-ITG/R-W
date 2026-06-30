@@ -7,7 +7,6 @@
 import Agenda from 'agenda'
 import { schedulerConfig } from './scheduler.config'
 import { achSyncConfig } from '../payment/achStatusSync.config'
-import { dropshipPaymentConfig } from '../dropship/dropshipPayment.config'
 import { createLogger } from '../../utils/logger.utils'
 import { registerJobs, JOB_NAMES } from './jobs'
 
@@ -105,36 +104,16 @@ async function ensureRecurring(agenda) {
     schedule: achSyncConfig.intervalOverride || achSyncConfig.cron,
   })
 
-  // ── Drop-ship payment job ────────────────────────────────────────
-  // Independent of the wholesale payment ticks: collects UNPAID drop-ship
-  // invoices (Invoice.isDropship=true) by charging the configured NMI vault
-  // (DROPSHIP_NMI_VAULT_ID) and recording the QBO payment. Registered here
-  // (before the retry dev-override early-return below) so it runs in dev mode
-  // too. DROPSHIP_PAYMENT_INTERVAL gives the testing cadence (every 2
-  // minutes); otherwise the cron from config (production default: once per
-  // month, 00:30 on the 1st). The wholesale payment CRON excludes these
-  // invoices, so the two jobs never race on the same rows.
-  if (dropshipPaymentConfig.intervalOverride) {
-    await agenda.cancel({ name: JOB_NAMES.PROCESS_DROPSHIP_PAYMENTS })
-    await agenda.every(
-      dropshipPaymentConfig.intervalOverride,
-      JOB_NAMES.PROCESS_DROPSHIP_PAYMENTS,
-      { tick: 'dev' },
-    )
-    console.log(
-      `\n[scheduler] DEV MODE — process-dropship-payments running every ${dropshipPaymentConfig.intervalOverride}\n`,
-    )
-  } else {
-    await agenda.every(
-      dropshipPaymentConfig.cron,
-      JOB_NAMES.PROCESS_DROPSHIP_PAYMENTS,
-      { tick: 'scheduled' },
-      { timezone: dropshipPaymentConfig.timezone },
-    )
-  }
-  log.info('scheduler.dropship_payment_registered', {
-    mode: dropshipPaymentConfig.intervalOverride ? 'dev-interval' : 'cron',
-    schedule: dropshipPaymentConfig.intervalOverride || dropshipPaymentConfig.cron,
+  // ── Drop-ship payment job (CRON DISABLED — replaced by batch payment UI) ──
+  // The process-dropship-payments CRON has been superseded by the manual
+  // Admin Order Batch Payment flow (/app/admin-orders/batch). The admin
+  // reviews all unpaid drop-ship invoices, enters a single payment reference
+  // (cheque / bank transfer), and marks the entire batch paid in one step.
+  // Cancel any previously-scheduled runs that may still be in the Agenda
+  // agenda_jobs collection from before this change.
+  await agenda.cancel({ name: JOB_NAMES.PROCESS_DROPSHIP_PAYMENTS })
+  log.info('scheduler.dropship_payment_cancelled', {
+    reason: 'replaced by admin-order batch payment UI',
   })
 
   // Dev override: PAYMENT_RETRY_INTERVAL replaces the production cron

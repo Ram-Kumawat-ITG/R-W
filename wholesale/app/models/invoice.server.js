@@ -115,7 +115,7 @@ const invoiceSchema = new mongoose.Schema(
     // snapshot, immutable).
     paymentSettledVia: {
       type: String,
-      enum: ['card', 'check', 'ach'],
+      enum: ['card', 'check', 'ach', 'checkout'],
     },
     paymentSettledAt: Date,
 
@@ -506,6 +506,8 @@ const invoiceSchema = new mongoose.Schema(
       ],
     },
     invoiceEmailedAmountPaid: Number,
+    invoiceEmailedShipDate: String,
+    invoiceEmailedTrackingNum: String,
     lastEmailError: String,
 
     // ── Check-payment reminder history (daily reminder CRON) ──────────
@@ -601,6 +603,8 @@ const invoiceSchema = new mongoose.Schema(
                 'manual_resend',
                 // Daily Check-payment reminder CRON (services/reminder).
                 'payment_reminder',
+                // Re-send triggered by fulfillment/tracking update.
+                'fulfillment_updated',
               ],
               required: true,
             },

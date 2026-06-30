@@ -26,6 +26,16 @@ const cdoPractitionerHoldSchema = new mongoose.Schema(
     note: { type: String, default: null },
     resumedAt: { type: Date, default: null },
     resumedBy: { type: String, default: null },
+
+    // Admin override: include this practitioner in the automated payout CRON
+    // even though their preferred payout method is "check". When true,
+    // buildPayoutBatch skips the check-preference short-circuit and falls
+    // through to the standard ACH banking probe. Does not affect the paused
+    // flag — a paused practitioner with cronOverride=true is still excluded.
+    checkPayoutCronOverride: { type: Boolean, default: false },
+    cronOverrideSetBy: { type: String, default: null },
+    cronOverrideSetAt: { type: Date, default: null },
+    cronOverrideNote: { type: String, default: null },
   },
   { collection: "cdo_practitioner_holds", timestamps: true, strict: true },
 );

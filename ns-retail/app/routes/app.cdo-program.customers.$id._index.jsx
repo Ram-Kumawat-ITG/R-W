@@ -203,10 +203,7 @@ export default function CdoCustomerDetails() {
             ))}
           </s-stack>
 
-          <s-grid
-            gap="base"
-            gridTemplateColumns="repeat(4, minmax(0, 1fr))"
-          >
+          <s-grid gap="base" gridTemplateColumns="repeat(4, minmax(0, 1fr))">
             <MetricCard
               label="Total orders"
               value={formatNumber(kpis.totalOrders)}
@@ -216,37 +213,14 @@ export default function CdoCustomerDetails() {
               value={formatCurrency(kpis.totalRevenue, settings.currency)}
             />
             <MetricCard
-              label="Total commissions"
+              label="Commissions"
               value={formatCurrency(kpis.totalCommissions, settings.currency)}
               tone="success"
             />
             <MetricCard
-              label="Referral customers"
+              label="Referred patients"
               value={formatNumber(kpis.totalReferrals)}
               sublabel={`${formatNumber(kpis.convertedReferrals)} converted`}
-            />
-            <MetricCard
-              label="Conversion rate"
-              value={formatPercent(kpis.conversionRate)}
-              sublabel="Converted / total referrals"
-            />
-            <MetricCard
-              label="Pending payout"
-              value={formatCurrency(kpis.pendingPayout, settings.currency)}
-            />
-            <MetricCard
-              label="Paid to date"
-              value={formatCurrency(kpis.paidPayout, settings.currency)}
-              tone="success"
-            />
-            <MetricCard
-              label="Active codes"
-              value={formatNumber(kpis.activeCodes)}
-              sublabel={
-                primaryCode
-                  ? `Primary: ${primaryCode.code}`
-                  : "No primary set"
-              }
             />
           </s-grid>
         </s-stack>
@@ -267,7 +241,7 @@ export default function CdoCustomerDetails() {
           <MetricCard
             label="Pending commissions"
             value={formatCurrency(kpis.pendingCommissions, settings.currency)}
-            tone="critical"
+            tone={kpis.pendingCommissions > 0 ? "critical" : undefined}
             sublabel="Earned, not yet paid"
           />
           <MetricCard
@@ -276,25 +250,10 @@ export default function CdoCustomerDetails() {
             sublabel={
               kpis.upcomingPayoutAmount > 0
                 ? `Est. ${formatDate(kpis.nextPayoutDate)}`
-                : `Below ${formatCurrency(kpis.minimumPayoutAmount, settings.currency)} minimum`
+                : kpis.lastPayoutDate
+                  ? `Last paid ${formatDate(kpis.lastPayoutDate)}`
+                  : `Below ${formatCurrency(kpis.minimumPayoutAmount, settings.currency)} minimum`
             }
-          />
-          <MetricCard
-            label="Referred customers"
-            value={formatNumber(kpis.referredCustomers)}
-          />
-          <MetricCard
-            label="Referral orders"
-            value={formatNumber(kpis.totalReferralOrders)}
-          />
-          <MetricCard
-            label="Lifetime referral revenue"
-            value={formatCurrency(kpis.lifetimeReferralRevenue, settings.currency)}
-          />
-          <MetricCard
-            label="Last payout"
-            value={kpis.lastPayoutDate ? formatDate(kpis.lastPayoutDate) : "—"}
-            sublabel={kpis.lastPayoutDate ? "Most recent paid payout" : "No payouts yet"}
           />
         </s-grid>
       </s-section>
@@ -541,7 +500,7 @@ const CreateCodeModal = forwardRef(function CreateCodeModal(
   ref,
 ) {
   const [code, setCode] = useState("");
-  const [discountPercent, setDiscountPercent] = useState("");
+  const [discountPercent, setDiscountPercent] = useState("20");
 
   // Reset on open so a previous draft doesn't leak into the next create.
   useEffect(() => {

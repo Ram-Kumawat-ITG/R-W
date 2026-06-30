@@ -9,8 +9,9 @@
 //
 // This file is the entry point for Phases A + B. Phase A is just the
 // foundation: identifying / creating the "Natural Solutions Retail"
-// customer on the wholesale store. Phase B (next) adds the actual
-// Draft Order creation with ½-price line items.
+// customer on the wholesale store. Phase B adds the actual Draft Order
+// creation; line items are priced at the WHOLESALE product price
+// (sync_id_maps.wholesalePrice — see resolveWholesaleLines).
 
 import { unauthenticated } from '../../shopify.server'
 import { createLogger } from '../../utils/logger.utils'
@@ -184,9 +185,11 @@ export async function processRetailOrderForDropShip({
 
   // 1. Compute the amounts — locked at order receipt so any later
   //    price changes on the catalog don't retroactively shift this
-  //    drop-ship order's wholesale invoice.
+  //    drop-ship order's wholesale invoice. wholesaleSubtotal is sourced
+  //    from the actual wholesale product prices (sync_id_maps), not a
+  //    ½-of-retail estimate.
   const { retailBaseSubtotal, wholesaleSubtotal, currency } =
-    computeDropshipAmounts(order)
+    await computeDropshipAmounts(order)
 
   // 2. Upsert the mapping doc (idempotent on (shop, retailOrderId)).
   //    If a row already exists and is past 'received' we ALREADY started
@@ -256,8 +259,8 @@ export async function processRetailOrderForDropShip({
     customerGid: nsRetailCustomerGid,
   })
 
-  // 4. Create the wholesale Draft Order with ½-price line items, then
-  //    complete it to a real Order (Phase B).
+  // 4. Create the wholesale Draft Order with wholesale-priced line items,
+  //    then complete it to a real Order (Phase B).
   try {
     const result = await createDropshipWholesaleOrder({
       shop: wholesaleShop,
@@ -328,9 +331,9 @@ const MUTATION_DRAFT_ORDER_COMPLETE = `#graphql
 
 /**
  * Create the wholesale Shopify order that fulfills the retail order.
- * Uses Shopify's Draft Order API so we can set custom (½-base) line item
- * prices, then completes the draft into a real order (which decrements
- * wholesale inventory natively).
+ * Uses Shopify's Draft Order API so we can set the wholesale product price
+ * per line (via priceOverride), then completes the draft into a real order
+ * (which decrements wholesale inventory natively).
  *
  * @returns {Promise<{draftOrderGid, orderGid, orderId, orderName}>}
  */
@@ -442,48 +445,121 @@ async function runDraftOrderCreate(admin, draftInput) {
   return await res.json()
 }
 
+// Fallback factor for the rare case where a variant's wholesale price
+// snapshot isn't populated in sync_id_maps yet — preserves the legacy
+// ½-of-retail behavior so an un-synced product never blocks invoicing.
+// Mirrors the retail Vendor Bill's QBO_RETAIL_WHOLESALE_PRICE_FACTOR (0.5)
+// so the two sides stay in sync even on this fallback path.
+const WHOLESALE_PRICE_FALLBACK_FACTOR = 0.5
+
 /**
- * Walk the retail order's line_items, look up the matching wholesale
- * variant GID via the sync_id_maps collection, and return DraftOrder
- * line item inputs at ½ of the retail BASE price.
+ * Resolve each retail order line to its matching wholesale variant + the
+ * wholesale UNIT price to charge. Pricing precedence (per the "Admin Order
+ * invoices must use the wholesale product price" requirement):
  *
- * Throws if ANY variant is unmappable (we'd rather hard-fail than
- * silently drop products from the wholesale order).
+ *   1. sync_id_maps.wholesalePrice — the actual wholesale Shopify variant
+ *      price captured by the product sync. AUTHORITATIVE. The retail QBO
+ *      Vendor Bill reads the SAME field, so the wholesale invoice (A/R) and
+ *      the retail vendor bill (A/P) stay numerically in sync by construction.
+ *   2. retail base price × WHOLESALE_PRICE_FALLBACK_FACTOR — graceful
+ *      fallback when the snapshot isn't populated yet (legacy ½ behavior).
+ *
+ * Lines with no variant_id, or no sync_id_maps row, come back with
+ * wholesaleVariantId=null so the caller can skip + warn (we never silently
+ * drop a product onto the wholesale order). Used by BOTH buildDropshipLineItems
+ * (the order/invoice) and computeDropshipAmounts (the mapping audit subtotal)
+ * so the two always agree.
  */
-async function buildDropshipLineItems(order) {
+async function resolveWholesaleLines(order) {
   const lines = Array.isArray(order?.line_items) ? order.line_items : []
   const out = []
-  const unmapped = []
-
   for (const line of lines) {
     const retailVariantId = String(line?.variant_id || '')
+    const qty = parseInt(line?.quantity || '1', 10) || 1
+    const retailUnit = parseFloat(line?.price || '0') || 0
+    const fallbackUnit =
+      Math.round(retailUnit * WHOLESALE_PRICE_FALLBACK_FACTOR * 100) / 100
+
     if (!retailVariantId) {
-      unmapped.push({ line_id: line?.id, reason: 'no variant_id in retail line' })
+      out.push({
+        line,
+        qty,
+        retailVariantId: '',
+        retailUnit,
+        wholesaleVariantId: null,
+        wholesaleUnitPrice: fallbackUnit,
+        priceSource: 'fallback_no_variant',
+        reason: 'no variant_id in retail line',
+      })
       continue
     }
+
     const idMap = await SyncIdMap.findOne({
       entityType: 'productVariant',
       retailId: retailVariantId,
     })
-      .select('wholesaleId')
+      .select('wholesaleId wholesalePrice')
       .lean()
+
     if (!idMap?.wholesaleId) {
-      unmapped.push({
-        line_id: line?.id,
+      out.push({
+        line,
+        qty,
         retailVariantId,
+        retailUnit,
+        wholesaleVariantId: null,
+        wholesaleUnitPrice: fallbackUnit,
+        priceSource: 'fallback_no_mapping',
         reason: 'no sync_id_maps row for this retail variant',
       })
       continue
     }
-    const basePrice = parseFloat(line?.price || '0')
-    const halfPrice = Math.round(basePrice * 50) / 100 // /2 → cents
-    const qty = parseInt(line?.quantity || '1', 10)
 
+    const snapshot = Number(idMap.wholesalePrice)
+    const hasSnapshot = Number.isFinite(snapshot) && snapshot > 0
     out.push({
-      variantId: `gid://shopify/ProductVariant/${idMap.wholesaleId}`,
-      quantity: qty,
+      line,
+      qty,
+      retailVariantId,
+      retailUnit,
+      wholesaleVariantId: idMap.wholesaleId,
+      wholesaleUnitPrice: hasSnapshot
+        ? Math.round(snapshot * 100) / 100
+        : fallbackUnit,
+      priceSource: hasSnapshot
+        ? 'sync_id_maps.wholesalePrice'
+        : 'fallback_no_snapshot',
+    })
+  }
+  return out
+}
+
+/**
+ * Build the wholesale DraftOrder line item inputs from the retail order,
+ * priced at the actual WHOLESALE product price (see resolveWholesaleLines).
+ *
+ * Throws if ANY variant is unmappable (we'd rather hard-fail than silently
+ * drop products from the wholesale order).
+ */
+async function buildDropshipLineItems(order) {
+  const resolved = await resolveWholesaleLines(order)
+  const out = []
+  const unmapped = []
+
+  for (const r of resolved) {
+    if (!r.wholesaleVariantId) {
+      unmapped.push({
+        line_id: r.line?.id,
+        retailVariantId: r.retailVariantId,
+        reason: r.reason,
+      })
+      continue
+    }
+    out.push({
+      variantId: `gid://shopify/ProductVariant/${r.wholesaleVariantId}`,
+      quantity: r.qty,
       priceOverride: {
-        amount: halfPrice.toFixed(2),
+        amount: r.wholesaleUnitPrice.toFixed(2),
         currencyCode: order?.currency || 'USD',
       },
     })
@@ -492,11 +568,27 @@ async function buildDropshipLineItems(order) {
   if (unmapped.length) {
     log.warn('unmapped_line_items', { count: unmapped.length, unmapped })
   }
-  if (out.length === 0 && lines.length > 0) {
+  const lineCount = Array.isArray(order?.line_items)
+    ? order.line_items.length
+    : 0
+  if (out.length === 0 && lineCount > 0) {
     throw new Error(
-      `All ${lines.length} line items unmappable to wholesale variants`,
+      `All ${lineCount} line items unmappable to wholesale variants`,
     )
   }
+  // Trace so an admin can confirm the wholesale price was applied per line
+  // (and which lines fell back) when verifying an Admin Order invoice.
+  log.info('dropship_line_pricing', {
+    lines: resolved
+      .filter((r) => r.wholesaleVariantId)
+      .map((r) => ({
+        wholesaleVariantId: r.wholesaleVariantId,
+        qty: r.qty,
+        retailUnit: r.retailUnit,
+        wholesaleUnit: r.wholesaleUnitPrice,
+        source: r.priceSource,
+      })),
+  })
   return out
 }
 
@@ -556,28 +648,30 @@ function buildShippingLine(order) {
 // ── Internals ───────────────────────────────────────────────────────────
 
 /**
- * Compute the retail base subtotal (sum of variant.price × qty BEFORE
- * patient discount/shipping/tax) and the wholesale subtotal (½ of that).
+ * Compute the retail base subtotal (sum of retail variant.price × qty BEFORE
+ * patient discount/shipping/tax) and the wholesale subtotal (sum of the
+ * resolved WHOLESALE unit prices × qty — see resolveWholesaleLines). Both are
+ * informational fields stored on the DropshipMapping for traceability; the
+ * actual invoiced amount comes from the QBO invoice the wholesale pipeline
+ * creates from the order's wholesale-priced lines.
  *
- * Reads `line_items[].price` from the REST payload, which Shopify defines
- * as the unit price at the time the line was added. For practitioner-
- * discounted orders this is still the BASE price — Shopify applies the
- * discount separately in `discount_allocations`. So `price × qty` matches
- * our locked decision: ½ of BASE, ignoring discounts.
+ * Reads `line_items[].price` from the REST payload (the retail BASE unit
+ * price; Shopify applies any patient discount separately in
+ * `discount_allocations`, so this ignores discounts by design). Locked at
+ * order receipt so later catalog price changes don't retroactively shift the
+ * recorded amounts.
  */
-function computeDropshipAmounts(order) {
-  const lines = Array.isArray(order?.line_items) ? order.line_items : []
+async function computeDropshipAmounts(order) {
+  const resolved = await resolveWholesaleLines(order)
   let retailBaseSubtotal = 0
-  for (const line of lines) {
-    const unitPrice = parseFloat(line?.price || '0')
-    const qty = parseInt(line?.quantity || '0', 10)
-    if (Number.isFinite(unitPrice) && Number.isFinite(qty)) {
-      retailBaseSubtotal += unitPrice * qty
-    }
+  let wholesaleSubtotal = 0
+  for (const r of resolved) {
+    retailBaseSubtotal += r.retailUnit * r.qty
+    wholesaleSubtotal += r.wholesaleUnitPrice * r.qty
   }
   // Round to cents to avoid floating-point drift in downstream comparisons.
   retailBaseSubtotal = Math.round(retailBaseSubtotal * 100) / 100
-  const wholesaleSubtotal = Math.round(retailBaseSubtotal * 50) / 100 // / 2 → cents
+  wholesaleSubtotal = Math.round(wholesaleSubtotal * 100) / 100
   const currency = order?.currency || 'USD'
   return { retailBaseSubtotal, wholesaleSubtotal, currency }
 }

@@ -172,6 +172,9 @@ export async function notifyRetailOfDropshipChange({ localOrder, event = 'fulfil
           'x-sync-secret': syncConfig.syncSecret,
         },
         body: JSON.stringify(payload),
+        // Bound the call so a hung / slow tunnel can't stall the fulfillment
+        // webhook, an Order-Details page load, or a resync CRON tick.
+        signal: AbortSignal.timeout(syncConfig.fulfillmentSyncTimeoutMs),
       })
     } catch (err) {
       const msg = `network: ${err?.message || err}`

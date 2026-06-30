@@ -457,19 +457,26 @@ on change) to **backfill** these onto invoices synced before the fields
 existed, then converge.
 `order.service.pushShippingToInvoice` composes the lines + ship date from
 the order's fulfillments and is called best-effort from both fulfillment
-paths on any tracking change (never breaks tracking capture). The customer
-sees it on the next invoice view / PDF; the invoice email is **not**
-auto-resent on tracking changes (avoids spam across the
-label→in-transit→delivered status sequence — admins use the "Send invoice"
-button to push an updated copy).
+paths on any tracking change (never breaks tracking capture). After a
+successful QBO shipping update, `pushShippingToInvoice` also **resends the
+invoice email** to the customer via `dispatchInvoiceLifecycleEmails` (event
+`'fulfillment'`) — but only when the `ShipDate` or `TrackingNum` value
+differs from the last-emailed snapshot (`Invoice.invoiceEmailedShipDate` /
+`invoiceEmailedTrackingNum`). This means the customer receives one resend
+when tracking first arrives and another if the tracking number changes later;
+repeated syncs with the same data are no-ops. The dedup snapshot fields and
+the `'fulfillment_updated'` source enum are persisted via `invoice.save()`
+inside `pushShippingToInvoice` after a successful QBO write.
 
 **Ship Date (Shopify-sourced).** The official Ship Date is the Shopify
 fulfillment date, not the order-creation date. `ShopifyOrder.shippedAt` is
 denormalized as the **earliest** `fulfillments[].fulfilledAt`
 (`order.service.recomputeShipDate`, run in both fulfillment paths) and fed
-to the QBO invoice `ShipDate` (above), overwriting the order-date `ShipDate`
-set at invoice creation (§7.3 / §18.3). Shown as "Ship date" on Order
-Details (Overview), the invoice Shipping block, and per-shipment in the
+to the QBO invoice `ShipDate` (above) via `pushShippingToInvoice`. The QBO
+invoice **starts with `ShipDate` blank** at creation (§7.3 / §18.3) —
+`orders/create` fires pre-fulfillment so there is no real ship timestamp yet;
+the field is populated once a fulfillment arrives. Shown as "Ship date" on
+Order Details (Overview), the invoice Shipping block, and per-shipment in the
 tracking section (so partially-fulfilled orders show each shipment's own
 date).
 
@@ -629,6 +636,61 @@ does not need to re-fetch from Shopify. If an order's `rawPayload` is
 missing (legacy data, schema migration), it's recorded as skipped and the
 admin must re-trigger via another mechanism.
 
+### 5.5a Practitioner prepaid orders (paid at Shopify checkout)
+
+Approved wholesale customers (Practitioners) can pay for their orders directly
+at Shopify checkout instead of being billed later via the NMI vault / monthly
+CRON. These orders arrive at the `orders/create` webhook with
+`order.financial_status === 'paid'` — Shopify has already collected the full
+payment via its own payment processor.
+
+**Detection.** After the approval gate succeeds and `createInvoiceForOrder`
+has created the QBO invoice + fired the initial customer email, the orchestrator
+checks:
+
+```js
+if (order.financial_status === 'paid') {
+  return await settlePrepaidOrder({ invoice, customerMap, order, local })
+}
+```
+
+This check is intentionally placed **after** the approval gate (so drop-ship
+and non-approved customers are handled first) and **after** invoice creation
+(so the customer always receives their QBO invoice email regardless of how
+payment was collected).
+
+**`settlePrepaidOrder` behaviour.** The helper:
+
+1. Sets `Invoice.amountPaid = amountDue` + `paidAt = now`.
+2. Pre-marks `shopifyMarkedPaid = true` + `shopifyMarkedPaidAt` +
+   `shopifyRecordedTotal = amountDue` — this prevents `propagateSuccessfulPayment`
+   from posting a manual SALE transaction to the already-paid Shopify order
+   (which would over-count the balance). The QBO payment record is still
+   created normally.
+3. Appends a `system_note` remark: `"Order paid at Shopify checkout
+   (financial_status=paid) — no NMI charge required; invoice closed
+   automatically"`.
+4. Calls `propagateSuccessfulPayment({ transactionId: undefined })`, which:
+   - Derives `paymentStatus = 'paid'` (self-heal from amountPaid/amountDue).
+   - Records the QBO Payment against the invoice (closing its open balance).
+   - Skips the Shopify SALE transaction write (shopifyRecordedTotal already
+     covers the amount).
+   - Updates `ShopifyOrder.processingStatus → 'completed'` via findOneAndUpdate.
+   - Fires the lifecycle email re-send (invoice shows balance = $0.00).
+5. Returns the updated local ShopifyOrder.
+
+**CRON exclusion.** No CRON-side changes are required:
+- PASS 1 filters `paymentStatus: 'pending'` — a `paid` invoice is not matched.
+- PASS 1.5 filters `paymentStatus: 'failed'` — not applicable.
+- PASS 2 (sync retry) backstops any partial QBO sync failure (e.g. a QBO
+  timeout between recording the payment and setting `qboPaymentRecorded`): on
+  the next CRON tick it would re-call `propagateSuccessfulPayment`, which
+  detects the missing `qboRecordedTotal` and records only the diff — idempotent.
+
+**Fulfillment, tracking, and cancellation** work identically to regular
+wholesale orders — those paths key on the ShopifyOrder doc and are unaffected
+by how the invoice was settled.
+
 ### 5.6 Drop-ship orders (retail drop-ship customer)
 
 Orders placed by the retail drop-ship customer — the synthetic
@@ -681,6 +743,42 @@ just-created invoice if `orders/cancelled` overtook creation.
 passes (charge / failed-followup / sync-retry). Collection is owned solely by
 `process-dropship-payments` (§10.6), which sweeps `isDropship: true`.
 
+**Line-item pricing — the WHOLESALE product price (not ½-of-retail).** The
+drop-ship orchestrator (`services/dropship/dropship.service.js`) builds the
+parallel **wholesale Shopify order** that the invoice is generated from. Each
+retail order line is mapped to its wholesale variant via the product sync's
+`sync_id_maps` collection (`entityType:'productVariant'`, keyed by
+`retailId` = the retail variant id), and the wholesale **Draft Order** line is
+priced at the **actual wholesale product price**:
+
+- **Primary source:** `sync_id_maps.wholesalePrice` — the wholesale Shopify
+  variant's price, captured by the product sync (`services/sync/product.sync.js`
+  `upsertVariantMappings`) on every product create/update. `resolveWholesaleLines`
+  applies it as the Draft Order `priceOverride`; `shopifyLinesToQboLines` then
+  reads it straight onto the QBO invoice lines, so the Admin Order invoice shows
+  the true per-product wholesale price.
+- **Fallback:** for a variant whose `wholesalePrice` snapshot isn't populated
+  yet, the line falls back to `retail base price × 0.5` (the legacy ½-of-retail
+  behavior) so an un-synced product never blocks invoicing. Logged per line via
+  `log.info('dropship_line_pricing', …)` with the chosen `source`.
+
+  > Historical note: the original drop-ship cut priced **every** line at ½ of
+  > the retail price (an approximation that's only correct when retail is exactly
+  > 2× wholesale). That is now the fallback, not the default.
+
+**Vendor Bill stays in sync (A/P = A/R).** The retail-side QBO **Vendor Bill**
+(ns-retail `services/retailQbo/retailVendorBill.service.js` +
+`retailQbo.service.createBillForOrder`) — what the retail company owes the
+wholesale supplier — is built from the **same** `sync_id_maps.wholesalePrice`
+field (ns-retail reads it through a read-only `models/syncIdMap.server.js`
+mirror, single-owner discipline), with the identical `retail × factor`
+fallback (`QBO_RETAIL_WHOLESALE_PRICE_FACTOR`, 0.5). Because both the wholesale
+invoice and the retail vendor bill resolve each line from the same source, the
+two documents match by construction. (The bill-payment reconciliation in
+`retailBillReconcile.service.js` is amount-agnostic — it pays the bill's full
+balance when the wholesale invoice is `paid` — so this change does not alter
+reconciliation behavior.)
+
 **Separation in the UI.**
 
 - The wholesale **Orders** list (`app.orders._index.jsx`) excludes them with
@@ -690,8 +788,55 @@ passes (charge / failed-followup / sync-retry). Collection is owned solely by
 - A dedicated **Admin Orders** nav item exposes two read-only routes:
   - `app.admin-orders._index.jsx` — list, anchored on
     `{ customerEmail: RETAIL_CUSTOMER_EMAIL }` (captures every such order
-    regardless of `processingStatus`, including legacy `admin_order` rows),
-    with fulfillment-status chips + search + pagination.
+    regardless of `processingStatus`, including legacy `admin_order` rows).
+    Built for parity with the ns-retail Order List: the shared
+    `AdvancedFilters` form (order number / fulfillment / payment / date range),
+    **clickable sortable headers** on **Order** (`receivedAt`) and **Total**
+    (`totalAmount`) — toggling desc → asc with a ▲/▼ arrow, whitelisted via
+    `SORT_FIELDS`, the chosen sort preserved across filter changes by the
+    `AdvancedFilters` `extraParams` prop — and pagination. Columns: **Order**
+    (number + date stacked), **Total**, **Payment** (Shopify financial status),
+    **Fulfillment**, **Delivery status**, **QBO Invoice**, **Vendor Bill**,
+    **Remarks**, and **Actions** (mirroring the ns-retail "practitioner" Order
+    List's cell layout). **Fulfillment** stacks the ship date (`shippedAt`, subdued, on top)
+    → fulfillment badge → carrier tracking link(s); **Delivery status** stacks
+    the delivered date (`deliveredAt`, on top) → delivery badge. Tracking has
+    no standalone column — it lists one clickable carrier link per shipment
+    (`tracking[]` = `{ company, url }`) inside the Fulfillment cell,
+    deep-linking to the carrier page (tracking number pre-filled in the URL
+    but not shown). The **QBO Invoice** column shows the linked drop-ship
+    invoice's
+    payment-status badge (the wholesale→retail collection state — distinct from
+    Shopify's customer-facing "Payment"), an in-app PDF **Preview** (reuses the
+    `/api/admin/orders/:id/qbo-invoice-pdf` endpoint), and an **Open in QBO
+    #<docNumber>** deep link; the loader joins the page's invoices in one query
+    (`qboInvoiceId` / `qboDocNumber` / `paymentStatus`) and builds the QBO web
+    URL server-side via `getInvoiceWebUrl`. Legacy `admin_order` rows (no
+    invoice) render "—". The **Vendor Bill** column surfaces the linked
+    **ns-retail Vendor Bill** (A/P — what the retail company owes Natural
+    Solution Wholesale for this drop-ship order; the wholesale app never creates
+    a vendor bill, only the dropship invoice). It shows the **bill amount**
+    (`qboBillTotal`) + a **status badge** (Paid once reconciled against the paid
+    wholesale invoice / Unpaid while `created` / Reconcile-error / Error) + an
+    **Open in QBO #<docNumber>** deep link. Sourced cross-repo on the shared
+    `natural-solutions` DB via a **two-hop join** (no N+1, no live API call):
+    wholesale `ShopifyOrder.shopifyOrderId` → `dropship_mappings.wholesaleOrderId`
+    → `mapping.retailOrderGid` → `cdo_orders.shopifyOrderId` (a GID) →
+    `retailQbo` bill fields. The bill data is read from `cdo_orders.retailQbo`
+    (ns-retail-owned, written there) — NOT the legacy `dropship_mappings.retailQboBillId`
+    (unwritten/`null`). A new READ-ONLY mirror model `models/retailCdoOrder.server.js`
+    (collection `cdo_orders`, `strict:false`, declares only the bill fields) does
+    the read; wholesale never writes it (single-owner discipline — the symmetric
+    pattern to ns-retail read-only-mirroring the wholesale `invoices` /
+    `dropship_mappings` collections). Renders "—" when no linked bill exists.
+    The **Remarks** column shows the linked invoice's latest `remarks[]` entry
+    (the drop-ship collection / admin-action note — e.g. a "Duplicate
+    transaction" collection error) + a "+N more" pointer to the detail page,
+    plus a critical "Collection failed — $X · N/M attempts" header when the
+    invoice `paymentStatus` is `failed`. Mirrors the wholesale Orders list's
+    `RemarksCell` (no cheque/ACH "Payment Due" cue — drop-ship uses
+    `paymentMethod: 'dropship'`); the invoice join selects `remarks` + the
+    amount/attempt fields and each row projects a `remarks` summary.
   - `app.admin-orders.$id.jsx` — full detail (order info, customer info, tags,
     line items + quantities/pricing, shipping + billing addresses, shipping
     method, fulfillment + tracking numbers/URLs, order note + note attributes,
@@ -701,6 +846,29 @@ passes (charge / failed-followup / sync-retry). Collection is owned solely by
     push (carrier/tracking) lands on the drop-ship invoice too. The loader
     hard-guards with `isRetailCustomerEmail` so a wholesale order id cannot
     resolve here (and vice versa).
+
+    **Line items data table (shared, sortable, printable).** The line-items
+    section on both Order Details pages (`app.orders.$id.jsx` and
+    `app.admin-orders.$id.jsx`) renders through one shared component,
+    `LineItemsTable` in `app/components/admin-ui.jsx`. It is a Polaris
+    `s-table` with **clickable, sortable column headers** (Product / SKU / Qty /
+    Unit price / Discount / Line total — `s-clickable` in each header, ▲/▼ on
+    the active column; the same header-toggle idiom the Orders/Admin-Orders
+    list pages use). Default sort is **Product A→Z**; clicking the active column
+    flips its direction, clicking a new column starts ascending. Sorting is
+    **client-side** over the loader-provided rows (the full line-item set is
+    already in hand — no loader round-trip) via a locale-aware `Intl.Collator`
+    for text columns and numeric compare for the rest, with an always-A→Z
+    tiebreak on product name. The component also exposes **Print** (opens a
+    clean, print-ready window of the current sorted order — opened
+    synchronously for popup-blocker safety, same pattern as the PDF-preview
+    windows) and **Export CSV** (downloads the current sorted order as a
+    BOM-prefixed UTF-8 CSV via a `Blob` + anchor click). Both pages keep their
+    own totals box as a sibling below the table (the wholesale page's
+    `invoiceCalc` breakdown vs. the admin page's `totals`) — only the
+    line-item table itself is shared. Pure Polaris `s-*`; the print window is a
+    separate generated document (not the admin-route DOM), so its inline styles
+    don't violate the no-CSS-in-admin-routes rule.
 
     **Invoice view + actions (parity with the wholesale Order Details page).**
     The detail page surfaces the full invoice the same way the wholesale page
@@ -752,7 +920,89 @@ Order-Details views never re-POST a duplicate or conflicting update. The call
 is **best-effort and never throws** — a retail outage can't break wholesale
 fulfillment capture. It POSTs to `${NS_RETAIL_API_BASE}/api/sync/wholesale-fulfillment`
 with the shared `x-sync-secret` (`RETAIL_SYNC_SECRET`), gated by
-`isFulfillmentSyncEnabled()` (`NS_RETAIL_API_BASE` + secret set).
+`isFulfillmentSyncEnabled()` (`NS_RETAIL_API_BASE` + secret set). The POST is
+bounded by `NS_RETAIL_SYNC_TIMEOUT_MS` (default 10 s, `AbortSignal.timeout`) so
+a hung tunnel can't stall the webhook / page load / CRON tick.
+
+**Reliability — single backstop on the ns-retail side.** The push above fires
+the sync **once** per fulfillment change; if that single POST fails (ns-retail
+briefly down, the dev tunnel rotated, a transient 5xx) nothing re-fires it from
+here. Recovery is owned by **one** mechanism — the ns-retail **pull
+reconciler** (see "Pull-based backstop" below), which reads the wholesale
+fulfillment state straight from the shared Mongo DB and applies it without
+needing the tunnel. (An earlier wholesale-side retry CRON,
+`process-dropship-fulfillment-resync`, was **removed** — it only re-attempted
+the same flaky push and was redundant with the tunnel-independent pull
+reconciler.)
+
+> **Operational note.** The single most common cause of "fulfillment sync
+> stopped working" is `NS_RETAIL_API_BASE` (in wholesale's `.env`) pointing at a
+> **stale ns-retail tunnel** — Shopify CLI quick-tunnels (trycloudflare) rotate
+> their hostname on every `shopify app dev` restart, so the wholesale app keeps
+> POSTing to ns-retail's *previous* URL and every sync fails with
+> `network: fetch failed` / Cloudflare `530`. The fix is to update
+> `NS_RETAIL_API_BASE` to ns-retail's current `application_url` (and restart so
+> the env is re-read); the resync CRON then replays the backlog automatically.
+> Pin a stable URL (reserved ngrok domain / prod host) to avoid the rotation.
+
+**Pull-based backstop (ns-retail, tunnel-independent).** Because the push above
+depends on the wholesale→ns-retail tunnel being **up at the moment the
+wholesale order is fulfilled** — which it often isn't in dev (ns-retail not
+running / tunnel rotated → the push 530s and the retail order is left
+un-fulfilled) — ns-retail **also** reconciles by pulling. Both apps share one
+MongoDB and **ns-retail owns the retail Shopify Admin token**, so a CRON
+`reconcile-wholesale-fulfillments` (ns-retail
+`services/scheduler/jobs/processWholesaleFulfillmentReconcile.job.js` →
+`services/sync/wholesaleFulfillmentReconcile.reconcileWholesaleFulfillments`)
+reads the wholesale order's fulfillment state **directly from the shared DB**
+(read-only mirror `models/wholesaleOrder.server.js` over the wholesale
+`shopify_orders` collection) and fulfills the linked retail order **in-process**
+— no cross-app HTTP, no tunnel. It reuses the SAME `applyWholesaleFulfillment`
+the push receiver uses. Candidate gate: drop-ship mapping whose **wholesale
+order has a recorded fulfillment** AND whose **retail `cdo_orders` has none yet**
+(so it fulfills exactly once — the customer shipment email fires once — and
+never pre-emptively); `applyWholesaleFulfillment`'s open-fulfillment-order check
+prevents any double-fulfill if the push and pull race. This makes the push the
+fast path and the pull the reliable backstop. Cadence env-configurable
+(ns-retail `scheduler.config.js`): `CDO_FULFILLMENT_RECONCILE_CRON` (prod,
+default every 10 min) / `CDO_FULFILLMENT_RECONCILE_INTERVAL` (dev, e.g.
+`"1 minute"`). Cancellations stay push-only (they just tag the retail order).
+
+The reconciler also mirrors the **delivered milestone**, not just the first
+fulfillment: its candidate gate fires for either (a) the retail order not yet
+fulfilled → fulfill it, or (b) the wholesale order **delivered** while the retail
+order isn't → record delivery. It converges (skips once the retail side reflects
+the state) so the customer shipment email fires once and Shopify isn't churned
+between fulfillment and delivery.
+
+> **`deliveredAt` is authoritative for drop-ship delivery (retail side).** A
+> drop-ship order's RETAIL Shopify fulfillment never receives a real carrier
+> `delivered` scan — the WHOLESALE store ships + tracks it — so the delivered
+> state lives in `cdo_orders.fulfillments[].deliveredAt` (mirrored from
+> wholesale, first-write-wins). ns-retail's delivery derivation
+> (`app/utils/orderStatus.js` `deriveDeliveryStatus` / `deriveDeliveredAt`)
+> therefore treats a stamped `deliveredAt` as delivered **even when
+> `shipmentStatus` is blank** — important because a later carrier-less retail
+> `fulfillments/update` webhook can blank `shipmentStatus` back to `null` while
+> `deliveredAt` persists. Without this the retail Order List shows a delivered
+> drop-ship order as merely "shipped".
+
+**Native Shopify "Delivery status" (the merchant's Shopify admin Orders list).**
+The derivation above fixes ns-retail's OWN app UI. Shopify's **native** order
+list derives its "Delivery status" column from fulfillment **events**, not from
+tracking info — so a fulfillment created with only a tracking number sits at
+"Tracking added" forever. To mirror the delivered milestone onto the native
+column, `applyWholesaleFulfillment` pushes a **`fulfillmentEventCreate` with
+`status: DELIVERED`** (`happenedAt` = the wholesale delivery time) on the retail
+fulfillment when the wholesale order is delivered — gated on the fulfillment's
+`displayStatus` not already being `DELIVERED` (no duplicate events), best-effort
+(logged, never fatal). This needs the legacy **`write_fulfillments`** scope on
+the ns-retail app (distinct from the `*_fulfillment_orders` scopes that
+`fulfillmentCreate` uses) — granted via `access_scopes` in both
+`ns-retail/shopify.app*.toml`; **adding it requires a `shopify app deploy` /
+re-auth.** Until granted, the event call fails harmlessly and only the ns-retail
+app UI reflects delivery (via `deliveredAt`); after granting, the native Shopify
+order reads "Delivered" too.
 
 **Apply (ns-retail).** `POST /api/sync/wholesale-fulfillment`
 (`app/api/sync/wholesale-fulfillment.js`, shared-secret auth, module-level
@@ -1045,13 +1295,13 @@ which `BillAddr` on the customer payload also uses. If no address is
 on file at all, `ShipAddr` is omitted from the payload (QBO rejects
 empty address objects).
 
-`ShipDate` uses `order.created_at` (falling back to
-`localOrder.receivedAt`) formatted to `YYYY-MM-DD` via
-`invoice.utils.toYmd`. Shopify's `orders/create` webhook fires before
-fulfillment, so there's no real ship timestamp on the order yet — the
-order date is the closest meaningful "ship on or after" marker.
-Unparseable → omitted (QBO leaves the field blank on the rendered
-invoice).
+`ShipDate` is **omitted at invoice creation** — `orders/create` fires
+pre-fulfillment and there is no real ship timestamp yet. QBO leaves the
+field blank on the rendered invoice until a fulfillment arrives.
+`pushShippingToInvoice` populates it later from `ShopifyOrder.shippedAt`
+(the earliest fulfillment date, formatted `YYYY-MM-DD` via
+`invoice.utils.toYmd`) when a `fulfillments/create` or
+`fulfillments/update` webhook is received (§4.6).
 
 **Per-product Items (SKU column).** QBO sources an invoice's SKU column
 from the referenced **`Item.Sku`** — there is no per-line SKU field. So
@@ -2422,6 +2672,31 @@ When unset, every invoice is skipped with a clear
 `no DROPSHIP_NMI_VAULT_ID configured` reason (recorded on a PaymentAttempt
 + a `cron_dropship_attempt` remark) — the job never silently no-ops.
 
+**NMI duplicate-transaction handling (shared-vault gotcha — GATEWAY CONFIG, not
+code).** Because every drop-ship invoice charges the SAME vault, two distinct
+orders that happen to cost the same amount look identical to NMI's gateway-level
+amount+card duplicate-transaction check, and the second sale is rejected with
+`Duplicate transaction REFID:…` (it surfaces as an errored
+`cron_dropship_attempt` remark). **This cannot be fixed from code on this
+processor.** NMI's only per-transaction lever is `dup_seconds`, and this
+processor forbids it both ways: `dup_seconds=0` (disable) →
+`Disabling Duplicate Check is not allowed for this processor` (code 300), and any
+positive `dup_seconds=N` (override the window) →
+`Overriding Duplicate Threshold is not allowed for this processor` (code 300).
+Sending `dup_seconds` at all therefore fails EVERY drop-ship charge (even
+unique-amount orders), so we deliberately **never send it** (see the comment in
+`chargeCustomerVault`). The resolution is operational: in the **NMI control
+panel** → *Settings → Transaction/Security Options → Duplicate Transaction
+Checking* for this MID, **disable it, shorten the window, or set it to key on
+order id**. We send a unique `orderid` per order
+(`invoice.shopifyOrderId || invoice._id`), so the order-id-keyed mode lets NMI
+distinguish distinct orders. Relaxing NMI's amount-based dup check is safe
+because a *same-invoice* double-charge is already impossible regardless:
+`chargeInvoice` flips the invoice to `in_progress` **before** the sale (PASS A
+only sweeps `pending`, and the admin "Collect payment now" excludes
+`in_progress`), and the claim-first unique `(shop, shopifyOrderId)` invoice index
+guarantees one invoice per order.
+
 **Code:** `services/dropship/dropshipPayment.service.collectDropshipPayments()`
 + `dropshipPayment.config.js`; thin Agenda wrapper
 `services/scheduler/jobs/processDropshipPayments.job.js` (concurrency:1).
@@ -3113,7 +3388,7 @@ POST /v3/company/{realmId}/invoice?minorversion=73
               "SalesItemLineDetail": { "ItemRef": { "value": "1" },
                                        "Qty": 4, "UnitPrice": 5.79 } } ],
   "DocNumber": "1021", "CustomerMemo": { "value": "Shopify order #1021" },
-  "DueDate": "2026-06-05", "ShipDate": "2026-05-21",
+  "DueDate": "2026-06-05",
   "ShipAddr": { "Line1": "123 Main St", "City": "Austin",
                 "CountrySubDivisionCode": "TX", "PostalCode": "78701",
                 "Country": "US" } }

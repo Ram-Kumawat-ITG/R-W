@@ -1,6 +1,6 @@
 /* eslint-disable react/prop-types */
 import { useEffect, useRef } from "react";
-import { useLoaderData, useNavigate, useFetcher } from "react-router";
+import { useLoaderData, useNavigate, useRevalidator, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import { getCdoOrderDetail } from "../services/cdo/cdo.service";
 import {
@@ -15,6 +15,7 @@ import { reconcileRetailVendorBillForOrder } from "../services/retailQbo/retailB
 import StatusBadge from "../components/cdo/StatusBadge";
 import { ShippingBadge, DeliveryBadge } from "../components/cdo/StatusBadges";
 import { formatCurrency, formatDate, formatDateTime, formatPercent } from "../utils/format";
+import { CollapsibleSection, BackToTop } from "../components/ui";
 
 export const loader = async ({ request, params }) => {
   await authenticate.admin(request);
@@ -239,6 +240,7 @@ function BillPaymentBadge({ paymentStatus, reconcileStatus }) {
 export default function OrderDetail() {
   const { order } = useLoaderData();
   const navigate = useNavigate();
+  const revalidator = useRevalidator();
   const qboFetcher = useFetcher();
   const qboBusy = qboFetcher.state !== "idle";
   const pdfFetcher = useFetcher();
@@ -301,14 +303,24 @@ export default function OrderDetail() {
   }, [pdfFetcher.data, pdfFetcher.state]);
 
   return (
-    <s-stack direction="block" gap="base">
-      <s-box paddingBlockEnd="base">
-        <s-button variant="tertiary" icon="arrow-left" onClick={() => navigate("/app/orders")}>
-          Back to Orders
-        </s-button>
+    <s-stack direction="block" gap="small-200">
+      <s-box paddingBlockEnd="small-200">
+        <s-stack direction="inline" gap="base" alignItems="center">
+          <s-button variant="tertiary" icon="arrow-left" onClick={() => navigate("/app/orders")}>
+            Back to Orders
+          </s-button>
+          <s-button
+            variant="tertiary"
+            icon="refresh"
+            onClick={() => revalidator.revalidate()}
+            {...(revalidator.state !== "idle" ? { loading: true } : {})}
+          >
+            Refresh
+          </s-button>
+        </s-stack>
       </s-box>
 
-      <s-section heading={order.orderName}>
+      <CollapsibleSection heading={order.orderName} storageKey="r-ord-header" defaultOpen>
         <s-stack direction="inline" gap="large" alignItems="center">
           <StatusBadge status={order.status} />
           {order.attributed ? <s-badge tone="success">Attributed</s-badge> : <s-badge tone="neutral">Retail</s-badge>}
@@ -325,10 +337,10 @@ export default function OrderDetail() {
             <DeliveryBadge status={order.deliveryStatus} />
           </s-stack>
         </s-stack>
-      </s-section>
+      </CollapsibleSection>
 
       {/* ── Order information ── */}
-      <s-section heading="Order information">
+      <CollapsibleSection heading="Order information" storageKey="r-ord-info">
         <s-grid gap="base" gridTemplateColumns="repeat(3, minmax(0, 1fr))">
           <Row label="Order number" value={order.orderNumber || order.orderName} />
           <Row label="Order date" value={formatDateTime(order.placedAt)} />
@@ -344,8 +356,8 @@ export default function OrderDetail() {
           </s-stack>
           <Row label="Source channel" value={order.sourceName} />
         </s-grid>
-        <s-box paddingBlockStart="base">
-          <s-stack direction="block" gap="tight">
+        <s-box paddingBlockStart="small-200">
+          <s-stack direction="block" gap="small-200">
             <s-stack direction="block" gap="none">
               <s-text tone="subdued">Order tags</s-text>
               {order.tags?.length ? (
@@ -360,48 +372,53 @@ export default function OrderDetail() {
                 <s-text>—</s-text>
               )}
             </s-stack>
-            <Row label="Order notes" value={order.note} />
-            {order.noteAttributes?.length > 0 &&
-              order.noteAttributes.map((a, i) => <Row key={i} label={a.name || "—"} value={a.value || "—"} />)}
+            <s-grid gap="base" gridTemplateColumns="repeat(2, minmax(0, 1fr))">
+              <Row label="Order notes" value={order.note} />
+              {order.noteAttributes?.length > 0 &&
+                order.noteAttributes.map((a, i) => <Row key={i} label={a.name || "—"} value={a.value || "—"} />)}
+            </s-grid>
           </s-stack>
         </s-box>
-      </s-section>
+      </CollapsibleSection>
 
       {/* ── Customer ── */}
-      <s-grid gap="base" gridTemplateColumns="repeat(2, minmax(0, 1fr))">
-        <s-section heading="Customer information">
-          <s-stack direction="block" gap="tight">
+      <CollapsibleSection heading="Customer information" storageKey="r-ord-customer">
+        <s-stack direction="block" gap="base">
+          <s-grid gap="base" gridTemplateColumns="repeat(4, minmax(0, 1fr))">
             <Row label="Name" value={order.customer.name} />
             <Row label="Email" value={order.customer.email} />
             <Row label="Phone" value={order.customer.phone} />
+          </s-grid>
+          <s-grid gap="base" gridTemplateColumns="repeat(3, minmax(0, 1fr))">
             <AddressBlock label="Billing address" a={order.billingAddress} />
             <AddressBlock label="Shipping address" a={order.shippingAddress} />
-          </s-stack>
-        </s-section>
+          </s-grid>
+        </s-stack>
+      </CollapsibleSection>
 
-        <s-section heading="Referral & practitioner">
-          {order.attributed ? (
-            <s-stack direction="block" gap="tight">
-              <Row label="Referral code" value={order.referralCode} />
-              <Row label="Practitioner" value={order.practitioner?.name || order.practitioner?.email} />
-              <Row label="Practitioner email" value={order.practitioner?.email} />
-              <Row
-                label="Commission rate"
-                value={order.referral?.commissionRate != null ? formatPercent(order.referral.commissionRate) : "—"}
-              />
-              <Row
-                label="Attribution source"
-                value={order.attribution?.source ? `${order.attribution.source} (${order.attribution.code || "—"})` : "—"}
-              />
-            </s-stack>
-          ) : (
-            <s-paragraph tone="subdued">This order carried no (valid) referral code — standard retail order.</s-paragraph>
-          )}
-        </s-section>
-      </s-grid>
+      {/* ── Referral ── */}
+      <CollapsibleSection heading="Referral & practitioner" storageKey="r-ord-referral">
+        {order.attributed ? (
+          <s-grid gap="base" gridTemplateColumns="repeat(4, minmax(0, 1fr))">
+            <Row label="Referral code" value={order.referralCode} />
+            <Row
+              label="Commission rate"
+              value={order.referral?.commissionRate != null ? formatPercent(order.referral.commissionRate) : "—"}
+            />
+            <Row label="Practitioner" value={order.practitioner?.name || order.practitioner?.email} />
+            <Row label="Practitioner email" value={order.practitioner?.email} />
+            <Row
+              label="Attribution source"
+              value={order.attribution?.source ? `${order.attribution.source} (${order.attribution.code || "—"})` : "—"}
+            />
+          </s-grid>
+        ) : (
+          <s-paragraph tone="subdued">This order carried no (valid) referral code — standard retail order.</s-paragraph>
+        )}
+      </CollapsibleSection>
 
       {/* ── Products ── */}
-      <s-section heading={`Product information (${order.lineItems.length})`}>
+      <CollapsibleSection heading={`Product information (${order.lineItems.length})`} storageKey="r-ord-products">
         {order.lineItems.length === 0 ? (
           <s-paragraph tone="subdued">No line items recorded.</s-paragraph>
         ) : (
@@ -434,49 +451,38 @@ export default function OrderDetail() {
             </s-table-body>
           </s-table>
         )}
-      </s-section>
+      </CollapsibleSection>
 
       {/* ── Pricing / tax / discount ── */}
-      <s-grid gap="base" gridTemplateColumns="repeat(2, minmax(0, 1fr))">
-        <s-section heading="Pricing">
-          <s-stack direction="block" gap="tight">
-            <Row label="Subtotal" value={formatCurrency(p.subtotal, cur)} />
-            <Row label="Discounts" value={formatCurrency(p.totalDiscounts, cur)} />
-            <Row label="Tax" value={formatCurrency(p.totalTax, cur)} />
-            <Row label="Shipping" value={formatCurrency(p.totalShipping, cur)} />
-            <Row label="Total" value={formatCurrency(p.total ?? order.amount, cur)} />
-            {order.discountCodes.length > 0 ? (
-              <Row label="Discount codes" value={order.discountCodes.map((d) => d.code).join(", ")} />
-            ) : null}
-          </s-stack>
-        </s-section>
-
-        <s-section heading="Tax & discount details">
-          <s-stack direction="block" gap="tight">
-            {order.taxLines?.length ? (
-              order.taxLines.map((t, i) => (
+      <CollapsibleSection heading="Pricing & discounts" storageKey="r-ord-pricing">
+        <s-grid gap="base" gridTemplateColumns="repeat(5, minmax(0, 1fr))">
+          <Row label="Subtotal" value={formatCurrency(p.subtotal, cur)} />
+          <Row label="Shipping" value={formatCurrency(p.totalShipping, cur)} />
+          <Row label="Discounts" value={formatCurrency(p.totalDiscounts, cur)} />
+          <Row label="Tax" value={formatCurrency(p.totalTax, cur)} />
+          <Row label="Total" value={formatCurrency(p.total ?? order.amount, cur)} />
+          {order.discountCodes.length > 0 ? (
+            <Row label="Discount codes" value={order.discountCodes.map((d) => d.code).join(", ")} />
+          ) : null}
+          {order.taxLines?.length
+            ? order.taxLines.map((t, i) => (
                 <Row
                   key={i}
                   label={`${t.title || "Tax"}${t.rate != null ? ` (${formatPercent(t.rate)})` : ""}`}
                   value={formatCurrency(t.price, cur)}
                 />
               ))
-            ) : (
-              <Row label="Tax" value={formatCurrency(p.totalTax, cur)} />
-            )}
-            {order.discountCodes?.length ? (
-              order.discountCodes.map((d, i) => (
+            : null}
+          {order.discountCodes?.length
+            ? order.discountCodes.map((d, i) => (
                 <Row key={`d${i}`} label={`Discount: ${d.code || "—"}`} value={formatCurrency(d.amount, cur)} />
               ))
-            ) : (
-              <Row label="Discounts" value={formatCurrency(p.totalDiscounts, cur)} />
-            )}
-          </s-stack>
-        </s-section>
-      </s-grid>
+            : null}
+        </s-grid>
+      </CollapsibleSection>
 
       {/* ── Shipping & fulfillment ── */}
-      <s-section heading="Shipping & fulfillment">
+      <CollapsibleSection heading="Shipping & fulfillment" storageKey="r-ord-shipping">
         <s-grid gap="base" gridTemplateColumns="repeat(3, minmax(0, 1fr))">
           <s-stack direction="block" gap="none">
             <s-text tone="subdued">Shipping status</s-text>
@@ -542,10 +548,10 @@ export default function OrderDetail() {
             </s-table>
           )}
         </s-box>
-      </s-section>
+      </CollapsibleSection>
 
       {/* ── Payment information ── */}
-      <s-section heading="Payment information">
+      <CollapsibleSection heading="Payment information" storageKey="r-ord-payment">
         <s-grid gap="base" gridTemplateColumns="repeat(3, minmax(0, 1fr))">
           <Row label="Payment method" value={paymentMethod} />
           <Row label="Transaction ID" value={firstTxn?.id} />
@@ -555,10 +561,10 @@ export default function OrderDetail() {
           <Row label="Discount amount" value={formatCurrency(p.totalDiscounts, cur)} />
           <Row label="Shipping amount" value={formatCurrency(p.totalShipping, cur)} />
         </s-grid>
-      </s-section>
+      </CollapsibleSection>
 
       {/* ── QuickBooks information ── */}
-      <s-section heading="QuickBooks information">
+      <CollapsibleSection heading="QuickBooks information" storageKey="r-ord-qbo">
         <s-stack direction="block" gap="base">
           {qboFetcher.data ? (
             <s-banner
@@ -759,8 +765,23 @@ export default function OrderDetail() {
           ) : null}
 
           <s-stack direction="inline" gap="base" alignItems="center">
+            {q?.invoiceUrl ? (
+              <s-button
+                variant="primary"
+                onClick={() => window.open(q.invoiceUrl, "_blank")}
+              >
+                View Invoice ↗
+              </s-button>
+            ) : null}
+            {q?.billUrl ? (
+              <s-button
+                variant="primary"
+                onClick={() => window.open(q.billUrl, "_blank")}
+              >
+                View Vendor Bill ↗
+              </s-button>
+            ) : null}
             <s-button
-              variant="primary"
               disabled={qboBusy}
               onClick={() =>
                 qboFetcher.submit(
@@ -840,10 +861,10 @@ export default function OrderDetail() {
             {qboBusy || pdfLoading ? <s-text tone="subdued">Working…</s-text> : null}
           </s-stack>
         </s-stack>
-      </s-section>
+      </CollapsibleSection>
 
       {/* ── Commission (CDO) ── */}
-      <s-section heading="Commission">
+      <CollapsibleSection heading="Commission" storageKey="r-ord-commission">
         {order.commissions.length === 0 ? (
           <s-paragraph tone="subdued">
             {order.attributed
@@ -874,81 +895,119 @@ export default function OrderDetail() {
             </s-table-body>
           </s-table>
         )}
-      </s-section>
+
+        {/* Per-line commission breakdown — shows WHERE the money came from
+            (each line's vendor + rate), instead of only a single blended rate.
+            From the frozen snapshot, or reconstructed for legacy orders. */}
+        {order.commissionBreakdown && order.commissionBreakdown.lines.length > 0 ? (
+          <s-box paddingBlockStart="base">
+            <s-stack direction="block" gap="tight">
+              <s-stack direction="inline" gap="base" alignItems="center">
+                <s-text>
+                  <strong>Commission breakdown</strong>
+                  {order.commissionBreakdown.reconstructed
+                    ? " — reconstructed (legacy order, approximate)"
+                    : ""}
+                </s-text>
+                <s-text tone="subdued">
+                  Effective rate: {formatPercent(order.commissionBreakdown.effectiveRate)}
+                </s-text>
+              </s-stack>
+              <s-table>
+                <s-table-header-row>
+                  <s-table-header>Vendor</s-table-header>
+                  <s-table-header>Revenue</s-table-header>
+                  <s-table-header>Rate</s-table-header>
+                  <s-table-header>Commission</s-table-header>
+                </s-table-header-row>
+                <s-table-body>
+                  {order.commissionBreakdown.lines.map((l, i) => (
+                    <s-table-row key={i}>
+                      <s-table-cell>{l.vendor || "—"}</s-table-cell>
+                      <s-table-cell>{formatCurrency(l.revenue, cur)}</s-table-cell>
+                      <s-table-cell>{formatPercent(l.rate)}</s-table-cell>
+                      <s-table-cell>{formatCurrency(l.amount, cur)}</s-table-cell>
+                    </s-table-row>
+                  ))}
+                </s-table-body>
+              </s-table>
+            </s-stack>
+          </s-box>
+        ) : null}
+      </CollapsibleSection>
 
       {/* ── Audit & activity ── */}
-      <s-section heading="Order timeline">
-        <s-stack direction="block" gap="tight">
+      <CollapsibleSection heading="Order timeline" storageKey="r-ord-timeline">
+        <s-grid gap="base" gridTemplateColumns="repeat(3, minmax(0, 1fr))">
           {order.timeline.map((t, i) => (
             <Row key={i} label={t.label} value={formatDateTime(t.at)} />
           ))}
           <Row label="Shopify order id" value={order.shopifyOrderId} />
-        </s-stack>
-      </s-section>
+        </s-grid>
+      </CollapsibleSection>
 
-      <s-grid gap="base" gridTemplateColumns="repeat(2, minmax(0, 1fr))">
-        <s-section heading="QBO sync history">
-          {q?.syncLog?.length ? (
-            <s-table>
-              <s-table-header-row>
-                <s-table-header>When</s-table-header>
-                <s-table-header>Event</s-table-header>
-                <s-table-header>Result</s-table-header>
-                <s-table-header>Message</s-table-header>
-              </s-table-header-row>
-              <s-table-body>
-                {[...q.syncLog]
-                  .sort((a, b) => String(b.at).localeCompare(String(a.at)))
-                  .map((s, i) => (
-                    <s-table-row key={i}>
-                      <s-table-cell>{formatDateTime(s.at)}</s-table-cell>
-                      <s-table-cell>{s.event || "—"}</s-table-cell>
-                      <s-table-cell>
-                        <s-badge tone={s.ok ? "success" : "critical"}>{s.ok ? "OK" : "Error"}</s-badge>
-                      </s-table-cell>
-                      <s-table-cell>{s.message || "—"}</s-table-cell>
-                    </s-table-row>
-                  ))}
-              </s-table-body>
-            </s-table>
-          ) : (
-            <s-paragraph tone="subdued">No QBO sync activity yet.</s-paragraph>
-          )}
-        </s-section>
+      <CollapsibleSection heading="QBO sync history" storageKey="r-ord-qbo-log">
+        {q?.syncLog?.length ? (
+          <s-table>
+            <s-table-header-row>
+              <s-table-header>When</s-table-header>
+              <s-table-header>Event</s-table-header>
+              <s-table-header>Result</s-table-header>
+              <s-table-header>Message</s-table-header>
+            </s-table-header-row>
+            <s-table-body>
+              {[...q.syncLog]
+                .sort((a, b) => String(b.at).localeCompare(String(a.at)))
+                .map((s, i) => (
+                  <s-table-row key={i}>
+                    <s-table-cell>{formatDateTime(s.at)}</s-table-cell>
+                    <s-table-cell>{s.event || "—"}</s-table-cell>
+                    <s-table-cell>
+                      <s-badge tone={s.ok ? "success" : "critical"}>{s.ok ? "OK" : "Error"}</s-badge>
+                    </s-table-cell>
+                    <s-table-cell>{s.message || "—"}</s-table-cell>
+                  </s-table-row>
+                ))}
+            </s-table-body>
+          </s-table>
+        ) : (
+          <s-paragraph tone="subdued">No QBO sync activity yet.</s-paragraph>
+        )}
+      </CollapsibleSection>
 
-        <s-section heading="Shipment update history">
-          {order.trackingHistory?.length ? (
-            <s-table>
-              <s-table-header-row>
-                <s-table-header>When</s-table-header>
-                <s-table-header>Carrier</s-table-header>
-                <s-table-header>Number</s-table-header>
-                <s-table-header>Status</s-table-header>
-                <s-table-header>Event</s-table-header>
-              </s-table-header-row>
-              <s-table-body>
-                {[...order.trackingHistory]
-                  .sort((a, b) => String(b.at).localeCompare(String(a.at)))
-                  .map((h, i) => (
-                    <s-table-row key={i}>
-                      <s-table-cell>{formatDateTime(h.at)}</s-table-cell>
-                      <s-table-cell>{h.trackingCompany || "—"}</s-table-cell>
-                      <s-table-cell>{h.trackingNumber || "—"}</s-table-cell>
-                      <s-table-cell>{h.shipmentStatus || "—"}</s-table-cell>
-                      <s-table-cell>
-                        <s-badge tone={h.event === "created" ? "info" : "neutral"}>
-                          {h.event === "created" ? "Added" : "Updated"}
-                        </s-badge>
-                      </s-table-cell>
-                    </s-table-row>
-                  ))}
-              </s-table-body>
-            </s-table>
-          ) : (
-            <s-paragraph tone="subdued">No shipment updates yet.</s-paragraph>
-          )}
-        </s-section>
-      </s-grid>
+      <CollapsibleSection heading="Shipment update history" storageKey="r-ord-track-log">
+        {order.trackingHistory?.length ? (
+          <s-table>
+            <s-table-header-row>
+              <s-table-header>When</s-table-header>
+              <s-table-header>Carrier</s-table-header>
+              <s-table-header>Number</s-table-header>
+              <s-table-header>Status</s-table-header>
+              <s-table-header>Event</s-table-header>
+            </s-table-header-row>
+            <s-table-body>
+              {[...order.trackingHistory]
+                .sort((a, b) => String(b.at).localeCompare(String(a.at)))
+                .map((h, i) => (
+                  <s-table-row key={i}>
+                    <s-table-cell>{formatDateTime(h.at)}</s-table-cell>
+                    <s-table-cell>{h.trackingCompany || "—"}</s-table-cell>
+                    <s-table-cell>{h.trackingNumber || "—"}</s-table-cell>
+                    <s-table-cell>{h.shipmentStatus || "—"}</s-table-cell>
+                    <s-table-cell>
+                      <s-badge tone={h.event === "created" ? "info" : "neutral"}>
+                        {h.event === "created" ? "Added" : "Updated"}
+                      </s-badge>
+                    </s-table-cell>
+                  </s-table-row>
+                ))}
+            </s-table-body>
+          </s-table>
+        ) : (
+          <s-paragraph tone="subdued">No shipment updates yet.</s-paragraph>
+        )}
+      </CollapsibleSection>
+      <BackToTop />
     </s-stack>
   );
 }

@@ -24,7 +24,6 @@ import {
   getInvoice as getQboInvoice,
   sendInvoiceEmail as sendQboInvoiceEmail,
 } from '../qbo/qbo.service'
-import { mintPayToken, buildPayLinkUrl, appendPayLinkToMemo } from '../payment/payLink.utils'
 import {
   markShopifyOrderPaid,
   recordOrderTransaction as recordShopifyOrderTransaction,
@@ -52,7 +51,7 @@ const log = createLogger('invoice.service')
 const CLAIM_WAIT_MS = 30_000
 const CLAIM_POLL_MS = 500
 
-export async function createInvoiceForOrder({ shop, order, localOrder, customerMap, isDropship = false }) {
+export async function createInvoiceForOrder({ shop, order, localOrder, customerMap, isDropship = false, retailOrderName = null }) {
   const shopifyOrderId = String(order.id)
 
   // Drop-ship invoices lock `paymentMethod: 'dropship'` regardless of the
@@ -172,33 +171,12 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
   // Ship-to fields. Address uses the same shipping → billing → customer
   // default fallback as the customer sync (buildProfileFromShopifyOrder) so
   // the invoice still ships somewhere on pickup/digital orders with no
-  // shipping_address. ShipDate is the order date — Shopify's orders/create
-  // fires pre-fulfillment so we use created_at as the invoice's ship-on date.
+  // shipping_address. ShipDate is left blank at creation; pushShippingToInvoice
+  // populates it after the order is fulfilled.
   const shipAddr = buildProfileFromShopifyOrder(order).shippingAddress
-  const shipDate = toYmd(orderDateBasis)
-  console.log(
-    `[invoice] shipDate = ${shipDate || '(none)'} shipAddr = ${shipAddr ? 'present' : '(none)'}`,
-  )
+  console.log(`[invoice] shipAddr = ${shipAddr ? 'present' : '(none)'}`)
 
-  // Immediate Payment — mint the durable pay-link token NOW so the public
-  // /pay/<token> URL can be baked into the QBO invoice's CustomerMemo.
-  // Stamped on the in-memory doc; persisted in the single save() in Phase 4.
-  // The token is opaque (no amount) — outstanding is recomputed server-side
-  // at click time. For non-immediate invoices payLinkUrl stays null and the
-  // memo is unchanged. The URL is appended as its own full-width line (see
-  // buildPayLinkMemoSuffix) so QBO's auto-linkifier can't truncate it.
-  const isImmediate = invoice.paymentMethod === 'immediate'
-  let payLinkUrl = null
-  if (isImmediate) {
-    invoice.payToken = mintPayToken()
-    invoice.payTokenCreatedAt = new Date()
-    payLinkUrl = buildPayLinkUrl(invoice.payToken)
-    console.log(`[invoice] immediate payment — pay link ${payLinkUrl}`)
-  }
-  const baseMemo = `Shopify order ${order.name || order.id}`
-  const memo = isImmediate && payLinkUrl
-    ? appendPayLinkToMemo(baseMemo, payLinkUrl)
-    : baseMemo
+  const memo = `Shopify order ${order.name || order.id}`
 
   let qboInvoice
   try {
@@ -207,10 +185,11 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
       currency: order.currency || 'USD',
       lines,
       memo,
-      docNumber: order.name?.replace(/^#/, '') || shopifyOrderId,
+      docNumber: isDropship && retailOrderName
+        ? `RS-${retailOrderName}`.slice(0, 21)
+        : (order.name?.replace(/^#/, '') || shopifyOrderId),
       dueDate,
       shipAddr,
-      shipDate,
       // Tax renders in QBO's summary "Tax" row (TxnTaxDetail.TotalTax),
       // not as a product line — see shopifyLinesToQboLines.
       taxAmount: Number(order.total_tax || 0),
@@ -718,7 +697,7 @@ export async function propagateSuccessfulPayment({ invoice, customerMap, transac
 // QBO does not dedup `/send` calls server-side, so duplicate-send
 // protection lives entirely in the local guards (invoiceEmailSentAt
 // + invoiceEmailedAmountPaid + invoiceEmailedStatus).
-async function dispatchInvoiceLifecycleEmails({ invoice, customerMap, event }) {
+export async function dispatchInvoiceLifecycleEmails({ invoice, customerMap, event, shipDate, trackingNum }) {
   // Resolve recipient: prefer the live customer record (it can be
   // updated via /api/update-profile after registration) and fall back
   // to the invoice's stored email for legacy rows.
@@ -735,11 +714,14 @@ async function dispatchInvoiceLifecycleEmails({ invoice, customerMap, event }) {
   }
 
   // Decide whether to (re)send.
-  //   - 'created' → send once; guard on invoiceEmailSentAt
-  //   - 'payment' → re-send if amountPaid grew OR status moved since
-  //                 the last (re)send (also covers the case where the
-  //                 creation-time email failed and we never stamped a
-  //                 baseline — both fields are falsy then)
+  //   - 'created'     → send once; guard on invoiceEmailSentAt
+  //   - 'payment'     → re-send if amountPaid grew OR status moved since
+  //                     the last (re)send (also covers the case where the
+  //                     creation-time email failed and we never stamped a
+  //                     baseline — both fields are falsy then)
+  //   - 'fulfillment' → re-send if shipDate OR trackingNum differs from the
+  //                     snapshot recorded at the last fulfillment email, so
+  //                     the customer always sees the latest tracking info.
   const currentPaid = Number((invoice.amountPaid || 0).toFixed(2))
   const emailedPaid = Number((invoice.invoiceEmailedAmountPaid || 0).toFixed(2))
   const isInitial = event === 'created' && !invoice.invoiceEmailSentAt
@@ -747,7 +729,11 @@ async function dispatchInvoiceLifecycleEmails({ invoice, customerMap, event }) {
     event === 'payment' &&
     (currentPaid > emailedPaid + 0.005 ||
       invoice.invoiceEmailedStatus !== invoice.paymentStatus)
-  if (!isInitial && !isResend) {
+  const isFulfillmentResend =
+    event === 'fulfillment' &&
+    (shipDate !== invoice.invoiceEmailedShipDate ||
+      trackingNum !== invoice.invoiceEmailedTrackingNum)
+  if (!isInitial && !isResend && !isFulfillmentResend) {
     console.log(`[email] no action for invoice ${invoice._id} (event=${event})`)
     return
   }
@@ -757,11 +743,15 @@ async function dispatchInvoiceLifecycleEmails({ invoice, customerMap, event }) {
   // every reasonLabel branch maps to exactly one source enum value.
   const source = isInitial
     ? 'invoice_created'
+    : isFulfillmentResend
+    ? 'fulfillment_updated'
     : currentPaid > emailedPaid + 0.005
     ? 'payment_recorded'
     : 'status_changed'
   const reasonLabel = isInitial
     ? 'initial'
+    : isFulfillmentResend
+    ? `fulfillment updated (shipDate=${shipDate || '(none)'}, tracking=${trackingNum || '(none)'})`
     : source === 'payment_recorded'
     ? `payment recorded (paid $${emailedPaid.toFixed(2)} → $${currentPaid.toFixed(2)})`
     : `status changed (${invoice.invoiceEmailedStatus || '(none)'} → ${invoice.paymentStatus})`
@@ -774,6 +764,12 @@ async function dispatchInvoiceLifecycleEmails({ invoice, customerMap, event }) {
     invoice.invoiceEmailLastSentAt = now
     invoice.invoiceEmailedStatus = invoice.paymentStatus
     invoice.invoiceEmailedAmountPaid = currentPaid
+    // Fulfillment snapshot: only overwrite when this send was triggered by
+    // fulfillment so that payment re-sends don't erase the shipping snapshot.
+    if (event === 'fulfillment') {
+      invoice.invoiceEmailedShipDate = shipDate
+      invoice.invoiceEmailedTrackingNum = trackingNum
+    }
     invoice.lastEmailError = undefined
     recordEmailEvent(invoice, {
       triggerType: 'auto',

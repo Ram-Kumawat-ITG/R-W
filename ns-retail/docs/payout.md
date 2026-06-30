@@ -123,6 +123,17 @@ Settings → **Commission Configuration** tab and stored on
   Config edits bump `cdo_settings.commissionConfigVersion` and apply **only to future orders**;
   existing orders + their `cdo_commissions` are unaffected. The `cdo_commission` record's `rate`
   is the snapshot's blended `effectiveRate` (= commissionAmount ÷ Σ line revenue).
+- **Referral-rate snapshot is authoritative** (no live re-read): a returning customer's
+  order uses the `commissionRate` / `discountPercent` frozen in their
+  `cdo_applications.referral` snapshot at signup. `resolveOrderReferral` does **not**
+  re-read the practitioner's current catalogue rate (which would silently re-rate future
+  orders with no audit trail); it only fills a *missing* rate from the live code / program
+  default. The snapshot is the audit trail of the terms in effect at signup.
+- **Legacy fallback (compute-on-read)**: orders ingested before snapshots existed have
+  `commissionSnapshot: null`. `projectCommissionSnapshot(order)` reconstructs a best-effort
+  single blended line (`commissionAmount ÷ subtotal`, flagged `reconstructed`) so the Order
+  Details "Commission breakdown" still explains the math; `scripts/backfill-cdo-commission-snapshots.js`
+  persists those reconstructed snapshots.
 - **Audit**: every vendor-rate change (set/remove) appends a row to
   **`cdo_commission_config_history`** (`vendor, action, previousPercent, newPercent, version,
   changedBy, changedAt`), surfaced as "Recent changes" on the Commission Configuration tab.
@@ -548,6 +559,7 @@ Mutations are React Router **route actions** (embedded-admin), dispatched by a s
 
 | Risk | Guard |
 |---|---|
+| **Two commissions for one order** (concurrent webhooks) | **UNIQUE partial index on `cdo_commissions.orderId`** + `createCommissionForOrder` E11000 catch → loser treated as "already created", no second ledger entry. (Pre-existing dupes must be cleared via `scripts/dedupe-cdo-commissions.js` before the index can build.) |
 | Same commission batched twice | `payoutId` reservation + eligibility filter `payoutId: null` |
 | Two payouts for same practitioner/period | partial-unique index on open statuses + pre-check in `buildPayoutBatch` |
 | QBO create re-fired after a lost response | stable `requestid` (`cdo-bill-<id>` / `cdo-pay-<id>`) — QBO dedups |

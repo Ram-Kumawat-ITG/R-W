@@ -44,6 +44,30 @@ const cdoSettingSchema = new mongoose.Schema(
     // in cdo_commission_config_history.
     vendorCommissions: { type: [vendorCommissionSchema], default: [] },
     commissionConfigVersion: { type: Number, default: 1 },
+
+    // ── Tier-specific business rules (future-proof extension hook) ────
+    // Optional, per-discount-tier rules evaluated at validation time by
+    // cdo.service.evaluateTierRules (called from validateReferralCode). Empty
+    // = today's behavior: every active code is equally valid. A rule lets the
+    // program later express e.g. "30%+ codes are first-order only" or "10%
+    // codes are evergreen" by adding DATA here + a small evaluator — without
+    // rewriting the checkout-validation path. `strict:false` on the subdoc so
+    // new rule kinds need no migration; unknown kinds fail-open (ignored).
+    tierRules: {
+      type: [
+        new mongoose.Schema(
+          {
+            // Discount fraction this rule targets (0.30 = 30%); null = all tiers.
+            discountPercent: { type: Number, default: null },
+            kind: { type: String, default: null }, // e.g. "first_order_only"
+            enabled: { type: Boolean, default: true },
+            note: { type: String, default: null },
+          },
+          { _id: false, strict: false },
+        ),
+      ],
+      default: [],
+    },
   },
   { collection: "cdo_settings", timestamps: true, strict: true },
 );

@@ -153,17 +153,64 @@ export default function CdoCustomerSettings() {
             value={primary ? primary.code : "Not set"}
             hint={
               primary
-                ? `Discount ${formatPercent(primary.discountPercent)} · commission ${formatPercent(effectiveCommission)}`
+                ? `Patient discount ${formatPercent(primary.discountPercent)} · Practitioner commission ${formatPercent(effectiveCommission)}`
                 : "Set a primary from the Details tab so storefront links resolve."
             }
           />
         </s-stack>
       </s-section>
 
+      {/* All ACTIVE codes side-by-side (bug 8). A practitioner can run several
+          tiers at once (e.g. 10% / 20% / 35%), so surfacing them together here
+          lets an admin spot competing offers and consolidate. Labels are
+          explicit (bug 6): the patient's discount vs the practitioner's earning
+          rate are easy to confuse when both are stored as a fraction. */}
+      <s-section heading="Active referral codes">
+        <s-stack direction="block" gap="tight">
+          <s-paragraph tone="subdued">
+            Every code this practitioner currently has ACTIVE. Manage (create /
+            archive / set primary) from the Details tab.
+          </s-paragraph>
+          {codes.filter((c) => c.status === "active").length === 0 ? (
+            <s-paragraph tone="subdued">No active codes.</s-paragraph>
+          ) : (
+            <s-table>
+              <s-table-header-row>
+                <s-table-header>Code</s-table-header>
+                <s-table-header>Patient discount %</s-table-header>
+                <s-table-header>Practitioner commission %</s-table-header>
+                <s-table-header>Primary</s-table-header>
+              </s-table-header-row>
+              <s-table-body>
+                {codes
+                  .filter((c) => c.status === "active")
+                  .map((c) => (
+                    <s-table-row key={c.id || c.code}>
+                      <s-table-cell>{c.code}</s-table-cell>
+                      <s-table-cell>{formatPercent(c.discountPercent)}</s-table-cell>
+                      <s-table-cell>
+                        {formatPercent(
+                          c.commissionRate != null
+                            ? c.commissionRate
+                            : settings.defaultCommissionRate,
+                        )}
+                        {c.commissionRate == null ? " (default)" : ""}
+                      </s-table-cell>
+                      <s-table-cell>
+                        {c.isPrimary ? <s-badge tone="info">Primary</s-badge> : "—"}
+                      </s-table-cell>
+                    </s-table-row>
+                  ))}
+              </s-table-body>
+            </s-table>
+          )}
+        </s-stack>
+      </s-section>
+
       <s-section heading="Commission settings">
         <s-stack direction="block" gap="tight">
           <Row
-            label="Effective commission rate"
+            label="Effective practitioner commission rate"
             value={formatPercent(effectiveCommission)}
             hint={
               primary?.commissionRate != null

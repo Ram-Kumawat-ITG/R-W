@@ -318,6 +318,7 @@ function Extension() {
       if (applyResult?.type === "success") {
         applyState.value = "applied";
         applyMessage.value = `${confirmedCode} applied`;
+        // Customer tagging happens AFTER order is placed via the orders/create webhook.
       } else {
         applyState.value = "error";
         applyMessage.value =
@@ -353,7 +354,19 @@ function Extension() {
     // Valid for THIS buyer: same practitioner as an existing binding, or a
     // first-time / no-binding patient, AND the code is active + its
     // practitioner exists. Leave the discount applied; checkout proceeds.
+    // Stamp the cart attribute so the webhook extracts this code from
+    // note_attributes instead of falling back to the customer's saved tag.
     if (result?.valid) {
+      const confirmedCode = result.code || code;
+      try {
+        await shopify.applyAttributeChange({
+          type: "updateAttribute",
+          key: CART_ATTR_KEY,
+          value: confirmedCode,
+        });
+      } catch (err) {
+        console.warn("[checkout-ui-code] cart-attr stamp failed for referral link:", err);
+      }
       referralBlockMessage.value = null;
       linkChecking.value = false;
       return;
@@ -463,6 +476,7 @@ function Extension() {
       if (result?.type === "success") {
         applyState.value = "applied";
         applyMessage.value = `${code} applied`;
+        // Customer tagging happens AFTER order is placed via the orders/create webhook.
       } else {
         applyState.value = "error";
         applyMessage.value =

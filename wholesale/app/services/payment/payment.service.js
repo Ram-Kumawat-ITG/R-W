@@ -242,7 +242,13 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
       billingId: targetBillingId,
       amount,
       currency: invoice.currency,
-      orderId: invoice.shopifyOrderId,
+      // A UNIQUE per-order reference. Drop-ship invoices all charge ONE shared
+      // vault, so a unique orderid is the only lever (this processor forbids
+      // the `dup_seconds` override) to let NMI's gateway-level duplicate check
+      // distinguish distinct same-amount orders — IF the gateway's "Duplicate
+      // Transaction Checking" is configured to key on order id. Falls back to
+      // the invoice id so the reference is never empty.
+      orderId: invoice.shopifyOrderId || invoice._id?.toString(),
       invoiceNumber: invoice.qboDocNumber || invoice.qboInvoiceId,
     })
   } catch (err) {

@@ -32,6 +32,17 @@ export const schedulerConfig = {
   billReconcileCron: readEnv("CDO_BILL_RECONCILE_CRON", { fallback: "0 */6 * * *" }),
   billReconcileIntervalOverride: readEnv("CDO_BILL_RECONCILE_INTERVAL"),
 
+  // ── Wholesale→Retail fulfillment reconciliation cadence ──
+  // Pull-based backstop for the drop-ship fulfillment mirror: when a WHOLESALE
+  // dropship order is fulfilled, fulfill the linked RETAIL order directly from
+  // the shared Mongo DB (no dependency on the wholesale→ns-retail HTTP push
+  // being reachable). Production every 10 min; dev/test uses
+  // CDO_FULFILLMENT_RECONCILE_INTERVAL (e.g. "1 minute").
+  fulfillmentReconcileCron: readEnv("CDO_FULFILLMENT_RECONCILE_CRON", {
+    fallback: "*/10 * * * *",
+  }),
+  fulfillmentReconcileIntervalOverride: readEnv("CDO_FULFILLMENT_RECONCILE_INTERVAL"),
+
   // Hard kill switch — when true the scheduler never boots (entry.server
   // skips getAgenda()). Useful for one-off processes / migrations / tests.
   disabled: readBool("CDO_SCHEDULER_DISABLED", false),

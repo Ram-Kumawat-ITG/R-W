@@ -3,6 +3,7 @@ import {
   useLoaderData,
   useNavigate,
   useNavigation,
+  useRevalidator,
 } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
@@ -10,6 +11,7 @@ import connectDB from "../services/APIService/mongo.service";
 import ShopifyOrder from "../models/order.server";
 import Invoice from "../models/invoice.server";
 import { RETAIL_CUSTOMER_EMAIL } from "../services/dropship/dropship.config";
+import { carrierDisplayName } from "../utils/shipping.constants";
 import { ProcessingBadge, PaymentMethodShortText } from "../components/admin-ui";
 import {
   formatAmount,
@@ -84,7 +86,6 @@ const METHOD_OPTIONS = [
   { value: "card", label: "Card" },
   { value: "ach", label: "ACH" },
   { value: "check", label: "Cheque" },
-  { value: "immediate", label: "Immediate (pay link)" },
 ];
 
 // Quick invoice flags — composite predicates that don't map to a single
@@ -277,7 +278,8 @@ export const loader = async ({ request }) => {
     .select(
       "shopifyOrderId shopifyOrderNumber shopifyOrderName customerEmail " +
         "currency totalAmount processingStatus paymentStatus paidAt " +
-        "qboInvoiceId invoiceRef receivedAt completedAt processingError rejectionCode",
+        "qboInvoiceId invoiceRef receivedAt completedAt processingError rejectionCode " +
+        "fulfillmentStatus shippedAt deliveredAt fulfillments",
     )
     .lean();
 
@@ -316,6 +318,20 @@ export const loader = async ({ request }) => {
         completedAt: r.completedAt || null,
         processingError: r.processingError || null,
         rejectionCode: r.rejectionCode || null,
+        fulfillmentStatus: r.fulfillmentStatus || null,
+        shippedAt: r.shippedAt || null,
+        deliveredAt: r.deliveredAt || null,
+        // First fulfillment with a tracking URL — used for the Delivery
+        // column link. Formatted server-side so shipping.constants stays
+        // out of the browser bundle.
+        primaryTracking: (() => {
+          const f = (r.fulfillments || []).find((f) => f.trackingUrl || f.trackingNumber);
+          if (!f) return null;
+          return {
+            carrier: carrierDisplayName(f.carrierKey, f.trackingCompany),
+            trackingUrl: f.trackingUrl || null,
+          };
+        })(),
         invoice: inv
           ? {
               paymentStatus: inv.paymentStatus,
@@ -389,6 +405,7 @@ export default function OrdersList() {
   const { rows, total, page, pageSize, filters, sort, dir } = useLoaderData();
   const navigate = useNavigate();
   const navigation = useNavigation();
+  const revalidator = useRevalidator();
   const shopify = useAppBridge();
   const loadedToastShown = useRef(false);
 
@@ -399,7 +416,8 @@ export default function OrdersList() {
     shopify?.toast?.show(`Loaded ${total} ${total === 1 ? "order" : "orders"}`);
   }, [total, shopify]);
 
-  const tableLoading = navigation.state === "loading";
+  const tableLoading = navigation.state === "loading" || revalidator.state !== "idle";
+  const refreshLoading = revalidator.state !== "idle";
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const firstShown = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const lastShown = Math.min(page * pageSize, total);
@@ -555,6 +573,14 @@ export default function OrdersList() {
             <s-button variant="tertiary" onClick={resetFilters}>
               Reset
             </s-button>
+            <s-button
+              variant="tertiary"
+              icon="refresh"
+              onClick={() => revalidator.revalidate()}
+              {...(refreshLoading ? { loading: true } : {})}
+            >
+              Refresh
+            </s-button>
             {hasActiveFilter && (
               <s-text tone="subdued">
                 {activeChips.length} filter
@@ -624,11 +650,8 @@ export default function OrdersList() {
               <s-table-header>Settled via</s-table-header>
               <s-table-header>Settled at</s-table-header>
               <s-table-header>Due</s-table-header>
-              <s-table-header>Remarks</s-table-header>
-              <s-table-header>Order date</s-table-header>
-              {/* Dedicated action column — replaces the previous
-                  whole-row click navigation. See the inline comment on
-                  the View button below for the rationale. */}
+              <s-table-header>Shipping status</s-table-header>
+              <s-table-header>Delivery status</s-table-header>
               <s-table-header>Actions</s-table-header>
             </s-table-header-row>
             <s-table-body>
@@ -646,7 +669,14 @@ export default function OrdersList() {
                 return (
                   <s-table-row key={r.id}>
                     <s-table-cell>
-                      <s-text>{orderLabel}</s-text>
+                      <s-stack direction="block" gap="none">
+                        <s-text>{orderLabel}</s-text>
+                        {r.receivedAt && (
+                          <s-text tone="subdued">
+                            {new Date(r.receivedAt).toLocaleDateString()}
+                          </s-text>
+                        )}
+                      </s-stack>
                     </s-table-cell>
                     <s-table-cell>{r.customerEmail || "—"}</s-table-cell>
                     <s-table-cell>
@@ -680,15 +710,10 @@ export default function OrdersList() {
                       <DueDateCell invoice={r.invoice} />
                     </s-table-cell>
                     <s-table-cell>
-                      <RemarksCell
-                        invoice={r.invoice}
-                        currency={r.currency}
-                      />
+                      <ShippingStatusCell order={r} />
                     </s-table-cell>
                     <s-table-cell>
-                      {r.receivedAt
-                        ? new Date(r.receivedAt).toLocaleString()
-                        : "—"}
+                      <DeliveryStatusCell order={r} />
                     </s-table-cell>
                     <s-table-cell>
                       <s-button
@@ -858,88 +883,84 @@ function SettledAtCell({ invoice }) {
   return <s-text>{new Date(invoice.paymentSettledAt).toLocaleString()}</s-text>;
 }
 
-// Render the Remarks cell — latest follow-up note from Invoice.remarks[]
-// plus a cheque-specific overdue warning. Strategy:
-//   1. Cheque/ACH pending invoices ALWAYS get a "Payment Due — $X"
-//      reminder line, even before CRON has logged anything, so admins
-//      can spot manual-collection work at a glance.
-//   2. Overdue (qboDueDate < today AND unpaid) renders in critical
-//      tone with an "Overdue" flag.
-//   3. The most recent remark message (from CRON ticks or admin
-//      actions) is shown underneath with its timestamp.
-//   4. A "+N more" count points to Order Details for the full ledger.
-//
-// Paid invoices show "—" unless a remark exists (still useful for the
-// post-payment audit trail).
-function RemarksCell({ invoice, currency }) {
-  if (!invoice) return <s-text tone="subdued">—</s-text>;
-  const outstanding = Number(
-    ((invoice.amountDue ?? 0) - (invoice.amountPaid ?? 0)).toFixed(2),
-  );
-  const isUnpaid =
-    invoice.paymentStatus !== "paid" && invoice.paymentStatus !== "cancelled";
-  const isManual =
-    invoice.paymentMethod === "check" || invoice.paymentMethod === "ach";
-  // Prefer the full-datetime dueAt (driven by INVOICE_TERMS_MINUTES so
-  // the testing knob can flip invoices overdue within minutes); fall
-  // back to the QBO date-only field for older invoices that pre-date
-  // dueAt.
-  const overdue = isUnpaid && isOverdueByInvoice(invoice, new Date());
-  const latest = invoice.latestRemark;
-  const moreCount = Math.max(0, (invoice.remarkCount || 0) - 1);
+// Fulfillment / shipping status for the Order List — left of the two new
+// shipping columns. Shows the Shopify fulfilment state + shipped date.
+function ShippingStatusCell({ order }) {
+  const { fulfillmentStatus, shippedAt, processingStatus } = order;
 
-  // Nothing to surface — paid + no historical remark — render the dash.
-  if (!isUnpaid && !latest) {
+  if (processingStatus === "cancelled" && !shippedAt) {
     return <s-text tone="subdued">—</s-text>;
   }
 
-  // Synthetic header line for unpaid cheque/ACH invoices. CRON adds its
-  // own reminder remark on each tick; this static line is the always-on
-  // collections cue so the column is meaningful even before CRON has
-  // run for the first time.
-  const showChequeWarning = isUnpaid && isManual;
-  const showFailedWarning = invoice.paymentStatus === "failed";
-  const methodLabel =
-    invoice.paymentMethod === "ach" ? "ACH" : invoice.paymentMethod === "check" ? "Cheque" : null;
+  if (fulfillmentStatus === "fulfilled" || (shippedAt && !fulfillmentStatus)) {
+    return (
+      <s-stack direction="block" gap="none">
+        {shippedAt && (
+          <s-text tone="subdued">{new Date(shippedAt).toLocaleDateString()}</s-text>
+        )}
+        <s-badge tone="success">Fulfilled</s-badge>
+      </s-stack>
+    );
+  }
 
-  return (
-    <s-stack direction="block" gap="none">
-      {showChequeWarning && (
-        <>
-          <s-text tone="critical">
-            <strong>Payment Due — {formatAmount(outstanding, currency)}</strong>
-          </s-text>
-          <s-text tone={overdue ? "critical" : "subdued"}>
-            {methodLabel} pending{overdue ? " · OVERDUE" : ""}
-          </s-text>
-        </>
-      )}
-      {showFailedWarning && !showChequeWarning && (
-        <>
-          <s-text tone="critical">
-            <strong>Payment Failed — {formatAmount(outstanding, currency)}</strong>
-          </s-text>
-          <s-text tone="critical">
-            {invoice.attemptCount}/{invoice.maxAttempts} attempts
-          </s-text>
-        </>
-      )}
-      {latest && (
-        <s-text tone="subdued">
-          {latest.message}
-          {latest.createdAt
-            ? ` · ${new Date(latest.createdAt).toLocaleDateString()}`
-            : ""}
-        </s-text>
-      )}
-      {moreCount > 0 && (
-        <s-text tone="subdued">+{moreCount} more (see Order)</s-text>
-      )}
-      {!showChequeWarning && !showFailedWarning && !latest && (
-        <s-text tone="subdued">—</s-text>
-      )}
-    </s-stack>
-  );
+  if (fulfillmentStatus === "partial") {
+    return (
+      <s-stack direction="block" gap="none">
+        {shippedAt && (
+          <s-text tone="subdued">{new Date(shippedAt).toLocaleDateString()}</s-text>
+        )}
+        <s-badge tone="warning">Partially fulfilled</s-badge>
+      </s-stack>
+    );
+  }
+
+  return <s-badge tone="warning">Unfulfilled</s-badge>;
+}
+
+// Carrier delivery status for the Order List — right of the two new shipping
+// columns. Shows whether the parcel has been delivered, is in transit, or
+// hasn't shipped yet. Delivered date and a tracking deep-link are surfaced
+// when available.
+function DeliveryStatusCell({ order }) {
+  const { deliveredAt, shippedAt, primaryTracking } = order;
+
+  if (deliveredAt) {
+    return (
+      <s-stack direction="block" gap="none">
+        <s-text tone="subdued">{new Date(deliveredAt).toLocaleDateString()}</s-text>
+        <s-badge tone="success">Delivered</s-badge>
+      </s-stack>
+    );
+  }
+
+  if (primaryTracking) {
+    return (
+      <s-stack direction="block" gap="none">
+        {shippedAt && (
+          <s-text tone="subdued">{new Date(shippedAt).toLocaleDateString()}</s-text>
+        )}
+        <s-badge tone="info">In transit</s-badge>
+        {primaryTracking.trackingUrl ? (
+          <s-link url={primaryTracking.trackingUrl} external>
+            {primaryTracking.carrier} ↗
+          </s-link>
+        ) : (
+          <s-text tone="subdued">{primaryTracking.carrier}</s-text>
+        )}
+      </s-stack>
+    );
+  }
+
+  if (shippedAt) {
+    return (
+      <s-stack direction="block" gap="none">
+        <s-text tone="subdued">{new Date(shippedAt).toLocaleDateString()}</s-text>
+        <s-badge tone="info">Shipped</s-badge>
+      </s-stack>
+    );
+  }
+
+  return <s-badge>Not shipped</s-badge>;
 }
 
 // Render the QBO due date for an invoice. Highlights overdue + unpaid in

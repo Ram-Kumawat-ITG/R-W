@@ -3,33 +3,49 @@ import {
   useLoaderData,
   useNavigate,
   useNavigation,
+  useRevalidator,
   useSearchParams,
+  useFetcher,
 } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import connectDB from "../services/APIService/mongo.service";
 import ShopifyOrder from "../models/order.server";
+import Invoice from "../models/invoice.server";
+import DropshipMapping from "../models/dropshipMapping.server";
+import RetailCdoOrder from "../models/retailCdoOrder.server";
 import { RETAIL_CUSTOMER_EMAIL } from "../services/dropship/dropship.config";
+import { getInvoiceWebUrl } from "../services/qbo/qbo.service";
 import {
   carrierDisplayName,
   deriveDeliveryStatus,
 } from "../utils/shipping.constants";
-import { ShipmentStatusBadge, AdvancedFilters } from "../components/admin-ui";
+import {
+  ShipmentStatusBadge,
+  PaymentStatusBadge,
+  AdvancedFilters,
+} from "../components/admin-ui";
 import { formatAmount, parseDateOnly, startOfDay } from "../utils/format.utils";
 
 // Admin Orders — orders placed by the retail drop-ship customer
 // (DROPSHIP_RETAIL_CUSTOMER_EMAIL). These run on a separate flow from the
 // wholesale order pipeline: each new order gets an UNPAID QBO invoice on
-// creation, and the dedicated process-dropship-payments CRON collects it
-// against the configured drop-ship NMI vault (DROPSHIP_NMI_VAULT_ID) — they
-// are NOT touched by the wholesale payment CRON. (Orders ingested before
-// drop-ship invoicing existed remain as legacy "Admin order" rows with no
-// invoice.)
+// creation, collected via the Admin Order Batch Payment UI
+// (/app/admin-orders/batch) rather than an auto-charge CRON. The admin reviews
+// all unpaid invoices, enters a single payment reference, and marks the batch
+// paid in one step. (Orders ingested before drop-ship invoicing existed remain
+// as legacy "Admin order" rows with no invoice.)
 //
 // This page is read-only — it surfaces what Shopify sent us so an admin can
 // audit drop-ship fulfillment.
 
 const PAGE_SIZE = 15;
+
+// Columns exposed as clickable, sortable table headers (retail Order List
+// parity). Whitelisted so a hand-edited `?sort=` can't inject an arbitrary
+// Mongo path into the query.
+const SORT_FIELDS = new Set(["receivedAt", "totalAmount"]);
+const DEFAULT_SORT = "receivedAt";
 
 // Fulfillment filter chips. Each maps to the set of fulfillmentStatus values
 // we may have stored — both REST webhook values (`fulfilled` / `partial` /
@@ -93,6 +109,10 @@ export const loader = async ({ request }) => {
   const dateFrom = (url.searchParams.get("dateFrom") || "").trim();
   const dateTo = (url.searchParams.get("dateTo") || "").trim();
   const page = Math.max(1, Number(url.searchParams.get("page") || 1));
+  const sort = SORT_FIELDS.has(url.searchParams.get("sort") || "")
+    ? url.searchParams.get("sort")
+    : DEFAULT_SORT;
+  const dir = url.searchParams.get("dir") === "asc" ? "asc" : "desc";
 
   // Anchor the whole page on the retail drop-ship customer's email — the
   // single source of truth for "is this an Admin Order". Captures every such
@@ -138,21 +158,109 @@ export const loader = async ({ request }) => {
 
   const total = await ShopifyOrder.countDocuments(filter);
   const rows = await ShopifyOrder.find(filter)
-    .sort({ receivedAt: -1 })
+    .sort({ [sort]: dir === "asc" ? 1 : -1 })
     .skip((page - 1) * PAGE_SIZE)
     .limit(PAGE_SIZE)
     .select(
       "shopifyOrderId shopifyOrderNumber shopifyOrderName customerEmail " +
         "currency totalAmount financialStatus fulfillmentStatus processingStatus " +
-        "fulfillments deliveredAt receivedAt",
+        "fulfillments trackingHistory shippedAt deliveredAt receivedAt invoiceRef",
     )
     .lean();
+
+  // Join the linked drop-ship invoices in one query (no N+1) so the list can
+  // show a QBO Invoice column — payment status, a live "Open in QBO" deep
+  // link, and an in-app PDF preview — mirroring the retail Order List. Legacy
+  // `admin_order` rows have no invoiceRef and degrade to "—".
+  const invoiceIds = rows.map((r) => r.invoiceRef).filter(Boolean);
+  const invoiceById = new Map();
+  if (invoiceIds.length) {
+    const invoices = await Invoice.find({ _id: { $in: invoiceIds } })
+      .select(
+        "qboInvoiceId qboDocNumber paymentStatus paymentMethod amountDue " +
+          "amountPaid attemptCount maxAttempts remarks",
+      )
+      .lean();
+    for (const inv of invoices) invoiceById.set(inv._id.toString(), inv);
+  }
+
+  // Vendor Bill (A/P) join — cross-repo, READ-ONLY. Each drop-ship Admin Order
+  // has a linked ns-retail order that carries the retail QBO **Vendor Bill**
+  // (what the retail company owes Natural Solution Wholesale for the dropship).
+  // Resolve it in two hops on the shared DB (no N+1, no live API call):
+  //   wholesale shopifyOrderId → dropship_mappings.wholesaleOrderId
+  //   → mapping.retailOrderGid → cdo_orders.shopifyOrderId → retailQbo bill fields.
+  // The bill is owned + written by ns-retail; the wholesale list only reads it.
+  const wsOrderIds = rows.map((r) => String(r.shopifyOrderId)).filter(Boolean);
+  const vendorBillByOrderId = new Map();
+  if (wsOrderIds.length) {
+    const maps = await DropshipMapping.find({
+      wholesaleOrderId: { $in: wsOrderIds },
+    })
+      .select("wholesaleOrderId retailOrderGid")
+      .lean();
+    const retailGidByWsId = new Map();
+    const retailGids = [];
+    for (const m of maps) {
+      if (m.wholesaleOrderId && m.retailOrderGid) {
+        retailGidByWsId.set(String(m.wholesaleOrderId), m.retailOrderGid);
+        retailGids.push(m.retailOrderGid);
+      }
+    }
+    if (retailGids.length) {
+      const cdoRows = await RetailCdoOrder.find({
+        shopifyOrderId: { $in: retailGids },
+      })
+        .select("shopifyOrderId retailQbo")
+        .lean();
+      const rqByGid = new Map();
+      for (const c of cdoRows) rqByGid.set(c.shopifyOrderId, c.retailQbo || null);
+      for (const [wsId, gid] of retailGidByWsId) {
+        const rq = rqByGid.get(gid);
+        if (rq?.qboBillId) {
+          vendorBillByOrderId.set(wsId, {
+            billId: rq.qboBillId,
+            docNumber: rq.qboBillDocNumber || null,
+            amount: rq.qboBillTotal ?? null,
+            billUrl: rq.billUrl || null,
+            syncStatus: rq.billSyncStatus || null,
+            paymentStatus: rq.billPaymentStatus || null,
+            reconcileStatus: rq.billReconcileStatus || null,
+          });
+        }
+      }
+    }
+  }
 
   return {
     rows: rows.map((r) => {
       const fulfillments = Array.isArray(r.fulfillments) ? r.fulfillments : [];
-      const trackingCount = fulfillments.filter((f) => f.trackingNumber).length;
-      const firstTracked = fulfillments.find((f) => f.trackingNumber) || null;
+      const deliveryStatus = deriveDeliveryStatus(fulfillments);
+
+      // Delivery date — prefer the order-level official stamp, then fall back
+      // to the latest per-shipment `deliveredAt`, then to the tracking-history
+      // row where the carrier first reported `delivered`. The order-level
+      // value is only set once EVERY active shipment is delivered, so a fully
+      // delivered order can still lack it; these fallbacks surface a real
+      // delivery date without a per-row live Shopify call. Gated to fully
+      // delivered orders so a partial delivery never shows a misleading date.
+      let deliveredAtMs = r.deliveredAt ? new Date(r.deliveredAt).getTime() : null;
+      if (deliveredAtMs == null && deliveryStatus === "delivered") {
+        const candidates = [
+          ...fulfillments.map((f) =>
+            f.deliveredAt ? new Date(f.deliveredAt).getTime() : NaN,
+          ),
+          ...(Array.isArray(r.trackingHistory) ? r.trackingHistory : [])
+            .filter(
+              (h) =>
+                String(h.shipmentStatus || "").toLowerCase() === "delivered" &&
+                h.at,
+            )
+            .map((h) => new Date(h.at).getTime()),
+        ].filter((t) => Number.isFinite(t));
+        if (candidates.length) deliveredAtMs = Math.max(...candidates);
+      }
+
       return {
         id: r._id.toString(),
         shopifyOrderId: r.shopifyOrderId,
@@ -163,25 +271,71 @@ export const loader = async ({ request }) => {
         financialStatus: r.financialStatus || null,
         fulfillmentStatus: r.fulfillmentStatus || null,
         processingStatus: r.processingStatus || null,
+        // Fulfillment (ship) date — earliest fulfillment date across
+        // fulfillments[], denormalized onto the order. Shown under the
+        // Fulfillment badge.
+        shippedAt: r.shippedAt ? new Date(r.shippedAt).toISOString() : null,
         // Order-level carrier delivery status, rolled up from fulfillments[].
-        deliveryStatus: deriveDeliveryStatus(fulfillments),
-        deliveredAt: r.deliveredAt ? new Date(r.deliveredAt).toISOString() : null,
+        deliveryStatus,
+        deliveredAt: deliveredAtMs ? new Date(deliveredAtMs).toISOString() : null,
         receivedAt: r.receivedAt ? new Date(r.receivedAt).toISOString() : null,
-        trackingCount,
-        firstTracking: firstTracked
-          ? {
-              carrier: carrierDisplayName(
-                firstTracked.carrierKey,
-                firstTracked.trackingCompany,
-              ),
-              number: firstTracked.trackingNumber || null,
-            }
-          : null,
+        // Tracking — one entry per fulfillment that carries tracking, each a
+        // carrier name + its resolved deep-link (carrier page, tracking number
+        // pre-filled). The tracking number itself is intentionally not shown
+        // in the list; the carrier name is the clickable link.
+        tracking: fulfillments
+          .filter((f) => f.trackingNumber || f.trackingUrl)
+          .map((f) => ({
+            company: carrierDisplayName(f.carrierKey, f.trackingCompany),
+            url: f.trackingUrl || null,
+          })),
+        // Linked drop-ship invoice summary for the QBO Invoice column. The
+        // QBO web URL is built here in the loader (server-only) and passed as
+        // a plain string so the client never imports the QBO service.
+        invoice: (() => {
+          const inv = r.invoiceRef
+            ? invoiceById.get(r.invoiceRef.toString())
+            : null;
+          if (!inv?.qboInvoiceId) return null;
+          return {
+            qboInvoiceId: inv.qboInvoiceId,
+            qboDocNumber: inv.qboDocNumber || null,
+            paymentStatus: inv.paymentStatus || null,
+            qboInvoiceUrl: getInvoiceWebUrl(inv.qboInvoiceId),
+          };
+        })(),
+        // Linked ns-retail Vendor Bill (A/P) — amount + status for the Vendor
+        // Bill column. Null when the order has no linked retail bill yet.
+        vendorBill: vendorBillByOrderId.get(String(r.shopifyOrderId)) || null,
+        // Invoice remarks for the Remarks column — the latest drop-ship
+        // collection / admin note + total count (full timeline on the detail
+        // page). Mirrors the wholesale Orders list's Remarks column.
+        remarks: (() => {
+          const inv = r.invoiceRef
+            ? invoiceById.get(r.invoiceRef.toString())
+            : null;
+          if (!inv) return null;
+          const list = Array.isArray(inv.remarks) ? inv.remarks : [];
+          const last = list.length ? list[list.length - 1] : null;
+          return {
+            paymentStatus: inv.paymentStatus || null,
+            amountDue: inv.amountDue ?? null,
+            amountPaid: inv.amountPaid ?? null,
+            attemptCount: inv.attemptCount ?? null,
+            maxAttempts: inv.maxAttempts ?? null,
+            latest: last
+              ? { message: last.message || null, createdAt: last.createdAt || null }
+              : null,
+            count: list.length,
+          };
+        })(),
       };
     }),
     total,
     page,
     pageSize: PAGE_SIZE,
+    sort,
+    dir,
     fulfillment,
     payment,
     q,
@@ -225,12 +379,140 @@ function FinancialBadge({ status }) {
   );
 }
 
+// Carrier tracking link(s), rendered inside the Fulfillment cell (under the
+// badge) — one clickable carrier link per shipment, deep-linking to the
+// carrier's tracking page (the tracking number is pre-filled in the URL but
+// intentionally not shown; clicking the carrier name opens its tracking
+// page). Renders nothing until the order ships, so an unfulfilled row shows
+// just its badge. Falls back to plain carrier text when no URL resolved.
+function TrackingLinks({ tracking }) {
+  if (!Array.isArray(tracking) || tracking.length === 0) return null;
+  return (
+    <s-stack direction="block" gap="none">
+      {tracking.map((t, i) =>
+        t.url ? (
+          <s-link key={i} href={t.url} target="_blank">
+            {t.company || "Track"} ↗
+          </s-link>
+        ) : (
+          <s-text key={i}>{t.company || "Tracking"}</s-text>
+        ),
+      )}
+    </s-stack>
+  );
+}
+
+// QBO Invoice cell — drop-ship invoice summary, mirroring the retail Order
+// List's QBO column: the invoice payment status (the wholesale→retail
+// collection state, distinct from Shopify's customer-facing "Payment"),
+// an in-app PDF preview, and a deep link into QuickBooks. Renders "—" for
+// legacy admin orders that never had an invoice created.
+function QboInvoiceCell({ invoice, previewing, onPreview }) {
+  if (!invoice?.qboInvoiceId) return <s-text tone="subdued">—</s-text>;
+  return (
+    <s-stack direction="block" gap="small-200">
+      <PaymentStatusBadge status={invoice.paymentStatus} />
+      <s-stack direction="inline" gap="small-200" alignItems="center" wrap>
+        <s-button variant="tertiary" disabled={previewing} onClick={onPreview}>
+          {previewing ? "Opening…" : "Preview"}
+        </s-button>
+        {invoice.qboInvoiceUrl && (
+          <s-link href={invoice.qboInvoiceUrl} target="_blank">
+            Open in QBO{invoice.qboDocNumber ? ` ${invoice.qboDocNumber}` : ""} ↗
+          </s-link>
+        )}
+      </s-stack>
+    </s-stack>
+  );
+}
+
+// Vendor Bill cell — the linked ns-retail Vendor Bill (A/P): what the retail
+// company owes Natural Solution Wholesale for this drop-ship order. Shows the
+// bill amount + a settlement-status badge (Paid once reconciled against the
+// paid wholesale invoice, else Unpaid / Error), plus a deep link into QBO.
+// Renders "—" for orders with no linked retail bill (e.g. legacy admin orders).
+function VendorBillCell({ bill, currency }) {
+  if (!bill?.billId) return <s-text tone="subdued">—</s-text>;
+  let badge;
+  if (bill.paymentStatus === "paid") {
+    badge = <s-badge tone="success">Paid</s-badge>;
+  } else if (bill.reconcileStatus === "error") {
+    badge = <s-badge tone="critical">Reconcile error</s-badge>;
+  } else if (bill.syncStatus === "error") {
+    badge = <s-badge tone="critical">Error</s-badge>;
+  } else if (bill.syncStatus === "created") {
+    badge = <s-badge tone="warning">Unpaid</s-badge>;
+  } else {
+    badge = <s-badge tone="default">{bill.syncStatus || "Pending"}</s-badge>;
+  }
+  return (
+    <s-stack direction="block" gap="small-200">
+      <s-text>
+        {bill.amount != null ? formatAmount(bill.amount, currency) : "—"}
+      </s-text>
+      {badge}
+      {bill.billUrl && (
+        <s-link href={bill.billUrl} target="_blank">
+          Open in QBO{bill.docNumber ? ` ${bill.docNumber}` : ""} ↗
+        </s-link>
+      )}
+    </s-stack>
+  );
+}
+
+// Remarks cell — the latest drop-ship collection / admin note from the
+// invoice's remarks[] timeline + a "+N more" pointer to the detail page.
+// Surfaces a "Collection failed" header (with the outstanding balance +
+// attempt count) when the drop-ship charge has exhausted its retries — so the
+// duplicate-transaction / decline errors are visible at a glance. Renders "—"
+// when there's nothing to show. Mirrors the wholesale Orders list's Remarks
+// column (drop-ship invoices have no cheque/ACH "Payment Due" state).
+function RemarksCell({ remarks, currency }) {
+  if (!remarks) return <s-text tone="subdued">—</s-text>;
+  const latest = remarks.latest;
+  const moreCount = Math.max(0, (remarks.count || 0) - 1);
+  const failed = remarks.paymentStatus === "failed";
+  const outstanding = Number(
+    ((remarks.amountDue ?? 0) - (remarks.amountPaid ?? 0)).toFixed(2),
+  );
+  if (!failed && !latest) return <s-text tone="subdued">—</s-text>;
+  return (
+    <s-stack direction="block" gap="none">
+      {failed && (
+        <>
+          <s-text tone="critical">
+            <strong>Collection failed — {formatAmount(outstanding, currency)}</strong>
+          </s-text>
+          {remarks.attemptCount != null && remarks.maxAttempts != null && (
+            <s-text tone="critical">
+              {remarks.attemptCount}/{remarks.maxAttempts} attempts
+            </s-text>
+          )}
+        </>
+      )}
+      {latest && (
+        <s-text tone="subdued">
+          {latest.message}
+          {latest.createdAt
+            ? ` · ${new Date(latest.createdAt).toLocaleDateString()}`
+            : ""}
+        </s-text>
+      )}
+      {moreCount > 0 && (
+        <s-text tone="subdued">+{moreCount} more (see Order)</s-text>
+      )}
+    </s-stack>
+  );
+}
+
 export default function AdminOrdersList() {
   const {
     rows,
     total,
     page,
     pageSize,
+    sort,
+    dir,
     fulfillment,
     payment,
     q,
@@ -240,6 +522,7 @@ export default function AdminOrdersList() {
   } = useLoaderData();
   const navigate = useNavigate();
   const navigation = useNavigation();
+  const revalidator = useRevalidator();
   const shopify = useAppBridge();
   const [searchParams, setSearchParams] = useSearchParams();
   const loadedToastShown = useRef(false);
@@ -252,7 +535,80 @@ export default function AdminOrdersList() {
     );
   }, [total, shopify]);
 
-  const tableLoading = navigation.state === "loading";
+  // ── In-app QBO invoice PDF preview ───────────────────────────────────
+  // One fetcher serves the whole list (only one preview opens at a time).
+  // The window is opened synchronously in the click (user gesture) to
+  // survive popup blockers; we swap in the blob URL once the base64 PDF
+  // returns. Reuses the shared /api/admin/orders/:id/qbo-invoice-pdf
+  // endpoint that the Admin Order Details page already uses.
+  const pdfFetcher = useFetcher();
+  const pdfWindowRef = useRef(null);
+  const handledPdfRef = useRef(null);
+  const previewingId =
+    pdfFetcher.state !== "idle" ? pdfFetcher.formData?.get("orderId") : null;
+
+  const onPreviewInvoice = (orderId) => {
+    pdfWindowRef.current = window.open("about:blank", "_blank");
+    pdfFetcher.submit(
+      { orderId: orderId || "" },
+      { method: "POST", action: `/api/admin/orders/${orderId}/qbo-invoice-pdf` },
+    );
+  };
+
+  useEffect(() => {
+    if (!pdfFetcher.data || pdfFetcher.state !== "idle") return;
+    if (handledPdfRef.current === pdfFetcher.data) return;
+    handledPdfRef.current = pdfFetcher.data;
+    const data = pdfFetcher.data;
+    if (data.status === "success" && data.result?.base64) {
+      const { base64, contentType, filename } = data.result;
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const blob = new Blob([bytes], { type: contentType || "application/pdf" });
+      const blobUrl = URL.createObjectURL(blob);
+      const win = pdfWindowRef.current;
+      if (win && !win.closed) {
+        win.location.href = blobUrl;
+      } else {
+        const a = document.createElement("a");
+        a.href = blobUrl;
+        a.download = filename || "invoice.pdf";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      }
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+      pdfWindowRef.current = null;
+    } else if (data.status === "error") {
+      const win = pdfWindowRef.current;
+      if (win && !win.closed) win.close();
+      pdfWindowRef.current = null;
+      shopify?.toast?.show(data.message || "Failed to load invoice PDF", {
+        isError: true,
+      });
+    }
+  }, [pdfFetcher.data, pdfFetcher.state, shopify]);
+
+  // Clickable-header sort. Toggles desc → asc on the active column,
+  // defaulting new columns to desc. Preserves the active filters (they
+  // live in searchParams) and resets to page 1.
+  const setSort = (field) => {
+    const nextDir = sort === field && dir === "desc" ? "asc" : "desc";
+    const merged = new URLSearchParams(searchParams);
+    merged.set("sort", field);
+    merged.set("dir", nextDir);
+    merged.delete("page");
+    setSearchParams(merged);
+  };
+  const sortArrow = (field) =>
+    sort === field ? (dir === "asc" ? " ▲" : " ▼") : "";
+  // Only carry sort/dir through the filter form when they're non-default,
+  // so an unsorted, unfiltered view keeps a clean URL.
+  const sortParams =
+    sort !== DEFAULT_SORT || dir !== "desc" ? { sort, dir } : {};
+
+  const tableLoading = navigation.state === "loading" || revalidator.state !== "idle";
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const firstShown = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const lastShown = Math.min(page * pageSize, total);
@@ -277,14 +633,27 @@ export default function AdminOrdersList() {
 
   return (
     <s-page inlineSize="large" heading="Admin Orders">
+      <s-box paddingBlockEnd="base">
+        <s-stack direction="inline" gap="small-200" alignItems="center">
+          <s-button variant="primary" onClick={() => navigate("/app/admin-orders/batch")}>
+            Batch Payment
+          </s-button>
+          <s-text tone="subdued">
+            Mark multiple unpaid invoices paid in a single operation
+          </s-text>
+        </s-stack>
+      </s-box>
       <AdvancedFilters
         fields={FILTER_FIELDS}
         values={{ q, fulfillment, payment, dateFrom, dateTo }}
         defaults={FILTER_DEFAULTS}
+        extraParams={sortParams}
         applying={tableLoading}
+        onRefresh={() => revalidator.revalidate()}
+        refreshing={revalidator.state !== "idle"}
         description={`Orders placed by the retail drop-ship customer${
           customerEmail ? ` (${customerEmail})` : ""
-        }. Each new order gets an unpaid QBO invoice on creation; the drop-ship payment job collects it automatically against the card on file and marks it paid in QBO. They are handled separately from the wholesale payment flow.`}
+        }. Each new order gets an unpaid QBO invoice on creation. Use the Batch Payment button above to mark multiple invoices paid at once with a single payment reference.`}
       />
       <s-section padding="none">
         <s-box padding="base">
@@ -319,13 +688,22 @@ export default function AdminOrdersList() {
         ) : (
           <s-table loading={tableLoading}>
             <s-table-header-row>
-              <s-table-header>Order</s-table-header>
-              <s-table-header>Total</s-table-header>
+              <s-table-header>
+                <s-clickable onClick={() => setSort("receivedAt")}>
+                  Order{sortArrow("receivedAt")}
+                </s-clickable>
+              </s-table-header>
+              <s-table-header>
+                <s-clickable onClick={() => setSort("totalAmount")}>
+                  Total{sortArrow("totalAmount")}
+                </s-clickable>
+              </s-table-header>
               <s-table-header>Payment</s-table-header>
               <s-table-header>Fulfillment</s-table-header>
               <s-table-header>Delivery status</s-table-header>
-              <s-table-header>Tracking</s-table-header>
-              <s-table-header>Order date</s-table-header>
+              <s-table-header>QBO Invoice</s-table-header>
+              <s-table-header>Vendor Bill</s-table-header>
+              <s-table-header>Remarks</s-table-header>
               <s-table-header>Actions</s-table-header>
             </s-table-header-row>
             <s-table-body>
@@ -338,7 +716,14 @@ export default function AdminOrdersList() {
                 return (
                   <s-table-row key={r.id}>
                     <s-table-cell>
-                      <s-text>{orderLabel}</s-text>
+                      <s-stack direction="block" gap="none">
+                        <s-text>{orderLabel}</s-text>
+                        <s-text tone="subdued">
+                          {r.receivedAt
+                            ? new Date(r.receivedAt).toLocaleString()
+                            : "—"}
+                        </s-text>
+                      </s-stack>
                     </s-table-cell>
                     <s-table-cell>
                       <s-text>
@@ -351,41 +736,38 @@ export default function AdminOrdersList() {
                       <FinancialBadge status={r.financialStatus} />
                     </s-table-cell>
                     <s-table-cell>
-                      <FulfillmentBadge status={r.fulfillmentStatus} />
+                      <s-stack direction="block" gap="small-200">
+                        {r.shippedAt ? (
+                          <s-text tone="subdued">
+                            {new Date(r.shippedAt).toLocaleDateString()}
+                          </s-text>
+                        ) : null}
+                        <FulfillmentBadge status={r.fulfillmentStatus} />
+                        <TrackingLinks tracking={r.tracking} />
+                      </s-stack>
                     </s-table-cell>
                     <s-table-cell>
-                      <s-stack direction="block" gap="none">
-                        <ShipmentStatusBadge status={r.deliveryStatus} />
-                        {r.deliveryStatus === "delivered" && r.deliveredAt ? (
+                      <s-stack direction="block" gap="small-200">
+                        {r.deliveredAt ? (
                           <s-text tone="subdued">
                             {new Date(r.deliveredAt).toLocaleDateString()}
                           </s-text>
                         ) : null}
+                        <ShipmentStatusBadge status={r.deliveryStatus} />
                       </s-stack>
                     </s-table-cell>
                     <s-table-cell>
-                      {r.trackingCount > 0 ? (
-                        <s-stack direction="block" gap="none">
-                          <s-text>
-                            {r.firstTracking?.carrier || "Tracking"}
-                            {r.firstTracking?.number
-                              ? ` · ${r.firstTracking.number}`
-                              : ""}
-                          </s-text>
-                          {r.trackingCount > 1 && (
-                            <s-text tone="subdued">
-                              +{r.trackingCount - 1} more
-                            </s-text>
-                          )}
-                        </s-stack>
-                      ) : (
-                        <s-text tone="subdued">—</s-text>
-                      )}
+                      <QboInvoiceCell
+                        invoice={r.invoice}
+                        previewing={previewingId === r.id}
+                        onPreview={() => onPreviewInvoice(r.id)}
+                      />
                     </s-table-cell>
                     <s-table-cell>
-                      {r.receivedAt
-                        ? new Date(r.receivedAt).toLocaleString()
-                        : "—"}
+                      <VendorBillCell bill={r.vendorBill} currency={r.currency} />
+                    </s-table-cell>
+                    <s-table-cell>
+                      <RemarksCell remarks={r.remarks} currency={r.currency} />
                     </s-table-cell>
                     <s-table-cell>
                       <s-button

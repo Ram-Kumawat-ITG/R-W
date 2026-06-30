@@ -1,4 +1,4 @@
-import { useState } from 'preact/hooks'
+import { useState, useRef } from 'preact/hooks'
 import {
   useResource,
   useDebounced,
@@ -9,13 +9,46 @@ import {
   Table,
   Pagination,
 } from './ui.jsx'
-import { apiPost, ApiError } from './api.js'
-import { formatMoney, formatDate, formatPercent, formatNumber, titleCase } from './format.js'
+import { apiPost, ApiError } from '../../services/FullPageApi.jsx'
+import {
+  formatMoney,
+  formatDate,
+  formatPercent,
+  formatNumber,
+  titleCase,
+  payoutReasonMessage,
+} from './format.js'
 
 // Discount tiers offered when a practitioner creates a code. Kept in sync with
 // the backend's PORTAL_DISCOUNT_PERCENTS (extensions can't import server
 // modules) — update both if this list changes.
-const DISCOUNT_PERCENTS = [10, 15, 20, 25, 30, 35]
+const DISCOUNT_PERCENTS = [10, 15, 20, 25, 30, 35, 40]
+
+// Commission payout-status filter options (mirrors CdoCommission.payoutStatus).
+const COMMISSION_PAYOUT_STATUSES = [
+  { value: 'pending', label: 'Pending' },
+  { value: 'processing', label: 'Processing' },
+  { value: 'paid', label: 'Paid' },
+  { value: 'failed', label: 'Failed' },
+  { value: 'skipped', label: 'Skipped' },
+  { value: 'paused', label: 'Paused' },
+  { value: 'cancelled', label: 'Cancelled' },
+]
+
+// Payout-status filter options (mirrors CdoPayout.status; 'draft' is internal).
+const PAYOUT_STATUSES = [
+  { value: 'awaiting_approval', label: 'Awaiting approval' },
+  { value: 'approved', label: 'Approved' },
+  { value: 'processing', label: 'Processing' },
+  { value: 'awaiting_settlement', label: 'Awaiting settlement' },
+  { value: 'paid', label: 'Paid' },
+  { value: 'failed', label: 'Failed' },
+  { value: 'rejected', label: 'Rejected' },
+  { value: 'cancelled', label: 'Cancelled' },
+]
+
+const labelFor = (options, value) =>
+  options.find((o) => o.value === value)?.label || value
 
 function SectionShell({ heading, description, children }) {
   return (
@@ -30,9 +63,14 @@ function SectionShell({ heading, description, children }) {
 
 // ── Overview ─────────────────────────────────────────────────────────────────
 export function OverviewSection({ onAuthError }) {
-  const [range, setRange] = useState({ from: '', to: '' })
+  // `draft` = what's typed in the date inputs; `applied` = what the revenue
+  // query actually uses. Keeping them separate makes the filter explicit — it
+  // only runs on Apply, and Reset clears both — so "how do I apply / reset?" is
+  // answered by the buttons rather than a silent on-type refetch.
+  const [draft, setDraft] = useState({ from: '', to: '' })
+  const [applied, setApplied] = useState({ from: '', to: '' })
   const summary = useResource('summary', null, onAuthError)
-  const revenue = useResource('revenue', range, onAuthError)
+  const revenue = useResource('revenue', applied, onAuthError)
 
   if (summary.loading && !summary.data) return <Loading />
   if (summary.error) return <ErrorBanner message={summary.error} onRetry={summary.reload} />
@@ -40,35 +78,84 @@ export function OverviewSection({ onAuthError }) {
   const s = summary.data || {}
   const r = revenue.data || {}
 
+  const hasDraft = !!(draft.from || draft.to)
+  const hasApplied = !!(applied.from || applied.to)
+  const draftMatchesApplied = draft.from === applied.from && draft.to === applied.to
+  const lifetimeOrders = Number(s.lifetimeOrders) || 0
+
+  const applyRange = () => setApplied({ ...draft })
+  const resetRange = () => {
+    setDraft({ from: '', to: '' })
+    setApplied({ from: '', to: '' })
+  }
+
   return (
     <SectionShell heading="Overview" description="Your referral program at a glance.">
       <StatCards
         cards={[
-          { label: 'Referred patients', value: formatNumber(s.referredPatients) },
-          { label: 'Lifetime revenue', value: formatMoney(s.lifetimeRevenue), sub: 'From referred orders' },
-          { label: 'Total commission', value: formatMoney(s.totalCommission) },
-          { label: 'Paid commission', value: formatMoney(s.paidCommission) },
-          { label: 'Awaiting payout', value: formatMoney(s.awaitingPayoutCommission) },
-          { label: 'Pending commission', value: formatMoney(s.pendingCommission) },
-          { label: 'Active referral codes', value: formatNumber(s.activeReferralCodes) },
-          { label: 'Revenue this month', value: formatMoney(s.revenueThisMonth) },
+          { label: 'Referred patients', value: formatNumber(s.referredPatients), sub: 'Unique patients you referred' },
+          {
+            label: 'Lifetime revenue',
+            value: formatMoney(s.lifetimeRevenue),
+            sub: lifetimeOrders ? `From ${formatNumber(lifetimeOrders)} referred orders` : 'From referred orders',
+          },
+          { label: 'Total commission', value: formatMoney(s.totalCommission), sub: 'Earned to date (excludes reversed)' },
+          { label: 'Paid commission', value: formatMoney(s.paidCommission), sub: 'Already paid out to you' },
+          { label: 'Awaiting payout', value: formatMoney(s.awaitingPayoutCommission), sub: 'Approved — due in an upcoming payout' },
+          { label: 'Pending commission', value: formatMoney(s.pendingCommission), sub: 'Accrued — awaiting approval' },
+          { label: 'Active referral codes', value: formatNumber(s.activeReferralCodes), sub: 'Currently shareable' },
+          { label: 'Revenue this month', value: formatMoney(s.revenueThisMonth), sub: 'Referred orders this month' },
         ]}
       />
 
       <s-stack direction="block" gap="base">
-        <s-heading>Revenue breakdown</s-heading>
+        <s-stack direction="block" gap="small-300">
+          <s-heading>Revenue breakdown</s-heading>
+          <s-text color="subdued">
+            Revenue from your referred orders. Pick a From and/or To date and choose
+            Apply to see a custom range; Reset clears the filter.
+          </s-text>
+        </s-stack>
+
         <s-grid gridTemplateColumns="1fr 1fr" gap="base">
           <s-date-field
             label="From"
-            value={range.from}
-            onChange={(e) => setRange((p) => ({ ...p, from: e.currentTarget.value }))}
+            value={draft.from}
+            onChange={(e) => setDraft((p) => ({ ...p, from: e.currentTarget.value }))}
           />
           <s-date-field
             label="To"
-            value={range.to}
-            onChange={(e) => setRange((p) => ({ ...p, to: e.currentTarget.value }))}
+            value={draft.to}
+            onChange={(e) => setDraft((p) => ({ ...p, to: e.currentTarget.value }))}
           />
         </s-grid>
+
+        <s-stack direction="inline" gap="small-300" alignItems="center">
+          <s-button
+            variant="primary"
+            disabled={!hasDraft || draftMatchesApplied || revenue.loading}
+            onClick={applyRange}
+          >
+            Apply
+          </s-button>
+          <s-button
+            variant="secondary"
+            disabled={!hasDraft && !hasApplied}
+            onClick={resetRange}
+          >
+            Reset
+          </s-button>
+        </s-stack>
+
+        {hasApplied ? (
+          <s-banner tone="info">
+            <s-text>
+              Showing revenue for {applied.from ? formatDate(applied.from) : 'the beginning'} →{' '}
+              {applied.to ? formatDate(applied.to) : 'today'}.
+            </s-text>
+          </s-banner>
+        ) : null}
+
         {revenue.error ? (
           <ErrorBanner message={revenue.error} onRetry={revenue.reload} />
         ) : (
@@ -79,13 +166,44 @@ export function OverviewSection({ onAuthError }) {
               { label: 'Current year', value: formatMoney(r.thisYear) },
               { label: 'Lifetime', value: formatMoney(r.lifetime) },
               ...(r.range !== null && r.range !== undefined
-                ? [{ label: 'Selected range', value: formatMoney(r.range), sub: `${range.from || '…'} → ${range.to || '…'}` }]
+                ? [
+                    {
+                      label: 'Selected range',
+                      value: formatMoney(r.range),
+                      sub: `${applied.from ? formatDate(applied.from) : '…'} → ${
+                        applied.to ? formatDate(applied.to) : '…'
+                      }${r.rangeOrderCount != null ? ` · ${formatNumber(r.rangeOrderCount)} orders` : ''}`,
+                    },
+                  ]
                 : []),
             ]}
           />
         )}
       </s-stack>
     </SectionShell>
+  )
+}
+
+// Expandable panel shown beneath a patient row: their referral-code history,
+// newest first ("Latest" tagged, with the date each code was used). `row.codes`
+// arrives already deduped + ordered newest→oldest from the backend. Returns null
+// when the patient has no codes (so that row isn't made expandable).
+function CodeHistory({ row }) {
+  const codes = row.codes || []
+  if (codes.length === 0) return null
+  return (
+    <s-stack direction="block" gap="small-300">
+      <s-text type="strong" color="subdued">
+        Referral code history
+      </s-text>
+      {codes.map((c, i) => (
+        <s-stack key={`${c.code}-${i}`} direction="inline" gap="small-300" alignItems="center">
+          <s-text type={i === 0 ? 'strong' : 'generic'}>{c.code}</s-text>
+          {i === 0 ? <s-badge tone="neutral">Latest</s-badge> : null}
+          {c.usedAt ? <s-text color="subdued">{formatDate(c.usedAt)}</s-text> : null}
+        </s-stack>
+      ))}
+    </s-stack>
   )
 }
 
@@ -96,7 +214,7 @@ export function PatientsSection({ onAuthError }) {
   const debounced = useDebounced(search)
   const { data, loading, error, reload } = useResource(
     'customers',
-    { search: debounced, page, pageSize: 20 },
+    { search: debounced, page, pageSize: 10 },
     onAuthError,
   )
 
@@ -106,7 +224,6 @@ export function PatientsSection({ onAuthError }) {
     { key: 'email', label: 'Email', render: (r) => <s-text>{r.email || '—'}</s-text> },
     { key: 'referralCode', label: 'Code', render: (r) => <s-text>{r.referralCode || '—'}</s-text> },
     { key: 'registeredAt', label: 'Registered', render: (r) => <s-text>{formatDate(r.registeredAt)}</s-text> },
-    { key: 'status', label: 'Status', render: (r) => <StatusBadge value={r.status} /> },
     { key: 'totalOrders', label: 'Orders', render: (r) => <s-text>{formatNumber(r.totalOrders)}</s-text> },
     { key: 'lifetimeValue', label: 'LTV', render: (r) => <s-text>{formatMoney(r.lifetimeValue)}</s-text> },
   ]
@@ -128,7 +245,12 @@ export function PatientsSection({ onAuthError }) {
         <Loading />
       ) : (
         <s-stack direction="block" gap="base">
-          <Table columns={columns} rows={rows} empty="No referred customers yet." />
+          <Table
+            columns={columns}
+            rows={rows}
+            empty="No referred customers yet."
+            renderExpanded={(r) => (r.codes && r.codes.length > 0 ? <CodeHistory row={r} /> : null)}
+          />
           <Pagination
             page={data?.page || 1}
             totalPages={data?.totalPages || 1}
@@ -143,32 +265,71 @@ export function PatientsSection({ onAuthError }) {
 }
 
 // ── Commissions (all + pending) ──────────────────────────────────────────────
+const EMPTY_COMMISSION_FILTERS = { patient: '', payoutStatus: '', from: '', to: '' }
+
 export function CommissionsSection({ mode = 'all', onAuthError }) {
   const pendingOnly = mode === 'pending'
-  const [range, setRange] = useState({ from: '', to: '' })
+  // draft = the filter inputs; applied = what the query uses. Filtering only
+  // runs on Apply; Reset clears both — so the controls are explicit.
+  const [draft, setDraft] = useState(EMPTY_COMMISSION_FILTERS)
+  const [applied, setApplied] = useState(EMPTY_COMMISSION_FILTERS)
   const [page, setPage] = useState(1)
   const { data, loading, error, reload } = useResource(
     'commissions',
     {
       pendingOnly: pendingOnly ? '1' : undefined,
-      from: range.from,
-      to: range.to,
+      patient: applied.patient || undefined,
+      payoutStatus: applied.payoutStatus || undefined,
+      from: applied.from,
+      to: applied.to,
       page,
-      pageSize: 20,
+      pageSize: 10,
     },
     onAuthError,
   )
 
   const rows = data?.rows || []
   const totals = data?.totals || {}
+  const patients = data?.patients || []
+
+  const setField = (k) => (e) => setDraft((p) => ({ ...p, [k]: e.currentTarget.value }))
+  const draftMatchesApplied =
+    draft.patient === applied.patient &&
+    draft.payoutStatus === applied.payoutStatus &&
+    draft.from === applied.from &&
+    draft.to === applied.to
+  const hasDraft = !!(draft.patient || draft.payoutStatus || draft.from || draft.to)
+  const hasApplied = !!(applied.patient || applied.payoutStatus || applied.from || applied.to)
+
+  const applyFilters = () => {
+    setApplied({ ...draft })
+    setPage(1)
+  }
+  const resetFilters = () => {
+    setDraft(EMPTY_COMMISSION_FILTERS)
+    setApplied(EMPTY_COMMISSION_FILTERS)
+    setPage(1)
+  }
+
   const columns = [
     { key: 'orderName', label: 'Order', render: (r) => <s-text>{r.orderName || '—'}</s-text> },
-    { key: 'amount', label: pendingOnly ? 'Expected' : 'Amount', render: (r) => <s-text>{formatMoney(r.amount)}</s-text> },
+    {
+      key: 'amount',
+      label: pendingOnly ? 'Expected' : 'Amount',
+      render: (r) => <s-text type="strong">{formatMoney(r.amount)}</s-text>,
+    },
     { key: 'rate', label: 'Rate', render: (r) => <s-text>{formatPercent(r.rate)}</s-text> },
     {
       key: 'payoutStatus',
       label: 'Payout status',
-      render: (r) => <StatusBadge value={r.payoutStatus || 'awaiting'} />,
+      render: (r) => (
+        <s-stack direction="block" gap="small-500">
+          <StatusBadge value={r.payoutStatus || 'pending'} />
+          {r.payoutStatus === 'failed' && r.payoutFailureReason ? (
+            <s-text color="subdued">{payoutReasonMessage(r.payoutFailureReason)}</s-text>
+          ) : null}
+        </s-stack>
+      ),
     },
     { key: 'earnedAt', label: 'Earned on', render: (r) => <s-text>{formatDate(r.earnedAt)}</s-text> },
   ]
@@ -179,35 +340,61 @@ export function CommissionsSection({ mode = 'all', onAuthError }) {
       description={
         pendingOnly
           ? 'Commissions earned but not yet paid out.'
-          : 'All commissions earned from referred orders.'
+          : 'Commissions you earned from referred orders. Filter by patient, payout status, or date, then choose Apply.'
       }
     >
       <StatCards
         cards={[
-          { label: 'Total earned', value: formatMoney(totals.total) },
-          { label: 'Paid', value: formatMoney(totals.paid) },
-          { label: 'Awaiting payout', value: formatMoney(totals.awaitingPayout) },
-          { label: 'Pending', value: formatMoney(totals.pending) },
+          { label: 'Total earned', value: formatMoney(totals.total), sub: 'Excludes reversed' },
+          { label: 'Paid', value: formatMoney(totals.paid), sub: 'Already paid out to you' },
+          { label: 'Awaiting payout', value: formatMoney(totals.awaitingPayout), sub: 'Approved — upcoming payout' },
+          { label: 'Pending', value: formatMoney(totals.pending), sub: 'Awaiting approval' },
         ]}
       />
-      <s-grid gridTemplateColumns="1fr 1fr" gap="base">
-        <s-date-field
-          label="From"
-          value={range.from}
-          onChange={(e) => {
-            setRange((p) => ({ ...p, from: e.currentTarget.value }))
-            setPage(1)
-          }}
-        />
-        <s-date-field
-          label="To"
-          value={range.to}
-          onChange={(e) => {
-            setRange((p) => ({ ...p, to: e.currentTarget.value }))
-            setPage(1)
-          }}
-        />
-      </s-grid>
+
+      {/* Filters */}
+      <s-stack direction="block" gap="base">
+        <s-grid gridTemplateColumns="1fr 1fr" gap="base">
+          <s-select label="Patient" value={draft.patient} onChange={setField('patient')}>
+            <s-option value="">All patients</s-option>
+            {patients.map((pt) => (
+              <s-option key={pt.value} value={pt.value}>
+                {pt.label}
+              </s-option>
+            ))}
+          </s-select>
+          <s-select label="Payout status" value={draft.payoutStatus} onChange={setField('payoutStatus')}>
+            <s-option value="">All statuses</s-option>
+            {COMMISSION_PAYOUT_STATUSES.map((o) => (
+              <s-option key={o.value} value={o.value}>
+                {o.label}
+              </s-option>
+            ))}
+          </s-select>
+          <s-date-field label="From" value={draft.from} onChange={setField('from')} />
+          <s-date-field label="To" value={draft.to} onChange={setField('to')} />
+        </s-grid>
+        <s-stack direction="inline" gap="small-300" alignItems="center">
+          <s-button variant="primary" disabled={draftMatchesApplied || loading} onClick={applyFilters}>
+            Apply
+          </s-button>
+          <s-button variant="secondary" disabled={!hasDraft && !hasApplied} onClick={resetFilters}>
+            Reset
+          </s-button>
+        </s-stack>
+        {hasApplied ? (
+          <s-banner tone="info">
+            <s-text>
+              Filtered
+              {applied.patient ? ` · patient: ${labelFor(patients, applied.patient)}` : ''}
+              {applied.payoutStatus ? ` · status: ${labelFor(COMMISSION_PAYOUT_STATUSES, applied.payoutStatus)}` : ''}
+              {applied.from ? ` · from ${formatDate(applied.from)}` : ''}
+              {applied.to ? ` · to ${formatDate(applied.to)}` : ''}.
+            </s-text>
+          </s-banner>
+        ) : null}
+      </s-stack>
+
       {error ? (
         <ErrorBanner message={error} onRetry={reload} />
       ) : loading && rows.length === 0 ? (
@@ -217,7 +404,13 @@ export function CommissionsSection({ mode = 'all', onAuthError }) {
           <Table
             columns={columns}
             rows={rows}
-            empty={pendingOnly ? 'No pending commissions.' : 'No commissions yet.'}
+            empty={
+              pendingOnly
+                ? 'No pending commissions.'
+                : hasApplied
+                  ? 'No commissions match these filters.'
+                  : 'No commissions yet.'
+            }
           />
           <Pagination
             page={data?.page || 1}
@@ -305,55 +498,78 @@ function PayoutCard({ payout }) {
   )
 }
 
+const EMPTY_PAYOUT_FILTERS = { status: '', from: '', to: '' }
+
 export function PayoutsSection({ onAuthError }) {
-  const [range, setRange] = useState({ from: '', to: '' })
-  const [status, setStatus] = useState('')
+  const [draft, setDraft] = useState(EMPTY_PAYOUT_FILTERS)
+  const [applied, setApplied] = useState(EMPTY_PAYOUT_FILTERS)
   const [page, setPage] = useState(1)
   const { data, loading, error, reload } = useResource(
     'payouts',
-    { status, from: range.from, to: range.to, page, pageSize: 20 },
+    { status: applied.status || undefined, from: applied.from, to: applied.to, page, pageSize: 10 },
     onAuthError,
   )
 
   const rows = data?.rows || []
 
+  const setField = (k) => (e) => setDraft((p) => ({ ...p, [k]: e.currentTarget.value }))
+  const draftMatchesApplied =
+    draft.status === applied.status && draft.from === applied.from && draft.to === applied.to
+  const hasDraft = !!(draft.status || draft.from || draft.to)
+  const hasApplied = !!(applied.status || applied.from || applied.to)
+
+  const applyFilters = () => {
+    setApplied({ ...draft })
+    setPage(1)
+  }
+  const resetFilters = () => {
+    setDraft(EMPTY_PAYOUT_FILTERS)
+    setApplied(EMPTY_PAYOUT_FILTERS)
+    setPage(1)
+  }
+
   return (
     <SectionShell heading="Payout history" description="Commission payouts sent to you. Expand a payout to see the order commissions it covers.">
-      <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="base">
-        <s-select
-          label="Status"
-          value={status}
-          onChange={(e) => {
-            setStatus(e.currentTarget.value)
-            setPage(1)
-          }}
-        >
-          <s-option value="">All</s-option>
-          <s-option value="paid">Paid</s-option>
-        </s-select>
-        <s-date-field
-          label="From"
-          value={range.from}
-          onChange={(e) => {
-            setRange((p) => ({ ...p, from: e.currentTarget.value }))
-            setPage(1)
-          }}
-        />
-        <s-date-field
-          label="To"
-          value={range.to}
-          onChange={(e) => {
-            setRange((p) => ({ ...p, to: e.currentTarget.value }))
-            setPage(1)
-          }}
-        />
-      </s-grid>
+      {/* Filters */}
+      <s-stack direction="block" gap="base">
+        <s-grid gridTemplateColumns="1fr 1fr 1fr" gap="base">
+          <s-select label="Status" value={draft.status} onChange={setField('status')}>
+            <s-option value="">All statuses</s-option>
+            {PAYOUT_STATUSES.map((o) => (
+              <s-option key={o.value} value={o.value}>
+                {o.label}
+              </s-option>
+            ))}
+          </s-select>
+          <s-date-field label="From" value={draft.from} onChange={setField('from')} />
+          <s-date-field label="To" value={draft.to} onChange={setField('to')} />
+        </s-grid>
+        <s-stack direction="inline" gap="small-300" alignItems="center">
+          <s-button variant="primary" disabled={draftMatchesApplied || loading} onClick={applyFilters}>
+            Apply
+          </s-button>
+          <s-button variant="secondary" disabled={!hasDraft && !hasApplied} onClick={resetFilters}>
+            Reset
+          </s-button>
+        </s-stack>
+        {hasApplied ? (
+          <s-banner tone="info">
+            <s-text>
+              Filtered
+              {applied.status ? ` · status: ${labelFor(PAYOUT_STATUSES, applied.status)}` : ''}
+              {applied.from ? ` · from ${formatDate(applied.from)}` : ''}
+              {applied.to ? ` · to ${formatDate(applied.to)}` : ''}.
+            </s-text>
+          </s-banner>
+        ) : null}
+      </s-stack>
+
       {error ? (
         <ErrorBanner message={error} onRetry={reload} />
       ) : loading && rows.length === 0 ? (
         <Loading />
       ) : rows.length === 0 ? (
-        <s-text color="subdued">No payouts yet.</s-text>
+        <s-text color="subdued">{hasApplied ? 'No payouts match these filters.' : 'No payouts yet.'}</s-text>
       ) : (
         <s-stack direction="block" gap="base">
           {rows.map((p) => (
@@ -372,14 +588,52 @@ export function PayoutsSection({ onAuthError }) {
   )
 }
 
+// Copy-to-clipboard button for a referral URL. The customer-account Web Worker
+// sandbox has no `navigator.clipboard`, but Polaris exposes a declarative
+// clipboard: an invisible `s-clipboard-item` holds the text and an invoker
+// button copies it via `command="--copy"` + `commandFor` (targeting the item by
+// id). `onCopy` briefly flips the label/icon to a "Copied" confirmation.
+function CopyUrlButton({ url, id }) {
+  const [copied, setCopied] = useState(false)
+  return (
+    <s-stack direction="inline" gap="small-300" alignItems="center">
+      <s-button
+        commandFor={id}
+        command="--copy"
+        variant="secondary"
+        icon={copied ? 'clipboard-check' : 'clipboard'}
+        accessibilityLabel={copied ? 'Referral URL copied' : 'Copy referral URL'}
+      >
+        {copied ? 'Copied' : 'Copy URL'}
+      </s-button>
+      <s-clipboard-item
+        id={id}
+        text={url}
+        onCopy={() => {
+          setCopied(true)
+          setTimeout(() => setCopied(false), 2000)
+        }}
+      ></s-clipboard-item>
+    </s-stack>
+  )
+}
+
 // ── Referral codes ───────────────────────────────────────────────────────────
+const CREATE_MODAL_ID = 'create-referral-code-modal'
+
 export function ReferralsSection({ onAuthError }) {
-  const { data, loading, error, reload } = useResource('referrals', null, onAuthError)
+  const [page, setPage] = useState(1)
+  const { data, loading, error, reload } = useResource(
+    'referrals',
+    { page, pageSize: 10 },
+    onAuthError,
+  )
   const rows = data?.rows || []
 
-  // Create-form state.
+  // Create-form state (the form lives inside the modal).
+  const modalRef = useRef(null)
   const [code, setCode] = useState('')
-  const [percent, setPercent] = useState('')
+  const [percent, setPercent] = useState('20')
   const [submitting, setSubmitting] = useState(false)
   const [formError, setFormError] = useState('')
   const [notice, setNotice] = useState('')
@@ -387,14 +641,12 @@ export function ReferralsSection({ onAuthError }) {
   const [busyId, setBusyId] = useState(null)
 
   // Rule A (client-side mirror): a discount tier already used by an ACTIVE code
-  // can't be re-used, so drop it from the dropdown. Pausing a code frees its
-  // tier. The server still enforces this authoritatively.
-  const usedActiveTiers = new Set(
-    rows
-      .filter((r) => r.status === 'active')
-      .map((r) => Math.round((r.discountPercent || 0) * 100)),
-  )
+  // can't be re-used, so drop it from the dropdown. The table is paginated, so
+  // this comes from the server's full-set `usedActivePercents` (NOT the current
+  // page's rows). Pausing a code frees its tier; the server still enforces this.
+  const usedActiveTiers = new Set(data?.usedActivePercents || [])
   const availablePercents = DISCOUNT_PERCENTS.filter((p) => !usedActiveTiers.has(p))
+  const canCreate = availablePercents.length > 0
 
   // Map an ApiError to either the auth-shell switch (401/403) or an inline msg.
   const handleApiError = (err, fallback) => {
@@ -404,6 +656,17 @@ export function ReferralsSection({ onAuthError }) {
     }
     setFormError(err?.message || fallback)
   }
+
+  const resetForm = () => {
+    setCode('')
+    setPercent('')
+    setFormError('')
+  }
+
+  // Close the modal programmatically. The s-modal element's method is
+  // `hideOverlay()` (BaseOverlayMethods) — NOT `hide()`; the latter silently
+  // no-ops, leaving the popup open after a successful create.
+  const closeModal = () => modalRef.current?.hideOverlay?.()
 
   const handleCreate = async () => {
     setFormError('')
@@ -424,9 +687,9 @@ export function ReferralsSection({ onAuthError }) {
         code: trimmed,
         discountPercent: Number(percent),
       })
-      setCode('')
-      setPercent('')
       setNotice(`Referral code “${trimmed.toLowerCase()}” created.`)
+      resetForm()
+      closeModal()
       reload()
     } catch (err) {
       handleApiError(err, 'Could not create the referral code.')
@@ -463,19 +726,15 @@ export function ReferralsSection({ onAuthError }) {
     { key: 'orders', label: 'Orders', render: (r) => <s-text>{formatNumber(r.orders)}</s-text> },
     { key: 'revenue', label: 'Revenue', render: (r) => <s-text>{formatMoney(r.revenue)}</s-text> },
     { key: 'commission', label: 'Commission', render: (r) => <s-text>{formatMoney(r.commission)}</s-text> },
-    // Full shareable referral link. Rendered as an s-link so the customer can
-    // view, click-to-open, and copy/share it (the customer-account sandbox has
-    // no clipboard/DOM API, so the link text itself is the copy affordance).
-    // Given a wider column since the URL is long.
+    // Shareable referral link — surfaced as a compact "Copy URL" button
+    // (replaces the long inline link). Copy uses Polaris's declarative
+    // clipboard (see CopyUrlButton); the column no longer needs extra width.
     {
       key: 'referralUrl',
       label: 'Referral URL',
-      width: '2fr',
       render: (r) =>
         r.referralUrl ? (
-          <s-link href={r.referralUrl} target="_blank">
-            {r.referralUrl}
-          </s-link>
+          <CopyUrlButton url={r.referralUrl} id={`copy-${r.id}`} />
         ) : (
           <s-text color="subdued">Not generated yet</s-text>
         ),
@@ -497,58 +756,81 @@ export function ReferralsSection({ onAuthError }) {
 
   return (
     <SectionShell heading="Referral management" description="Create, share, and manage your referral codes.">
-      {/* Create a new code + auto-generated link */}
-      <s-box border="base subdued" borderRadius="base" padding="base">
+      {/* Create-code trigger (right-aligned) + result notice. Form lives in a modal. */}
+      <s-stack direction="block" gap="base">
+        <s-stack direction="inline" gap="base" alignItems="center" justifyContent="end">
+          {!canCreate ? (
+            <s-text color="subdued">
+              You have an active code for every discount tier — pause one to free a tier.
+            </s-text>
+          ) : null}
+          <s-button
+            variant="primary"
+            commandFor={CREATE_MODAL_ID}
+            command="--show"
+            disabled={!canCreate}
+            onClick={resetForm}
+          >
+            Create referral code
+          </s-button>
+        </s-stack>
+        {notice ? (
+          <s-banner tone="info" heading="Done">
+            <s-text>{notice}</s-text>
+          </s-banner>
+        ) : null}
+      </s-stack>
+
+      {/* Create-code modal — the full creation flow runs from here. */}
+      <s-modal id={CREATE_MODAL_ID} ref={modalRef} heading="Create a referral code">
         <s-stack direction="block" gap="base">
-          <s-heading>Create a referral code</s-heading>
           <s-text color="subdued">
             Choose a code and a discount — we generate the shareable link automatically.
             Codes are unique store-wide; lowercase letters, numbers, “-” or “_”.
           </s-text>
 
           {formError ? <ErrorBanner message={formError} /> : null}
-          {notice ? (
-            <s-banner tone="info" heading="Done">
-              <s-text>{notice}</s-text>
-            </s-banner>
-          ) : null}
 
-          {availablePercents.length === 0 ? (
-            <s-text color="subdued">
-              You have an active code for every discount tier. Pause one below to free up a tier.
-            </s-text>
-          ) : (
+          {canCreate ? (
             <s-stack direction="block" gap="base">
-              <s-grid gridTemplateColumns="2fr 1fr" gap="base">
-                <s-text-field
-                  label="Referral code"
-                  placeholder="e.g. jane_clinic"
-                  value={code}
-                  onInput={(e) => setCode(e.target.value)}
-                />
-                <s-select
-                  label="Discount"
-                  value={percent}
-                  onChange={(e) => setPercent(e.currentTarget.value)}
-                >
-                  <s-option value="">Select…</s-option>
-                  {availablePercents.map((p) => (
-                    <s-option key={p} value={String(p)}>
-                      {p}%
-                    </s-option>
-                  ))}
-                </s-select>
-              </s-grid>
-              <s-button
-                onClick={handleCreate}
-                disabled={submitting || !code.trim() || !percent}
+              <s-text-field
+                label="Referral code"
+                placeholder="e.g. jane_clinic"
+                value={code}
+                onInput={(e) => setCode(e.target.value)}
+              />
+              <s-select
+                label="Discount"
+                value={percent}
+                onChange={(e) => setPercent(e.currentTarget.value)}
               >
-                {submitting ? 'Creating…' : 'Create code'}
-              </s-button>
+                <s-option value="">Select…</s-option>
+                {availablePercents.map((p) => (
+                  <s-option key={p} value={String(p)}>
+                    {p}%
+                  </s-option>
+                ))}
+              </s-select>
             </s-stack>
+          ) : (
+            <s-text color="subdued">
+              All discount tiers are in use by active codes. Pause one to free a tier.
+            </s-text>
           )}
         </s-stack>
-      </s-box>
+
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          onClick={handleCreate}
+          disabled={submitting || !canCreate || !code.trim() || !percent}
+        >
+          {submitting ? 'Creating…' : 'Create code'}
+        </s-button>
+        <s-button slot="secondary-actions" commandFor={CREATE_MODAL_ID} command="--hide">
+          Cancel
+        </s-button>
+      </s-modal>
 
       {/* Existing codes */}
       {error ? (
@@ -556,7 +838,16 @@ export function ReferralsSection({ onAuthError }) {
       ) : loading && rows.length === 0 ? (
         <Loading />
       ) : (
-        <Table columns={columns} rows={rows} empty="No referral codes yet — create one above." />
+        <s-stack direction="block" gap="base">
+          <Table columns={columns} rows={rows} empty="No referral codes yet — create one above." />
+          <Pagination
+            page={data?.page || 1}
+            totalPages={data?.totalPages || 1}
+            total={data?.total || 0}
+            loading={loading}
+            onPage={setPage}
+          />
+        </s-stack>
       )}
     </SectionShell>
   )

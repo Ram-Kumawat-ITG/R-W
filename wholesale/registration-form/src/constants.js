@@ -178,13 +178,6 @@ export const PAYMENT_METHODS = [
     feeLabel: "3% fee",
     desc: "Card on file charged automatically. Most flexible option.",
   },
-  {
-    id: "immediate",
-    name: "Immediate payment",
-    fee: "3% fee",
-    feeLabel: "3% fee",
-    desc: "Email payment link per invoice. Pay on receipt — no auto-charge.",
-  },
 ];
 
 export const CARD_BRANDS = ["visa", "mastercard", "discover", "amex"];

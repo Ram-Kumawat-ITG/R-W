@@ -6,7 +6,6 @@ import { qbo, qboGetBinary } from './qbo.apis'
 import { qboConfig } from './qbo.config'
 import { QBO_APP_URLS } from './qbo.constants'
 import { escapeQboQuery, toCustomerPayload, toInvoiceLine, toQboAddress } from './qbo.utils'
-import { PAY_LINK_MEMO_REGEX, appendPayLinkToMemo } from '../payment/payLink.utils'
 import QboItemMap from '../../models/qboItemMap.server'
 import { createLogger } from '../../utils/logger.utils'
 
@@ -439,40 +438,6 @@ export async function setInvoiceShipping({ qboInvoiceId, lines = [], shipDate, t
   const res = await qbo.post('/invoice', payload)
   const updated = res?.Invoice
   if (!updated?.Id) throw new Error('QBO invoice update returned no Id')
-  return updated
-}
-
-// Add (or refresh) the Immediate-Payment pay link in an existing invoice's
-// CustomerMemo. Used to realign an open invoice to `immediate` after
-// creation, or to re-stamp the link when the app's base URL changed (the
-// "Refresh link on invoice" admin action). GET → strip any existing managed
-// pay-link block (old OR new label) → append the current block → sparse-POST
-// with the current SyncToken. Returns the updated invoice. Idempotent:
-// re-running with the same URL is a no-op. The block format (URL alone on
-// its own line) lives in payLink.utils so creation + refresh never drift.
-export async function setInvoicePayLinkMemo({ qboInvoiceId, payLinkUrl }) {
-  if (!qboInvoiceId) throw new Error('setInvoicePayLinkMemo: qboInvoiceId is required')
-  if (!payLinkUrl) throw new Error('setInvoicePayLinkMemo: payLinkUrl is required')
-  const current = await getInvoice(qboInvoiceId)
-  if (!current?.Id) throw new Error(`setInvoicePayLinkMemo: QBO invoice ${qboInvoiceId} not found`)
-
-  const existingMemo = current.CustomerMemo?.value || ''
-  const base = existingMemo.replace(PAY_LINK_MEMO_REGEX, '').trimEnd()
-  // Trim the base (not the URL) to fit QBO's memo cap so the full pay link
-  // always survives — see appendPayLinkToMemo.
-  const memo = appendPayLinkToMemo(base, payLinkUrl)
-  if (memo === existingMemo) {
-    return current
-  }
-  const res = await qbo.post('/invoice', {
-    Id: String(current.Id),
-    SyncToken: String(current.SyncToken),
-    sparse: true,
-    CustomerMemo: { value: memo },
-  })
-  const updated = res?.Invoice
-  if (!updated?.Id) throw new Error('QBO invoice memo update returned no Id')
-  log.info('invoice.pay_link_memo.set', { qboInvoiceId })
   return updated
 }
 

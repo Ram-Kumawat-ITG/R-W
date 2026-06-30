@@ -1,6 +1,6 @@
 /* eslint-disable react/prop-types */
 import { useEffect, useRef, useState } from "react";
-import { useLoaderData, useNavigate, useNavigation, useFetcher } from "react-router";
+import { useLoaderData, useNavigate, useNavigation, useRevalidator, useFetcher } from "react-router";
 import { authenticate } from "../shopify.server";
 import { listCdoOrders } from "../services/cdo/cdo.service";
 import { getRetailInvoicePdf } from "../services/retailQbo/retailOrderInvoice.service";
@@ -107,7 +107,9 @@ export default function OrdersList() {
   const { result, filters, sort, dir } = useLoaderData();
   const navigate = useNavigate();
   const navigation = useNavigation();
-  const loading = navigation.state === "loading";
+  const revalidator = useRevalidator();
+  const loading = navigation.state === "loading" || revalidator.state !== "idle";
+  const refreshLoading = revalidator.state !== "idle";
 
   const EMPTY_DRAFT = {
     orderNumber: "", customer: "", practitioner: "", referralCode: "",
@@ -266,6 +268,14 @@ export default function OrdersList() {
               Apply filters
             </s-button>
             <s-button variant="tertiary" onClick={resetFilters}>Reset</s-button>
+            <s-button
+              variant="tertiary"
+              icon="refresh"
+              onClick={() => revalidator.revalidate()}
+              {...(refreshLoading ? { loading: true } : {})}
+            >
+              Refresh
+            </s-button>
             {activeChips.length > 0 && (
               <s-text tone="subdued">
                 {activeChips.length} filter{activeChips.length === 1 ? "" : "s"} applied
@@ -323,6 +333,7 @@ export default function OrdersList() {
               <s-table-header>Shipping status</s-table-header>
               <s-table-header>Delivery status</s-table-header>
               <s-table-header>QBO Invoice</s-table-header>
+              <s-table-header>Vendor Bills</s-table-header>
               <s-table-header>Actions</s-table-header>
             </s-table-header-row>
             <s-table-body>
@@ -363,6 +374,9 @@ export default function OrdersList() {
                       previewing={previewingId === o.shopifyOrderId}
                       onPreview={() => onPreviewInvoice(o.shopifyOrderId)}
                     />
+                  </s-table-cell>
+                  <s-table-cell>
+                    <VendorBillCell qbo={o.qbo} />
                   </s-table-cell>
                   <s-table-cell>
                     <s-button
@@ -442,6 +456,38 @@ function QboInvoiceCell({ qbo, onPreview, previewing }) {
           </s-link>
         ) : null}
       </s-stack>
+    </s-stack>
+  );
+}
+
+// Vendor-bill (A/P) summary cell: the dropship cost owed to the wholesale
+// supplier. Mirrors the QBO Invoice column but for the Bill side — a
+// settlement badge (Paid once the wholesale dropship invoice reconciles, else
+// Unpaid / Error) plus a deep link into QuickBooks. Vendor bills have no
+// customer-facing PDF, so there is no in-app Preview. Renders "—" until a bill
+// exists for the order.
+function VendorBillCell({ qbo }) {
+  if (!qbo?.billId) return <s-text tone="subdued">—</s-text>;
+  let badge;
+  if (qbo.billPaymentStatus === "paid") {
+    badge = <s-badge tone="success">Paid</s-badge>;
+  } else if (qbo.billReconcileStatus === "error") {
+    badge = <s-badge tone="critical">Reconcile error</s-badge>;
+  } else if (qbo.billStatus === "error") {
+    badge = <s-badge tone="critical">Error</s-badge>;
+  } else if (qbo.billStatus === "created") {
+    badge = <s-badge tone="neutral">Unpaid</s-badge>;
+  } else {
+    badge = <s-badge tone="neutral">{qbo.billStatus || "Pending"}</s-badge>;
+  }
+  return (
+    <s-stack direction="block" gap="small-200">
+      {badge}
+      {qbo.billUrl ? (
+        <s-link href={qbo.billUrl} target="_blank">
+          Open in QBO {qbo.billDocNumber ? `${qbo.billDocNumber}` : qbo.billId} ↗
+        </s-link>
+      ) : null}
     </s-stack>
   );
 }

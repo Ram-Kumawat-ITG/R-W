@@ -2,7 +2,7 @@
 import '@shopify/ui-extensions/preact'
 import { render } from 'preact'
 import { useCallback, useEffect, useState } from 'preact/hooks'
-import { apiGet, ApiError } from './api.js'
+import { apiGet, ApiError } from '../../services/FullPageApi.jsx'
 import { Loading, Tabs } from './ui.jsx'
 import {
   OverviewSection,
@@ -116,7 +116,7 @@ function App() {
         {profile?.name ? (
           <s-text color="subdued">
             Welcome back, {profile.name}
-            {profile.primaryCode ? ` · code ${profile.primaryCode}` : ''}
+            {/* {profile.primaryCode ? ` · code ${profile.primaryCode}` : ''} */}
           </s-text>
         ) : null}
 

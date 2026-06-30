@@ -3,7 +3,7 @@
 //   POST — practitioner self-service: create a code, or pause/resume one.
 //          Body: { op: 'create', code, discountPercent }   (discountPercent = integer percent)
 //                { op: 'pause'  | 'resume', codeId }
-import { portalLoader, portalMutation } from "./_guard";
+import { portalLoader, portalMutation, pageParams } from "./_guard";
 import { ok, badRequest, sendResponse } from "../../services/APIService/api.service";
 import {
   getReferralCodes,
@@ -12,8 +12,8 @@ import {
   normalizeShopDomain,
 } from "../../services/cdo/cdo.portal.service";
 
-export const loader = portalLoader(async ({ ctx }) => {
-  return ok("Referral codes", await getReferralCodes(ctx.practitionerId));
+export const loader = portalLoader(async ({ ctx, url }) => {
+  return ok("Referral codes", await getReferralCodes(ctx.practitionerId, pageParams(url)));
 });
 
 export const action = portalMutation(async ({ ctx, body, sessionToken }) => {

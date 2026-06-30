@@ -5,13 +5,14 @@
 // Styling rule (from CLAUDE.md): admin UI is Polaris-only — no `style={{}}`
 // and no CSS classes in this file or the routes that consume it.
 
-import { useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router";
 import {
   PAYMENT_METHOD_LABEL,
   PAYMENT_METHOD_SHORT,
 } from "../utils/payment.constants";
 import { shipmentStatusLabel } from "../utils/shipping.constants";
+import { formatAmount } from "../utils/format.utils";
 
 // Label/value pair used throughout the admin detail pages. Renders the
 // label as subdued small text above the value; empty / nullish values
@@ -218,6 +219,9 @@ export function PaymentMethodShortText({ method }) {
 //             URL and never shown as an active chip.
 //   onRefresh / refreshing: optional live-reload button (QBO/NMI tabs).
 //   applying: render the Apply button in its loading state.
+//   extraParams: caller-owned URL params (e.g. { sort, dir }) preserved
+//     across every Apply / chip-removal so a chosen sort isn't lost when
+//     the filters change. Empties are skipped; Reset still clears them.
 //
 // A control whose draft equals its default is dropped from the URL, so
 // the loader's own `param || default` fallbacks keep working unchanged.
@@ -230,6 +234,7 @@ export function AdvancedFilters({
   onRefresh,
   refreshing = false,
   applying = false,
+  extraParams = {},
 }) {
   const navigate = useNavigate();
 
@@ -265,6 +270,12 @@ export function AdvancedFilters({
     const params = new URLSearchParams();
     for (const [k, v] of Object.entries(next)) {
       if (isDefault(k, v)) continue;
+      params.set(k, String(v));
+    }
+    // Preserve caller-owned params (e.g. sort/dir) so the chosen sort
+    // survives a filter change. Empties are skipped.
+    for (const [k, v] of Object.entries(extraParams)) {
+      if (v == null || v === "") continue;
       params.set(k, String(v));
     }
     const qs = params.toString();
@@ -369,7 +380,8 @@ export function AdvancedFilters({
           </s-button>
           {onRefresh && (
             <s-button
-              variant="secondary"
+              variant="tertiary"
+              icon="refresh"
               onClick={onRefresh}
               {...(refreshing ? { loading: true } : {})}
             >
@@ -400,6 +412,297 @@ export function AdvancedFilters({
           </s-stack>
         )}
       </s-stack>
+    </s-section>
+  );
+}
+
+// ── Line items data table ───────────────────────────────────────────
+//
+// Sortable, exportable line-items table shared by the wholesale Order
+// Details and Admin Order Details pages. Renders the Polaris `s-table`
+// with clickable column headers (toggle asc/desc, ▲/▼ on the active
+// column) plus Print / Export-CSV actions. Sorting, export, and print
+// all run client-side over the loader-provided rows — the full
+// line-item set is already in hand, so there's no loader round-trip.
+//
+// Default sort is Product A→Z (per the admin request).
+
+const LINE_ITEM_COLUMNS = [
+  { key: "name", label: "Product", type: "text" },
+  { key: "sku", label: "SKU", type: "text" },
+  { key: "quantity", label: "Qty", type: "number" },
+  { key: "unitPrice", label: "Unit price", type: "number" },
+  { key: "discount", label: "Discount", type: "number" },
+  { key: "lineTotal", label: "Line total", type: "number" },
+];
+
+// Locale-aware, case-insensitive collators. `numeric` so names / SKUs
+// with embedded numbers sort naturally (item-2 before item-10).
+const TEXT_COLLATOR = new Intl.Collator(undefined, {
+  sensitivity: "base",
+  numeric: true,
+});
+const NAME_COLLATOR = new Intl.Collator(undefined, { sensitivity: "base" });
+
+// Comparator factory for one column. Numbers compare numerically, text
+// via the locale collator; an always-A→Z tiebreak on product name keeps
+// equal values in a deterministic, human-friendly order regardless of
+// the active sort direction.
+function compareLineItems(field, type, dir) {
+  const factor = dir === "asc" ? 1 : -1;
+  return (a, b) => {
+    const cmp =
+      type === "number"
+        ? (Number(a[field]) || 0) - (Number(b[field]) || 0)
+        : TEXT_COLLATOR.compare(String(a[field] ?? ""), String(b[field] ?? ""));
+    if (cmp !== 0) return cmp * factor;
+    return NAME_COLLATOR.compare(String(a.name ?? ""), String(b.name ?? ""));
+  };
+}
+
+// Quote a CSV cell only when it contains a comma, quote, or newline.
+function csvCell(v) {
+  const s = String(v ?? "");
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+// Escape a value for safe interpolation into the print window's HTML.
+function htmlEsc(v) {
+  return String(v ?? "").replace(
+    /[&<>"']/g,
+    (c) =>
+      ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;",
+      })[c],
+  );
+}
+
+// Filesystem-friendly token for the export filename (order label → slug).
+function fileSlug(s) {
+  return (
+    String(s ?? "")
+      .replace(/[^a-z0-9]+/gi, "-")
+      .replace(/^-+|-+$/g, "")
+      .toLowerCase() || "order"
+  );
+}
+
+export function LineItemsTable({ lineItems = [], currency, orderLabel = "" }) {
+  // Default to Product A→Z. Clicking the active column flips its
+  // direction; clicking a new column starts ascending.
+  const [sort, setSort] = useState({ field: "name", dir: "asc" });
+
+  const onSort = (field) =>
+    setSort((s) =>
+      s.field === field
+        ? { field, dir: s.dir === "asc" ? "desc" : "asc" }
+        : { field, dir: "asc" },
+    );
+  const arrow = (field) =>
+    sort.field === field ? (sort.dir === "asc" ? " ▲" : " ▼") : "";
+
+  const rows = useMemo(() => {
+    const col =
+      LINE_ITEM_COLUMNS.find((c) => c.key === sort.field) ||
+      LINE_ITEM_COLUMNS[0];
+    return [...lineItems].sort(compareLineItems(col.key, col.type, sort.dir));
+  }, [lineItems, sort]);
+
+  const fmtDiscount = (d) => (d > 0 ? `− ${formatAmount(d, currency)}` : "—");
+
+  // Export the currently-sorted rows as a CSV download.
+  const handleExport = () => {
+    const header = [
+      "Product",
+      "Variant",
+      "Vendor",
+      "SKU",
+      "Qty",
+      "Unit price",
+      "Discount",
+      "Line total",
+    ];
+    const data = rows.map((li) => [
+      li.name ?? "",
+      li.variantTitle ?? "",
+      li.vendor ?? "",
+      li.sku ?? "",
+      li.quantity ?? 0,
+      li.unitPrice ?? 0,
+      li.discount ?? 0,
+      li.lineTotal ?? 0,
+    ]);
+    const csv = [header, ...data]
+      .map((r) => r.map(csvCell).join(","))
+      .join("\r\n");
+    // Prefix a BOM so Excel reads the UTF-8 content correctly.
+    const blob = new Blob(["﻿" + csv], {
+      type: "text/csv;charset=utf-8;",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `line-items-${fileSlug(orderLabel)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  };
+
+  // Open a clean, print-ready window of the currently-sorted rows. The
+  // window is opened synchronously (popup-blocker safety — same pattern
+  // as the PDF-preview windows on these pages).
+  const handlePrint = () => {
+    const win = window.open("", "_blank");
+    if (!win) return;
+    const bodyRows = rows
+      .map(
+        (li) => `<tr>
+          <td>${htmlEsc(li.name)}${
+            li.variantTitle
+              ? `<div class="sub">${htmlEsc(li.variantTitle)}</div>`
+              : ""
+          }${
+            li.vendor ? `<div class="sub">by ${htmlEsc(li.vendor)}</div>` : ""
+          }</td>
+          <td>${htmlEsc(li.sku || "—")}</td>
+          <td class="num">${htmlEsc(li.quantity)}</td>
+          <td class="num">${htmlEsc(formatAmount(li.unitPrice, currency))}</td>
+          <td class="num">${htmlEsc(fmtDiscount(li.discount))}</td>
+          <td class="num">${htmlEsc(formatAmount(li.lineTotal, currency))}</td>
+        </tr>`,
+      )
+      .join("");
+    const doc = `<!doctype html><html><head><meta charset="utf-8" />
+      <title>Line items — ${htmlEsc(orderLabel)}</title>
+      <style>
+        body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#202223;margin:32px;}
+        h1{font-size:18px;margin:0 0 4px;}
+        .meta{color:#6d7175;font-size:12px;margin:0 0 20px;}
+        table{width:100%;border-collapse:collapse;font-size:13px;}
+        th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #e1e3e5;vertical-align:top;}
+        th{background:#f6f6f7;font-weight:600;}
+        td.num,th.num{text-align:right;white-space:nowrap;}
+        .sub{color:#6d7175;font-size:11px;}
+        @media print{body{margin:0;}}
+      </style></head>
+      <body>
+        <h1>Line items — ${htmlEsc(orderLabel)}</h1>
+        <p class="meta">${rows.length} item${
+          rows.length === 1 ? "" : "s"
+        } · Generated ${htmlEsc(new Date().toLocaleString())}</p>
+        <table>
+          <thead><tr>
+            <th>Product</th><th>SKU</th><th class="num">Qty</th>
+            <th class="num">Unit price</th><th class="num">Discount</th>
+            <th class="num">Line total</th>
+          </tr></thead>
+          <tbody>${bodyRows}</tbody>
+        </table>
+      </body></html>`;
+    win.document.open();
+    win.document.write(doc);
+    win.document.close();
+    win.focus();
+    // Let the new document lay out before invoking the print dialog.
+    setTimeout(() => {
+      try {
+        win.print();
+      } catch {
+        // user can still print manually from the opened window
+      }
+    }, 250);
+  };
+
+  return (
+    <s-stack direction="block" gap="base">
+      <s-stack
+        direction="inline"
+        gap="base"
+        alignItems="center"
+        justifyContent="end"
+        wrap
+      >
+        <s-button variant="secondary" onClick={handlePrint}>
+          Print
+        </s-button>
+        <s-button variant="secondary" onClick={handleExport}>
+          Export CSV
+        </s-button>
+      </s-stack>
+      <s-table>
+        <s-table-header-row>
+          {LINE_ITEM_COLUMNS.map((c) => (
+            <s-table-header key={c.key}>
+              <s-clickable onClick={() => onSort(c.key)}>
+                {c.label}
+                {arrow(c.key)}
+              </s-clickable>
+            </s-table-header>
+          ))}
+        </s-table-header-row>
+        <s-table-body>
+          {rows.map((li) => (
+            <s-table-row key={li.id || `${li.name}-${li.sku}`}>
+              <s-table-cell>
+                <s-stack direction="block" gap="none">
+                  <s-text>{li.name}</s-text>
+                  {li.variantTitle && (
+                    <s-text tone="subdued">{li.variantTitle}</s-text>
+                  )}
+                  {li.vendor && <s-text tone="subdued">by {li.vendor}</s-text>}
+                  {li.giftCard && <s-badge tone="info">Gift card</s-badge>}
+                </s-stack>
+              </s-table-cell>
+              <s-table-cell>{li.sku || "—"}</s-table-cell>
+              <s-table-cell>{li.quantity}</s-table-cell>
+              <s-table-cell>{formatAmount(li.unitPrice, currency)}</s-table-cell>
+              <s-table-cell>{fmtDiscount(li.discount)}</s-table-cell>
+              <s-table-cell>{formatAmount(li.lineTotal, currency)}</s-table-cell>
+            </s-table-row>
+          ))}
+        </s-table-body>
+      </s-table>
+    </s-stack>
+  );
+}
+
+// ── CollapsibleSection ────────────────────────────────────────────────
+//
+// Wraps content in an s-section with a clickable heading that expands or
+// collapses the body. State persists across renders in sessionStorage so
+// the user's layout is preserved while navigating within the same tab.
+// The first section on each order detail page passes defaultOpen so it
+// starts expanded; all others start collapsed.
+export function CollapsibleSection({ heading, children, defaultOpen = false, storageKey }) {
+  const key = storageKey ? `cs:${storageKey}` : null;
+  const [open, setOpen] = useState(() => {
+    if (!key) return defaultOpen;
+    try {
+      const v = sessionStorage.getItem(key);
+      return v !== null ? v === "true" : defaultOpen;
+    } catch {
+      return defaultOpen;
+    }
+  });
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (key) try { sessionStorage.setItem(key, String(next)); } catch {}
+  };
+  return (
+    <s-section>
+      <s-clickable onClick={toggle}>
+        <s-stack direction="inline" gap="base" alignItems="center" justifyContent="space-between">
+          <s-text variant="headingMd">{heading}</s-text>
+          <s-text tone="subdued">{open ? "▲" : "▼"}</s-text>
+        </s-stack>
+      </s-clickable>
+      {open ? <s-box paddingBlockStart="base">{children}</s-box> : null}
     </s-section>
   );
 }

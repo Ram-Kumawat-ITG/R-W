@@ -35,7 +35,6 @@ const PAYMENT_METHODS = [
   { value: 'check', label: 'Check', fee: 'No fees' },
   { value: 'ach', label: 'ACH / Bank transfer', fee: '1% fee' },
   { value: 'card', label: 'Credit card', fee: '3% fee' },
-  { value: 'immediate', label: 'Immediate (pay-by-link)', fee: '3% fee' },
 ]
 
 const TAX_CLASSIFICATIONS = [

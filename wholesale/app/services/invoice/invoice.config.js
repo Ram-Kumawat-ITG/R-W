@@ -30,9 +30,6 @@ export const invoiceConfig = {
     check: readInt('CHEQUE_DUE_DATE', DEFAULT_TERMS_DAYS),
     ach: readInt('ACH_DUE_DATE', DEFAULT_TERMS_DAYS),
     card: readInt('CARD_DUE_DATE', DEFAULT_TERMS_DAYS),
-    // Immediate Payment — customer self-pays each invoice on demand via
-    // a hosted pay-link/QR, so the due window is typically short.
-    immediate: readInt('IMMEDIATE_DUE_DATE', DEFAULT_TERMS_DAYS),
     // Drop-ship — invoices for the retail drop-ship customer, collected by
     // the dedicated process-dropship-payments CRON (production: once per
     // month). The due window is independent of the wholesale terms; defaults
@@ -68,7 +65,6 @@ export const invoiceConfig = {
     card: readNumber('INVOICE_FEE_RATE_CARD', 0.03),
     ach: readNumber('INVOICE_FEE_RATE_ACH', 0.01),
     check: readNumber('INVOICE_FEE_RATE_CHECK', 0),
-    immediate: readNumber('INVOICE_FEE_RATE_IMMEDIATE', 0.03),
   },
 }
 
