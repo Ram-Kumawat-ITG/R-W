@@ -140,6 +140,16 @@ export const loader = async ({ request }) => {
     const startIdx = (page - 1) * PAGE_SIZE;
     const pageRows = refundRows.slice(startIdx, startIdx + PAGE_SIZE);
 
+    // Compute window-level stats from the FULL filtered set, not just the
+    // current page — otherwise the summary tile shows wrong totals on page 2+.
+    const windowApproved = refundRows.filter((r) => r.success);
+    const windowDeclined = total - windowApproved.length;
+    const windowTotalAmount = windowApproved.reduce(
+      (s, r) => s + r.refundAmount,
+      0,
+    );
+    const windowCurrency = refundRows[0]?.currency || "USD";
+
     return {
       rows: pageRows,
       total,
@@ -150,6 +160,10 @@ export const loader = async ({ request }) => {
       statusFilter,
       dateFrom,
       dateTo,
+      windowApprovedCount: windowApproved.length,
+      windowDeclinedCount: windowDeclined,
+      windowTotalAmount,
+      windowCurrency,
       error: null,
     };
   } catch (e) {
@@ -164,6 +178,10 @@ export const loader = async ({ request }) => {
       statusFilter,
       dateFrom,
       dateTo,
+      windowApprovedCount: 0,
+      windowDeclinedCount: 0,
+      windowTotalAmount: 0,
+      windowCurrency: "USD",
       error: e?.message || "Failed to load NMI refunds",
     };
   }
@@ -217,25 +235,21 @@ export default function NmiRefunds() {
     statusFilter,
     dateFrom,
     dateTo,
+    windowApprovedCount,
+    windowDeclinedCount,
+    windowTotalAmount,
+    windowCurrency,
     error,
   } = useLoaderData();
   const navigation = useNavigation();
   const revalidator = useRevalidator();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const tableLoading = navigation.state === "loading";
   const refreshing = revalidator.state !== "idle";
+  const tableLoading = navigation.state === "loading" || refreshing;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const firstShown = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const lastShown = Math.min(page * pageSize, total);
-
-  // Window-level refund summary card.
-  const successfulRefunds = rows.filter((r) => r.success);
-  const totalRefunded = successfulRefunds.reduce(
-    (s, r) => s + r.refundAmount,
-    0,
-  );
-  const currency = rows[0]?.currency || "USD";
 
   const updateParams = (next) => {
     const merged = new URLSearchParams(searchParams);
@@ -272,12 +286,12 @@ export default function NmiRefunds() {
             <s-stack direction="block" gap="none">
               <s-text tone="subdued">Refunds in this window</s-text>
               <s-heading>
-                {formatAmount(totalRefunded, currency)} ·{" "}
-                {successfulRefunds.length} approved
+                {formatAmount(windowTotalAmount, windowCurrency)} ·{" "}
+                {windowApprovedCount} approved
               </s-heading>
             </s-stack>
             <s-text tone="subdued">
-              {total - successfulRefunds.length} declined / errored
+              {windowDeclinedCount} declined / errored
             </s-text>
           </s-stack>
         </s-box>

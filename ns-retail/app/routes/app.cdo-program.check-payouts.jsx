@@ -6,12 +6,10 @@ import { authenticate } from "../shopify.server";
 import { CollapsibleSection } from "../components/ui";
 import {
   listCheckPayoutPractitioners,
-  voidCheckPreferredPayouts,
   approvePayout,
   rejectPayout,
   markCheckPayoutPaid,
   buildPayoutBatch,
-  setCheckPayoutCronOverride,
 } from "../services/cdo/cdo.service";
 import StatusBadge from "../components/cdo/StatusBadge";
 import MetricCard from "../components/cdo/MetricCard";
@@ -21,11 +19,6 @@ import { formatCurrency, formatDate, formatDateTime } from "../utils/format";
 
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
-  // Cancel any stale CRON-created payouts for check-preferred practitioners
-  // and release their commissions back to the manual queue. Runs on every
-  // page load so legacy payouts are cleaned up immediately without waiting
-  // for the next CRON cycle.
-  await voidCheckPreferredPayouts();
   const rows = await listCheckPayoutPractitioners();
   return { rows };
 };
@@ -112,19 +105,6 @@ export const action = async ({ request }) => {
           message: `Check #${checkNumber} issued — ${formatCurrency(paid.amount || 0, paid.currency || "USD")} to ${paid.practitionerName || paid.practitionerEmail}`,
         };
       }
-      case "set-cron-override": {
-        if (!practitionerId) return { status: "error", op, message: "Practitioner id is required" };
-        const override = formData.get("override") === "true";
-        const note = String(formData.get("note") || "").trim();
-        await setCheckPayoutCronOverride(practitionerId, override, actor, note);
-        return {
-          status: "success",
-          op,
-          message: override
-            ? "CRON override enabled — this practitioner will be included in automated ACH payouts."
-            : "CRON override cleared — this practitioner returns to the check payout queue.",
-        };
-      }
       default:
         return { status: "error", op, message: `Unknown action: ${op}` };
     }
@@ -151,10 +131,12 @@ function Avatar({ name }) {
     .join("");
   return (
     <div style={{
-      width: "38px", height: "38px", borderRadius: "50%", flexShrink: 0,
-      background: "#f0f4ff", border: "1px solid #c9d7f8",
+      width: "40px", height: "40px", borderRadius: "50%", flexShrink: 0,
+      background: "linear-gradient(135deg, #e8eeff 0%, #c9d7f8 100%)",
+      border: "1px solid #b0c4ef",
       display: "flex", alignItems: "center", justifyContent: "center",
       fontWeight: 700, fontSize: "13px", color: "#2c5ee8", letterSpacing: "0.5px",
+      boxShadow: "0 1px 3px rgba(44,94,232,0.12)",
     }}>
       {initials || "?"}
     </div>
@@ -208,7 +190,6 @@ function PractitionerCard({
   onOpenMarkPaid,
   onOpenReject,
   onOpenGenerate,
-  onOpenOverride,
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded);
 
@@ -250,7 +231,6 @@ function PractitionerCard({
           <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
             <span style={{ fontWeight: 600, fontSize: "14px", color: "#303030" }}>{row.name}</span>
             <s-badge>Check</s-badge>
-            {row.cronOverride && <s-badge tone="warning">CRON Override</s-badge>}
             {row.currentPayoutStatus && (
               <StatusBadge status={row.currentPayoutStatus} />
             )}
@@ -266,29 +246,35 @@ function PractitionerCard({
         </div>
 
         {/* Inline stats */}
-        <div style={{ display: "flex", gap: "28px", alignItems: "center", flexShrink: 0 }}>
-          <div style={{ textAlign: "right" }}>
-            <div style={{ fontSize: "11px", color: "#6d7175", marginBottom: "1px" }}>Orders</div>
-            <div style={{ fontWeight: 600, fontSize: "13px", color: "#303030" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "0", flexShrink: 0 }}>
+          <div style={{ textAlign: "right", padding: "0 16px", borderRight: "1px solid #e1e3e5" }}>
+            <div style={{ fontSize: "10px", color: "#8c9196", marginBottom: "2px", textTransform: "uppercase", letterSpacing: "0.4px" }}>Orders</div>
+            <div style={{ fontWeight: 600, fontSize: "14px", color: "#303030" }}>
               {row.upcomingOrderCount || 0}
             </div>
           </div>
-          <div style={{ textAlign: "right" }}>
-            <div style={{ fontSize: "11px", color: "#6d7175", marginBottom: "1px" }}>Total Sales</div>
-            <div style={{ fontWeight: 600, fontSize: "13px", color: "#303030" }}>
+          <div style={{ textAlign: "right", padding: "0 16px", borderRight: "1px solid #e1e3e5" }}>
+            <div style={{ fontSize: "10px", color: "#8c9196", marginBottom: "2px", textTransform: "uppercase", letterSpacing: "0.4px" }}>Total Sales</div>
+            <div style={{ fontWeight: 600, fontSize: "14px", color: "#303030" }}>
               {row.totalSales > 0 ? formatCurrency(row.totalSales, "USD") : "—"}
             </div>
           </div>
-          <div style={{ textAlign: "right" }}>
-            <div style={{ fontSize: "11px", color: "#6d7175", marginBottom: "1px" }}>Pending Check</div>
-            <div style={{
-              fontWeight: 700, fontSize: "14px",
-              color: row.upcomingPayoutAmount > 0 ? "#00a47c" : "#8c9196",
-            }}>
-              {row.upcomingPayoutAmount > 0 ? formatCurrency(row.upcomingPayoutAmount, "USD") : "—"}
-            </div>
+          <div style={{ textAlign: "right", padding: "0 16px" }}>
+            <div style={{ fontSize: "10px", color: "#8c9196", marginBottom: "4px", textTransform: "uppercase", letterSpacing: "0.4px" }}>Pending Check</div>
+            {row.upcomingPayoutAmount > 0 ? (
+              <div style={{
+                display: "inline-block",
+                background: "#f1faf7", border: "1px solid #00a47c50",
+                borderRadius: "6px", padding: "2px 8px",
+                fontWeight: 700, fontSize: "13px", color: "#007a5a",
+              }}>
+                {formatCurrency(row.upcomingPayoutAmount, "USD")}
+              </div>
+            ) : (
+              <div style={{ fontWeight: 500, fontSize: "13px", color: "#c9cccf" }}>—</div>
+            )}
           </div>
-          <span style={{ fontSize: "14px", color: "#9ba0a5", marginLeft: "4px" }}>
+          <span style={{ fontSize: "12px", color: "#9ba0a5", marginLeft: "8px", paddingLeft: "4px" }}>
             {expanded ? "▲" : "▼"}
           </span>
         </div>
@@ -300,36 +286,32 @@ function PractitionerCard({
           <s-stack direction="block" gap="base">
             {/* All-time summary strip */}
             <div style={{
-              display: "flex", gap: "24px", flexWrap: "wrap",
-              padding: "10px 14px", background: "#f9fafb",
-              borderRadius: "6px", fontSize: "12px", color: "#6d7175",
+              display: "flex", gap: "0", flexWrap: "wrap",
+              background: "#f9fafb", border: "1px solid #e1e3e5",
+              borderRadius: "8px", overflow: "hidden",
             }}>
-              <span>
-                Total earned:{" "}
-                <strong style={{ color: "#303030" }}>{formatCurrency(row.totalCommission, "USD")}</strong>
-              </span>
-              <span>
-                Total paid:{" "}
-                <strong style={{ color: "#303030" }}>{formatCurrency(row.totalPaid, "USD")}</strong>
-              </span>
-              {row.currentPayoutReference && (
-                <span>
-                  Active ref:{" "}
-                  <strong style={{ color: "#303030" }}>{row.currentPayoutReference}</strong>
-                </span>
-              )}
+              {[
+                { label: "All-time Earned", value: formatCurrency(row.totalCommission, "USD") },
+                { label: "Total Paid Out", value: formatCurrency(row.totalPaid, "USD") },
+                { label: "Balance Remaining", value: formatCurrency(Math.max(0, row.totalCommission - row.totalPaid), "USD"), highlight: true },
+                ...(row.currentPayoutReference ? [{ label: "Active Ref", value: row.currentPayoutReference }] : []),
+              ].map((stat, i, arr) => (
+                <div key={stat.label} style={{
+                  flex: "1 0 120px",
+                  padding: "10px 16px",
+                  borderRight: i < arr.length - 1 ? "1px solid #e1e3e5" : "none",
+                }}>
+                  <div style={{ fontSize: "10px", color: "#8c9196", textTransform: "uppercase", letterSpacing: "0.4px", marginBottom: "3px" }}>
+                    {stat.label}
+                  </div>
+                  <div style={{ fontWeight: 600, fontSize: "14px", color: stat.highlight ? "#007a5a" : "#303030" }}>
+                    {stat.value}
+                  </div>
+                </div>
+              ))}
             </div>
 
             {/* Warnings */}
-            {row.cronOverride && (
-              <s-banner tone="warning">
-                <s-paragraph>
-                  <strong>CRON Override Active</strong> — Next automated run will include this
-                  practitioner as ACH. Set by {row.cronOverrideSetBy || "admin"}.
-                  {row.cronOverrideNote && ` "${row.cronOverrideNote}"`}
-                </s-paragraph>
-              </s-banner>
-            )}
             {row.currentPayoutBankingError && (
               <s-banner tone="critical">
                 <s-paragraph>Banking issue: {row.currentPayoutBankingError}</s-paragraph>
@@ -380,13 +362,6 @@ function PractitionerCard({
                   Mark as Paid
                 </s-button>
               )}
-              <div style={{ flex: 1 }} />
-              <s-button
-                variant="tertiary"
-                onClick={() => onOpenOverride(row.id, row.name, row.cronOverride, row.cronOverrideNote)}
-              >
-                {row.cronOverride ? "Clear CRON Override" : "Override to CRON"}
-              </s-button>
             </div>
 
             {/* Orders sub-section */}
@@ -524,34 +499,29 @@ export default function CheckPayouts() {
   const rejectFetcher = useFetcher();
   const markPaidFetcher = useFetcher();
   const generateFetcher = useFetcher();
-  const overrideFetcher = useFetcher();
 
   // Idempotency refs — prevent double-firing effects on re-renders
   const approveHandled = useRef(null);
   const rejectHandled = useRef(null);
   const markPaidHandled = useRef(null);
   const generateHandled = useRef(null);
-  const overrideHandled = useRef(null);
 
   // Modal refs
   const markPaidModalRef = useRef(null);
   const rejectModalRef = useRef(null);
   const generateModalRef = useRef(null);
-  const overrideModalRef = useRef(null);
 
   // Modal target state
   // Modal target state (payload for the open modal)
   const [markPaidTarget, setMarkPaidTarget] = useState(null);
   const [rejectTarget, setRejectTarget] = useState(null);
   const [generateTarget, setGenerateTarget] = useState(null);
-  const [overrideTarget, setOverrideTarget] = useState(null);
 
   // Modal form field state
   const [checkNumber, setCheckNumber] = useState("");
   const [checkDate, setCheckDate] = useState("");
   const [checkNotes, setCheckNotes] = useState("");
   const [rejectReason, setRejectReason] = useState("");
-  const [overrideNote, setOverrideNote] = useState("");
 
   // Per-commission selection for Issue Check modal (Set of commissionId strings)
   const [selectedCommIds, setSelectedCommIds] = useState(new Set());
@@ -583,12 +553,6 @@ export default function CheckPayouts() {
     setCheckDate("");
     setCheckNotes("");
     generateModalRef.current?.showOverlay?.();
-  };
-
-  const openOverride = (practitionerId, name, currentOverride, note) => {
-    setOverrideTarget({ practitionerId, name, currentOverride });
-    setOverrideNote(note || "");
-    overrideModalRef.current?.showOverlay?.();
   };
 
   // ── Fetcher effects ─────────────────────────────────────────────────────────
@@ -642,19 +606,6 @@ export default function CheckPayouts() {
     }
   }, [generateFetcher.data, generateFetcher.state, shopify]);
 
-  useEffect(() => {
-    const d = overrideFetcher.data;
-    if (!d || overrideFetcher.state !== "idle") return;
-    if (overrideHandled.current === d) return;
-    overrideHandled.current = d;
-    if (d.status === "success") {
-      shopify?.toast?.show(d.message || "Override updated");
-      overrideModalRef.current?.hideOverlay?.();
-    } else {
-      shopify?.toast?.show(d.message || "Failed", { isError: true });
-    }
-  }, [overrideFetcher.data, overrideFetcher.state, shopify]);
-
   // ── Summary stats ───────────────────────────────────────────────────────────
 
   // Row 1 — overview
@@ -692,47 +643,74 @@ export default function CheckPayouts() {
     onOpenMarkPaid: openMarkPaid,
     onOpenReject: openReject,
     onOpenGenerate: openGenerate,
-    onOpenOverride: openOverride,
   };
 
   return (
     <s-page inlineSize="large" heading="Check Payout Queue">
       <s-stack direction="block" gap="base">
 
+        {/* Action needed banner */}
+        {totalAmountToBePaid > 0 && (
+          <div style={{
+            display: "flex", alignItems: "center", gap: "14px",
+            padding: "12px 18px",
+            background: "#fdf9ed",
+            border: "1px solid #b98900",
+            borderLeft: "4px solid #b98900",
+            borderRadius: "8px",
+          }}>
+            <span style={{ fontSize: "20px" }}>⚠️</span>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontWeight: 600, fontSize: "14px", color: "#916800" }}>
+                {pendingCheckRows.length} practitioner{pendingCheckRows.length !== 1 ? "s" : ""} pending — {formatCurrency(totalAmountToBePaid, "USD")} to be paid
+              </div>
+              <div style={{ fontSize: "12px", color: "#916800", opacity: 0.8, marginTop: "2px" }}>
+                Review the active queue below and issue checks to clear the pending balance.
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Stats header */}
         <div style={{ border: "1px solid #e1e3e5", borderRadius: "8px", overflow: "hidden" }}>
           <div style={{
             display: "flex", alignItems: "center", justifyContent: "space-between",
-            padding: "12px 20px", background: "#f6f6f7", borderBottom: "1px solid #e1e3e5",
+            padding: "10px 18px", background: "#f6f6f7", borderBottom: "1px solid #e1e3e5",
           }}>
-            <span style={{ fontWeight: 600, fontSize: "14px", color: "#303030" }}>
+            <span style={{ fontWeight: 600, fontSize: "13px", color: "#303030" }}>
               Queue Summary
             </span>
-            <span style={{ fontSize: "12px", color: "#6d7175" }}>
-              Practitioners opting for physical check — excluded from automated ACH CRON
+            <span style={{ fontSize: "11px", color: "#8c9196" }}>
+              Physical check practitioners — excluded from automated ACH CRON
             </span>
           </div>
-          <div style={{ padding: "16px 20px" }}>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: "12px" }}>
+          <div style={{ padding: "14px 18px" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "10px" }}>
               <MetricCard
-                label="Total Practitioners"
+                label="Practitioners"
                 value={String(rows.length)}
                 sublabel="in check queue"
+                icon="👥"
               />
               <MetricCard
-                label="Total Orders"
+                label="Pending Orders"
                 value={String(totalOrders)}
-                sublabel="pending commissions"
+                sublabel="unpaid commissions"
+                icon="📦"
+                tone={totalOrders > 0 ? "info" : undefined}
               />
               <MetricCard
-                label="Total Commission Amount"
+                label="All-time Earned"
                 value={formatCurrency(totalCommissionEarned, "USD")}
-                sublabel="all-time earned"
+                sublabel="total commission"
+                icon="💰"
               />
               <MetricCard
-                label="Total Check Payouts"
+                label="Total Paid Out"
                 value={formatCurrency(totalPaidHistorical, "USD")}
-                sublabel={`${totalCheckPayoutsIssued} payout${totalCheckPayoutsIssued === 1 ? "" : "s"} issued`}
+                sublabel={`${totalCheckPayoutsIssued} check${totalCheckPayoutsIssued === 1 ? "" : "s"} issued`}
+                icon="✅"
+                tone="success"
               />
               <MetricCard
                 label="Amount to Be Paid"
@@ -741,8 +719,9 @@ export default function CheckPayouts() {
                 sublabel={
                   pendingCheckRows.length > 0
                     ? `${pendingCheckRows.length} practitioner${pendingCheckRows.length === 1 ? "" : "s"} pending`
-                    : "no pending checks"
+                    : "all clear"
                 }
+                icon={totalAmountToBePaid > 0 ? "⏳" : "🎉"}
               />
             </div>
           </div>
@@ -766,9 +745,16 @@ export default function CheckPayouts() {
                 padding: "10px 20px", background: "#f6f6f7", borderBottom: "1px solid #e1e3e5",
                 display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap",
               }}>
-                <span style={{ fontWeight: 600, fontSize: "14px", color: "#303030" }}>
-                  Active Queue
-                </span>
+                <div style={{ display: "flex", alignItems: "baseline", gap: "8px" }}>
+                  <span style={{ fontWeight: 600, fontSize: "14px", color: "#303030" }}>
+                    Active Queue
+                  </span>
+                  {totalAmountToBePaid > 0 && (
+                    <span style={{ fontSize: "12px", color: "#916800", fontWeight: 500 }}>
+                      · {formatCurrency(totalAmountToBePaid, "USD")} pending
+                    </span>
+                  )}
+                </div>
                 {/* Filter pills */}
                 <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
                   {FILTERS.map((f) => {
@@ -805,15 +791,21 @@ export default function CheckPayouts() {
               </div>
 
               {/* Body */}
-              <div style={{ padding: "16px 20px" }}>
+              <div style={{ padding: "12px 16px" }}>
                 {filteredActive.length === 0 ? (
                   <div style={{
-                    textAlign: "center", padding: "40px 16px",
+                    textAlign: "center", padding: "48px 16px",
                     color: "#6d7175", fontSize: "13px",
                   }}>
-                    {queueFilter === "all"
-                      ? "No practitioners with pending check payouts."
-                      : `No practitioners match the "${FILTERS.find((f) => f.key === queueFilter)?.label}" filter.`}
+                    <div style={{ fontSize: "32px", marginBottom: "10px", opacity: 0.4 }}>✅</div>
+                    <div style={{ fontWeight: 600, fontSize: "14px", color: "#303030", marginBottom: "4px" }}>
+                      {queueFilter === "all" ? "All clear" : "No matches"}
+                    </div>
+                    <div style={{ color: "#8c9196" }}>
+                      {queueFilter === "all"
+                        ? "No practitioners with pending check payouts."
+                        : `No practitioners match the "${FILTERS.find((f) => f.key === queueFilter)?.label}" filter.`}
+                    </div>
                   </div>
                 ) : (
                   <s-stack direction="block" gap="small-200">
@@ -1143,51 +1135,6 @@ export default function CheckPayouts() {
             Issue Check{selectedCommIds.size > 0 ? ` (${selectedCommIds.size})` : ""}
           </s-button>
           <s-button slot="secondary-actions" onClick={() => generateModalRef.current?.hideOverlay?.()}>
-            Cancel
-          </s-button>
-        </s-modal>
-
-        {/* CRON override */}
-        <s-modal
-          ref={overrideModalRef}
-          id="cdo-cron-override-modal"
-          heading={overrideTarget?.currentOverride ? "Clear CRON Override" : "Override to CRON"}
-          accessibilityLabel="Set CRON override"
-        >
-          <s-stack direction="block" gap="base">
-            <s-paragraph tone="subdued">
-              {overrideTarget?.currentOverride
-                ? `Clearing the override will return ${overrideTarget?.name || "this practitioner"} to the check payout queue. Future CRON runs will skip them and they must be processed manually.`
-                : `Enabling the override will include ${overrideTarget?.name || "this practitioner"} in the next automated payout CRON run as ACH (banking must be valid). Their check preference is not changed — only the next CRON batch is affected.`}
-            </s-paragraph>
-            <s-text-area
-              label="Admin note (optional)"
-              placeholder="Reason for override..."
-              value={overrideNote}
-              onInput={(e) => setOverrideNote(e.target.value)}
-              onChange={(e) => setOverrideNote(e.target.value)}
-            />
-          </s-stack>
-          <s-button
-            slot="primary-action"
-            variant="primary"
-            {...(overrideTarget?.currentOverride ? { tone: "critical" } : {})}
-            {...(overrideFetcher.state !== "idle" ? { loading: true } : {})}
-            onClick={() => {
-              overrideFetcher.submit(
-                {
-                  _action: "set-cron-override",
-                  practitionerId: overrideTarget.practitionerId,
-                  override: String(!overrideTarget.currentOverride),
-                  note: overrideNote.trim(),
-                },
-                { method: "POST" },
-              );
-            }}
-          >
-            {overrideTarget?.currentOverride ? "Clear Override" : "Enable Override"}
-          </s-button>
-          <s-button slot="secondary-actions" onClick={() => overrideModalRef.current?.hideOverlay?.()}>
             Cancel
           </s-button>
         </s-modal>

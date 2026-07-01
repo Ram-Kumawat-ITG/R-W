@@ -81,6 +81,7 @@ export default function App() {
         <s-link href="/app" rel="home">Home</s-link>
         <s-link href="/app/orders">Orders</s-link>
         <s-link href="/app/cdo-program">CDO Program</s-link>
+        <s-link href="/app/qbo">QBO</s-link>
         {/* <s-link href="/app/additional">Additional page</s-link> */}
       </s-app-nav>
       <Outlet />

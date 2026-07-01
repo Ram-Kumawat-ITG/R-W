@@ -47,7 +47,7 @@ import {
   executeGraphQL,
   executeMutation,
   shopifyRestPost,
-} from './shopify.apis'
+} from './shopify.apis.server'
 import { createLogger } from '../../utils/logger.utils'
 import { PermanentError, TransientError } from '../../utils/retry.utils'
 

@@ -4,7 +4,7 @@ import {
   getUnauthenticatedAdmin,
   executeGraphQL,
   executeMutation,
-} from "../services/shopify/shopify.apis";
+} from "../services/shopify/shopify.apis.server";
 import { QUERY_CUSTOMER_TAGS } from "../services/shopify/shopify.queries";
 import {
   MUTATION_CUSTOMER_DELETE,

@@ -101,7 +101,8 @@ export default function NmiDashboard() {
                 </s-clickable-chip>
               ))}
               <s-button
-                variant="secondary"
+                variant="tertiary"
+                icon="refresh"
                 onClick={() => revalidator.revalidate()}
                 {...(refreshing ? { loading: true } : {})}
               >
@@ -163,13 +164,13 @@ export default function NmiDashboard() {
             <MetricCard
               label="Credit card payments"
               value={fmtCount(counts.creditCard)}
-              subtitle="transaction_type=cc"
+              subtitle="Credit card transactions"
               onClick={() => navigate("/app/nmi/payments?method=cc")}
             />
             <MetricCard
               label="ACH payments"
               value={fmtCount(counts.ach)}
-              subtitle="transaction_type=ck"
+              subtitle="ACH / eCheck transactions"
               onClick={() => navigate("/app/nmi/payments?method=ck")}
             />
             <MetricCard
@@ -199,7 +200,10 @@ export default function NmiDashboard() {
               label="Period transactions / day"
               value={
                 counts.transactions != null
-                  ? (counts.transactions / 30).toFixed(1)
+                  ? (
+                      counts.transactions /
+                      (PERIOD_OPTIONS.find((p) => p.id === periodId)?.days || 30)
+                    ).toFixed(1)
                   : "—"
               }
               subtitle="Averaged across the window"

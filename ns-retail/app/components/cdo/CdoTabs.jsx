@@ -7,7 +7,7 @@ export const CDO_TABS = [
   { label: "CDO Practitioners", path: `${CDO_BASE}/customers` },
   { label: "Orders", path: `${CDO_BASE}/orders` },
   { label: "Commissions", path: `${CDO_BASE}/commissions` },
-  { label: "Payout Batches", path: `${CDO_BASE}/batches` },
+  { label: "CRON Run History", path: `${CDO_BASE}/batches` },
   { label: "Check Payouts", path: `${CDO_BASE}/check-payouts` },
   { label: "Payouts", path: `${CDO_BASE}/payouts` },
   { label: "Referrals", path: `${CDO_BASE}/referrals` },

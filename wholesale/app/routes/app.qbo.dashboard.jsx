@@ -75,7 +75,8 @@ export default function QboDashboard() {
               {asOf ? new Date(asOf).toLocaleString() : "—"}
             </s-text>
             <s-button
-              variant="secondary"
+              variant="tertiary"
+              icon="refresh"
               onClick={() => revalidator.revalidate()}
               {...(refreshing ? { loading: true } : {})}
             >
@@ -244,8 +245,19 @@ export default function QboDashboard() {
             </s-table-header-row>
             <s-table-body>
               {recentInvoices.map((inv) => {
+                const total = Number(inv.TotalAmt || 0);
                 const balance = Number(inv.Balance || 0);
-                const status = balance === 0 ? "Paid" : "Open";
+                const paid = Number((total - balance).toFixed(2));
+                let status;
+                if (total === 0) status = "Voided";
+                else if (balance === 0) status = "Paid";
+                else if (paid > 0) status = "Partial";
+                else status = "Pending";
+                const statusTone =
+                  status === "Paid" ? "success"
+                  : status === "Partial" ? "info"
+                  : status === "Voided" ? "default"
+                  : "warning";
                 return (
                   <s-table-row
                     key={inv.Id}
@@ -256,17 +268,15 @@ export default function QboDashboard() {
                     </s-table-cell>
                     <s-table-cell>{inv.CustomerRef?.name || "—"}</s-table-cell>
                     <s-table-cell>
-                      {inv.TotalAmt != null
-                        ? formatAmount(inv.TotalAmt, inv.CurrencyRef?.value || "USD")
+                      {total > 0
+                        ? formatAmount(total, inv.CurrencyRef?.value || "USD")
                         : "—"}
                     </s-table-cell>
                     <s-table-cell>
                       {formatAmount(balance, inv.CurrencyRef?.value || "USD")}
                     </s-table-cell>
                     <s-table-cell>
-                      <s-badge tone={status === "Paid" ? "success" : "warning"}>
-                        {status}
-                      </s-badge>
+                      <s-badge tone={statusTone}>{status}</s-badge>
                     </s-table-cell>
                     <s-table-cell>{fmtDueDate(inv.DueDate) || "—"}</s-table-cell>
                   </s-table-row>

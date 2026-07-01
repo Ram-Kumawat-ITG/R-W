@@ -845,3 +845,361 @@ export function billWebUrl(billId) {
 export function billPaymentWebUrl(billPaymentId) {
   return `${retailQboConfig.appBaseUrl}/app/billpayment?txnId=${billPaymentId}`;
 }
+
+// ── Analytics query helpers ──────────────────────────────────────
+
+const ANALYTICS_MAX_PAGE_SIZE = 200;
+const ANALYTICS_DEFAULT_PAGE_SIZE = 50;
+
+async function runListQuery(ql, startPosition = 1, maxResults = ANALYTICS_DEFAULT_PAGE_SIZE) {
+  const resp = await retailQbo.query(
+    `${ql} STARTPOSITION ${startPosition} MAXRESULTS ${maxResults}`,
+  );
+  if (!resp?.QueryResponse) return [];
+  return Object.values(resp.QueryResponse)
+    .flat()
+    .filter((v) => v && typeof v === "object");
+}
+
+async function runCountQuery(entityAndWhere) {
+  const resp = await retailQbo.query(`SELECT COUNT(*) FROM ${entityAndWhere}`);
+  return resp?.QueryResponse?.totalCount ?? 0;
+}
+
+export async function listCustomers({
+  search = "",
+  status = "all",
+  page = 1,
+  pageSize = ANALYTICS_DEFAULT_PAGE_SIZE,
+} = {}) {
+  const predicates = [];
+  if (status === "active") predicates.push("Active = true");
+  if (status === "inactive") predicates.push("Active = false");
+  if (search) {
+    const v = escapeQuery(search);
+    predicates.push(
+      `(DisplayName LIKE '%${v}%' OR CompanyName LIKE '%${v}%' OR PrimaryEmailAddr LIKE '%${v}%')`,
+    );
+  }
+  const where = predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "";
+  const ql = `SELECT * FROM Customer${where} ORDERBY DisplayName`;
+  const startPos = (page - 1) * pageSize + 1;
+  return runListQuery(ql, startPos, pageSize);
+}
+
+export async function countCustomers({ search = "", status = "all" } = {}) {
+  const predicates = [];
+  if (status === "active") predicates.push("Active = true");
+  if (status === "inactive") predicates.push("Active = false");
+  if (search) {
+    const v = escapeQuery(search);
+    predicates.push(
+      `(DisplayName LIKE '%${v}%' OR CompanyName LIKE '%${v}%' OR PrimaryEmailAddr LIKE '%${v}%')`,
+    );
+  }
+  const where = predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "";
+  return runCountQuery(`Customer${where}`);
+}
+
+export async function listInvoices({
+  search = "",
+  status = "all",
+  dateFrom = "",
+  dateTo = "",
+  customerId = "",
+  page = 1,
+  pageSize = ANALYTICS_DEFAULT_PAGE_SIZE,
+} = {}) {
+  const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+  const todayYmd = new Date().toISOString().slice(0, 10);
+  const predicates = [];
+  if (status === "paid") predicates.push("Balance = '0' AND TotalAmt > '0'");
+  else if (status === "pending") predicates.push("Balance > '0'");
+  else if (status === "overdue")
+    predicates.push(`Balance > '0' AND DueDate < '${todayYmd}'`);
+  else if (status === "voided") predicates.push("TotalAmt = '0'");
+  if (customerId) predicates.push(`CustomerRef = '${escapeQuery(customerId)}'`);
+  if (YMD_RE.test(dateFrom)) predicates.push(`TxnDate >= '${dateFrom}'`);
+  if (YMD_RE.test(dateTo)) predicates.push(`TxnDate <= '${dateTo}'`);
+  if (search) {
+    const v = escapeQuery(search);
+    predicates.push(`DocNumber LIKE '%${v}%'`);
+  }
+  const where = predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "";
+  const ql = `SELECT * FROM Invoice${where} ORDERBY TxnDate DESC`;
+  const startPos = (page - 1) * pageSize + 1;
+  return runListQuery(ql, startPos, pageSize);
+}
+
+export async function countInvoices({
+  search = "",
+  status = "all",
+  dateFrom = "",
+  dateTo = "",
+  customerId = "",
+} = {}) {
+  const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+  const todayYmd = new Date().toISOString().slice(0, 10);
+  const predicates = [];
+  if (status === "paid") predicates.push("Balance = '0' AND TotalAmt > '0'");
+  else if (status === "pending") predicates.push("Balance > '0'");
+  else if (status === "overdue")
+    predicates.push(`Balance > '0' AND DueDate < '${todayYmd}'`);
+  else if (status === "voided") predicates.push("TotalAmt = '0'");
+  if (customerId) predicates.push(`CustomerRef = '${escapeQuery(customerId)}'`);
+  if (YMD_RE.test(dateFrom)) predicates.push(`TxnDate >= '${dateFrom}'`);
+  if (YMD_RE.test(dateTo)) predicates.push(`TxnDate <= '${dateTo}'`);
+  if (search) {
+    const v = escapeQuery(search);
+    predicates.push(`DocNumber LIKE '%${v}%'`);
+  }
+  const where = predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "";
+  return runCountQuery(`Invoice${where}`);
+}
+
+export async function listPayments({
+  search = "",
+  dateFrom = "",
+  dateTo = "",
+  customerId = "",
+  page = 1,
+  pageSize = ANALYTICS_DEFAULT_PAGE_SIZE,
+} = {}) {
+  const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+  const predicates = [];
+  if (customerId) predicates.push(`CustomerRef = '${escapeQuery(customerId)}'`);
+  if (YMD_RE.test(dateFrom)) predicates.push(`TxnDate >= '${dateFrom}'`);
+  if (YMD_RE.test(dateTo)) predicates.push(`TxnDate <= '${dateTo}'`);
+  if (search) {
+    const v = escapeQuery(search);
+    predicates.push(`PaymentRefNum LIKE '%${v}%'`);
+  }
+  const where = predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "";
+  const ql = `SELECT * FROM Payment${where} ORDERBY TxnDate DESC`;
+  const startPos = (page - 1) * pageSize + 1;
+  return runListQuery(ql, startPos, pageSize);
+}
+
+export async function countPayments({ search = "", dateFrom = "", dateTo = "", customerId = "" } = {}) {
+  const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+  const predicates = [];
+  if (customerId) predicates.push(`CustomerRef = '${escapeQuery(customerId)}'`);
+  if (YMD_RE.test(dateFrom)) predicates.push(`TxnDate >= '${dateFrom}'`);
+  if (YMD_RE.test(dateTo)) predicates.push(`TxnDate <= '${dateTo}'`);
+  if (search) {
+    const v = escapeQuery(search);
+    predicates.push(`PaymentRefNum LIKE '%${v}%'`);
+  }
+  const where = predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "";
+  return runCountQuery(`Payment${where}`);
+}
+
+export async function listVendors() {
+  const res = await retailQbo.query(
+    "SELECT * FROM Vendor ORDERBY DisplayName MAXRESULTS 1000",
+  );
+  return res?.QueryResponse?.Vendor || [];
+}
+
+export async function listBills({
+  search = "",
+  status = "all",
+  dateFrom = "",
+  dateTo = "",
+  vendorId = "",
+  page = 1,
+  pageSize = ANALYTICS_DEFAULT_PAGE_SIZE,
+} = {}) {
+  const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+  const todayYmd = new Date().toISOString().slice(0, 10);
+  const predicates = [];
+  if (status === "paid") predicates.push("Balance = '0' AND TotalAmt > '0'");
+  else if (status === "open") predicates.push("Balance > '0'");
+  else if (status === "overdue")
+    predicates.push(`Balance > '0' AND DueDate < '${todayYmd}'`);
+  else if (status === "voided") predicates.push("TotalAmt = '0'");
+  if (vendorId) predicates.push(`VendorRef = '${escapeQuery(vendorId)}'`);
+  if (YMD_RE.test(dateFrom)) predicates.push(`TxnDate >= '${dateFrom}'`);
+  if (YMD_RE.test(dateTo)) predicates.push(`TxnDate <= '${dateTo}'`);
+  if (search) {
+    const v = escapeQuery(search);
+    predicates.push(`DocNumber LIKE '%${v}%'`);
+  }
+  const where = predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "";
+  const ql = `SELECT * FROM Bill${where} ORDERBY TxnDate DESC`;
+  const startPos = (page - 1) * pageSize + 1;
+  return runListQuery(ql, startPos, pageSize);
+}
+
+export async function countBills({
+  search = "",
+  status = "all",
+  dateFrom = "",
+  dateTo = "",
+  vendorId = "",
+} = {}) {
+  const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+  const todayYmd = new Date().toISOString().slice(0, 10);
+  const predicates = [];
+  if (status === "paid") predicates.push("Balance = '0' AND TotalAmt > '0'");
+  else if (status === "open") predicates.push("Balance > '0'");
+  else if (status === "overdue")
+    predicates.push(`Balance > '0' AND DueDate < '${todayYmd}'`);
+  else if (status === "voided") predicates.push("TotalAmt = '0'");
+  if (vendorId) predicates.push(`VendorRef = '${escapeQuery(vendorId)}'`);
+  if (YMD_RE.test(dateFrom)) predicates.push(`TxnDate >= '${dateFrom}'`);
+  if (YMD_RE.test(dateTo)) predicates.push(`TxnDate <= '${dateTo}'`);
+  if (search) {
+    const v = escapeQuery(search);
+    predicates.push(`DocNumber LIKE '%${v}%'`);
+  }
+  const where = predicates.length ? ` WHERE ${predicates.join(" AND ")}` : "";
+  return runCountQuery(`Bill${where}`);
+}
+
+export async function getBillCountSnapshot() {
+  const todayYmd = new Date().toISOString().slice(0, 10);
+  const safe = async (fn) => {
+    try { return await fn(); } catch { return null; }
+  };
+
+  const [total, paid, open, overdue, recentRaw] = await Promise.all([
+    safe(() => runCountQuery("Bill")),
+    safe(() => runCountQuery("Bill WHERE Balance = '0' AND TotalAmt > '0'")),
+    safe(() => runCountQuery("Bill WHERE Balance > '0'")),
+    safe(() => runCountQuery(`Bill WHERE Balance > '0' AND DueDate < '${todayYmd}'`)),
+    safe(() => runListQuery(
+      "SELECT * FROM Bill ORDERBY TxnDate DESC",
+      1,
+      ANALYTICS_MAX_PAGE_SIZE,
+    )),
+  ]);
+
+  let totalBilled = 0;
+  let totalOutstanding = 0;
+  let currency = "USD";
+  if (recentRaw) {
+    for (const b of recentRaw) {
+      totalBilled += Number(b.TotalAmt || 0);
+      totalOutstanding += Number(b.Balance || 0);
+      if (b.CurrencyRef?.value) currency = b.CurrencyRef.value;
+    }
+  }
+
+  const billCount = recentRaw?.length ?? 0;
+  return {
+    total: total ?? 0,
+    paid: paid ?? 0,
+    open: open ?? 0,
+    overdue: overdue ?? 0,
+    totalBilled,
+    totalOutstanding,
+    currency,
+    billCount,
+    truncated: billCount >= ANALYTICS_MAX_PAGE_SIZE,
+    recentBills: (recentRaw ?? []).slice(0, 10),
+  };
+}
+
+export async function getDashboardSnapshot() {
+  const safe = async (label, fn) => {
+    try {
+      return await fn();
+    } catch (e) {
+      console.error(`[retailQbo/dashboard] ${label} failed:`, e?.message || e);
+      return null;
+    }
+  };
+
+  const todayYmd = new Date().toISOString().slice(0, 10);
+
+  const [
+    customers,
+    activeCustomers,
+    invoices,
+    paidInvoices,
+    pendingInvoices,
+    overdueInvoices,
+    recentPaymentsRaw,
+    recentInvoicesRaw,
+    billedRaw,
+  ] = await Promise.all([
+    safe("customers", () => runCountQuery("Customer")),
+    safe("activeCustomers", () => runCountQuery("Customer WHERE Active = true")),
+    safe("invoices", () => runCountQuery("Invoice")),
+    safe("paidInvoices", () =>
+      runCountQuery("Invoice WHERE Balance = '0' AND TotalAmt > '0'"),
+    ),
+    safe("pendingInvoices", () => runCountQuery("Invoice WHERE Balance > '0'")),
+    safe("overdueInvoices", () =>
+      runCountQuery(`Invoice WHERE Balance > '0' AND DueDate < '${todayYmd}'`),
+    ),
+    safe("recentPayments", () =>
+      runListQuery("SELECT * FROM Payment ORDERBY TxnDate DESC", 1, 10),
+    ),
+    safe("recentInvoices", () =>
+      runListQuery("SELECT * FROM Invoice ORDERBY TxnDate DESC", 1, 10),
+    ),
+    safe("billedRaw", () =>
+      runListQuery(
+        "SELECT * FROM Invoice WHERE TotalAmt > '0' ORDERBY TxnDate DESC",
+        1,
+        ANALYTICS_MAX_PAGE_SIZE,
+      ),
+    ),
+  ]);
+
+  let billed = 0;
+  let collected = 0;
+  let sampledInvoiceCount = 0;
+  let truncated = false;
+  let currency = "USD";
+  if (billedRaw) {
+    sampledInvoiceCount = billedRaw.length;
+    truncated = billedRaw.length >= ANALYTICS_MAX_PAGE_SIZE;
+    for (const inv of billedRaw) {
+      const total = Number(inv.TotalAmt || 0);
+      const balance = Number(inv.Balance || 0);
+      billed += total;
+      collected += total - balance;
+      if (inv.CurrencyRef?.value) currency = inv.CurrencyRef.value;
+    }
+  }
+
+  const errors = [
+    customers == null && "customers",
+    activeCustomers == null && "activeCustomers",
+    invoices == null && "invoices",
+    paidInvoices == null && "paidInvoices",
+    pendingInvoices == null && "pendingInvoices",
+    overdueInvoices == null && "overdueInvoices",
+    recentPaymentsRaw == null && "recentPayments",
+    recentInvoicesRaw == null && "recentInvoices",
+    billedRaw == null && "revenue",
+  ].filter(Boolean);
+
+  return {
+    counts: {
+      customers: customers ?? 0,
+      activeCustomers: activeCustomers ?? 0,
+      invoices: invoices ?? 0,
+      paidInvoices: paidInvoices ?? 0,
+      pendingInvoices: pendingInvoices ?? 0,
+      overdueInvoices: overdueInvoices ?? 0,
+    },
+    revenue: {
+      billed,
+      collected,
+      periodLabel: truncated
+        ? `Last ${ANALYTICS_MAX_PAGE_SIZE} invoices`
+        : "All invoices",
+      sampledInvoiceCount,
+      truncated,
+      currency,
+    },
+    recentPayments: recentPaymentsRaw ?? [],
+    recentInvoices: recentInvoicesRaw ?? [],
+    errors,
+    asOf: new Date().toISOString(),
+  };
+}

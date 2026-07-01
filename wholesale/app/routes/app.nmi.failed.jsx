@@ -221,8 +221,8 @@ export default function NmiFailed() {
   const revalidator = useRevalidator();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const tableLoading = navigation.state === "loading";
   const refreshing = revalidator.state !== "idle";
+  const tableLoading = navigation.state === "loading" || refreshing;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const firstShown = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const lastShown = Math.min(page * pageSize, total);
@@ -354,16 +354,24 @@ export default function NmiFailed() {
                       tone={
                         f.condition === "complete"
                           ? "success"
-                          : f.condition === "failed"
-                            ? "critical"
-                            : "default"
+                          : f.condition === "pendingsettlement" || f.condition === "pending"
+                            ? "info"
+                            : f.condition === "failed"
+                              ? "critical"
+                              : "default"
                       }
                     >
                       {f.condition === "complete"
                         ? "Later succeeded"
-                        : f.condition === "failed"
-                          ? "Failed"
-                          : f.condition || "—"}
+                        : f.condition === "pendingsettlement"
+                          ? "Awaiting settlement"
+                          : f.condition === "pending"
+                            ? "Pending"
+                            : f.condition === "failed"
+                              ? "Failed"
+                              : f.condition === "canceled"
+                                ? "Canceled"
+                                : f.condition || "—"}
                     </s-badge>
                   </s-table-cell>
                   <s-table-cell>
