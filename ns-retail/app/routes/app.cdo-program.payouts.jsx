@@ -1,5 +1,5 @@
 /* eslint-disable react/prop-types */
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useFetcher, useLoaderData } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
@@ -15,12 +15,6 @@ import {
 import DataTable from "../components/cdo/DataTable";
 import StatusBadge from "../components/cdo/StatusBadge";
 import { formatCurrency, formatDate } from "../utils/format";
-
-// CDO commission payouts — approve-then-auto-execute. Eligible approved
-// commissions are aggregated into payout batches (awaiting_approval); an
-// admin approves, then execution posts a Vendor Bill + BillPayment to the
-// CDO QuickBooks account and settles the commissions. All mutations
-// submit to this route's action via a shared fetcher.
 
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
@@ -42,8 +36,6 @@ export const action = async ({ request }) => {
       case "generate-batch": {
         const periodEndRaw = formData.get("periodEnd");
         const periodEnd = periodEndRaw ? new Date(periodEndRaw) : new Date();
-        // 1) Calculate commissions from attributed orders, then 2) batch
-        // the eligible (approved, unpaid, above-minimum) ones for approval.
         const accrual = await accrueCommissionsForOrders();
         const { created, skipped } = await buildPayoutBatch({ periodEnd, actor });
         return {
@@ -101,10 +93,56 @@ export const action = async ({ request }) => {
   }
 };
 
-const period = (r) =>
-  r.periodStart || r.periodEnd
-    ? `${formatDate(r.periodStart)} – ${formatDate(r.periodEnd)}`
-    : "—";
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function fmtPeriod(r) {
+  if (!r.periodStart && !r.periodEnd) return "—";
+  if (!r.periodStart) return `Up to ${formatDate(r.periodEnd)}`;
+  if (!r.periodEnd) return `From ${formatDate(r.periodStart)}`;
+  return `${formatDate(r.periodStart)} – ${formatDate(r.periodEnd)}`;
+}
+
+const METHOD_LABEL = { ach: "ACH", check: "Check", manual: "Manual" };
+const METHOD_TONE  = { ach: "info", check: "default", manual: "default" };
+
+function MethodBadge({ method }) {
+  const m = (method || "manual").toLowerCase();
+  return (
+    <s-badge tone={METHOD_TONE[m] || "default"}>
+      {METHOD_LABEL[m] || method || "—"}
+    </s-badge>
+  );
+}
+
+// Native date picker — s-text-field does not forward type="date".
+function DateField({ label, value, onChange }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+      <span style={{ fontSize: "13px", fontWeight: 550, color: "var(--p-color-text)" }}>
+        {label}
+      </span>
+      <input
+        type="date"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        style={{
+          padding: "7px 12px",
+          border: "1px solid var(--p-color-border, #919191)",
+          borderRadius: "8px",
+          fontSize: "14px",
+          color: "var(--p-color-text)",
+          background: "var(--p-color-bg-surface, #fff)",
+          outline: "none",
+          width: "100%",
+          boxSizing: "border-box",
+          cursor: "pointer",
+        }}
+      />
+    </div>
+  );
+}
+
+// ── Page ──────────────────────────────────────────────────────────────────────
 
 export default function CdoPayouts() {
   const { rows } = useLoaderData();
@@ -116,7 +154,38 @@ export default function CdoPayouts() {
   const pendingId = busy ? fetcher.formData?.get("payoutId") : null;
   const pendingOp = busy ? fetcher.formData?.get("_action") : null;
 
-  // Surface action results as toasts once per response.
+  // ── Filter state ────────────────────────────────────────────────────────────
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [methodFilter, setMethodFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("all");
+
+  // Pre-filter rows before passing to DataTable (DataTable owns text search).
+  const filteredRows = useMemo(() => {
+    return rows.filter((r) => {
+      if (methodFilter !== "all" && r.method !== methodFilter) return false;
+      if (statusFilter !== "all" && r.status !== statusFilter) return false;
+      if (dateFrom || dateTo) {
+        // Filter by periodEnd date (the batch cutoff).
+        const d = r.periodEnd ? new Date(r.periodEnd) : null;
+        if (!d) return false;
+        if (dateFrom && d < new Date(dateFrom)) return false;
+        if (dateTo && d > new Date(dateTo + "T23:59:59")) return false;
+      }
+      return true;
+    });
+  }, [rows, methodFilter, statusFilter, dateFrom, dateTo]);
+
+  const hasActiveFilters = methodFilter !== "all" || statusFilter !== "all" || dateFrom || dateTo;
+
+  const resetFilters = () => {
+    setDateFrom("");
+    setDateTo("");
+    setMethodFilter("all");
+    setStatusFilter("all");
+  };
+
+  // ── Toast effects ───────────────────────────────────────────────────────────
   useEffect(() => {
     if (!fetcher.data || fetcher.state !== "idle") return;
     if (handledRef.current === fetcher.data) return;
@@ -136,14 +205,12 @@ export default function CdoPayouts() {
   const onGenerate = () =>
     submit(
       { _action: "generate-batch" },
-      {
-        confirmText:
-          "Generate payout batch from all eligible approved commissions (up to today)?",
-      },
+      { confirmText: "Generate payout batch from all eligible approved commissions (up to today)?" },
     );
 
   const rowBusy = (r, op) => busy && pendingId === r.id && pendingOp === op;
 
+  // ── Columns ─────────────────────────────────────────────────────────────────
   const columns = [
     { key: "practitionerName", header: "Practitioner" },
     {
@@ -156,7 +223,16 @@ export default function CdoPayouts() {
       header: "Commissions",
       render: (r) => r.commissionCount ?? 0,
     },
-    { key: "period", header: "Period", render: period },
+    {
+      key: "method",
+      header: "Method",
+      render: (r) => <MethodBadge method={r.method} />,
+    },
+    {
+      key: "period",
+      header: "Period",
+      render: fmtPeriod,
+    },
     {
       key: "status",
       header: "Status",
@@ -239,15 +315,12 @@ export default function CdoPayouts() {
     },
   ];
 
+  // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <s-stack direction="block" gap="base">
+      {/* Header section */}
       <s-section padding="base">
-        <s-stack
-          direction="inline"
-          gap="base"
-          alignItems="center"
-          justifyContent="space-between"
-        >
+        <s-stack direction="inline" gap="base" alignItems="center" justifyContent="space-between">
           <s-paragraph tone="subdued">
             Aggregate eligible approved commissions into payout batches. Approve,
             then Execute to record the QBO Vendor Bill and initiate a real bank
@@ -266,13 +339,89 @@ export default function CdoPayouts() {
         </s-stack>
       </s-section>
 
+      {/* Filters */}
+      <s-section heading="Filters">
+        <s-stack direction="block" gap="base">
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "12px" }}>
+            <DateField
+              label="Period from"
+              value={dateFrom}
+              onChange={setDateFrom}
+            />
+            <DateField
+              label="Period to"
+              value={dateTo}
+              onChange={setDateTo}
+            />
+            <s-select
+              label="Method"
+              value={methodFilter}
+              onChange={(e) => setMethodFilter(e?.target?.value ?? "all")}
+            >
+              <s-option value="all">All methods</s-option>
+              <s-option value="ach">ACH</s-option>
+              <s-option value="check">Check</s-option>
+              <s-option value="manual">Manual</s-option>
+            </s-select>
+            <s-select
+              label="Status"
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e?.target?.value ?? "all")}
+            >
+              <s-option value="all">All statuses</s-option>
+              <s-option value="draft">Draft</s-option>
+              <s-option value="awaiting_approval">Awaiting Approval</s-option>
+              <s-option value="approved">Approved</s-option>
+              <s-option value="awaiting_settlement">Awaiting Settlement</s-option>
+              <s-option value="paid">Paid</s-option>
+              <s-option value="failed">Failed</s-option>
+              <s-option value="rejected">Rejected</s-option>
+              <s-option value="cancelled">Cancelled</s-option>
+            </s-select>
+          </div>
+
+          {/* Active filter chips + reset */}
+          {hasActiveFilters && (
+            <s-stack direction="inline" gap="small-200" alignItems="center" wrap>
+              {dateFrom && (
+                <s-tag onRemove={() => setDateFrom("")}>From: {dateFrom}</s-tag>
+              )}
+              {dateTo && (
+                <s-tag onRemove={() => setDateTo("")}>To: {dateTo}</s-tag>
+              )}
+              {methodFilter !== "all" && (
+                <s-tag onRemove={() => setMethodFilter("all")}>
+                  Method: {METHOD_LABEL[methodFilter] || methodFilter}
+                </s-tag>
+              )}
+              {statusFilter !== "all" && (
+                <s-tag onRemove={() => setStatusFilter("all")}>
+                  Status: {statusFilter.replace(/_/g, " ")}
+                </s-tag>
+              )}
+              <s-button variant="tertiary" onClick={resetFilters}>
+                Clear all
+              </s-button>
+              <s-text tone="subdued">
+                {filteredRows.length} of {rows.length} payout{rows.length !== 1 ? "s" : ""}
+              </s-text>
+            </s-stack>
+          )}
+        </s-stack>
+      </s-section>
+
+      {/* Table */}
       <DataTable
         columns={columns}
-        rows={rows}
+        rows={filteredRows}
         searchKeys={["practitionerName", "method", "status", "reference"]}
         searchPlaceholder="Search by practitioner, method, or status"
-        emptyHeading="No payouts yet"
-        emptyBody="Generate a payout batch to aggregate eligible commissions for approval."
+        emptyHeading="No payouts"
+        emptyBody={
+          hasActiveFilters
+            ? "No payouts match the current filters. Clear filters to see all payouts."
+            : "Generate a payout batch to aggregate eligible commissions for approval."
+        }
       />
     </s-stack>
   );

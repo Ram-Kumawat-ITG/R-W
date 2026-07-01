@@ -6,12 +6,10 @@ import { authenticate } from "../shopify.server";
 import { CollapsibleSection } from "../components/ui";
 import {
   listCheckPayoutPractitioners,
-  voidCheckPreferredPayouts,
   approvePayout,
   rejectPayout,
   markCheckPayoutPaid,
   buildPayoutBatch,
-  setCheckPayoutCronOverride,
 } from "../services/cdo/cdo.service";
 import StatusBadge from "../components/cdo/StatusBadge";
 import MetricCard from "../components/cdo/MetricCard";
@@ -21,11 +19,6 @@ import { formatCurrency, formatDate, formatDateTime } from "../utils/format";
 
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
-  // Cancel any stale CRON-created payouts for check-preferred practitioners
-  // and release their commissions back to the manual queue. Runs on every
-  // page load so legacy payouts are cleaned up immediately without waiting
-  // for the next CRON cycle.
-  await voidCheckPreferredPayouts();
   const rows = await listCheckPayoutPractitioners();
   return { rows };
 };
@@ -110,19 +103,6 @@ export const action = async ({ request }) => {
           status: "success",
           op,
           message: `Check #${checkNumber} issued — ${formatCurrency(paid.amount || 0, paid.currency || "USD")} to ${paid.practitionerName || paid.practitionerEmail}`,
-        };
-      }
-      case "set-cron-override": {
-        if (!practitionerId) return { status: "error", op, message: "Practitioner id is required" };
-        const override = formData.get("override") === "true";
-        const note = String(formData.get("note") || "").trim();
-        await setCheckPayoutCronOverride(practitionerId, override, actor, note);
-        return {
-          status: "success",
-          op,
-          message: override
-            ? "CRON override enabled — this practitioner will be included in automated ACH payouts."
-            : "CRON override cleared — this practitioner returns to the check payout queue.",
         };
       }
       default:
@@ -210,7 +190,6 @@ function PractitionerCard({
   onOpenMarkPaid,
   onOpenReject,
   onOpenGenerate,
-  onOpenOverride,
 }) {
   const [expanded, setExpanded] = useState(defaultExpanded);
 
@@ -252,7 +231,6 @@ function PractitionerCard({
           <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
             <span style={{ fontWeight: 600, fontSize: "14px", color: "#303030" }}>{row.name}</span>
             <s-badge>Check</s-badge>
-            {row.cronOverride && <s-badge tone="warning">CRON Override</s-badge>}
             {row.currentPayoutStatus && (
               <StatusBadge status={row.currentPayoutStatus} />
             )}
@@ -334,15 +312,6 @@ function PractitionerCard({
             </div>
 
             {/* Warnings */}
-            {row.cronOverride && (
-              <s-banner tone="warning">
-                <s-paragraph>
-                  <strong>CRON Override Active</strong> — Next automated run will include this
-                  practitioner as ACH. Set by {row.cronOverrideSetBy || "admin"}.
-                  {row.cronOverrideNote && ` "${row.cronOverrideNote}"`}
-                </s-paragraph>
-              </s-banner>
-            )}
             {row.currentPayoutBankingError && (
               <s-banner tone="critical">
                 <s-paragraph>Banking issue: {row.currentPayoutBankingError}</s-paragraph>
@@ -393,13 +362,6 @@ function PractitionerCard({
                   Mark as Paid
                 </s-button>
               )}
-              <div style={{ flex: 1 }} />
-              <s-button
-                variant="tertiary"
-                onClick={() => onOpenOverride(row.id, row.name, row.cronOverride, row.cronOverrideNote)}
-              >
-                {row.cronOverride ? "Clear CRON Override" : "Override to CRON"}
-              </s-button>
             </div>
 
             {/* Orders sub-section */}
@@ -537,34 +499,29 @@ export default function CheckPayouts() {
   const rejectFetcher = useFetcher();
   const markPaidFetcher = useFetcher();
   const generateFetcher = useFetcher();
-  const overrideFetcher = useFetcher();
 
   // Idempotency refs — prevent double-firing effects on re-renders
   const approveHandled = useRef(null);
   const rejectHandled = useRef(null);
   const markPaidHandled = useRef(null);
   const generateHandled = useRef(null);
-  const overrideHandled = useRef(null);
 
   // Modal refs
   const markPaidModalRef = useRef(null);
   const rejectModalRef = useRef(null);
   const generateModalRef = useRef(null);
-  const overrideModalRef = useRef(null);
 
   // Modal target state
   // Modal target state (payload for the open modal)
   const [markPaidTarget, setMarkPaidTarget] = useState(null);
   const [rejectTarget, setRejectTarget] = useState(null);
   const [generateTarget, setGenerateTarget] = useState(null);
-  const [overrideTarget, setOverrideTarget] = useState(null);
 
   // Modal form field state
   const [checkNumber, setCheckNumber] = useState("");
   const [checkDate, setCheckDate] = useState("");
   const [checkNotes, setCheckNotes] = useState("");
   const [rejectReason, setRejectReason] = useState("");
-  const [overrideNote, setOverrideNote] = useState("");
 
   // Per-commission selection for Issue Check modal (Set of commissionId strings)
   const [selectedCommIds, setSelectedCommIds] = useState(new Set());
@@ -596,12 +553,6 @@ export default function CheckPayouts() {
     setCheckDate("");
     setCheckNotes("");
     generateModalRef.current?.showOverlay?.();
-  };
-
-  const openOverride = (practitionerId, name, currentOverride, note) => {
-    setOverrideTarget({ practitionerId, name, currentOverride });
-    setOverrideNote(note || "");
-    overrideModalRef.current?.showOverlay?.();
   };
 
   // ── Fetcher effects ─────────────────────────────────────────────────────────
@@ -655,19 +606,6 @@ export default function CheckPayouts() {
     }
   }, [generateFetcher.data, generateFetcher.state, shopify]);
 
-  useEffect(() => {
-    const d = overrideFetcher.data;
-    if (!d || overrideFetcher.state !== "idle") return;
-    if (overrideHandled.current === d) return;
-    overrideHandled.current = d;
-    if (d.status === "success") {
-      shopify?.toast?.show(d.message || "Override updated");
-      overrideModalRef.current?.hideOverlay?.();
-    } else {
-      shopify?.toast?.show(d.message || "Failed", { isError: true });
-    }
-  }, [overrideFetcher.data, overrideFetcher.state, shopify]);
-
   // ── Summary stats ───────────────────────────────────────────────────────────
 
   // Row 1 — overview
@@ -705,7 +643,6 @@ export default function CheckPayouts() {
     onOpenMarkPaid: openMarkPaid,
     onOpenReject: openReject,
     onOpenGenerate: openGenerate,
-    onOpenOverride: openOverride,
   };
 
   return (
@@ -1198,51 +1135,6 @@ export default function CheckPayouts() {
             Issue Check{selectedCommIds.size > 0 ? ` (${selectedCommIds.size})` : ""}
           </s-button>
           <s-button slot="secondary-actions" onClick={() => generateModalRef.current?.hideOverlay?.()}>
-            Cancel
-          </s-button>
-        </s-modal>
-
-        {/* CRON override */}
-        <s-modal
-          ref={overrideModalRef}
-          id="cdo-cron-override-modal"
-          heading={overrideTarget?.currentOverride ? "Clear CRON Override" : "Override to CRON"}
-          accessibilityLabel="Set CRON override"
-        >
-          <s-stack direction="block" gap="base">
-            <s-paragraph tone="subdued">
-              {overrideTarget?.currentOverride
-                ? `Clearing the override will return ${overrideTarget?.name || "this practitioner"} to the check payout queue. Future CRON runs will skip them and they must be processed manually.`
-                : `Enabling the override will include ${overrideTarget?.name || "this practitioner"} in the next automated payout CRON run as ACH (banking must be valid). Their check preference is not changed — only the next CRON batch is affected.`}
-            </s-paragraph>
-            <s-text-area
-              label="Admin note (optional)"
-              placeholder="Reason for override..."
-              value={overrideNote}
-              onInput={(e) => setOverrideNote(e.target.value)}
-              onChange={(e) => setOverrideNote(e.target.value)}
-            />
-          </s-stack>
-          <s-button
-            slot="primary-action"
-            variant="primary"
-            {...(overrideTarget?.currentOverride ? { tone: "critical" } : {})}
-            {...(overrideFetcher.state !== "idle" ? { loading: true } : {})}
-            onClick={() => {
-              overrideFetcher.submit(
-                {
-                  _action: "set-cron-override",
-                  practitionerId: overrideTarget.practitionerId,
-                  override: String(!overrideTarget.currentOverride),
-                  note: overrideNote.trim(),
-                },
-                { method: "POST" },
-              );
-            }}
-          >
-            {overrideTarget?.currentOverride ? "Clear Override" : "Enable Override"}
-          </s-button>
-          <s-button slot="secondary-actions" onClick={() => overrideModalRef.current?.hideOverlay?.()}>
             Cancel
           </s-button>
         </s-modal>

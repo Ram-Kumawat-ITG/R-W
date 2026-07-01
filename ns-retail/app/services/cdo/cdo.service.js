@@ -486,9 +486,6 @@ export async function listCheckPayoutPractitioners() {
       email: p.email || "—",
       preferredMethod: "check",
       checkPayableTo: p.commission?.check?.payableTo || null,
-      cronOverride: hold?.checkPayoutCronOverride === true,
-      cronOverrideSetBy: hold?.cronOverrideSetBy || null,
-      cronOverrideNote: hold?.cronOverrideNote || null,
       // Aggregate stats.
       totalCommission,
       totalPaid,
@@ -516,27 +513,6 @@ export async function listCheckPayoutPractitioners() {
   });
 }
 
-// Set or clear the CRON override flag for a check-preferred practitioner.
-// When override=true, buildPayoutBatch will treat this practitioner as ACH
-// (run the banking probe) instead of routing them to the check queue.
-// Upserts the CdoPractitionerHold document (safe to call even if no hold
-// exists yet).
-export async function setCheckPayoutCronOverride(practitionerId, override, actor, note) {
-  await connectDB();
-  if (!isValidObjectId(practitionerId)) throw new Error("Invalid practitioner id");
-  return CdoPractitionerHold.findOneAndUpdate(
-    { practitionerId },
-    {
-      $set: {
-        checkPayoutCronOverride: !!override,
-        cronOverrideSetBy: actor || "admin",
-        cronOverrideSetAt: new Date(),
-        cronOverrideNote: note || null,
-      },
-    },
-    { upsert: true, new: true },
-  );
-}
 
 // Mark a check payout as paid after the admin has physically issued and
 // mailed the check. Settles the linked commissions, creates a QBO Vendor Bill
@@ -2779,13 +2755,8 @@ export async function buildPayoutBatch({ periodStart, periodEnd, practitionerId,
     // `practitionerId` being passed distinguishes the two call sites:
     //   - CRON: buildPayoutBatch({ periodEnd, actor: 'system' })  → no pid
     //   - Admin: buildPayoutBatch({ practitionerId, actor })      → pid set
-    const [practitionerApp, practitionerHold] = await Promise.all([
-      WholesaleApplication.findById(pid).select("commission").lean(),
-      CdoPractitionerHold.findOne({ practitionerId: pid }).lean(),
-    ]);
-    const preferredMethod = practitionerApp?.commission?.payoutMethod;
-    const cronOverride = practitionerHold?.checkPayoutCronOverride === true;
-    const prefersCheck = preferredMethod === "check" && !cronOverride;
+    const practitionerApp = await WholesaleApplication.findById(pid).select("commission").lean();
+    const prefersCheck = practitionerApp?.commission?.payoutMethod === "check";
 
     if (prefersCheck && !practitionerId) {
       // CRON full-batch mode: skip check-preferred practitioners completely.
@@ -4169,20 +4140,14 @@ export async function getHeldPractitionerIds() {
   return rows.map((r) => r.practitionerId).filter(Boolean);
 }
 
-// Practitioner IDs whose preferred payout method is "check" and who have no
-// active CRON override. These practitioners are excluded from ALL automated
-// CRON processing (eligibility, auto-approval, and batching). Their commissions
-// accumulate as pending/approved and are processed manually via the Check Payout
-// queue. An admin can set checkPayoutCronOverride=true on a practitioner's hold
-// record to temporarily include them in the automated ACH path.
+// Practitioner IDs whose preferred payout method is "check". These
+// practitioners are excluded from ALL automated CRON processing (eligibility,
+// auto-approval, and batching). Their commissions accumulate as pending/approved
+// and are processed manually via the Check Payout queue.
 async function getCheckPreferredPractitionerIds() {
   await connectDB();
-  const [checkApps, overrideHolds] = await Promise.all([
-    WholesaleApplication.find({ "commission.payoutMethod": "check" }).select("_id").lean(),
-    CdoPractitionerHold.find({ checkPayoutCronOverride: true }).select("practitionerId").lean(),
-  ]);
-  const overrideSet = new Set(overrideHolds.map((h) => String(h.practitionerId)));
-  return checkApps.map((a) => String(a._id)).filter((id) => !overrideSet.has(id));
+  const checkApps = await WholesaleApplication.find({ "commission.payoutMethod": "check" }).select("_id").lean();
+  return checkApps.map((a) => String(a._id));
 }
 
 // Cancel any non-paid payouts for check-preferred practitioners and release
@@ -4193,43 +4158,49 @@ async function getCheckPreferredPractitionerIds() {
 // Only targets statuses that haven't settled money:
 //   draft | awaiting_approval | approved | processing | failed
 // Does NOT touch "paid", "rejected", or "cancelled".
+// Remove stale ACH payouts that were created for check-preferred practitioners
+// before the CRON exclusion was enforced. Only targets `method: "ach"` payouts
+// — these are erroneous records that should never have been created. Admin-
+// created check payouts (`method: "check"`) are left completely untouched so
+// they remain available for manual processing in the Check Payout queue.
+//
+// Deleted payouts are removed entirely (not marked cancelled) so they do not
+// pollute the practitioner's payout history. The associated commissions are
+// released back to the pending pool so they can be picked up by the admin
+// via the Check Payout workflow.
 export async function voidCheckPreferredPayouts() {
   await connectDB();
   const checkPreferredIds = await getCheckPreferredPractitionerIds();
   if (!checkPreferredIds.length) return { voided: 0 };
 
-  const openPayouts = await CdoPayout.find({
+  // Only target ACH payouts — check-method payouts were created intentionally
+  // by the admin for manual check processing and must not be touched here.
+  const staleAchPayouts = await CdoPayout.find({
     practitionerId: { $in: checkPreferredIds },
+    method: "ach",
     status: { $in: ["draft", "awaiting_approval", "approved", "processing", "failed"] },
   }).lean();
 
-  if (!openPayouts.length) return { voided: 0 };
+  if (!staleAchPayouts.length) return { voided: 0 };
 
-  for (const payout of openPayouts) {
+  for (const payout of staleAchPayouts) {
     // Release commission reservations so they re-enter the eligible pool
-    // for manual check-payout processing.
+    // for manual check-payout processing via the Check Payout queue.
     await CdoCommission.updateMany(
       { payoutId: payout._id },
       { $set: { payoutId: null, payoutStatus: null } },
     );
-    // Mark the payout cancelled with a clear audit reason.
-    await CdoPayout.updateOne(
-      { _id: payout._id },
-      {
-        $set: {
-          status: "cancelled",
-          lastError:
-            "Cancelled by CRON: practitioner prefers check payout. Use the Check Payout queue to process manually.",
-        },
-      },
-    );
+    // Delete the stale payout record entirely — do NOT mark it cancelled.
+    // Marking cancelled pollutes history with records that should never have
+    // existed; deletion keeps the practitioner's history clean.
+    await CdoPayout.deleteOne({ _id: payout._id });
   }
 
-  log.info("payouts.check_preferred_voided", {
-    count: openPayouts.length,
-    practitionerIds: [...new Set(openPayouts.map((p) => p.practitionerId))],
+  log.info("payouts.stale_ach_payouts_deleted", {
+    count: staleAchPayouts.length,
+    practitionerIds: [...new Set(staleAchPayouts.map((p) => String(p.practitionerId)))],
   });
-  return { voided: openPayouts.length };
+  return { voided: staleAchPayouts.length };
 }
 
 // ── Phase 5: fully-automated payout run (CRON) ───────────────────────
@@ -4458,10 +4429,11 @@ export async function runAutomatedPayouts({ shop, periodEnd, mode = "cron", trig
   };
 
   try {
-    // 0. Cancel any legacy non-paid payouts for check-preferred practitioners
-    //    and release their commission reservations. This cleans up payouts that
-    //    were created before the check-preference exclusion was enforced, and
-    //    ensures every CRON run starts with a clean slate for those practitioners.
+    // 0. Delete any stale ACH payouts for check-preferred practitioners and
+    //    release their commissions back to the pending pool. These are legacy
+    //    records that should never have been created (the check-preference
+    //    exclusion now prevents them). Admin-created check payouts (method:
+    //    "check") are never touched — they remain for manual processing.
     await voidCheckPreferredPayouts();
 
     // 1. Accrue (safety net) + 2. auto-approve (no manual approval).
@@ -4744,8 +4716,8 @@ export async function reprocessBatch(batchId, { actor } = {}) {
     status: "running",
   });
 
-  // Fetch check-preferred IDs once so we can skip (and cancel) their payouts
-  // in the loop below instead of retrying a transfer that will always fail.
+  // Fetch check-preferred IDs once so we can skip their failed payouts instead
+  // of retrying a transfer that will always fail for check-preferred practitioners.
   const checkPreferredIds = new Set(await getCheckPreferredPractitionerIds());
 
   const items = [];
@@ -4754,23 +4726,17 @@ export async function reprocessBatch(batchId, { actor } = {}) {
       const payout = await CdoPayout.findById(pid).lean();
       if (!payout || payout.status === "paid") continue; // already settled — skip
 
-      // If the practitioner prefers check payouts, cancel this payout and
-      // release the commissions rather than retrying the failed transfer.
+      // If the practitioner prefers check payouts, release the commissions
+      // and delete this failed ACH payout rather than retrying the transfer.
+      // The commissions return to the pending pool for manual processing via
+      // the Check Payout queue. We delete (not cancel) so that no spurious
+      // "Cancelled" entry appears in the practitioner's payout history.
       if (checkPreferredIds.has(String(payout.practitionerId))) {
         await CdoCommission.updateMany(
           { payoutId: payout._id },
           { $set: { payoutId: null, payoutStatus: null } },
         );
-        await CdoPayout.updateOne(
-          { _id: payout._id },
-          {
-            $set: {
-              status: "cancelled",
-              lastError:
-                "Cancelled during reprocess: practitioner prefers check payout. Use the Check Payout queue.",
-            },
-          },
-        );
+        await CdoPayout.deleteOne({ _id: payout._id });
         continue;
       }
 
