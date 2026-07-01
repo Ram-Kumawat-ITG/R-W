@@ -1086,6 +1086,7 @@ export async function getBillCountSnapshot() {
     }
   }
 
+  const billCount = recentRaw?.length ?? 0;
   return {
     total: total ?? 0,
     paid: paid ?? 0,
@@ -1094,6 +1095,8 @@ export async function getBillCountSnapshot() {
     totalBilled,
     totalOutstanding,
     currency,
+    billCount,
+    truncated: billCount >= ANALYTICS_MAX_PAGE_SIZE,
     recentBills: (recentRaw ?? []).slice(0, 10),
   };
 }
