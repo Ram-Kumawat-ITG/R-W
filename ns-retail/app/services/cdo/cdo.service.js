@@ -218,20 +218,45 @@ export async function listCommissions() {
   const rows = await CdoCommission.find({})
     .sort({ earnedAt: -1, createdAt: -1 })
     .lean();
-  return rows.map((r) => ({
-    id: r._id.toString(),
-    practitionerId: r.practitionerId || null,
-    practitionerName: r.practitionerName || r.practitionerEmail || "—",
-    orderName: r.orderName || "—",
-    amount: r.amount || 0,
-    rate: r.rate || 0,
-    currency: r.currency || "USD",
-    status: r.status || "pending",
-    paused: r.paused === true,
-    pausedBy: r.pausedBy || null,
-    pausedAt: r.pausedAt || null,
-    earnedAt: r.earnedAt || r.createdAt || null,
-  }));
+
+  // Join payout info so the UI can show the QBO bill link for paid commissions.
+  const payoutIds = [...new Set(rows.filter((r) => r.payoutId).map((r) => String(r.payoutId)))];
+  const payoutMap = {};
+  if (payoutIds.length) {
+    const payouts = await CdoPayout.find({ _id: { $in: payoutIds } })
+      .select("_id qboBillId reference")
+      .lean();
+    for (const p of payouts) {
+      payoutMap[String(p._id)] = {
+        qboBillId: p.qboBillId || null,
+        qboBillUrl: p.qboBillId ? billWebUrl(p.qboBillId) : null,
+        reference: p.reference || null,
+      };
+    }
+  }
+
+  return rows.map((r) => {
+    const pid = r.payoutId ? String(r.payoutId) : null;
+    const payout = pid ? (payoutMap[pid] || null) : null;
+    return {
+      id: r._id.toString(),
+      practitionerId: r.practitionerId || null,
+      practitionerName: r.practitionerName || r.practitionerEmail || "—",
+      orderName: r.orderName || "—",
+      amount: r.amount || 0,
+      rate: r.rate || 0,
+      currency: r.currency || "USD",
+      status: r.status || "pending",
+      paused: r.paused === true,
+      pausedBy: r.pausedBy || null,
+      pausedAt: r.pausedAt || null,
+      earnedAt: r.earnedAt || r.createdAt || null,
+      payoutId: pid,
+      qboBillId: payout?.qboBillId || null,
+      qboBillUrl: payout?.qboBillUrl || null,
+      payoutReference: payout?.reference || null,
+    };
+  });
 }
 
 export async function listPayouts() {
@@ -2311,21 +2336,91 @@ export async function listPractitionerPayouts(practitionerId) {
     { sort: { createdAt: -1 } },
   );
   if (!profile) return [];
-  return rows.map((r) => ({
-    id: r._id.toString(),
-    amount: r.amount || 0,
-    currency: r.currency || "USD",
-    method: r.method || "manual",
-    status: r.status || "pending",
-    periodStart: r.periodStart || null,
-    periodEnd: r.periodEnd || null,
-    reference: r.reference || "",
-    paidAt: r.paidAt || null,
-    commissionCount: Array.isArray(r.commissionIds) ? r.commissionIds.length : 0,
-    qboBillId: r.qboBillId || null,
-    qboBillUrl: r.qboBillId ? billWebUrl(r.qboBillId) : null,
-    lastError: r.lastError || null,
-  }));
+
+  // Fetch all commissions across all payouts in a single batch so we can
+  // embed the per-commission breakdown without N+1 queries.
+  const allCommissionIds = rows.flatMap((r) => r.commissionIds || []);
+  const commissionMap = {};
+  if (allCommissionIds.length) {
+    const commissions = await CdoCommission.find({ _id: { $in: allCommissionIds } })
+      .select("_id orderName amount rate currency status earnedAt")
+      .lean();
+    for (const c of commissions) {
+      commissionMap[String(c._id)] = c;
+    }
+  }
+
+  return rows.map((r) => {
+    const commissions = (r.commissionIds || [])
+      .map((cid) => {
+        const c = commissionMap[String(cid)];
+        if (!c) return null;
+        return {
+          id: String(c._id),
+          orderName: c.orderName || "—",
+          amount: c.amount || 0,
+          rate: c.rate || 0,
+          currency: c.currency || "USD",
+          status: c.status || "—",
+          earnedAt: c.earnedAt || null,
+        };
+      })
+      .filter(Boolean);
+
+    // Detect status inconsistency: payout is cancelled/rejected but some
+    // commissions are "paid". This is legacy data — money went out before
+    // the payout was cancelled by the old void logic without resetting
+    // commission statuses. Flag it so the UI can surface a data warning.
+    const paidCommissionCount = commissions.filter((c) => c.status === "paid").length;
+    const hasInconsistency =
+      (r.status === "cancelled" || r.status === "rejected") && paidCommissionCount > 0;
+
+    // Sort audit remarks chronologically.
+    const remarks = (r.remarks || [])
+      .map((rem) => ({
+        kind: rem.kind || "",
+        message: rem.message || "",
+        actor: rem.actor || "system",
+        source: rem.source || "system",
+        createdAt: rem.createdAt || null,
+      }))
+      .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+
+    // Derive "Processed By" — prefer settlement/check actor over approver.
+    const settlementRemark = [...remarks].reverse().find(
+      (rem) => rem.kind === "settled" || rem.kind === "check_issued",
+    );
+    const approvedRemark = remarks.find((rem) => rem.kind === "approved");
+
+    return {
+      id: r._id.toString(),
+      reference: r.reference || "",
+      amount: r.amount || 0,
+      currency: r.currency || "USD",
+      method: r.method || "manual",
+      status: r.status || "pending",
+      periodStart: r.periodStart || null,
+      periodEnd: r.periodEnd || null,
+      paidAt: r.paidAt || null,
+      commissionCount: Array.isArray(r.commissionIds) ? r.commissionIds.length : 0,
+      commissions,
+      hasInconsistency,
+      paidCommissionCount,
+      // Audit fields
+      processedBy: settlementRemark?.actor || approvedRemark?.actor || null,
+      approvedBy: r.approvedBy || approvedRemark?.actor || null,
+      approvedAt: r.approvedAt || null,
+      transactionId: r.providerTransferId || null,
+      transferInitiatedAt: r.transferInitiatedAt || null,
+      checkNumber: r.checkDetails?.checkNumber || null,
+      checkDate: r.checkDetails?.checkDate || null,
+      checkIssuedBy: r.checkDetails?.issuedBy || null,
+      remarks,
+      qboBillId: r.qboBillId || null,
+      qboBillUrl: r.qboBillId ? billWebUrl(r.qboBillId) : null,
+      lastError: r.lastError || null,
+    };
+  });
 }
 
 export async function listPractitionerReferrals(practitionerId) {
@@ -4183,21 +4278,38 @@ export async function voidCheckPreferredPayouts() {
 
   if (!staleAchPayouts.length) return { voided: 0 };
 
+  let deletedCount = 0;
+  let skippedCount = 0;
+
   for (const payout of staleAchPayouts) {
-    // Release commission reservations so they re-enter the eligible pool
-    // for manual check-payout processing via the Check Payout queue.
+    // If any commission in this payout is already "paid", real money went out —
+    // do NOT delete the payout. Deleting it would sever the historical record
+    // of a real financial transaction. Leave it intact; an admin can review it.
+    const paidCommissionCount = await CdoCommission.countDocuments({
+      payoutId: payout._id,
+      status: "paid",
+    });
+    if (paidCommissionCount > 0) {
+      log.warn("payouts.stale_ach_skip_has_paid_commissions", {
+        payoutId: String(payout._id),
+        paidCommissionCount,
+      });
+      skippedCount++;
+      continue;
+    }
+
+    // No paid commissions — safe to release and delete.
     await CdoCommission.updateMany(
       { payoutId: payout._id },
       { $set: { payoutId: null, payoutStatus: null } },
     );
-    // Delete the stale payout record entirely — do NOT mark it cancelled.
-    // Marking cancelled pollutes history with records that should never have
-    // existed; deletion keeps the practitioner's history clean.
     await CdoPayout.deleteOne({ _id: payout._id });
+    deletedCount++;
   }
 
   log.info("payouts.stale_ach_payouts_deleted", {
-    count: staleAchPayouts.length,
+    deleted: deletedCount,
+    skipped: skippedCount,
     practitionerIds: [...new Set(staleAchPayouts.map((p) => String(p.practitionerId)))],
   });
   return { voided: staleAchPayouts.length };
@@ -4553,6 +4665,7 @@ export async function listPayoutBatches({ limit = 0 } = {}) {
     completedAt: b.completedAt || null,
     totalCommissions: b.totalCommissions || 0,
     totalAmount: b.totalAmount || 0,
+    practitionerCount: (b.practitionerPayouts || []).length,
     ...batchOutcomeCounts(b),
   }));
 }
@@ -4595,7 +4708,7 @@ export async function getPayoutBatch(id) {
     .filter(Boolean);
   const payoutDocs = payoutIds.length
     ? await CdoPayout.find({ _id: { $in: payoutIds } })
-        .select("status method paidAt qboBillId qboBillPaymentId reference remarks")
+        .select("status method paidAt qboBillId qboBillPaymentId reference remarks providerTransferId checkDetails")
         .lean()
     : [];
   const payoutById = new Map(payoutDocs.map((p) => [String(p._id), p]));
@@ -4629,6 +4742,9 @@ export async function getPayoutBatch(id) {
         reference: doc?.reference || null,
         paidAt: doc?.paidAt || null,
         txnRef: p.txnRef || doc?.qboBillPaymentId || billId || null,
+        transactionId: doc?.providerTransferId || null,
+        checkNumber: doc?.checkDetails?.checkNumber || null,
+        checkDate: doc?.checkDetails?.checkDate || null,
         qboBillId: billId,
         qboBillUrl: billId ? billWebUrl(billId) : null,
         remarks: (doc?.remarks || []).map((r) => ({
@@ -4658,6 +4774,24 @@ export async function getPayoutBatch(id) {
 }
 
 // Cross-batch attempt trail for one commission (every batch that touched it).
+export async function getPayoutCommissions(payoutId) {
+  if (!isValidObjectId(payoutId)) return [];
+  await connectDB();
+  const commissions = await CdoCommission.find({ payoutId })
+    .sort({ createdAt: 1 })
+    .select("orderName amount currency status earnedAt rate")
+    .lean();
+  return commissions.map((c) => ({
+    id: c._id.toString(),
+    orderName: c.orderName || "—",
+    amount: c.amount || 0,
+    currency: c.currency || "USD",
+    status: c.status,
+    earnedAt: c.earnedAt || null,
+    rate: c.rate || 0,
+  }));
+}
+
 export async function getCommissionPayoutHistory(commissionId) {
   if (!isValidObjectId(commissionId)) return [];
   await connectDB();

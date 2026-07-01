@@ -90,10 +90,27 @@ export default function CdoCommissions() {
     },
     { key: "earnedAt", header: "Earned", render: (r) => formatDate(r.earnedAt) },
     {
-      key: "actions",
+      key: "payout",
       header: "Payout",
       render: (r) => {
-        if (r.status === "paid" || r.status === "reversed") return "—";
+        // Paid/reversed — show QBO bill link or payout reference.
+        if (r.status === "paid" || r.status === "reversed") {
+          if (r.qboBillUrl) {
+            return (
+              <s-link href={r.qboBillUrl} target="_blank">
+                Bill {r.qboBillId}
+              </s-link>
+            );
+          }
+          if (r.payoutReference) {
+            return <s-text tone="subdued">{r.payoutReference}</s-text>;
+          }
+          if (r.payoutId) {
+            return <s-badge tone="success">Paid</s-badge>;
+          }
+          return "—";
+        }
+        // Pending/approved — Pause / Resume controls.
         const rowBusy = busy && pendingId === r.id;
         return r.paused ? (
           <s-button
