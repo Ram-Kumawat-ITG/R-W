@@ -1,7 +1,6 @@
 import connectDB from '../../services/APIService/mongo.service'
 import { sendResponse } from '../../services/APIService/api.service'
 import { syncConfig, isSyncEnabled } from '../../services/sync/sync.config'
-import { deductWholesaleInventoryForOrder } from '../../services/sync/inventory.sync'
 import { processRetailOrderForDropShip } from '../../services/dropship/dropship.service'
 import { createLogger } from '../../utils/logger.utils'
 
