@@ -5115,3 +5115,142 @@ export async function getCdoOrderDetail(id) {
     ].filter(Boolean),
   };
 }
+
+// ── Dashboard helpers ─────────────────────────────────────────────────────────
+
+// Aggregate per-order QBO sync state from cdo_orders.retailQbo — invoice,
+// vendor-bill, and payment sync. Used by the QBO dashboard sync-status section.
+export async function getSyncStatusSnapshot() {
+  await connectDB();
+  const result = await CdoOrder.aggregate([
+    {
+      $group: {
+        _id: null,
+        totalOrders: { $sum: 1 },
+        invoiceSynced: {
+          $sum: { $cond: [{ $gt: ["$retailQbo.qboInvoiceId", null] }, 1, 0] },
+        },
+        invoiceErrors: {
+          $sum: { $cond: [{ $eq: ["$retailQbo.qboSyncStatus", "error"] }, 1, 0] },
+        },
+        billSynced: {
+          $sum: { $cond: [{ $gt: ["$retailQbo.qboBillId", null] }, 1, 0] },
+        },
+        billErrors: {
+          $sum: { $cond: [{ $eq: ["$retailQbo.billSyncStatus", "error"] }, 1, 0] },
+        },
+        paymentSynced: {
+          $sum: { $cond: [{ $gt: ["$retailQbo.qboPaymentId", null] }, 1, 0] },
+        },
+        paymentErrors: {
+          $sum: { $cond: [{ $eq: ["$retailQbo.paymentSyncStatus", "error"] }, 1, 0] },
+        },
+        lastInvoiceSync: { $max: "$retailQbo.qboSyncedAt" },
+        lastBillSync: { $max: "$retailQbo.billSyncedAt" },
+        lastPaymentSync: { $max: "$retailQbo.paymentAppliedAt" },
+      },
+    },
+  ]);
+
+  const r = result[0] || {};
+  const total = r.totalOrders || 0;
+  const invoiceSynced = r.invoiceSynced || 0;
+  const invoiceErrors = r.invoiceErrors || 0;
+  return {
+    totalOrders: total,
+    invoices: {
+      synced: invoiceSynced,
+      errors: invoiceErrors,
+      pending: Math.max(0, total - invoiceSynced - invoiceErrors),
+      lastSyncAt: r.lastInvoiceSync ? r.lastInvoiceSync.toISOString() : null,
+    },
+    bills: {
+      synced: r.billSynced || 0,
+      errors: r.billErrors || 0,
+      lastSyncAt: r.lastBillSync ? r.lastBillSync.toISOString() : null,
+    },
+    payments: {
+      synced: r.paymentSynced || 0,
+      errors: r.paymentErrors || 0,
+      lastSyncAt: r.lastPaymentSync ? r.lastPaymentSync.toISOString() : null,
+    },
+  };
+}
+
+// Aggregate paid payout counts and amounts by method (check / ACH / manual).
+export async function getPayoutMethodBreakdown() {
+  await connectDB();
+  const OPEN_STATUSES = [
+    "draft",
+    "awaiting_approval",
+    "approved",
+    "processing",
+    "awaiting_settlement",
+  ];
+  const rows = await CdoPayout.aggregate([
+    {
+      $group: {
+        _id: { method: "$method", status: "$status" },
+        count: { $sum: 1 },
+        amount: { $sum: "$amount" },
+      },
+    },
+  ]);
+
+  const acc = {};
+  for (const row of rows) {
+    const method = row._id.method || "manual";
+    const st = row._id.status || "";
+    if (!acc[method]) {
+      acc[method] = { total: 0, paid: 0, failed: 0, pending: 0, totalAmount: 0, paidAmount: 0 };
+    }
+    acc[method].total += row.count;
+    acc[method].totalAmount = roundMoney(acc[method].totalAmount + (row.amount || 0));
+    if (st === "paid") {
+      acc[method].paid += row.count;
+      acc[method].paidAmount = roundMoney(acc[method].paidAmount + (row.amount || 0));
+    }
+    if (st === "failed" || st === "rejected") acc[method].failed += row.count;
+    if (OPEN_STATUSES.includes(st)) acc[method].pending += row.count;
+  }
+
+  const zero = () => ({ total: 0, paid: 0, failed: 0, pending: 0, totalAmount: 0, paidAmount: 0 });
+  const ach = zero();
+  for (const m of ["ach", "bank"]) {
+    if (acc[m]) {
+      ach.total += acc[m].total;
+      ach.paid += acc[m].paid;
+      ach.failed += acc[m].failed;
+      ach.pending += acc[m].pending;
+      ach.totalAmount = roundMoney(ach.totalAmount + acc[m].totalAmount);
+      ach.paidAmount = roundMoney(ach.paidAmount + acc[m].paidAmount);
+    }
+  }
+  return {
+    check: acc.check || zero(),
+    ach,
+    manual: acc.manual || zero(),
+  };
+}
+
+// Recent payouts — last N by creation date, lightweight projection for the
+// dashboard "recently processed" widget.
+export async function listRecentPayouts(limit = 5) {
+  await connectDB();
+  const docs = await CdoPayout.find({})
+    .sort({ createdAt: -1 })
+    .limit(limit)
+    .select("practitionerName amount currency method status reference paidAt createdAt")
+    .lean();
+  return docs.map((p) => ({
+    id: String(p._id),
+    practitionerName: p.practitionerName || "—",
+    amount: Number(p.amount) || 0,
+    currency: p.currency || "USD",
+    method: p.method || "manual",
+    status: p.status || "unknown",
+    reference: p.reference || null,
+    paidAt: p.paidAt ? new Date(p.paidAt).toISOString() : null,
+    createdAt: p.createdAt ? new Date(p.createdAt).toISOString() : null,
+  }));
+}
