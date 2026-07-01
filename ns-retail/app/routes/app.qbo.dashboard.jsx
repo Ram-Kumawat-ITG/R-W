@@ -91,9 +91,9 @@ function fmtDeposit(p) {
   return ref.name || ref.value || "—";
 }
 
-const RESPONSIVE_4 = "repeat(auto-fill, minmax(180px, 1fr))";
-const RESPONSIVE_3 = "repeat(auto-fill, minmax(200px, 1fr))";
-const RESPONSIVE_2 = "repeat(auto-fill, minmax(260px, 1fr))";
+const RESPONSIVE_4 = "repeat(auto-fit, minmax(180px, 1fr))";
+const RESPONSIVE_3 = "repeat(auto-fit, minmax(200px, 1fr))";
+const RESPONSIVE_2 = "repeat(auto-fit, minmax(260px, 1fr))";
 
 const PAYOUT_STATUS_TONE = {
   paid: "success", processing: "info", awaiting_settlement: "info",
@@ -108,9 +108,17 @@ const PAYOUT_STATUS_LABEL = {
 
 function SectionDivider({ label }) {
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: "12px", margin: "4px 0" }}>
+    <div style={{ display: "flex", alignItems: "center", gap: "14px", margin: "8px 0 0" }}>
       <div style={{ flex: 1, height: "1px", background: "#e1e3e5" }} />
-      <span style={{ fontSize: "11px", fontWeight: 600, color: "#6d7175", textTransform: "uppercase", letterSpacing: "0.08em", whiteSpace: "nowrap" }}>
+      <span style={{
+        fontSize: "10px",
+        fontWeight: 700,
+        color: "#8c9196",
+        textTransform: "uppercase",
+        letterSpacing: "0.10em",
+        whiteSpace: "nowrap",
+        padding: "0 4px",
+      }}>
         {label}
       </span>
       <div style={{ flex: 1, height: "1px", background: "#e1e3e5" }} />
@@ -231,24 +239,28 @@ export default function QboDashboard() {
                 label="Total Invoices"
                 value={(qboSnap.counts.invoices || 0).toLocaleString()}
                 sublabel="All time"
+                icon="🧾"
               />
               <MetricCard
                 label="Open Invoices"
                 value={(qboSnap.counts.pendingInvoices || 0).toLocaleString()}
                 sublabel="Balance outstanding"
                 tone={qboSnap.counts.pendingInvoices > 0 ? "warning" : undefined}
+                icon="📋"
               />
               <MetricCard
                 label="Paid Invoices"
                 value={(qboSnap.counts.paidInvoices || 0).toLocaleString()}
                 sublabel="Fully settled"
                 tone="success"
+                icon="✅"
               />
               <MetricCard
                 label="Overdue Invoices"
                 value={(qboSnap.counts.overdueInvoices || 0).toLocaleString()}
                 tone={qboSnap.counts.overdueInvoices > 0 ? "critical" : undefined}
                 sublabel="Past due date"
+                icon="⚠️"
               />
             </s-grid>
 
@@ -262,18 +274,21 @@ export default function QboDashboard() {
                     ? `Sampled (${qboSnap.revenue.sampledInvoiceCount} invoices)`
                     : qboSnap.revenue.periodLabel
                 }
+                icon="💰"
               />
               <MetricCard
                 label="Amount Collected"
                 value={formatCurrency(qboSnap.revenue.collected, currency)}
                 sublabel="Payments applied"
                 tone="success"
+                icon="💳"
               />
               <MetricCard
                 label="Outstanding Balance"
                 value={formatCurrency(outstandingBalance, currency)}
                 tone={outstandingBalance > 0 ? "warning" : undefined}
                 sublabel={`${(qboSnap.counts.pendingInvoices || 0).toLocaleString()} open invoice${qboSnap.counts.pendingInvoices !== 1 ? "s" : ""}`}
+                icon="⏳"
               />
             </s-grid>
 
@@ -340,19 +355,21 @@ export default function QboDashboard() {
         ) : (
           <s-stack direction="block" gap="base">
             <s-grid gap="base" gridTemplateColumns={RESPONSIVE_4}>
-              <MetricCard label="Total Bills" value={billSnap.total.toLocaleString()} sublabel="All time" />
+              <MetricCard label="Total Bills" value={billSnap.total.toLocaleString()} sublabel="All time" icon="📄" />
               <MetricCard
                 label="Open Bills"
                 value={billSnap.open.toLocaleString()}
                 sublabel="Balance outstanding"
                 tone={billSnap.open > 0 ? "warning" : undefined}
+                icon="📋"
               />
-              <MetricCard label="Paid Bills" value={billSnap.paid.toLocaleString()} sublabel="Fully settled" tone="success" />
+              <MetricCard label="Paid Bills" value={billSnap.paid.toLocaleString()} sublabel="Fully settled" tone="success" icon="✅" />
               <MetricCard
                 label="Overdue Bills"
                 value={billSnap.overdue.toLocaleString()}
                 tone={billSnap.overdue > 0 ? "critical" : undefined}
                 sublabel="Past due date"
+                icon="⚠️"
               />
             </s-grid>
 
@@ -361,12 +378,14 @@ export default function QboDashboard() {
                 label="Total Vendor Bills Issued"
                 value={formatCurrency(billSnap.totalBilled, billCurrency)}
                 sublabel={billAmountSublabel}
+                icon="🏦"
               />
               <MetricCard
                 label="Total Outstanding Amount"
                 value={formatCurrency(billSnap.totalOutstanding, billCurrency)}
                 tone={billSnap.totalOutstanding > 0 ? "warning" : undefined}
                 sublabel="Unpaid bill balance"
+                icon="⏳"
               />
             </s-grid>
 
@@ -437,19 +456,21 @@ export default function QboDashboard() {
                 label="Total Payments Received"
                 value={paymentCount.toLocaleString()}
                 sublabel="Recorded in QBO"
+                icon="💳"
               />
               <MetricCard
                 label="Total Amount Collected"
                 value={formatCurrency(qboSnap.revenue.collected, currency)}
                 sublabel="Sum of all payments applied"
                 tone="success"
+                icon="✅"
               />
-              {/* FIX: dollar amount is the primary value; count is context */}
               <MetricCard
                 label="Outstanding Balance"
                 value={formatCurrency(outstandingBalance, currency)}
                 sublabel={`${(qboSnap.counts.pendingInvoices || 0).toLocaleString()} open invoice${qboSnap.counts.pendingInvoices !== 1 ? "s" : ""}`}
                 tone={outstandingBalance > 0 ? "warning" : undefined}
+                icon="⏳"
               />
             </s-grid>
 
