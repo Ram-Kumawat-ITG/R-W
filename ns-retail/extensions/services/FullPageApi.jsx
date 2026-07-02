@@ -130,6 +130,72 @@ export async function apiGet(path, params) {
 }
 
 /**
+ * GET a PUBLIC endpoint under a custom sub-path (e.g. `/api/cdo/fee-tiers`).
+ * Unlike `apiGet`, no session-token is attached — for endpoints that expose
+ * public, non-PII data (or ones that need to be callable from checkout UI
+ * extensions where the customer-account session token isn't available).
+ *
+ * @param {string} fullPath  absolute path under the app backend, e.g. "/api/cdo/fee-tiers"
+ * @param {Record<string, any>} [params]  query-string params (empties dropped)
+ * @returns {Promise<any>}  the response `result`, or throws ApiError on !ok
+ */
+export async function apiPublicGet(fullPath, params) {
+  const base = baseUrl()
+  if (!base) {
+    throw new ApiError(0, 'App backend URL is not configured.')
+  }
+  const url = new URL(`${base}${fullPath.startsWith('/') ? fullPath : `/${fullPath}`}`)
+  if (params) {
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v))
+    }
+  }
+
+  let res
+  try {
+    res = await fetch(url.toString(), {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    })
+  } catch (err) {
+    throw new ApiError(0, 'Network error. Please try again.', { err: String(err) })
+  }
+  return parseResponse(res)
+}
+
+/**
+ * POST a JSON body to a PUBLIC endpoint under a custom sub-path
+ * (e.g. `/api/cdo/fee-variant`). No session-token attached — matches
+ * the auth surface of `apiPublicGet`.
+ *
+ * @param {string} fullPath  absolute path under the app backend
+ * @param {Record<string, any>} [payload]
+ * @returns {Promise<any>}
+ */
+export async function apiPublicPost(fullPath, payload) {
+  const base = baseUrl()
+  if (!base) {
+    throw new ApiError(0, 'App backend URL is not configured.')
+  }
+  const url = `${base}${fullPath.startsWith('/') ? fullPath : `/${fullPath}`}`
+
+  let res
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload || {}),
+    })
+  } catch (err) {
+    throw new ApiError(0, 'Network error. Please try again.', { err: String(err) })
+  }
+  return parseResponse(res)
+}
+
+/**
  * POST a JSON body to a portal endpoint. Same Bearer-token auth as apiGet; the
  * Authorization header + JSON content-type make this a "non-simple" request, so
  * the browser sends a CORS preflight first (answered by the backend guard).
@@ -258,5 +324,19 @@ export default class FullPageApi {
   /** @param {string} codeId */
   resumeReferral(codeId) {
     return apiPost('referrals', { op: 'resume', codeId })
+  }
+
+  // ── Processing Fee variant — on-demand (PUBLIC, no auth) ───────────────────
+  // Resolves (or creates) a Processing Fee variant at EXACTLY the requested
+  // cent-precise price. Backend caches an in-memory price → GID map and
+  // creates a new variant via Admin API on cache miss (LRU-evicting the
+  // oldest variant when the product hits its variant-count cap).
+  //
+  /**
+   * @param {number} price   e.g. 28.42
+   * @returns {Promise<{ price: number, gid: string, source: string }>}
+   */
+  getFeeVariant(price) {
+    return apiPublicPost('/api/cdo/fee-variant', { price })
   }
 }

@@ -631,6 +631,50 @@ export async function action({ request }) {
     `[shipping.rates] inbound: ${rate.items.length} line(s) (${feeLinesExcluded} processing-fee excluded), realQty=${totalQty}, dest=${rate.destination?.country}/${rate.destination?.province}/${rate.destination?.postal_code}`,
   );
 
+  // ── 1a. Free-shipping rule (retail store) ─────────────────────────
+  //
+  // Mirrors wholesale/app/api/shipping/rates.js §1a. Both conditions must
+  // hold:
+  //   (a) Every line item's vendor is exactly "Natural Solutions"
+  //       (case-insensitive, trimmed — guards against trailing spaces in
+  //       admin-typed vendor names).
+  //   (b) Cart subtotal (sum of items[].price * quantity, pre-discount)
+  //       is >= $500 USD.
+  //
+  // When both are met, the real carrier rate + handling markup are both
+  // zeroed and the service_name is decorated so the customer sees why.
+  // Customer still picks Ground vs Priority vs Express — they're all
+  // shown at $0 with their respective delivery windows so the pick has
+  // meaning. Pre-discount subtotal is by design: Shopify's carrier-
+  // service payload doesn't expose post-discount totals.
+  const FREE_SHIPPING_VENDOR = "Natural Solutions";
+  const FREE_SHIPPING_THRESHOLD_USD = 500;
+
+  // Use `realItems` (Processing Fee already stripped) so the vendor +
+  // subtotal checks reflect the customer's actual purchase, not the fee
+  // line we tacked on.
+  const allItemsNaturalSolutions =
+    realItems.length > 0 &&
+    realItems.every(
+      (it) =>
+        (it?.vendor || "").trim().toLowerCase() ===
+        FREE_SHIPPING_VENDOR.toLowerCase(),
+    );
+  const cartSubtotalUsd =
+    realItems.reduce(
+      (sum, it) =>
+        sum + (Number(it?.price) || 0) * (Number(it?.quantity) || 0),
+      0,
+    ) / 100;
+  const isFreeShipping =
+    allItemsNaturalSolutions && cartSubtotalUsd >= FREE_SHIPPING_THRESHOLD_USD;
+
+  if (isFreeShipping) {
+    console.log(
+      `[shipping.rates] FREE shipping ELIGIBLE — vendor=NS × ${realItems.length} line(s), subtotal=$${cartSubtotalUsd.toFixed(2)}`,
+    );
+  }
+
   // ── 2. Fetch live rates from all configured direct carriers ──────────
   // Handling markup is TIERED by total cart quantity (see `tieredMarkupCents`):
   //   1–2 items → +$2, 3 → +$3, 4+ → +$5.
@@ -659,13 +703,21 @@ export async function action({ request }) {
     }
 
     const rates = Array.from(dedup.values()).map((r) => {
-      const finalCents = r.rateCents + baseCents;
+      // Free-shipping rule wins over carrier cost + handling markup.
+      // Customer still sees per-service labels (Ground/Priority/Express)
+      // for delivery-speed choice — only the prices flatten to $0.
+      const finalCents = isFreeShipping ? 0 : r.rateCents + baseCents;
+      const baseName = `${r.carrier} ${r.service}`.trim();
       return {
-        service_name: `${r.carrier} ${r.service}`.trim(),
+        service_name: isFreeShipping
+          ? `${baseName} (FREE — orders over $${FREE_SHIPPING_THRESHOLD_USD})`
+          : baseName,
         service_code: r.code,
         total_price: String(finalCents), // STRING in cents
         currency: r.currency || "USD",
-        description: `${r.carrier} ${r.service} (incl. handling)`,
+        description: isFreeShipping
+          ? `Complimentary on Natural Solutions orders over $${FREE_SHIPPING_THRESHOLD_USD}`
+          : `${r.carrier} ${r.service} (incl. handling)`,
         ...(r.deliveryDateMin ? { min_delivery_date: r.deliveryDateMin } : {}),
         ...(r.deliveryDateMax ? { max_delivery_date: r.deliveryDateMax } : {}),
       };
@@ -678,7 +730,9 @@ export async function action({ request }) {
     );
 
     console.log(
-      `[shipping.rates] Direct carriers OK: ${rates.length} real rate(s), tiered markup=$${baseCents / 100} on ${totalQty} item(s)`,
+      isFreeShipping
+        ? `[shipping.rates] Direct carriers OK: ${rates.length} rate(s) FREE on $${cartSubtotalUsd.toFixed(2)} NS-only cart`
+        : `[shipping.rates] Direct carriers OK: ${rates.length} real rate(s), tiered markup=$${baseCents / 100} on ${totalQty} item(s)`,
     );
     return ratesResponse(rates);
   }

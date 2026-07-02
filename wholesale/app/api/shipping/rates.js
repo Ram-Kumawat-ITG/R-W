@@ -115,16 +115,24 @@ function sumQuantity(items) {
 //                           carry default weight that inflates carrier
 //                           quotes
 //
-// Detection: variant_id match first (fast + exact), then title regex as
-// a defensive fallback for misconfigured products / variant-id drift.
-// Keep PROCESSING_FEE_VARIANT_ID in sync with FEE_VARIANT_GID in
-// extensions/checkout-ui/src/Checkout.jsx.
-const PROCESSING_FEE_VARIANT_ID = 45231995191365
+// Detection: title regex — since 2026-07-01 the extension provisions
+// exact-price fee variants on-demand (see extensions/checkout-ui/src/
+// Checkout.jsx + /api/cdo/fee-variant), so there is no single stable
+// variant_id to match anymore. Every fee variant is created on the
+// same "Processing Fee" product with title starting "Processing Fee",
+// so the regex is authoritative. The variant_id fast-path is kept as
+// a defensive optimization but defaults to null.
+const PROCESSING_FEE_VARIANT_ID = null
 const PROCESSING_FEE_TITLE_RE = /processing\s*fee/i
 
 function isProcessingFeeItem(it) {
   if (!it) return false
-  if (Number(it.variant_id) === PROCESSING_FEE_VARIANT_ID) return true
+  if (
+    PROCESSING_FEE_VARIANT_ID != null &&
+    Number(it.variant_id) === PROCESSING_FEE_VARIANT_ID
+  ) {
+    return true
+  }
   const name = String(it.name || it.title || '').trim()
   return PROCESSING_FEE_TITLE_RE.test(name)
 }
