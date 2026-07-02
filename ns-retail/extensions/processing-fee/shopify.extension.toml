@@ -1,0 +1,46 @@
+# Processing Fee — ns-retail Checkout UI extension.
+#
+# Mirrors wholesale/extensions/checkout-ui (added 2026-06-29). Adds a 3%
+# processing fee as a real cart line item at checkout. Shopify Checkout
+# UI extensions cannot inflate the cart total directly — the only
+# supported path is to add a real ProductVariant via
+# `applyCartLinesChange({ type: 'addCartLine' })`.
+#
+# Configuration reference:
+# https://shopify.dev/docs/api/checkout-ui-extensions/latest/configuration
+
+api_version = "2026-04"
+
+[[extensions]]
+name = "processing-fee"
+handle = "processing-fee"
+type = "ui_extension"
+# Generated via `node -e "console.log(require('crypto').randomUUID())"`.
+# DO NOT regenerate. The CLI's auto-generated UID can have a 20-char last
+# segment (instead of the 12 a real UUIDv4 needs); Shopify silently
+# rejects those and the extension fails to load on the storefront —
+# fixed by using crypto.randomUUID() output.
+uid = "83bda889-19a2-4db6-87af-17f7ced0fde3"
+
+# Same target as the wholesale processing-fee extension. Two extensions
+# CAN target the same block.render slot — they render side by side in
+# the checkout editor. This extension renders nothing visible; it just
+# subscribes to cart signals and mutates the cart.
+[[extensions.targeting]]
+module = "./src/Checkout.jsx"
+target = "purchase.checkout.block.render"
+
+[extensions.capabilities]
+# Disabled — extension does NOT call the Storefront API. With
+# `api_access = true`, Shopify proactively fetches a private storefront
+# access token at boot from `/private_access_tokens?...`, which 401s in
+# dev preview before the customer is authenticated and floods the console.
+# https://shopify.dev/docs/api/checkout-ui-extensions/latest/configuration#api-access
+api_access = false
+
+# REQUIRED so the extension can fetch() the ns-retail app backend at
+# `${SERVER_URL}/api/cdo/fee-tiers` (via extensions/services/FullPageApi.jsx
+# → getFeeTiers()) to get the LIVE tier variant list. The bundled
+# FEE_TIERS array in Checkout.jsx is the fallback if the fetch fails.
+# https://shopify.dev/docs/api/checkout-ui-extensions/latest/configuration#network-access
+network_access = true

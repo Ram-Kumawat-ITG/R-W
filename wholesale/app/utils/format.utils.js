@@ -64,3 +64,11 @@ export function fmtDueDate(qboDueDate) {
     day: 'numeric',
   })
 }
+
+// First letter of the first two words of a name, for an <s-avatar>
+// fallback. "?" for empty/missing names.
+export function initialsOf(name) {
+  const parts = String(name || '').trim().split(/\s+/).filter(Boolean)
+  if (parts.length === 0) return '?'
+  return (parts[0][0] + (parts[1]?.[0] || '')).toUpperCase()
+}

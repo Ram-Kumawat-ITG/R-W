@@ -5,7 +5,7 @@ import { getNmiDashboardSnapshot } from "../services/nmi/nmi.service";
 // nmi.config.js — which calls process.env at module init — out of the
 // client bundle. See nmi.utils.js for the split rationale.
 import { latestAction, fromNmiDate } from "../services/nmi/nmi.utils";
-import { formatAmount } from "../utils/format.utils";
+import { formatAmount, initialsOf } from "../utils/format.utils";
 
 // Allowed period windows. NMI's query.php pulls everything in the
 // range in one shot — keeping the window bounded protects the page
@@ -101,7 +101,8 @@ export default function NmiDashboard() {
                 </s-clickable-chip>
               ))}
               <s-button
-                variant="secondary"
+                variant="tertiary"
+                icon="refresh"
                 onClick={() => revalidator.revalidate()}
                 {...(refreshing ? { loading: true } : {})}
               >
@@ -163,13 +164,13 @@ export default function NmiDashboard() {
             <MetricCard
               label="Credit card payments"
               value={fmtCount(counts.creditCard)}
-              subtitle="transaction_type=cc"
+              subtitle="Credit card transactions"
               onClick={() => navigate("/app/nmi/payments?method=cc")}
             />
             <MetricCard
               label="ACH payments"
               value={fmtCount(counts.ach)}
-              subtitle="transaction_type=ck"
+              subtitle="ACH / eCheck transactions"
               onClick={() => navigate("/app/nmi/payments?method=ck")}
             />
             <MetricCard
@@ -199,7 +200,10 @@ export default function NmiDashboard() {
               label="Period transactions / day"
               value={
                 counts.transactions != null
-                  ? (counts.transactions / 30).toFixed(1)
+                  ? (
+                      counts.transactions /
+                      (PERIOD_OPTIONS.find((p) => p.id === periodId)?.days || 30)
+                    ).toFixed(1)
                   : "—"
               }
               subtitle="Averaged across the window"
@@ -218,7 +222,7 @@ export default function NmiDashboard() {
             <s-table-header-row>
               <s-table-header>Transaction</s-table-header>
               <s-table-header>Customer</s-table-header>
-              <s-table-header>Type</s-table-header>
+              <s-table-header>Action</s-table-header>
               <s-table-header>Method</s-table-header>
               <s-table-header>Amount</s-table-header>
               <s-table-header>Outcome</s-table-header>
@@ -242,15 +246,26 @@ export default function NmiDashboard() {
                   >
                     <s-table-cell>#{tx.transaction_id}</s-table-cell>
                     <s-table-cell>
-                      <s-stack direction="block" gap="none">
-                        <s-text>{name || "—"}</s-text>
-                        {tx.email && (
-                          <s-text tone="subdued">{tx.email}</s-text>
-                        )}
+                      <s-stack direction="inline" gap="small-200" alignItems="center">
+                        <s-avatar
+                          size="small-200"
+                          initials={initialsOf(name)}
+                          alt={name || "Customer"}
+                        />
+                        <s-stack direction="block" gap="none">
+                          <s-text>{name || "—"}</s-text>
+                          {tx.email && (
+                            <s-text tone="subdued">{tx.email}</s-text>
+                          )}
+                        </s-stack>
                       </s-stack>
                     </s-table-cell>
                     <s-table-cell>{action}</s-table-cell>
-                    <s-table-cell>{txType}</s-table-cell>
+                    <s-table-cell>
+                      <s-badge tone={txType === "ACH" ? "warning" : "info"}>
+                        {txType}
+                      </s-badge>
+                    </s-table-cell>
                     <s-table-cell>
                       {formatAmount(amount, tx.currency || "USD")}
                     </s-table-cell>

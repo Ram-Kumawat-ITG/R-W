@@ -13,6 +13,19 @@ const invoiceSchema = new mongoose.Schema(
     customerMapRef: { type: mongoose.Schema.Types.ObjectId, ref: 'CustomerMap' },
     customerEmail: { type: String, lowercase: true, index: true },
 
+    // Drop-ship invoice marker. True for invoices created for the synthetic
+    // retail drop-ship customer (DROPSHIP_RETAIL_CUSTOMER_EMAIL) — see
+    // services/order/order.service.js + services/dropship. These are created
+    // UNPAID and collected by a DEDICATED CRON (process-dropship-payments)
+    // against a single configured NMI vault (DROPSHIP_NMI_VAULT_ID), NOT a
+    // per-customer registration vault. The flag segregates them from the
+    // wholesale payment CRON (process-pending-payments excludes
+    // `isDropship: { $ne: true }` from all of its passes) and is the cursor
+    // key the dropship CRON sweeps on. `paymentMethod: 'dropship'` is the
+    // companion segregation key (it falls outside the wholesale PASS 1
+    // card/ach filter and carries a 0% processing fee).
+    isDropship: { type: Boolean, default: false, index: true },
+
     // Optional during the brief window between claiming the (shop,
     // shopifyOrderId) slot and actually creating the invoice in QBO.
     // Set after the QBO POST succeeds.
@@ -60,9 +73,21 @@ const invoiceSchema = new mongoose.Schema(
     // (api/admin/charge-card.js). For the immutable order-time
     // preference, see `customerPaymentPreference`. For what actually
     // settled the invoice, see `paymentSettledVia`.
+    //   immediate — customer self-pays via a hosted NMI pay-link + QR on
+    //               the QBO invoice (no stored vault). NOT auto-charged by
+    //               the CRON (PASS 1 filters card/ach only). Settles via
+    //               the public /pay/<token> flow → propagateSuccessfulPayment.
+    //   dropship  — invoice for the synthetic retail drop-ship customer
+    //               (see `isDropship`). NOT auto-charged by the wholesale
+    //               CRON (PASS 1 filters card/ach only); collected by the
+    //               dedicated process-dropship-payments CRON against the
+    //               configured DROPSHIP_NMI_VAULT_ID. Carries no processing
+    //               fee (no rate configured → computeProcessingFee returns
+    //               null). Locked at creation; never flipped by an admin
+    //               fallback.
     paymentMethod: {
       type: String,
-      enum: ['card', 'check', 'ach'],
+      enum: ['card', 'check', 'ach', 'immediate', 'dropship'],
       default: 'card',
       index: true,
     },
@@ -76,7 +101,7 @@ const invoiceSchema = new mongoose.Schema(
     // cheque → card override existed).
     customerPaymentPreference: {
       type: String,
-      enum: ['card', 'check', 'ach'],
+      enum: ['card', 'check', 'ach', 'immediate', 'dropship'],
     },
 
     // Method that actually settled (or last contributed to settling)
@@ -90,9 +115,25 @@ const invoiceSchema = new mongoose.Schema(
     // snapshot, immutable).
     paymentSettledVia: {
       type: String,
-      enum: ['card', 'check', 'ach'],
+      enum: ['card', 'check', 'ach', 'checkout'],
     },
     paymentSettledAt: Date,
+
+    // ── Immediate Payment — self-pay link ────────────────────────────
+    //
+    // For `paymentMethod: 'immediate'` invoices only. `payToken` is an
+    // opaque, cryptographically-random bearer credential (NOT a signed
+    // amount) minted at invoice creation and embedded in the durable public
+    // URL /pay/<payToken> (baked into the QBO invoice CustomerMemo). That
+    // page looks the invoice up by this token, computes the outstanding
+    // balance SERVER-SIDE, and collects it via NMI Collect.js.
+    //
+    // `payTransactionIds` dedups settlement — a returning NMI transaction
+    // id already present here is ignored so a double charge / resubmit
+    // can't bump amountPaid twice.
+    payToken: { type: String, index: { unique: true, sparse: true } },
+    payTokenCreatedAt: Date,
+    payTransactionIds: { type: [String], default: undefined },
 
     // Lifecycle of the invoice's payment, independent of QBO's own status.
     //
@@ -158,6 +199,62 @@ const invoiceSchema = new mongoose.Schema(
     pendingSettlementSince: Date,
     pendingSettlementLastCheckedAt: Date,
 
+    // ── ACH status synchronization (services/payment/achStatusSync) ───
+    //
+    // The dedicated ACH Status Synchronization CRON
+    // (`process-ach-status-sync`) polls NMI for the latest condition of
+    // every awaiting-settlement ACH transaction and records the outcome
+    // here. `achReturnCode` / `achReturnReason` capture the NACHA return
+    // detail when a debit is returned or voided (e.g. R01 — insufficient
+    // funds); `achStatusHistory[]` is the append-only audit trail of every
+    // detected status CHANGE — one entry per transition, so a re-poll that
+    // sees no change adds nothing (keeps the sync idempotent).
+    achReturnCode: String,
+    achReturnReason: String,
+    achReturnedAt: Date,
+    achStatusHistory: {
+      type: [
+        new mongoose.Schema(
+          {
+            at: { type: Date, default: Date.now },
+            // Normalized lifecycle status we transitioned TO, derived from
+            // NMI's transaction condition: pending_settlement | settled |
+            // returned | voided | failed | unknown.
+            status: { type: String, required: true },
+            previousStatus: String, // our paymentStatus before the change
+            nmiCondition: String, // raw NMI condition string
+            nmiTransactionId: String,
+            returnCode: String, // NACHA return code, when applicable
+            returnReason: String,
+            amount: Number,
+            source: { type: String, default: 'cron_ach_status_sync' },
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+
+    // ── Manual "Sync ACH Status" admin action ─────────────────────────
+    //
+    // The Order Details page exposes an on-demand "Sync ACH status"
+    // button that runs the SAME reconciliation as the CRON, for a single
+    // invoice, without waiting for the scheduled `process-ach-status-sync`
+    // tick. `achSyncInProgress` is an atomic lock (set via findOneAndUpdate)
+    // that prevents two syncs racing on the same invoice — a double-click
+    // or an overlapping CRON+manual run. `achSyncLastAt` / `achSyncLastStatus`
+    // / `achSyncLastCondition` / `achSyncLastSource` capture the most recent
+    // sync result (from EITHER the CRON or the manual button) so the UI can
+    // show "last synced X — status Y"; `achSyncLastBy` records the admin
+    // email when the sync was triggered manually.
+    achSyncInProgress: { type: Boolean, default: false },
+    achSyncStartedAt: Date,
+    achSyncLastAt: Date,
+    achSyncLastStatus: String, // normalized: settled|returned|voided|failed|pending_settlement|unknown|error
+    achSyncLastCondition: String, // raw NMI condition
+    achSyncLastSource: String, // 'cron_ach_status_sync' | 'admin_manual_sync'
+    achSyncLastBy: String,
+
     attemptCount: { type: Number, default: 0 },
     maxAttempts: { type: Number, default: 6 },
     lastAttemptAt: Date,
@@ -215,6 +312,12 @@ const invoiceSchema = new mongoose.Schema(
     //                          once per day to avoid spamming the
     //                          remarks panel during the normal 1–3 day
     //                          wait window.
+    //   cron_dropship_attempt — the dedicated process-dropship-payments
+    //                          CRON tried to collect a drop-ship invoice by
+    //                          charging the configured DROPSHIP_NMI_VAULT_ID.
+    //                          Kept distinct from cron_card_attempt so the
+    //                          Order Details / Remarks feed reads "Drop-ship
+    //                          collection" rather than a wholesale card charge.
     //   cron_cheque_reminder — PASS 1.5 CRON logged a reminder for a
     //                          pending cheque invoice (no charge
     //                          attempted — admins still need to act)
@@ -238,9 +341,15 @@ const invoiceSchema = new mongoose.Schema(
               enum: [
                 'cron_card_attempt',
                 'cron_ach_attempt',
+                'cron_dropship_attempt',
                 'cron_ach_settlement_check',
                 'cron_cheque_reminder',
                 'cron_ach_reminder',
+                // Daily Check-payment reminder CRON (services/reminder) —
+                // distinct from the legacy log-only PASS 1.5
+                // `cron_cheque_reminder`: this one is written when an
+                // actual QBO invoice reminder EMAIL was triggered.
+                'cron_payment_reminder',
                 'cron_failed_followup',
                 'admin_action',
                 'system_note',
@@ -321,6 +430,24 @@ const invoiceSchema = new mongoose.Schema(
     autoChargeResumedBy: String,
     autoChargePauseNote: String,
 
+    // Admin-controlled flag that mutes the Check-payment reminder CRON
+    // (services/reminder) for this invoice only. Distinct from
+    // `autoChargePaused` above: that gates the card auto-charge sweep
+    // (card-preferred invoices); THIS gates reminder EMAILS (cheque
+    // invoices). While `reminderPaused` is true the reminder job's
+    // eligibility filter (`reminderPaused: { $ne: true }`) skips the
+    // invoice entirely — no further automated reminder emails are sent
+    // — until an admin resumes. Surfaced via the "Pause auto email
+    // notifications" control on Order Details. Audit fields mirror the
+    // auto-charge pause set: `*PausedAt/By` capture the latest pause,
+    // `*ResumeAt/By` the latest resume, `*PauseNote` the optional reason.
+    reminderPaused: { type: Boolean, default: false, index: true },
+    reminderPausedAt: Date,
+    reminderPausedBy: String,
+    reminderResumeAt: Date,
+    reminderResumedBy: String,
+    reminderPauseNote: String,
+
     // Processing-fee state — captures the per-method surcharge added to
     // the invoice at settlement time (card=3%, ach=1%, check=0% by
     // default). The fee is decided by the **actual settlement method**
@@ -332,7 +459,7 @@ const invoiceSchema = new mongoose.Schema(
     // Payment retries the append on every run until it lands.
     processingFeeAmount: Number,
     processingFeeRate: Number,
-    processingFeeMethod: { type: String, enum: ['card', 'ach', 'check'] },
+    processingFeeMethod: { type: String, enum: ['card', 'ach', 'check', 'immediate'] },
     processingFeeAppliedAt: Date,
 
     // ── Customer email lifecycle (QBO-driven) ────────────────────────
@@ -379,7 +506,50 @@ const invoiceSchema = new mongoose.Schema(
       ],
     },
     invoiceEmailedAmountPaid: Number,
+    invoiceEmailedShipDate: String,
+    invoiceEmailedTrackingNum: String,
     lastEmailError: String,
+
+    // ── Check-payment reminder history (daily reminder CRON) ──────────
+    //
+    // Notification log for the standalone Check-reminder job
+    // (services/reminder). One entry per reminder EMAIL we asked QBO to
+    // send, keyed by `stage`. The named ladder stages (first / second /
+    // card) each send at most once — a 'sent' entry suppresses re-send.
+    // The 'recurring' stage is the exception: it repeats after the final
+    // ladder stage, throttled by the most recent entry's `sentAt` to the
+    // configured interval, so multiple 'recurring' rows accumulate (one
+    // per cycle) until the invoice is paid. A 'failed' entry is retryable
+    // on the next run. This is both the dedup source of truth and the
+    // per-invoice audit log.
+    paymentReminders: {
+      type: [
+        new mongoose.Schema(
+          {
+            // 'first' / 'second' / 'card' are the live ladder stage keys
+            // (semantic, ladder-position independent of the threshold
+            // value). 'recurring' is the post-final-stage reminder that
+            // repeats at the configured interval until paid — its entries
+            // accumulate (one per cycle). 'day7' / 'day9' / 'day13' are
+            // legacy keys kept so .save() doesn't fail enum validation on
+            // any pre-existing dev rows.
+            stage: {
+              type: String,
+              enum: ['first', 'second', 'card', 'recurring', 'day7', 'day9', 'day13'],
+              required: true,
+            },
+            sentAt: { type: Date, default: Date.now },
+            daysSinceOrder: Number,
+            recipient: String,
+            status: { type: String, enum: ['sent', 'failed'], required: true },
+            qboEmailStatus: String,
+            errorMessage: String,
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
 
     // Append-only history of every QBO `/invoice/<id>/send` attempt.
     // Powers the "Email history" panel on the Order Details page and
@@ -431,6 +601,10 @@ const invoiceSchema = new mongoose.Schema(
                 'payment_recorded',
                 'status_changed',
                 'manual_resend',
+                // Daily Check-payment reminder CRON (services/reminder).
+                'payment_reminder',
+                // Re-send triggered by fulfillment/tracking update.
+                'fulfillment_updated',
               ],
               required: true,
             },

@@ -8,10 +8,15 @@ export const NMI_BASE_URLS = {
   sandbox: {
     api: 'https://sandbox.nmi.com/api/transact.php',
     query: 'https://sandbox.nmi.com/api/query.php',
+    // Collect.js — NMI-hosted card tokenization (iframe fields). Powers the
+    // Immediate Payment self-pay page: the card is tokenized client-side and
+    // never touches our server; we then charge type=sale with the token.
+    collectJs: 'https://sandbox.nmi.com/token/Collect.js',
   },
   production: {
     api: 'https://secure.nmi.com/api/transact.php',
     query: 'https://secure.nmi.com/api/query.php',
+    collectJs: 'https://secure.nmi.com/token/Collect.js',
   },
 }
 

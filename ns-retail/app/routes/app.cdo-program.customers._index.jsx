@@ -2,7 +2,7 @@ import { useLoaderData, useNavigate } from "react-router";
 import { authenticate } from "../shopify.server";
 import { listPractitioners } from "../services/cdo/cdo.service";
 import DataTable from "../components/cdo/DataTable";
-import { formatDate } from "../utils/format";
+import { formatDate, formatCurrency } from "../utils/format";
 
 // CDO Customers list. Each row links to the practitioner's detail
 // page (`/app/cdo-program/customers/:id`) via a dedicated "View"
@@ -24,15 +24,44 @@ export default function CdoCustomers() {
   // values so this re-declaration per render is cheap.
   const columns = [
     { key: "name", header: "Practitioner", render: (r) => r.name || "—" },
-    { key: "businessName", header: "Business" },
-    { key: "email", header: "Email" },
-    { key: "phone", header: "Phone" },
     {
-      key: "submittedAt",
-      header: "Joined",
-      render: (r) => formatDate(r.submittedAt),
+      key: "pendingCommissions",
+      header: "Pending Commissions",
+      render: (r) => formatCurrency(r.pendingCommissions),
     },
-    { key: "customerId", header: "Customer ID" },
+    {
+      key: "upcomingPayout",
+      header: "Upcoming Payout",
+      render: (r) =>
+        r.upcomingPayout > 0 ? (
+          formatCurrency(r.upcomingPayout)
+        ) : (
+          <s-text tone="subdued">—</s-text>
+        ),
+    },
+    {
+      key: "lastPayout",
+      header: "Last Payout",
+      render: (r) =>
+        r.lastPayoutDate ? (
+          <s-stack direction="block" gap="none">
+            <s-text>{formatCurrency(r.lastPayoutAmount)}</s-text>
+            <s-text tone="subdued">{formatDate(r.lastPayoutDate)}</s-text>
+          </s-stack>
+        ) : (
+          <s-text tone="subdued">No payouts yet</s-text>
+        ),
+    },
+    {
+      key: "payoutsPaused",
+      header: "Payouts",
+      render: (r) =>
+        r.payoutsPaused ? (
+          <s-badge tone="warning">Paused</s-badge>
+        ) : (
+          <s-badge tone="success">Active</s-badge>
+        ),
+    },
     {
       key: "actions",
       header: "Actions",
@@ -52,8 +81,8 @@ export default function CdoCustomers() {
     <DataTable
       columns={columns}
       rows={rows}
-      searchKeys={["name", "email", "phone", "businessName", "customerId"]}
-      searchPlaceholder="Search by name, email, phone, business, or customer ID"
+      searchKeys={["name", "email"]}
+      searchPlaceholder="Search by name or email"
       description="Approved practitioners enrolled in the CDO Program (wholesale applicants who resell). Click View to manage referral codes, view commissions, and configure per-practitioner settings."
       emptyHeading="No CDO practitioners yet"
       emptyBody="Approved practitioners who choose to resell products will appear here."

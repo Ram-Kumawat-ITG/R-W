@@ -3,9 +3,10 @@
 // 401-retry-once, `requestid` idempotency, and Fault-structured error
 // classification. Pure transport; domain methods live in qbo.service.js.
 //
-// Independent from the wholesale QBO client: reads the CDO realm's config
+// Independent from the wholesale QBO client: reads this client's config
 // (qbo.config) and persists tokens in the cdo_qbo_tokens collection
-// (CdoQboToken). The two QBO accounts never share state.
+// (CdoQboToken), keyed by realmId. The retail A/R client (services/retailQbo)
+// targets the same QBO company, so both share that realm's token row.
 
 import { randomUUID } from "node:crypto";
 import { qboConfig, assertQboConfigured } from "./qbo.config";
@@ -18,9 +19,9 @@ import CdoQboToken from "../../models/cdoQboToken.server";
 const log = createLogger("cdo.qbo.apis");
 
 const RETRY = {
-  attempts: readInt("CDO_QBO_HTTP_RETRY_ATTEMPTS", 4),
-  baseMs: readInt("CDO_QBO_HTTP_RETRY_BASE_MS", 500),
-  maxMs: readInt("CDO_QBO_HTTP_RETRY_MAX_MS", 4000),
+  attempts: readInt("QBO_HTTP_RETRY_ATTEMPTS", 4),
+  baseMs: readInt("QBO_HTTP_RETRY_BASE_MS", 500),
+  maxMs: readInt("QBO_HTTP_RETRY_MAX_MS", 4000),
 };
 
 function truncate(str, max = 1000) {
@@ -44,7 +45,7 @@ async function bootstrapTokenDocFromEnv() {
   // token, then immediately refresh to populate access token + new refresh.
   if (!qboConfig.bootstrapRefreshToken) {
     throw new PermanentError(
-      "CDO QBO has no stored token and CDO_QBO_REFRESH_TOKEN is empty. " +
+      "CDO QBO has no stored token and QBO_RETAIL_REFRESH_TOKEN is empty. " +
         "Seed an initial refresh token via the Intuit OAuth Playground.",
     );
   }

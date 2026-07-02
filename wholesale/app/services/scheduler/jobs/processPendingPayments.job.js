@@ -4,7 +4,6 @@ import CustomerMap from '../../../models/customerMap.server'
 import {
   chargeInvoice,
   propagateSuccessfulPayment,
-  checkAchSettlement,
 } from '../../payment/payment.service'
 import { createLogger } from '../../../utils/logger.utils'
 
@@ -46,9 +45,16 @@ export function registerProcessPendingPaymentsJob(agenda) {
       // absent entirely — those default to "not paused". When an admin
       // hits Resume the flag flips back to false and the next tick
       // picks the invoice up again.
+      // `isDropship: { $ne: true }` excludes drop-ship invoices — those are
+      // collected by the dedicated process-dropship-payments CRON against the
+      // configured DROPSHIP_NMI_VAULT_ID, never here. ($ne also matches legacy
+      // rows where the field is absent.) Their `paymentMethod: 'dropship'`
+      // already falls outside the card/ach filter; the flag is the explicit,
+      // method-independent guard applied across all three passes below.
       const pendingCursor = Invoice.find({
         paymentStatus: 'pending',
         paymentMethod: { $in: ['card', 'ach'] },
+        isDropship: { $ne: true },
         autoChargePaused: { $ne: true },
         $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
       }).cursor()
@@ -141,51 +147,42 @@ export function registerProcessPendingPaymentsJob(agenda) {
         }
       }
 
-      // PASS 1.5 — cheque-pending invoices (no NMI vault to charge
-      // against) and failed card/ACH invoices that exhausted retries.
-      // CRON cannot auto-charge these, so we log a "reminder" / "follow-up"
-      // remark each tick. Admins see the trail on the Order List
-      // "Remarks" column and can act manually (mark cheque paid, charge
-      // card on file as a fallback, etc.). No customer-facing
-      // notifications are sent here — operator-visible log only.
+      // PASS 1.5 — failed card/ACH invoices that exhausted retries.
+      // CRON can no longer auto-charge these, so we log a payment
+      // "follow-up" remark each tick as part of this CRON's payment
+      // audit history. Admins see the trail on the Order List "Remarks"
+      // column and can act manually (charge card on file as a fallback,
+      // etc.). No customer-facing notifications are sent here.
       //
-      // ACH-pending invoices NO LONGER land here — they now flow through
-      // PASS 1 as an active charge path against the NMI billing id.
-      // The legacy `cron_ach_reminder` enum is preserved on the Invoice
-      // schema for back-compat with rows written before that change;
-      // PASS 1.5 will not emit it anymore.
+      // CHEQUE REMINDERS DO NOT LIVE HERE. Customer-facing payment
+      // reminders for unpaid cheque invoices are owned exclusively by the
+      // dedicated reminder CRON (`process-check-reminders` /
+      // services/reminder), which sends QBO emails on the Day 9 / 11 / 13
+      // ladder + recurring phase. This payment CRON is responsible only
+      // for charging, status updates, and payment/audit logs — keeping
+      // the two concerns separate avoids duplicate reminders. The legacy
+      // `cron_cheque_reminder` / `cron_ach_reminder` enum values remain on
+      // the Invoice schema for back-compat with historical rows; this
+      // pass no longer emits them.
       //
-      // Paused invoices are excluded from reminders too — pausing is
-      // an explicit "leave this one alone" signal. Surfacing a
-      // recurring reminder would defeat that intent.
-      const reminderCursor = Invoice.find({
+      // Paused invoices are excluded — pausing is an explicit "leave this
+      // one alone" signal.
+      const followupCursor = Invoice.find({
         autoChargePaused: { $ne: true },
-        $or: [
-          { paymentStatus: 'pending', paymentMethod: 'check' },
-          { paymentStatus: 'failed' },
-        ],
+        isDropship: { $ne: true }, // drop-ship follow-ups belong to the dropship CRON
+        paymentStatus: 'failed',
       }).cursor()
-      let remindersLogged = 0
-      for await (const invoice of reminderCursor) {
+      let followupsLogged = 0
+      for await (const invoice of followupCursor) {
         const outstanding = Number((invoice.amountDue - invoice.amountPaid).toFixed(2))
-        const isFailed = invoice.paymentStatus === 'failed'
-        // Failed invoices keep the "Failed follow-up" kind regardless
-        // of original method so the Order List filter stays clean.
-        // Pending invoices land here only when paymentMethod==='check',
-        // so the kind is fixed at cron_cheque_reminder.
-        const kind = isFailed ? 'cron_failed_followup' : 'cron_cheque_reminder'
-        const methodLabel = isFailed
-          ? (invoice.paymentMethod === 'ach' ? 'ACH' : 'Card')
-          : 'Cheque'
-        const message = isFailed
-          ? `Failed ${methodLabel.toLowerCase()} payment follow-up — $${outstanding.toFixed(2)} outstanding after ${invoice.attemptCount} attempt(s)`
-          : `${methodLabel} payment reminder — $${outstanding.toFixed(2)} still outstanding`
+        const methodLabel = invoice.paymentMethod === 'ach' ? 'ACH' : 'Card'
+        const message = `Failed ${methodLabel.toLowerCase()} payment follow-up — $${outstanding.toFixed(2)} outstanding after ${invoice.attemptCount} attempt(s)`
         await Invoice.updateOne(
           { _id: invoice._id },
           {
             $push: {
               remarks: {
-                kind,
+                kind: 'cron_failed_followup',
                 message,
                 amount: outstanding,
                 currency: invoice.currency,
@@ -195,123 +192,20 @@ export function registerProcessPendingPaymentsJob(agenda) {
             },
           },
         )
-        remindersLogged += 1
-        console.log(`│ ⓘ reminder logged invoice=${invoice._id} "${message}"`)
+        followupsLogged += 1
+        console.log(`│ ⓘ failed-payment follow-up logged invoice=${invoice._id} "${message}"`)
       }
 
-      // PASS 1.7 — poll NMI for awaiting-settlement ACH invoices.
-      //
-      // ACH sales return NMI response code 100 ("Approved") at the
-      // gateway level immediately, but funds settle 1–3 business days
-      // later when the ACH network responds. Until then the
-      // transaction can still bounce (NSF, closed account, frozen
-      // funds, etc.). chargeInvoice's ACH branch parks accepted
-      // transactions in paymentStatus='awaiting_settlement' WITHOUT
-      // bumping amountPaid or running downstream sync; this pass calls
-      // checkAchSettlement which queries NMI's query.php for the
-      // transaction's current `condition` and either:
-      //   - applies the credit + propagates to QBO/Shopify (settled)
-      //   - drops the credit + flips back to pending/failed (returned)
-      //   - leaves the invoice as-is (still pending — log a remark at
-      //     most once per day to avoid flooding the Remarks panel)
-      //
-      // PASS 1.5 already runs before this so any failed-then-returned
-      // invoice that flips out of awaiting_settlement back to pending
-      // is picked up by the next tick's PASS 1 for a retry — without
-      // double-billing the customer, since the original transaction
-      // was confirmed as returned by NMI.
-      //
-      // Once-per-day throttle: NMI reads aren't free + the Remarks
-      // panel becomes unreadable if every CRON tick (every 30s in dev,
-      // 15th/last in prod) logs "still pending". The check itself
-      // runs every tick — only the remark write is throttled.
-      const SETTLEMENT_REMARK_THROTTLE_MS = 24 * 60 * 60 * 1000
-      const settlementCursor = Invoice.find({
-        paymentStatus: 'awaiting_settlement',
-        pendingSettlementTxnId: { $exists: true, $ne: null },
-      }).cursor()
-      let settlementChecked = 0
-      let settlementSettled = 0
-      let settlementReturned = 0
-      let settlementStillPending = 0
-      let settlementUnknown = 0
-      for await (const invoice of settlementCursor) {
-        settlementChecked += 1
-        const invId = invoice._id.toString()
-        const lastCheck = invoice.pendingSettlementLastCheckedAt
-        console.log(
-          `│ ✓ settlement-check invoice ${invoice.qboInvoiceId || invId} txn=${invoice.pendingSettlementTxnId} ` +
-            `since=${invoice.pendingSettlementSince?.toISOString?.() || '?'}`,
-        )
-        try {
-          const customerMap = invoice.customerMapRef
-            ? await CustomerMap.findById(invoice.customerMapRef)
-            : null
-          const result = await checkAchSettlement({ invoice, customerMap })
-          let remarkMsg = null
-          if (result.action === 'settled') {
-            settlementSettled += 1
-            console.log(`│     ✓ → SETTLED amount=$${Number(result.amount || 0).toFixed(2)}`)
-            remarkMsg =
-              `ACH settlement confirmed (NMI txn ${result.transactionId || '?'}, ` +
-              `condition=${result.condition || 'complete'}) — ` +
-              `$${Number(result.amount || 0).toFixed(2)} applied to invoice`
-          } else if (result.action === 'returned') {
-            settlementReturned += 1
-            console.log(`│     ✓ → RETURNED condition=${result.condition} reason="${result.reason}"`)
-            remarkMsg =
-              `ACH return — NMI condition=${result.condition}, reason: ${result.reason || 'no detail'}. ` +
-              `Invoice reset to ${invoice.paymentStatus} so a retry / card fallback can be attempted.`
-          } else if (result.action === 'still_pending') {
-            settlementStillPending += 1
-            console.log(`│     ✓ → still pending (condition=${result.condition})`)
-            const since = lastCheck ? Date.now() - new Date(lastCheck).getTime() : Infinity
-            if (since >= SETTLEMENT_REMARK_THROTTLE_MS) {
-              const ageDays = invoice.pendingSettlementSince
-                ? Math.max(
-                    0,
-                    Math.floor(
-                      (Date.now() - new Date(invoice.pendingSettlementSince).getTime()) /
-                        (24 * 60 * 60 * 1000),
-                    ),
-                  )
-                : 0
-              remarkMsg =
-                `ACH still settling — NMI condition=${result.condition || 'pendingsettlement'}, ` +
-                `day ${ageDays} of typical 1–3 business day window`
-            }
-          } else if (result.action === 'unknown') {
-            settlementUnknown += 1
-            console.log(`│     ✓ → UNKNOWN reason="${result.reason}"`)
-            remarkMsg = `ACH settlement lookup failed: ${result.reason || 'unknown'} — will retry next tick`
-          } else {
-            // noop — invoice changed underneath us; just skip.
-            console.log(`│     ✓ → noop reason="${result.reason}"`)
-          }
-          if (remarkMsg) {
-            await Invoice.updateOne(
-              { _id: invoice._id },
-              {
-                $push: {
-                  remarks: {
-                    kind: 'cron_ach_settlement_check',
-                    message: remarkMsg,
-                    amount: result.amount,
-                    currency: invoice.currency,
-                    source: 'cron',
-                    createdAt: new Date(),
-                  },
-                },
-              },
-            )
-          }
-        } catch (err) {
-          settlementUnknown += 1
-          console.log(`│     ✓ → THREW ${err.message}`)
-          console.error(err.stack || err)
-          log.error('settlement.unexpected', { invoiceId: invId, err })
-        }
-      }
+      // NOTE: ACH settlement reconciliation used to live here as "PASS
+      // 1.7". It has moved to a dedicated, independent CRON
+      // (`process-ach-status-sync` / services/payment/achStatusSync)
+      // that polls NMI for awaiting-settlement ACH transactions on its
+      // own (frequent) cadence — settlement happens 1–3 business days
+      // after submission, which the monthly charge ticks here can't poll
+      // promptly. Keeping it separate also guarantees a single owner of
+      // the `awaiting_settlement` → paid/pending/failed transition (no
+      // race between two CRONs mutating the same invoices). This payment
+      // CRON now only CHARGES; it does not reconcile ACH status.
 
       // PASS 2 — invoices that have money paid but downstream sync
       // (QBO recordPayment, Shopify SALE transaction, or Shopify
@@ -336,6 +230,9 @@ export function registerProcessPendingPaymentsJob(agenda) {
       // sync skips work that's already done, and chargeInvoice's
       // own save() runs after this loop completes.
       const sweepFilter = {
+        // Drop-ship invoices sync via the dedicated dropship CRON's own
+        // sync-retry pass — keep them out of the wholesale sweep entirely.
+        isDropship: { $ne: true },
         paymentStatus: { $in: ['paid', 'partially_paid', 'partially_refunded', 'in_progress'] },
         $or: [
           { qboPaymentRecorded: false },
@@ -404,16 +301,13 @@ export function registerProcessPendingPaymentsJob(agenda) {
       console.log(
         `└─── tick ${tick} done in ${elapsedMs}ms — ` +
           `charges: processed=${processed} approved=${approved} declined=${declined} errored=${errored} skipped=${skipped}` +
-          ` | reminders: ${remindersLogged}` +
-          ` | ach-settlement: checked=${settlementChecked} settled=${settlementSettled} returned=${settlementReturned} pending=${settlementStillPending} unknown=${settlementUnknown}` +
+          ` | failed-followups: ${followupsLogged}` +
           ` | sync-retries: processed=${sweepProcessed} ok=${sweepOk} failed=${sweepFailed}\n`,
       )
       log.info('tick.complete', {
         tick, tickId, elapsedMs,
         processed, approved, declined, errored, skipped,
-        remindersLogged,
-        settlementChecked, settlementSettled, settlementReturned,
-        settlementStillPending, settlementUnknown,
+        followupsLogged,
         sweepProcessed, sweepOk, sweepFailed,
       })
     },

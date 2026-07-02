@@ -10,25 +10,9 @@ import {
   buildProfileFromShopifyOrder,
   missingBillingFields,
   formatAddress,
+  normalizePaymentMethod,
 } from './customer.utils'
 import { createLogger } from '../../utils/logger.utils'
-
-// Map a wholesale-application payment.method to the invoice/customerMap
-// enum. Tolerates either spelling of the cheque option ('check' or
-// 'cheque'), case insensitive, since both surface in real data — the
-// registration form uses id 'check' but some application records carry
-// 'cheque'. Canonical storage value is 'check'.
-//
-// Unknown / missing values default to 'card' so existing customers
-// without a captured preference keep the legacy CRON-auto-charge
-// behavior.
-function normalizePaymentMethod(raw) {
-  const v = String(raw || '').trim().toLowerCase()
-  if (v === 'check' || v === 'cheque') return 'check'
-  if (v === 'ach' || v === 'bank' || v === 'bank-transfer') return 'ach'
-  if (v === 'card' || v === 'credit-card' || v === 'creditcard' || v === 'cc') return 'card'
-  return 'card'
-}
 
 const log = createLogger('customer.service')
 
@@ -221,6 +205,67 @@ export async function ensureCustomerForOrder({ shop, order }) {
   mapping.lastSyncedAt = new Date()
   await mapping.save()
   console.log(`[customers] customer_maps saved _id=${mapping._id}`)
+  return mapping
+}
+
+// Ensure the synthetic retail drop-ship customer
+// (DROPSHIP_RETAIL_CUSTOMER_EMAIL) is mapped to a QBO customer, WITHOUT the
+// wholesale NMI-vault / billing-address requirements.
+//
+// Why a separate path from ensureCustomerForOrder:
+//   - Drop-ship invoices are collected by the dedicated
+//     process-dropship-payments CRON against a SINGLE configured NMI vault
+//     (DROPSHIP_NMI_VAULT_ID), not a per-customer registration vault — so we
+//     never source / validate a vault here and never write
+//     CustomerMap.nmiCustomerVaultId (the CRON injects the configured vault
+//     at charge time).
+//   - The synthetic customer has no wholesale_applications doc and the
+//     drop-ship Shopify order may arrive without a billing address, so the
+//     wholesale "billing address required for NMI" hard-fail must NOT apply.
+//
+// We still create / reuse the QBO customer (find-or-create by email, so every
+// drop-ship invoice consolidates under one QBO customer) and persist a
+// CustomerMap row carrying `qboCustomerId` + `email` — the two fields
+// createInvoiceForOrder + propagateSuccessfulPayment read. `paymentMethod` is
+// intentionally left unset on the map (its enum has no 'dropship'); the
+// invoice locks the method itself via createInvoiceForOrder({ isDropship }).
+export async function ensureDropshipCustomerMap({ shop, order }) {
+  const profile = buildProfileFromShopifyOrder(order)
+  if (!profile.email) {
+    throw new Error(`Drop-ship order ${order.id} has no email; cannot create QBO customer`)
+  }
+  console.log(`[customers] ensureDropshipCustomerMap(shop=${shop}, email=${profile.email})`)
+
+  let mapping = await CustomerMap.findOneAndUpdate(
+    { shop, email: profile.email },
+    {
+      $setOnInsert: { shop, email: profile.email },
+      $set: {
+        shopifyCustomerId: profile.shopifyCustomerId || undefined,
+        profile: {
+          firstName: profile.firstName,
+          lastName: profile.lastName,
+          companyName: profile.companyName,
+          phone: profile.phone,
+          billingAddress: profile.billingAddress,
+          shippingAddress: profile.shippingAddress,
+        },
+      },
+    },
+    { upsert: true, new: true },
+  )
+
+  if (!mapping.qboCustomerId) {
+    const { customer } = await findOrCreateQboCustomer(profile)
+    mapping.qboCustomerId = customer.Id
+    log.info('dropship.qbo.linked', { email: profile.email, qboCustomerId: customer.Id })
+    console.log(`[customers] drop-ship QBO customer linked Id=${customer.Id}`)
+  } else {
+    console.log(`[customers] drop-ship QBO link already set: Id=${mapping.qboCustomerId}`)
+  }
+
+  mapping.lastSyncedAt = new Date()
+  await mapping.save()
   return mapping
 }
 

@@ -10,6 +10,7 @@ import {
   resolveCustomerVaultId,
   resolveCustomerAchBillingId,
 } from '../../services/customer/customer.service'
+import { dropshipPaymentConfig } from '../../services/dropship/dropshipPayment.config'
 import { sendResponse } from '../../services/APIService/api.service'
 
 // POST /api/admin/orders/:id/retry-payment
@@ -119,49 +120,70 @@ export async function action({ request, params }) {
     ? await CustomerMap.findOne({ shop: session.shop, email: order.customerEmail })
     : null
 
-  // Resolve the customer vault id (always needed). For ACH invoices we
-  // ALSO need the ACH billing id — NMI's transact.php needs both to
-  // target the ACH billing entry inside the vault. Both reads run the
-  // cache → source-of-truth fallback chain; the response message is
-  // precise about which id is missing so the admin doesn't have to
-  // guess which side to fix.
-  const resolvedVaultId = order.customerEmail
-    ? await resolveCustomerVaultId({
-        shop: session.shop,
-        email: order.customerEmail,
-        customerMap,
-      })
-    : null
-  if (customerMap && resolvedVaultId && !customerMap.nmiCustomerVaultId) {
-    customerMap.nmiCustomerVaultId = resolvedVaultId
-  }
-  if (!resolvedVaultId) {
-    return sendResponse(
-      409,
-      'error',
-      'No NMI customer vault on file for this customer — collect a payment method before retrying',
-      null,
-    )
-  }
-
-  if (invoice.paymentMethod === 'ach') {
-    const resolvedAchBillingId = order.customerEmail
-      ? await resolveCustomerAchBillingId({
+  // Drop-ship invoices are collected against the SINGLE configured vault
+  // (DROPSHIP_NMI_VAULT_ID), not a per-customer registration vault — so we
+  // bypass the wholesale vault/ACH resolution and inject the configured vault
+  // (mirrors what the process-dropship-payments CRON does at charge time).
+  // This is the "Collect payment now" path on the Admin Order Details page.
+  if (invoice.isDropship) {
+    const vaultId = dropshipPaymentConfig.vaultId
+    if (!vaultId) {
+      return sendResponse(
+        409,
+        'error',
+        'DROPSHIP_NMI_VAULT_ID is not configured — set it before collecting drop-ship payments',
+        null,
+      )
+    }
+    if (!customerMap) {
+      return sendResponse(409, 'error', 'No customer map for this drop-ship invoice', null)
+    }
+    customerMap.nmiCustomerVaultId = vaultId
+  } else {
+    // Resolve the customer vault id (always needed). For ACH invoices we
+    // ALSO need the ACH billing id — NMI's transact.php needs both to
+    // target the ACH billing entry inside the vault. Both reads run the
+    // cache → source-of-truth fallback chain; the response message is
+    // precise about which id is missing so the admin doesn't have to
+    // guess which side to fix.
+    const resolvedVaultId = order.customerEmail
+      ? await resolveCustomerVaultId({
           shop: session.shop,
           email: order.customerEmail,
           customerMap,
         })
       : null
-    if (customerMap && resolvedAchBillingId && !customerMap.nmiAchBillingId) {
-      customerMap.nmiAchBillingId = resolvedAchBillingId
+    if (customerMap && resolvedVaultId && !customerMap.nmiCustomerVaultId) {
+      customerMap.nmiCustomerVaultId = resolvedVaultId
     }
-    if (!resolvedAchBillingId) {
+    if (!resolvedVaultId) {
       return sendResponse(
         409,
         'error',
-        'No NMI ACH billing id on file for this customer — capture the ACH billing profile in NMI (and store its id at wholesale_applications.payment.ach.nmi_billing_id) before retrying',
+        'No NMI customer vault on file for this customer — collect a payment method before retrying',
         null,
       )
+    }
+
+    if (invoice.paymentMethod === 'ach') {
+      const resolvedAchBillingId = order.customerEmail
+        ? await resolveCustomerAchBillingId({
+            shop: session.shop,
+            email: order.customerEmail,
+            customerMap,
+          })
+        : null
+      if (customerMap && resolvedAchBillingId && !customerMap.nmiAchBillingId) {
+        customerMap.nmiAchBillingId = resolvedAchBillingId
+      }
+      if (!resolvedAchBillingId) {
+        return sendResponse(
+          409,
+          'error',
+          'No NMI ACH billing id on file for this customer — capture the ACH billing profile in NMI (and store its id at wholesale_applications.payment.ach.nmi_billing_id) before retrying',
+          null,
+        )
+      }
     }
   }
 
@@ -205,21 +227,28 @@ export async function action({ request, params }) {
   // admins see follow-up activity without opening the Order Details
   // page. Failure-mode messages mirror what the CRON's PASS 1 writes
   // so the same column reads consistently across origins.
-  const methodLabel = invoice.paymentMethod === 'ach' ? 'ACH' : 'card'
+  // Label the action by what was actually charged. Drop-ship collection is a
+  // distinct concept from a wholesale card/ACH retry, so call it out.
+  const methodLabel = invoice.isDropship
+    ? 'drop-ship'
+    : invoice.paymentMethod === 'ach'
+      ? 'ACH'
+      : 'card'
+  const actionVerb = invoice.isDropship ? 'collection' : 'retry'
   let remarkMsg
   if (result.skipped) {
-    remarkMsg = `Admin ${methodLabel} retry skipped: ${result.reason}`
+    remarkMsg = `Admin ${methodLabel} ${actionVerb} skipped: ${result.reason}`
   } else if (result.outcome === 'approved') {
     remarkMsg = result.awaitingSettlement
       ? `Admin ACH retry submitted — NMI accepted txn ${result.transactionId || '?'}, awaiting settlement (typically 1–3 business days)`
-      : `Admin ${methodLabel} retry approved (NMI txn ${result.transactionId || '?'})`
+      : `Admin ${methodLabel} ${actionVerb} approved (NMI txn ${result.transactionId || '?'})`
   } else if (result.outcome === 'declined') {
-    remarkMsg = `Admin ${methodLabel} retry declined: ${result.responseText || 'no reason given'}`
+    remarkMsg = `Admin ${methodLabel} ${actionVerb} declined: ${result.responseText || 'no reason given'}`
   } else {
-    remarkMsg = `Admin ${methodLabel} retry errored: ${result.error || result.responseText || 'unknown'}`
+    remarkMsg = `Admin ${methodLabel} ${actionVerb} errored: ${result.error || result.responseText || 'unknown'}`
   }
   await appendInvoiceRemark(invoice._id, {
-    kind: 'admin_action',
+    kind: invoice.isDropship ? 'cron_dropship_attempt' : 'admin_action',
     message: `${remarkMsg} by ${initiatedBy}`,
     amount: result.amount,
     currency: invoice.currency,

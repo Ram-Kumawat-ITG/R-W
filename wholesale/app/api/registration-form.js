@@ -16,6 +16,7 @@ import {
   addBillingToCustomerVault,
 } from "../services/nmi/nmi.service";
 import { generatePractitionerCode } from "../services/cdo/cdo.service";
+import { encryptField } from "../utils/crypto.utils";
 
 // Generate a stable, readable NMI billing_id. Random suffix prevents
 // collisions when re-using a customer email; prefix makes logs scannable.
@@ -180,6 +181,105 @@ export async function action({ request }) {
   delete payload.signatureFile;
   delete payload.signatureType;
   delete payload.signatureValue;
+
+  // W-9 signature — mirrors the Step 3 signature into the nested
+  // w9.signature shape. The form collects ONE signature (on Step 3) that
+  // covers both terms acceptance and the W-9 IRS Part II perjury
+  // certification (per the "I authorize ..." block on Step 3, which now
+  // explicitly includes a W-9 certification bullet). Duplicating into
+  // w9.signature keeps the W-9 sub-doc self-contained for any future
+  // W-9 PDF generation or audit-export pipeline without forcing those
+  // tools to know about the top-level signature.
+  if (payload.signature) {
+    if (!payload.w9 || typeof payload.w9 !== "object") payload.w9 = {};
+    payload.w9.signature = { ...payload.signature };
+    payload.w9.submittedAt = signedAt;
+  }
+
+  // Strip empty-string values from W-9 sub-fields that have Mongoose
+  // enums (`llcClassification` accepts only C/S/P/null). The frontend
+  // emits `""` for these when the practitioner didn't pick LLC/Other —
+  // Mongoose then rejects `""` because it isn't in the enum. Convert
+  // empty → undefined so Mongoose treats the field as unset and falls
+  // back to its default (null).
+  if (payload.w9 && typeof payload.w9 === "object") {
+    for (const key of [
+      "llcClassification",
+      "otherClassification",
+      "exemptPayeeCode",
+      "fatcaCode",
+    ]) {
+      if (payload.w9[key] === "") delete payload.w9[key];
+    }
+  }
+
+  // Commission payout — required at signup. Two paths:
+  //   • payoutMethod === 'ach'   → encrypt account number, save last4,
+  //                                 wipe any check fields
+  //   • payoutMethod === 'check' → save check.payableTo + mailing address
+  //                                 (resolved against billingAddress if
+  //                                 useBillingAddress = true), wipe any
+  //                                 bank fields
+  //
+  // Server-side wipe of the non-selected branch prevents stale fields
+  // from a previous client-side toggle leaking into the saved doc.
+  if (payload.commission && typeof payload.commission === "object") {
+    const c = payload.commission;
+    const method = c.payoutMethod === "check" ? "check" : "ach";
+    c.payoutMethod = method;
+    c.enabled = true;
+    c.updatedAt = new Date();
+
+    if (method === "ach") {
+      // Encrypt account number at rest. Last-4 is the only plaintext
+      // representation that survives — used for admin display + audit.
+      const rawAccount = String(c.bankAccountNumber || "").replace(/\D/g, "");
+      if (rawAccount) {
+        c.bankAccountLast4 = rawAccount.slice(-4);
+        try {
+          c.bankAccountEncrypted = encryptField(rawAccount);
+        } catch (err) {
+          console.error(
+            "[registration-form] commission.encrypt_failed",
+            err?.message || err,
+          );
+          return sendResponse(
+            500,
+            "error",
+            "Could not securely save your commission bank account.",
+            null,
+          );
+        }
+        // Strip the legacy plaintext field so new rows never carry it.
+        delete c.bankAccountNumber;
+      }
+      // Wipe the unused check branch.
+      delete c.check;
+    } else {
+      // Check path — copy billing address into mailingAddress when the
+      // practitioner opted to reuse it. Falls back to whatever was sent
+      // when `useBillingAddress` is false. Billing (not shipping) is the
+      // financial-mail address, matching where invoices + 1099s go.
+      const chk = c.check && typeof c.check === "object" ? c.check : {};
+      if (chk.useBillingAddress && payload.billingAddress) {
+        chk.mailingAddress = { ...payload.billingAddress };
+      }
+      // Default `payableTo` to the applicant's name when blank — matches
+      // the form's placeholder hint.
+      if (!chk.payableTo || !String(chk.payableTo).trim()) {
+        chk.payableTo = `${payload.firstName || ""} ${payload.lastName || ""}`.trim();
+      }
+      c.check = chk;
+      // Wipe the unused ACH branch so the doc only carries the selected method's data.
+      delete c.bankAccountName;
+      delete c.bankRoutingNumber;
+      delete c.bankAccountNumber;
+      delete c.bankAccountEncrypted;
+      delete c.bankAccountLast4;
+      delete c.bankAccountType;
+      delete c.sourcedFromPaymentAch;
+    }
+  }
 
   payload.shop = shop;
 
@@ -376,7 +476,7 @@ export async function action({ request }) {
     customerId = await createCustomer(admin, {
       application: payload,
       note,
-      tags: ["Approved"],
+      tags: ["Approved", "practitioner"],
       subscribeNews: Boolean(payload.subscribeNews),
     });
 

@@ -29,7 +29,7 @@ import {
   recordOrderTransaction as recordShopifyOrderTransaction,
 } from '../shopify/shopify.service'
 import { paymentConfig } from '../payment/payment.config'
-import { invoiceConfig } from './invoice.config'
+import { invoiceConfig, dueDaysForMethod } from './invoice.config'
 import {
   syncWithRetry,
   shopifyLinesToQboLines,
@@ -51,8 +51,18 @@ const log = createLogger('invoice.service')
 const CLAIM_WAIT_MS = 30_000
 const CLAIM_POLL_MS = 500
 
-export async function createInvoiceForOrder({ shop, order, localOrder, customerMap }) {
+export async function createInvoiceForOrder({ shop, order, localOrder, customerMap, isDropship = false, retailOrderName = null }) {
   const shopifyOrderId = String(order.id)
+
+  // Drop-ship invoices lock `paymentMethod: 'dropship'` regardless of the
+  // customer map (the synthetic retail customer has no registration-time
+  // preference). 'dropship' falls outside the wholesale CRON's card/ach
+  // PASS 1 filter and carries no processing fee (no rate configured), and
+  // the `isDropship` flag below segregates the row for the dedicated
+  // process-dropship-payments CRON. Everything else (claim-first dedup, QBO
+  // create, due date, ship address, invoice email) is shared with the
+  // wholesale path.
+  const lockedMethod = isDropship ? 'dropship' : customerMap.paymentMethod || 'card'
 
   // Phase 1 — ATOMIC CLAIM via unique-index protected insert.
   //
@@ -80,8 +90,9 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
       // card admin fallback flips it. `customerPaymentPreference` is
       // the immutable order-time snapshot; even if the customer changes
       // their preference later, this stays. Both start equal.
-      paymentMethod: customerMap.paymentMethod || 'card',
-      customerPaymentPreference: customerMap.paymentMethod || 'card',
+      paymentMethod: lockedMethod,
+      customerPaymentPreference: lockedMethod,
+      isDropship: Boolean(isDropship),
       paymentStatus: 'pending',
       maxAttempts: paymentConfig.maxRetryAttempts,
       qboCreationStatus: 'claimed',
@@ -100,52 +111,88 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
 
   // Phase 2 — call QBO with the lock held.
   console.log(`[invoice] phase 2 — calling QBO createInvoice (we hold the claim)`)
-  // No processing-fee line at creation — the fee is appended at
-  // settlement time, with the rate selected by the actual settlement
-  // method (card / ach / check). This keeps the fee tied to the real
-  // method used to settle, including the cheque → card admin fallback
-  // and ACH receipts. See propagateSuccessfulPayment + recordManual-
-  // Payment for the append flow.
   const lines = shopifyLinesToQboLines(order)
-  // Due date = order date + termsDays. Sending DueDate explicitly makes
+
+  // Processing-fee line at creation — for card / ACH (any method with a
+  // non-zero rate), append the fee line NOW so the invoice the customer
+  // first receives by email already shows the full amount that will be
+  // charged. We stamp `processingFeeAppliedAt` + the staging fields here;
+  // every settlement-time fee path (chargeInvoice, propagateSuccessful-
+  // Payment §0, checkAchSettlement, recordManualPayment) guards on these,
+  // so the fee is never double-added downstream.
+  //
+  // Cheque (0% rate) gets NO fee line and we deliberately leave
+  // `processingFeeAppliedAt` UNSET — the cheque → card admin fallback still
+  // applies the 3% card fee at settlement, exactly as before. The fee is
+  // sized on the post-discount grand total (order.total_price = adjusted
+  // subtotal + shipping + tax), which the QBO sales lines now sum to.
+  const feeBase = Number(order.total_price ?? 0)
+  const creationFee = computeProcessingFee({
+    baseAmount: feeBase,
+    method: invoice.paymentMethod,
+    rates: invoiceConfig.processingFeeRates,
+  })
+  if (creationFee) {
+    const feeLine = buildProcessingFeeLine({ ...creationFee, baseAmount: feeBase })
+    if (feeLine) {
+      lines.push(feeLine)
+      invoice.processingFeeAmount = creationFee.amount
+      invoice.processingFeeRate = creationFee.rate
+      invoice.processingFeeMethod = creationFee.method
+      invoice.processingFeeAppliedAt = new Date()
+      console.log(
+        `[invoice] processing fee at creation — ${creationFee.method} ` +
+          `$${creationFee.amount.toFixed(2)} (${(creationFee.rate * 100).toFixed(2)}% of $${feeBase.toFixed(2)})`,
+      )
+    }
+  }
+  // Due date = order date + per-method terms. The term length is
+  // selected by the invoice's locked paymentMethod (cheque →
+  // CHEQUE_DUE_DATE, ACH → ACH_DUE_DATE, card → CARD_DUE_DATE; each
+  // falls back to INVOICE_TERMS_DAYS). Sending DueDate explicitly makes
   // us the source of truth and overrides any QBO customer-level
   // SalesTerm. Falls back to localOrder.receivedAt if Shopify's
   // created_at is missing; if both are unparseable, we omit DueDate
   // and let QBO compute it from its own defaults.
   const orderDateBasis = order?.created_at || localOrder?.receivedAt
-  const dueDate = computeInvoiceDueDate(orderDateBasis, invoiceConfig.termsDays)
+  const termsDays = dueDaysForMethod(invoice.paymentMethod)
+  const dueDate = computeInvoiceDueDate(orderDateBasis, termsDays)
   const dueAt = computeInvoiceDueAt(
     orderDateBasis,
-    invoiceConfig.termsDays,
+    termsDays,
     invoiceConfig.termsMinutes,
   )
   console.log(
     `[invoice] dueDate = ${dueDate || '(QBO default)'} ` +
-      `(order date ${orderDateBasis || '(unknown)'} + ${invoiceConfig.termsDays} days` +
+      `(order date ${orderDateBasis || '(unknown)'} + ${termsDays} days [method=${invoice.paymentMethod}]` +
       (invoiceConfig.termsMinutes ? ` + ${invoiceConfig.termsMinutes} min` : '') +
       `) dueAt = ${dueAt ? dueAt.toISOString() : '(none)'}`,
   )
   // Ship-to fields. Address uses the same shipping → billing → customer
   // default fallback as the customer sync (buildProfileFromShopifyOrder) so
   // the invoice still ships somewhere on pickup/digital orders with no
-  // shipping_address. ShipDate is the order date — Shopify's orders/create
-  // fires pre-fulfillment so we use created_at as the invoice's ship-on date.
+  // shipping_address. ShipDate is left blank at creation; pushShippingToInvoice
+  // populates it after the order is fulfilled.
   const shipAddr = buildProfileFromShopifyOrder(order).shippingAddress
-  const shipDate = toYmd(orderDateBasis)
-  console.log(
-    `[invoice] shipDate = ${shipDate || '(none)'} shipAddr = ${shipAddr ? 'present' : '(none)'}`,
-  )
+  console.log(`[invoice] shipAddr = ${shipAddr ? 'present' : '(none)'}`)
+
+  const memo = `Shopify order ${order.name || order.id}`
+
   let qboInvoice
   try {
     qboInvoice = await createQboInvoice({
       qboCustomerId: customerMap.qboCustomerId,
       currency: order.currency || 'USD',
       lines,
-      memo: `Shopify order ${order.name || order.id}`,
-      docNumber: order.name?.replace(/^#/, '') || shopifyOrderId,
+      memo,
+      docNumber: isDropship && retailOrderName
+        ? `RS-${retailOrderName}`.slice(0, 21)
+        : (order.name?.replace(/^#/, '') || shopifyOrderId),
       dueDate,
       shipAddr,
-      shipDate,
+      // Tax renders in QBO's summary "Tax" row (TxnTaxDetail.TotalTax),
+      // not as a product line — see shopifyLinesToQboLines.
+      taxAmount: Number(order.total_tax || 0),
     })
   } catch (qboErr) {
     // QBO call failed — mark the claim as failed so a re-run can
@@ -264,6 +311,13 @@ export async function propagateSuccessfulPayment({ invoice, customerMap, transac
   }
 
   // ── 0) QBO: append processing-fee line (if owed) ──────────────
+  //
+  // For card / ACH invoices the fee line is normally added at CREATION
+  // (createInvoiceForOrder stamps processingFeeAppliedAt), so feePending is
+  // false here and this step is a no-op. It still fires as the FALLBACK
+  // path for invoices that staged the fee at settlement but haven't told
+  // QBO yet — the cheque → card admin override, and any legacy invoice
+  // created before fee-at-creation.
   //
   // Runs BEFORE recordPayment because the recorded payment amount has
   // to match the invoice's TotalAmt; without the fee line, QBO would
@@ -643,7 +697,7 @@ export async function propagateSuccessfulPayment({ invoice, customerMap, transac
 // QBO does not dedup `/send` calls server-side, so duplicate-send
 // protection lives entirely in the local guards (invoiceEmailSentAt
 // + invoiceEmailedAmountPaid + invoiceEmailedStatus).
-async function dispatchInvoiceLifecycleEmails({ invoice, customerMap, event }) {
+export async function dispatchInvoiceLifecycleEmails({ invoice, customerMap, event, shipDate, trackingNum }) {
   // Resolve recipient: prefer the live customer record (it can be
   // updated via /api/update-profile after registration) and fall back
   // to the invoice's stored email for legacy rows.
@@ -660,11 +714,14 @@ async function dispatchInvoiceLifecycleEmails({ invoice, customerMap, event }) {
   }
 
   // Decide whether to (re)send.
-  //   - 'created' → send once; guard on invoiceEmailSentAt
-  //   - 'payment' → re-send if amountPaid grew OR status moved since
-  //                 the last (re)send (also covers the case where the
-  //                 creation-time email failed and we never stamped a
-  //                 baseline — both fields are falsy then)
+  //   - 'created'     → send once; guard on invoiceEmailSentAt
+  //   - 'payment'     → re-send if amountPaid grew OR status moved since
+  //                     the last (re)send (also covers the case where the
+  //                     creation-time email failed and we never stamped a
+  //                     baseline — both fields are falsy then)
+  //   - 'fulfillment' → re-send if shipDate OR trackingNum differs from the
+  //                     snapshot recorded at the last fulfillment email, so
+  //                     the customer always sees the latest tracking info.
   const currentPaid = Number((invoice.amountPaid || 0).toFixed(2))
   const emailedPaid = Number((invoice.invoiceEmailedAmountPaid || 0).toFixed(2))
   const isInitial = event === 'created' && !invoice.invoiceEmailSentAt
@@ -672,7 +729,11 @@ async function dispatchInvoiceLifecycleEmails({ invoice, customerMap, event }) {
     event === 'payment' &&
     (currentPaid > emailedPaid + 0.005 ||
       invoice.invoiceEmailedStatus !== invoice.paymentStatus)
-  if (!isInitial && !isResend) {
+  const isFulfillmentResend =
+    event === 'fulfillment' &&
+    (shipDate !== invoice.invoiceEmailedShipDate ||
+      trackingNum !== invoice.invoiceEmailedTrackingNum)
+  if (!isInitial && !isResend && !isFulfillmentResend) {
     console.log(`[email] no action for invoice ${invoice._id} (event=${event})`)
     return
   }
@@ -682,11 +743,15 @@ async function dispatchInvoiceLifecycleEmails({ invoice, customerMap, event }) {
   // every reasonLabel branch maps to exactly one source enum value.
   const source = isInitial
     ? 'invoice_created'
+    : isFulfillmentResend
+    ? 'fulfillment_updated'
     : currentPaid > emailedPaid + 0.005
     ? 'payment_recorded'
     : 'status_changed'
   const reasonLabel = isInitial
     ? 'initial'
+    : isFulfillmentResend
+    ? `fulfillment updated (shipDate=${shipDate || '(none)'}, tracking=${trackingNum || '(none)'})`
     : source === 'payment_recorded'
     ? `payment recorded (paid $${emailedPaid.toFixed(2)} → $${currentPaid.toFixed(2)})`
     : `status changed (${invoice.invoiceEmailedStatus || '(none)'} → ${invoice.paymentStatus})`
@@ -699,6 +764,12 @@ async function dispatchInvoiceLifecycleEmails({ invoice, customerMap, event }) {
     invoice.invoiceEmailLastSentAt = now
     invoice.invoiceEmailedStatus = invoice.paymentStatus
     invoice.invoiceEmailedAmountPaid = currentPaid
+    // Fulfillment snapshot: only overwrite when this send was triggered by
+    // fulfillment so that payment re-sends don't erase the shipping snapshot.
+    if (event === 'fulfillment') {
+      invoice.invoiceEmailedShipDate = shipDate
+      invoice.invoiceEmailedTrackingNum = trackingNum
+    }
     invoice.lastEmailError = undefined
     recordEmailEvent(invoice, {
       triggerType: 'auto',

@@ -159,7 +159,7 @@ export const REFERRALS = [
 export const PAYMENT_METHODS = [
   {
     id: "check",
-    name: "Check",
+    name: "Check Method",
     fee: null,
     feeLabel: "No fees",
     desc: "Balances emailed 1st & 15th. Check due within 10 business days.",

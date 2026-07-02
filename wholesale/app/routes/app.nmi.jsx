@@ -21,12 +21,42 @@ import { authenticate } from "../shopify.server";
 // links + browser back/forward behave as expected.
 
 const TABS = [
-  { id: "dashboard", label: "Dashboard", path: "/app/nmi/dashboard" },
-  { id: "customers", label: "Customers", path: "/app/nmi/customers" },
-  { id: "payments", label: "Payments", path: "/app/nmi/payments" },
-  { id: "transactions", label: "Transactions", path: "/app/nmi/transactions" },
-  { id: "failed", label: "Failed payments", path: "/app/nmi/failed" },
-  { id: "refunds", label: "Refunds", path: "/app/nmi/refunds" },
+  {
+    id: "dashboard",
+    label: "Dashboard",
+    path: "/app/nmi/dashboard",
+    description: "Live snapshot of NMI payment activity for the selected period.",
+  },
+  {
+    id: "customers",
+    label: "Customers",
+    path: "/app/nmi/customers",
+    description: "Every NMI Customer Vault entry (stored card / ACH profiles).",
+  },
+  {
+    id: "payments",
+    label: "Payments",
+    path: "/app/nmi/payments",
+    description: "Sale, capture, and credit transactions.",
+  },
+  {
+    id: "transactions",
+    label: "Transactions",
+    path: "/app/nmi/transactions",
+    description: "Every transaction and its full lifecycle, any condition.",
+  },
+  {
+    id: "failed",
+    label: "Failed payments",
+    path: "/app/nmi/failed",
+    description: "Declined or errored transactions, with retry history.",
+  },
+  {
+    id: "refunds",
+    label: "Refunds",
+    path: "/app/nmi/refunds",
+    description: "One row per refund action, paired with its original sale.",
+  },
 ];
 
 export const loader = async ({ request }) => {
@@ -40,28 +70,38 @@ export default function NmiLayout() {
 
   const segments = location.pathname.split("/").filter(Boolean);
   const trailing = segments[segments.length - 1];
-  const activeId = TABS.find((t) => t.id === trailing)?.id || "dashboard";
+  const activeTab = TABS.find((t) => t.id === trailing) || TABS[0];
+  const activeId = activeTab.id;
 
   return (
     <s-page inlineSize="large" heading="NMI">
       <s-section padding="none">
-        <s-box padding="base">
+        <s-box padding="base" paddingBlockEnd="small-300">
           {/* Chip-based tab bar — same idiom as the QBO section + the
               order list's filter chips. Polaris web components don't
-              ship a dedicated `s-tabs` element. */}
+              ship a dedicated `s-tabs` element. The active tab uses the
+              filled "strong" chip color plus a bold label so it reads
+              unambiguously as selected. */}
           <s-stack direction="inline" gap="small-200" wrap>
-            {TABS.map((t) => (
-              <s-clickable-chip
-                key={t.id}
-                color={activeId === t.id ? "strong" : "base"}
-                accessibilityLabel={`Open ${t.label} tab`}
-                onClick={() => navigate(t.path)}
-              >
-                {t.label}
-              </s-clickable-chip>
-            ))}
+            {TABS.map((t) => {
+              const isActive = activeId === t.id;
+              return (
+                <s-clickable-chip
+                  key={t.id}
+                  color={isActive ? "strong" : "base"}
+                  accessibilityLabel={`Open ${t.label} tab`}
+                  onClick={() => navigate(t.path)}
+                >
+                  {isActive ? <strong>{t.label}</strong> : t.label}
+                </s-clickable-chip>
+              );
+            })}
           </s-stack>
         </s-box>
+        <s-box padding="base" paddingBlockStart="small-300">
+          <s-paragraph tone="subdued">{activeTab.description}</s-paragraph>
+        </s-box>
+        <s-divider />
       </s-section>
 
       <s-box paddingBlockStart="large-200" />

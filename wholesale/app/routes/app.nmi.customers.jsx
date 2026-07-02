@@ -11,6 +11,8 @@ import { listNmiCustomerVaults } from "../services/nmi/nmi.service";
 // helpers are split out (avoids dragging process.env into the client
 // bundle via nmi.config.js).
 import { fromNmiDate } from "../services/nmi/nmi.utils";
+import { initialsOf } from "../utils/format.utils";
+import { AdvancedFilters } from "../components/admin-ui";
 
 const PAGE_SIZE = 50;
 
@@ -46,6 +48,23 @@ const STATUS_FILTERS = [
   { id: "card", label: "Card on file" },
   { id: "ach", label: "ACH on file" },
 ];
+
+// Config for the shared <AdvancedFilters> card.
+const FILTER_FIELDS = [
+  {
+    key: "q",
+    label: "Search",
+    type: "text",
+    placeholder: "Name, email, phone, or vault id",
+  },
+  {
+    key: "status",
+    label: "Payment on file",
+    type: "select",
+    options: STATUS_FILTERS.map((s) => ({ value: s.id, label: s.label })),
+  },
+];
+const FILTER_DEFAULTS = { status: "all" };
 
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
@@ -137,6 +156,7 @@ function projectCustomer(c) {
   // fall back to id so Pattern C responses don't render rows with a
   // blank Vault ID column.
   const vaultId = c.customer_vault_id || c.id || null;
+  const location = [c.city, c.state || c.country].filter(Boolean).join(", ");
   return {
     id: vaultId,
     firstName: c.first_name || null,
@@ -144,6 +164,7 @@ function projectCustomer(c) {
     email: c.email || null,
     phone: c.phone || null,
     company: c.company || null,
+    location: location || null,
     methodType: method.type,
     methodLabel: method.label,
     methodDetail: method.detail,
@@ -157,15 +178,15 @@ export default function NmiCustomers() {
   const navigation = useNavigation();
   const revalidator = useRevalidator();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [searchInput, setSearchInput] = useState(q);
   const [showDebug, setShowDebug] = useState(false);
 
-  const tableLoading = navigation.state === "loading";
   const refreshing = revalidator.state !== "idle";
+  const tableLoading = navigation.state === "loading" || refreshing;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const firstShown = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const lastShown = Math.min(page * pageSize, total);
 
+  // Pagination only — filter navigation is owned by <AdvancedFilters>.
   const updateParams = (next) => {
     const merged = new URLSearchParams(searchParams);
     for (const [k, v] of Object.entries(next)) {
@@ -176,63 +197,18 @@ export default function NmiCustomers() {
     setSearchParams(merged);
   };
 
-  const onStatusChip = (id) =>
-    updateParams({ status: id === "all" ? null : id });
-  const onSearchSubmit = (e) => {
-    e?.preventDefault?.();
-    updateParams({ q: searchInput.trim() || null });
-  };
-  const onSearchClear = () => {
-    setSearchInput("");
-    updateParams({ q: null });
-  };
-
   return (
-    <s-section heading={`Customer vault (${total})`}>
-      <s-stack direction="block" gap="base">
-        <form onSubmit={onSearchSubmit}>
-          <s-stack direction="inline" gap="small-200" alignItems="end">
-            <s-search-field
-              label="Search"
-              labelAccessibilityVisibility="exclusive"
-              placeholder="Search by name, email, phone, or vault id"
-              value={searchInput}
-              onInput={(e) => setSearchInput(e?.currentTarget?.value ?? "")}
-            />
-            <s-button variant="primary" type="submit">
-              Search
-            </s-button>
-            {q && (
-              <s-button variant="tertiary" onClick={onSearchClear}>
-                Clear
-              </s-button>
-            )}
-            <s-button
-              variant="secondary"
-              onClick={() => revalidator.revalidate()}
-              {...(refreshing ? { loading: true } : {})}
-            >
-              Refresh
-            </s-button>
-          </s-stack>
-        </form>
-
-        <s-stack direction="inline" gap="small-200">
-          {STATUS_FILTERS.map((f) => {
-            const active = status === f.id;
-            return (
-              <s-clickable-chip
-                key={f.id}
-                color={active ? "strong" : "base"}
-                accessibilityLabel={`Filter by ${f.label}`}
-                onClick={() => onStatusChip(f.id)}
-              >
-                {f.label}
-              </s-clickable-chip>
-            );
-          })}
-        </s-stack>
-
+    <>
+      <AdvancedFilters
+        fields={FILTER_FIELDS}
+        values={{ q, status }}
+        defaults={FILTER_DEFAULTS}
+        onRefresh={() => revalidator.revalidate()}
+        refreshing={refreshing}
+        applying={tableLoading}
+      />
+      <s-section heading={`Customer vault (${total})`}>
+        <s-stack direction="block" gap="base">
         {error && (
           <s-banner tone="critical" heading="Could not load customers">
             <s-paragraph>{error}</s-paragraph>
@@ -298,8 +274,9 @@ export default function NmiCustomers() {
               <s-table-header>Vault ID</s-table-header>
               <s-table-header>Customer</s-table-header>
               <s-table-header>Email</s-table-header>
+              <s-table-header>Phone</s-table-header>
+              <s-table-header>Location</s-table-header>
               <s-table-header>Payment method</s-table-header>
-              <s-table-header>Card / ACH detail</s-table-header>
               <s-table-header>Created</s-table-header>
               <s-table-header>Status</s-table-header>
             </s-table-header-row>
@@ -313,28 +290,41 @@ export default function NmiCustomers() {
                   <s-table-row key={c.id}>
                     <s-table-cell>#{c.id}</s-table-cell>
                     <s-table-cell>
-                      <s-stack direction="block" gap="none">
-                        <s-text>{name}</s-text>
-                        {c.company && (
-                          <s-text tone="subdued">{c.company}</s-text>
-                        )}
+                      <s-stack direction="inline" gap="small-200" alignItems="center">
+                        <s-avatar
+                          size="small-200"
+                          initials={initialsOf(name)}
+                          alt={name}
+                        />
+                        <s-stack direction="block" gap="none">
+                          <s-text>{name}</s-text>
+                          {c.company && (
+                            <s-text tone="subdued">{c.company}</s-text>
+                          )}
+                        </s-stack>
                       </s-stack>
                     </s-table-cell>
                     <s-table-cell>{c.email || "—"}</s-table-cell>
+                    <s-table-cell>{c.phone || "—"}</s-table-cell>
+                    <s-table-cell>{c.location || "—"}</s-table-cell>
                     <s-table-cell>
-                      <s-badge
-                        tone={
-                          c.methodType === "card"
-                            ? "info"
-                            : c.methodType === "ach"
-                              ? "warning"
-                              : "default"
-                        }
-                      >
-                        {c.methodLabel}
-                      </s-badge>
+                      <s-stack direction="block" gap="none">
+                        <s-badge
+                          tone={
+                            c.methodType === "card"
+                              ? "info"
+                              : c.methodType === "ach"
+                                ? "warning"
+                                : "default"
+                          }
+                        >
+                          {c.methodLabel}
+                        </s-badge>
+                        {c.methodType !== "none" && c.methodDetail && (
+                          <s-text tone="subdued">{c.methodDetail}</s-text>
+                        )}
+                      </s-stack>
                     </s-table-cell>
-                    <s-table-cell>{c.methodDetail || "—"}</s-table-cell>
                     <s-table-cell>
                       {c.createdAt
                         ? new Date(c.createdAt).toLocaleDateString()
@@ -438,7 +428,8 @@ export default function NmiCustomers() {
             </s-stack>
           </s-box>
         )}
-      </s-stack>
-    </s-section>
+        </s-stack>
+      </s-section>
+    </>
   );
 }

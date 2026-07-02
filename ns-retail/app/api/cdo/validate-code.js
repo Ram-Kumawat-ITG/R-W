@@ -72,20 +72,49 @@ export async function action({ request }) {
   try {
     await connectDB();
     const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+    // ── DIAGNOSTIC: log the exact value + length + char codes so we can
+    //    catch invisible characters (zero-width space, NBSP, trailing tab)
+    //    when the code visibly matches in Compass but the lookup fails.
+    console.log(
+      `[api.cdo.validate-code] received raw="${raw}" length=${raw.length} ` +
+        `charCodes=[${[...raw].map((c) => c.charCodeAt(0)).join(",")}]`,
+    );
+
     const doc = await CdoPractitionerCode.findOne({
       code: { $regex: `^${escaped}$`, $options: "i" },
       status: "active",
     })
-      .select("code practitionerName practitionerEmail")
+      .select("code practitionerName practitionerEmail status shop")
       .lean();
 
+    // ── DIAGNOSTIC: confirm what came back. If null but a doc EXISTS in
+    //    Compass with this code, the query path / connection / DB-name
+    //    is wrong.
     if (!doc) {
+      // Fallback diagnostic — try cross-status lookup so we can tell whether
+      // the issue is "row missing entirely" vs "row exists but not active".
+      const anyStatus = await CdoPractitionerCode.findOne({
+        code: { $regex: `^${escaped}$`, $options: "i" },
+      })
+        .select("code status shop")
+        .lean();
+      console.log(
+        `[api.cdo.validate-code] no active row for "${raw}". cross-status lookup: ` +
+          (anyStatus
+            ? `FOUND with status="${anyStatus.status}" shop="${anyStatus.shop}"`
+            : "ALSO NULL — code is not in cdo_practitioner_codes from this app's Mongo connection"),
+      );
       return json(200, {
         status: "success",
         message: "Code not found",
         result: { valid: false },
       });
     }
+
+    console.log(
+      `[api.cdo.validate-code] matched code="${doc.code}" status="${doc.status}" shop="${doc.shop}"`,
+    );
 
     return json(200, {
       status: "success",

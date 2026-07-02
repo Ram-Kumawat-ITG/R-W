@@ -1,0 +1,12 @@
+{
+  "name": "practitioner-portal-account",
+  "private": true,
+  "version": "0.0.0",
+  "license": "UNLICENSED",
+  "description": "Customer Account UI extension — practitioner referral portal (full page).",
+  "dependencies": {
+    "@preact/signals": "^2.0.0",
+    "@shopify/ui-extensions": "2025.10.15",
+    "preact": "^10.29.0"
+  }
+}

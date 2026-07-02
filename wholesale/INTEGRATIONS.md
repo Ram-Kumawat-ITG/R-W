@@ -236,12 +236,11 @@ Design rules:
 │     on approved: propagateSuccessfulPayment                           │
 │     always: push Invoice.remarks[] entry (cron_card_attempt)          │
 │                                                                       │
-│ PASS 1.5 — reminders for invoices CRON can't auto-charge              │
-│   for each Invoice where (pending && paymentMethod ∈ {check,ach})     │
-│                       OR paymentStatus='failed':                      │
-│     push Invoice.remarks[] entry (cron_cheque_reminder /              │
-│                                   cron_failed_followup)               │
+│ PASS 1.5 — failed-payment follow-up logs (payment audit)             │
+│   for each Invoice where paymentStatus='failed':                      │
+│     push Invoice.remarks[] entry (cron_failed_followup)               │
 │     no charge / no customer notification                              │
+│   (cheque reminders live in the process-check-reminders CRON, §10.5)  │
 │                                                                       │
 │ PASS 2 — paid invoices with broken downstream sync                    │
 │   for each Invoice where paymentStatus='paid' and                     │
@@ -382,6 +381,124 @@ It marks the invoice cancelled and leaves the audit trail; an admin
 who needs to give a partial-paid customer their money back uses the
 gateway's refund tooling directly (NMI portal / cheque void).
 
+### 4.6 `fulfillments/create` + `fulfillments/update` webhooks — shipment tracking
+
+`app/routes/webhooks.fulfillments.create.jsx` + `.update.jsx`. Same
+handler shape as the other webhooks (verify HMAC, log, fire-and-forget,
+ACK 200), both calling `order.service.handleFulfillmentUpdate({ shop,
+fulfillment, webhookId, event })` with `event: 'created' | 'updated'`.
+Subscriptions registered both declaratively (both `shopify.app*.toml`)
+and programmatically (`REQUIRED_SUBSCRIPTIONS` — `FULFILLMENTS_CREATE` /
+`FULFILLMENTS_UPDATE`; fulfillment data is protected-customer-data, same
+approval gate as `orders/create`). The `read_orders` scope covers it.
+
+Purpose: capture Shopify's shipment tracking onto the local order so the
+admin Order Details page can show carrier + number + status with a
+click-through to the carrier's official tracking page.
+
+`handleFulfillmentUpdate` flow:
+
+```
+1. Webhook-id dedup     → ShopifyOrder.seenWebhookIds.includes(webhookId)? exit
+2. Find local order by (shop, shopifyOrderId=fulfillment.order_id)
+                          → absent? log + ack (not our order)
+3. Extract tracking     → tracking_number || tracking_numbers[0],
+                          tracking_company, tracking_url || tracking_urls[0],
+                          shipment_status, status
+4. carrierKey = normalizeCarrier(tracking_company)          (ups|fedex|usps|dhl|other)
+   trackingUrl = resolveCarrierTrackingUrl({carrierKey, trackingNumber,
+                   shopifyUrl, extraTemplates})             (deep-link or Shopify URL)
+5. Upsert fulfillments[] by fulfillmentId (in place)
+6. If a tracked field changed (number/company/shipment_status/status):
+     push trackingHistory[] row (event created|updated), bump trackingUpdatedAt,
+     best-effort appendInvoiceRemark { kind:'system_note', "Tracking …" }
+7. seenWebhookIds += webhookId; save
+```
+
+**Carrier-link resolution** is split to respect the render-import rule:
+the pure, env-free `app/utils/shipping.constants.js` owns
+`CARRIER_TRACKING_URL_TEMPLATES` (UPS/FedEx/USPS/DHL, `{trackingNumber}`
+placeholder), `normalizeCarrier`, `resolveCarrierTrackingUrl`,
+`carrierDisplayName`, `shipmentStatusLabel`. The **service** resolves and
+STORES the final `trackingUrl`, so the Order Details render imports only
+this pure module + the stored value — never a `*.config.js`. Ops can add
+"other configured carriers" via `CARRIER_TRACKING_URLS` (JSON) read in
+the server-only `services/order/tracking.config.js` and merged on top of
+the base templates. Unknown carrier → falls back to Shopify's own
+`tracking_url`.
+
+**Storage** (`ShopifyOrder`): `fulfillments[]` (current state, one per
+Shopify fulfillment id), `trackingHistory[]` (append-only change log),
+`trackingUpdatedAt`. **Display**: a "Shipment tracking" section on
+`app.orders.$id.jsx` — Fulfillment status, carrier, the **tracking number
+itself as a clickable `<s-link target="_blank">`** to the carrier's tracking
+page (plus a "Track shipment" link), `ShipmentStatusBadge`
+(`components/admin-ui.jsx`), per-fulfillment Ship date + est. delivery +
+updated-at, and a newest-first history table. The in-app **QuickBooks
+invoice** panel also shows a Shipping block (Ship date + carrier +
+tracking-number deep-link, one row per shipment). On the **QBO-rendered**
+invoice PDF/email the tracking link can't be a true hyperlink (CustomerMemo
+is plain text), so the memo includes the bare tracking URL (`Track: <url>`)
+which most PDF/email clients auto-linkify.
+
+**On the customer-facing invoice.** Carrier + tracking is also written to
+the QBO invoice via `qbo.service.setInvoiceShipping({ qboInvoiceId, lines,
+shipDate, trackingNum })` — one sparse update that sets the managed
+"Shipping:" block in the `CustomerMemo` (SyncToken guard, replaces rather
+than duplicates, preserves the base memo, 1000-char clamp), the native
+`ShipDate` field, AND the native **`TrackingNum`** field (carrier + number
+per shipment, joined for multi-shipment). `TrackingNum` renders in the
+invoice **header next to Ship Date / Ship Via** (when shipping is enabled on
+the company's sales form) — that's how tracking shows "below the Ship Date"
+on the rendered invoice, separate from the top-of-invoice memo. A **no-op
+guard** skips the POST when memo/ShipDate/TrackingNum already match, so
+`pushShippingToInvoice` can be called on every order-view live-pull (not just
+on change) to **backfill** these onto invoices synced before the fields
+existed, then converge.
+`order.service.pushShippingToInvoice` composes the lines + ship date from
+the order's fulfillments and is called best-effort from both fulfillment
+paths on any tracking change (never breaks tracking capture). After a
+successful QBO shipping update, `pushShippingToInvoice` also **resends the
+invoice email** to the customer via `dispatchInvoiceLifecycleEmails` (event
+`'fulfillment'`) — but only when the `ShipDate` or `TrackingNum` value
+differs from the last-emailed snapshot (`Invoice.invoiceEmailedShipDate` /
+`invoiceEmailedTrackingNum`). This means the customer receives one resend
+when tracking first arrives and another if the tracking number changes later;
+repeated syncs with the same data are no-ops. The dedup snapshot fields and
+the `'fulfillment_updated'` source enum are persisted via `invoice.save()`
+inside `pushShippingToInvoice` after a successful QBO write.
+
+**Ship Date (Shopify-sourced).** The official Ship Date is the Shopify
+fulfillment date, not the order-creation date. `ShopifyOrder.shippedAt` is
+denormalized as the **earliest** `fulfillments[].fulfilledAt`
+(`order.service.recomputeShipDate`, run in both fulfillment paths) and fed
+to the QBO invoice `ShipDate` (above) via `pushShippingToInvoice`. The QBO
+invoice **starts with `ShipDate` blank** at creation (§7.3 / §18.3) —
+`orders/create` fires pre-fulfillment so there is no real ship timestamp yet;
+the field is populated once a fulfillment arrives. Shown as "Ship date" on
+Order Details (Overview), the invoice Shipping block, and per-shipment in the
+tracking section (so partially-fulfilled orders show each shipment's own
+date).
+
+**Live-pull fallback (reliability).** Webhooks alone are not enough —
+fulfillment topics are approval-gated and may not be subscribed, and they
+do **not** backfill orders fulfilled before the subscription existed. So
+the Order Details loader also **pulls** the order's fulfillments live via
+Admin GraphQL (`QUERY_ORDER_FULFILLMENTS` →
+`shopify.service.getOrderFulfillments`) and persists them through
+`order.service.syncFulfillmentsFromShopify`, which reuses the same
+`applyFulfillmentToOrder` upsert as the webhook path (push + pull stay in
+lockstep). Best-effort: a Shopify outage never 500s the page (mirrors the
+live-QBO-invoice fetch). This is why tracking shows on the order page even
+with no webhook delivery; the webhooks remain for real-time push + the
+invoice audit remark. `fulfilledAt` (the "Fulfillment Date") +
+`estimatedDeliveryAt` come from the GraphQL pull; order-level
+`fulfillmentStatus` mirrors `displayFulfillmentStatus`.
+
+Out of scope: a customer-facing storefront order portal (none exists —
+the embedded-admin Order Details page is the order view). Customers
+still receive Shopify's native shipping-confirmation email with tracking.
+
 ---
 
 ## 5. Order processing orchestrator
@@ -391,13 +508,18 @@ gateway's refund tooling directly (NMI portal / cheque void).
 ### 5.1 Lifecycle states (`ShopifyOrder.processingStatus`)
 
 ```
-received  → processing ──┬─→ pending_approval ──(admin approves)──┐
+received  → processing ──┬─→ dropship_invoiced  (retail drop-ship customer — unpaid QBO invoice; see §5.6)
+                         │        └─→ completed  (collected by the drop-ship CRON, §10.6)
+                         │
+                         ├─→ pending_approval ──(admin approves)──┐
                          │                                         │
                          └─→ customer_ready → invoiced → scheduled → completed
                                   │
                                   ├── rejected  (validation failed or no customer)
                                   ├── failed    (downstream error)
                                   └── cancelled (orders/cancelled webhook — see §4.5)
+
+(legacy: admin_order — pre-invoicing drop-ship orders, never invoiced; see §5.6)
 ```
 
 `pending_approval` is the hold state for orders from Shopify customers that
@@ -406,12 +528,20 @@ work entirely for these orders. They are re-entered into the pipeline by
 `replayPendingOrdersForCustomer` (triggered from `admin/review.js` when an
 admin approves the customer) — see §5.4 below.
 
+`dropship_invoiced` is the terminal state for orders placed by the retail
+drop-ship customer (`DROPSHIP_RETAIL_CUSTOMER_EMAIL`). The orchestrator
+diverts them **immediately after the atomic claim** — before the approval gate
+and the wholesale customer setup — and creates an **UNPAID** QBO invoice; the
+dedicated `process-dropship-payments` CRON (§10.6) later collects it and the
+order transitions to `completed`. The legacy `admin_order` state is retained
+for orders ingested before drop-ship invoicing existed (no backfill). See §5.6.
+
 ### 5.2 The three idempotency layers (in this function)
 
 | Layer | Mechanism | Catches |
 |---|---|---|
 | Webhook-id dedup | `seenWebhookIds[]` on ShopifyOrder | Shopify retries — same `x-shopify-webhook-id` |
-| Terminal-status return | `if status ∈ {completed, invoiced, scheduled, rejected, cancelled} → return` | Order already processed (or cancelled before / during creation) |
+| Terminal-status return | `if status ∈ {completed, invoiced, scheduled, rejected, cancelled, admin_order, dropship_invoiced} → return` | Order already processed (or cancelled before / during creation, or diverted as a drop-ship / legacy Admin Order) |
 | Atomic claim | `findOneAndUpdate(filter, $set: { status: 'processing' })` | Two concurrent workers |
 
 The claim filter:
@@ -505,6 +635,428 @@ Returns `{ total, processed, failed, skipped }` logged to console + structured l
 does not need to re-fetch from Shopify. If an order's `rawPayload` is
 missing (legacy data, schema migration), it's recorded as skipped and the
 admin must re-trigger via another mechanism.
+
+### 5.5a Practitioner prepaid orders (paid at Shopify checkout)
+
+Approved wholesale customers (Practitioners) can pay for their orders directly
+at Shopify checkout instead of being billed later via the NMI vault / monthly
+CRON. These orders arrive at the `orders/create` webhook with
+`order.financial_status === 'paid'` — Shopify has already collected the full
+payment via its own payment processor.
+
+**Detection.** After the approval gate succeeds and `createInvoiceForOrder`
+has created the QBO invoice + fired the initial customer email, the orchestrator
+checks:
+
+```js
+if (order.financial_status === 'paid') {
+  return await settlePrepaidOrder({ invoice, customerMap, order, local })
+}
+```
+
+This check is intentionally placed **after** the approval gate (so drop-ship
+and non-approved customers are handled first) and **after** invoice creation
+(so the customer always receives their QBO invoice email regardless of how
+payment was collected).
+
+**`settlePrepaidOrder` behaviour.** The helper:
+
+1. Sets `Invoice.amountPaid = amountDue` + `paidAt = now`.
+2. Pre-marks `shopifyMarkedPaid = true` + `shopifyMarkedPaidAt` +
+   `shopifyRecordedTotal = amountDue` — this prevents `propagateSuccessfulPayment`
+   from posting a manual SALE transaction to the already-paid Shopify order
+   (which would over-count the balance). The QBO payment record is still
+   created normally.
+3. Appends a `system_note` remark: `"Order paid at Shopify checkout
+   (financial_status=paid) — no NMI charge required; invoice closed
+   automatically"`.
+4. Calls `propagateSuccessfulPayment({ transactionId: undefined })`, which:
+   - Derives `paymentStatus = 'paid'` (self-heal from amountPaid/amountDue).
+   - Records the QBO Payment against the invoice (closing its open balance).
+   - Skips the Shopify SALE transaction write (shopifyRecordedTotal already
+     covers the amount).
+   - Updates `ShopifyOrder.processingStatus → 'completed'` via findOneAndUpdate.
+   - Fires the lifecycle email re-send (invoice shows balance = $0.00).
+5. Returns the updated local ShopifyOrder.
+
+**CRON exclusion.** No CRON-side changes are required:
+- PASS 1 filters `paymentStatus: 'pending'` — a `paid` invoice is not matched.
+- PASS 1.5 filters `paymentStatus: 'failed'` — not applicable.
+- PASS 2 (sync retry) backstops any partial QBO sync failure (e.g. a QBO
+  timeout between recording the payment and setting `qboPaymentRecorded`): on
+  the next CRON tick it would re-call `propagateSuccessfulPayment`, which
+  detects the missing `qboRecordedTotal` and records only the diff — idempotent.
+
+**Fulfillment, tracking, and cancellation** work identically to regular
+wholesale orders — those paths key on the ShopifyOrder doc and are unaffected
+by how the invoice was settled.
+
+### 5.6 Drop-ship orders (retail drop-ship customer)
+
+Orders placed by the retail drop-ship customer — the synthetic
+"Natural Solutions Retail" customer that the drop-ship orchestrator (§ drop-ship)
+attaches every retail-triggered wholesale order to — run on a **separate flow**
+from the wholesale order pipeline: they get an **UNPAID QBO invoice** on
+creation, and a dedicated CRON (`process-dropship-payments`, §10.6) collects
+that invoice later by charging a single configured NMI vault and recording the
+QBO payment. They skip the wholesale **approval gate** and the wholesale
+**NMI-vault customer setup** entirely, and are excluded from the wholesale
+payment CRON.
+
+> **History.** Before drop-ship invoicing existed these were "Admin Orders" —
+> diverted to a terminal `admin_order` state, never invoiced, never charged.
+> Orders ingested under that regime keep `processingStatus='admin_order'` (no
+> backfill); the new flow applies to orders created from this change forward.
+
+**Detection.** The single source of truth is the customer email. The anchor is
+`DROPSHIP_RETAIL_CUSTOMER_EMAIL` (read once at boot into
+`services/dropship/dropship.config.js` as the pre-normalized `RETAIL_CUSTOMER_EMAIL`).
+`isRetailCustomerEmail(email)` does the case-insensitive comparison.
+
+**Diversion (orchestrator).** `processShopifyOrder` checks the order's email
+(`order.email || order.customer?.email`) **immediately after the atomic claim**
+— before validation, the approval gate, and `ensureCustomerForOrder`. On a
+match it hands off to `invoiceDropshipOrder`, which:
+
+1. `ensureDropshipCustomerMap({ shop, order })` — find-or-create the QBO
+   customer (by email, so every drop-ship invoice consolidates under one QBO
+   customer) and upsert a `CustomerMap`. Unlike the wholesale
+   `ensureCustomerForOrder`, this does **not** source/validate an NMI vault and
+   does **not** hard-fail on a missing billing address (the drop-ship customer
+   has no `wholesale_applications` doc and may arrive without billing).
+2. `createInvoiceForOrder({ ..., isDropship: true })` — the SAME claim-first,
+   duplicate-safe QBO invoice creation as the wholesale path, but with
+   `paymentMethod` locked to `'dropship'` and `isDropship: true` stamped on the
+   row. `'dropship'` carries no processing fee (no configured rate) and falls
+   outside the wholesale PASS 1 `card/ach` charge filter.
+3. Sets `processingStatus = 'dropship_invoiced'` (terminal) + `invoiceRef`.
+
+Because this runs on the **replay path** too (`replayPendingOrdersForCustomer`
+→ `processShopifyOrder`), a drop-ship order can never be pulled into the
+wholesale pipeline even if the synthetic customer were ever tagged `Approved`.
+A cancellation-race guard (mirroring the wholesale path) voids the
+just-created invoice if `orders/cancelled` overtook creation.
+
+**Segregation from the wholesale CRON.** Drop-ship invoices DO produce an
+`Invoice` doc, so the wholesale `process-pending-payments` job
+(§11) now excludes them with `isDropship: { $ne: true }` on **all three**
+passes (charge / failed-followup / sync-retry). Collection is owned solely by
+`process-dropship-payments` (§10.6), which sweeps `isDropship: true`.
+
+**Line-item pricing — the WHOLESALE product price (not ½-of-retail).** The
+drop-ship orchestrator (`services/dropship/dropship.service.js`) builds the
+parallel **wholesale Shopify order** that the invoice is generated from. Each
+retail order line is mapped to its wholesale variant via the product sync's
+`sync_id_maps` collection (`entityType:'productVariant'`, keyed by
+`retailId` = the retail variant id), and the wholesale **Draft Order** line is
+priced at the **actual wholesale product price**:
+
+- **Primary source:** `sync_id_maps.wholesalePrice` — the wholesale Shopify
+  variant's price, captured by the product sync (`services/sync/product.sync.js`
+  `upsertVariantMappings`) on every product create/update. `resolveWholesaleLines`
+  applies it as the Draft Order `priceOverride`; `shopifyLinesToQboLines` then
+  reads it straight onto the QBO invoice lines, so the Admin Order invoice shows
+  the true per-product wholesale price.
+- **Fallback:** for a variant whose `wholesalePrice` snapshot isn't populated
+  yet, the line falls back to `retail base price × 0.5` (the legacy ½-of-retail
+  behavior) so an un-synced product never blocks invoicing. Logged per line via
+  `log.info('dropship_line_pricing', …)` with the chosen `source`.
+
+  > Historical note: the original drop-ship cut priced **every** line at ½ of
+  > the retail price (an approximation that's only correct when retail is exactly
+  > 2× wholesale). That is now the fallback, not the default.
+
+**Vendor Bill stays in sync (A/P = A/R).** The retail-side QBO **Vendor Bill**
+(ns-retail `services/retailQbo/retailVendorBill.service.js` +
+`retailQbo.service.createBillForOrder`) — what the retail company owes the
+wholesale supplier — is built from the **same** `sync_id_maps.wholesalePrice`
+field (ns-retail reads it through a read-only `models/syncIdMap.server.js`
+mirror, single-owner discipline), with the identical `retail × factor`
+fallback (`QBO_RETAIL_WHOLESALE_PRICE_FACTOR`, 0.5). Because both the wholesale
+invoice and the retail vendor bill resolve each line from the same source, the
+two documents match by construction. (The bill-payment reconciliation in
+`retailBillReconcile.service.js` is amount-agnostic — it pays the bill's full
+balance when the wholesale invoice is `paid` — so this change does not alter
+reconciliation behavior.)
+
+**Separation in the UI.**
+
+- The wholesale **Orders** list (`app.orders._index.jsx`) excludes them with
+  `customerEmail: { $ne: RETAIL_CUSTOMER_EMAIL }` on both the row query and the
+  chip-count aggregation (`$ne` still matches null/absent emails, so ordinary
+  wholesale orders are unaffected).
+- A dedicated **Admin Orders** nav item exposes two read-only routes:
+  - `app.admin-orders._index.jsx` — list, anchored on
+    `{ customerEmail: RETAIL_CUSTOMER_EMAIL }` (captures every such order
+    regardless of `processingStatus`, including legacy `admin_order` rows).
+    Built for parity with the ns-retail Order List: the shared
+    `AdvancedFilters` form (order number / fulfillment / payment / date range),
+    **clickable sortable headers** on **Order** (`receivedAt`) and **Total**
+    (`totalAmount`) — toggling desc → asc with a ▲/▼ arrow, whitelisted via
+    `SORT_FIELDS`, the chosen sort preserved across filter changes by the
+    `AdvancedFilters` `extraParams` prop — and pagination. Columns: **Order**
+    (number + date stacked), **Total**, **Payment** (Shopify financial status),
+    **Fulfillment**, **Delivery status**, **QBO Invoice**, **Vendor Bill**,
+    **Remarks**, and **Actions** (mirroring the ns-retail "practitioner" Order
+    List's cell layout). **Fulfillment** stacks the ship date (`shippedAt`, subdued, on top)
+    → fulfillment badge → carrier tracking link(s); **Delivery status** stacks
+    the delivered date (`deliveredAt`, on top) → delivery badge. Tracking has
+    no standalone column — it lists one clickable carrier link per shipment
+    (`tracking[]` = `{ company, url }`) inside the Fulfillment cell,
+    deep-linking to the carrier page (tracking number pre-filled in the URL
+    but not shown). The **QBO Invoice** column shows the linked drop-ship
+    invoice's
+    payment-status badge (the wholesale→retail collection state — distinct from
+    Shopify's customer-facing "Payment"), an in-app PDF **Preview** (reuses the
+    `/api/admin/orders/:id/qbo-invoice-pdf` endpoint), and an **Open in QBO
+    #<docNumber>** deep link; the loader joins the page's invoices in one query
+    (`qboInvoiceId` / `qboDocNumber` / `paymentStatus`) and builds the QBO web
+    URL server-side via `getInvoiceWebUrl`. Legacy `admin_order` rows (no
+    invoice) render "—". The **Vendor Bill** column surfaces the linked
+    **ns-retail Vendor Bill** (A/P — what the retail company owes Natural
+    Solution Wholesale for this drop-ship order; the wholesale app never creates
+    a vendor bill, only the dropship invoice). It shows the **bill amount**
+    (`qboBillTotal`) + a **status badge** (Paid once reconciled against the paid
+    wholesale invoice / Unpaid while `created` / Reconcile-error / Error) + an
+    **Open in QBO #<docNumber>** deep link. Sourced cross-repo on the shared
+    `natural-solutions` DB via a **two-hop join** (no N+1, no live API call):
+    wholesale `ShopifyOrder.shopifyOrderId` → `dropship_mappings.wholesaleOrderId`
+    → `mapping.retailOrderGid` → `cdo_orders.shopifyOrderId` (a GID) →
+    `retailQbo` bill fields. The bill data is read from `cdo_orders.retailQbo`
+    (ns-retail-owned, written there) — NOT the legacy `dropship_mappings.retailQboBillId`
+    (unwritten/`null`). A new READ-ONLY mirror model `models/retailCdoOrder.server.js`
+    (collection `cdo_orders`, `strict:false`, declares only the bill fields) does
+    the read; wholesale never writes it (single-owner discipline — the symmetric
+    pattern to ns-retail read-only-mirroring the wholesale `invoices` /
+    `dropship_mappings` collections). Renders "—" when no linked bill exists.
+    The **Remarks** column shows the linked invoice's latest `remarks[]` entry
+    (the drop-ship collection / admin-action note — e.g. a "Duplicate
+    transaction" collection error) + a "+N more" pointer to the detail page,
+    plus a critical "Collection failed — $X · N/M attempts" header when the
+    invoice `paymentStatus` is `failed`. Mirrors the wholesale Orders list's
+    `RemarksCell` (no cheque/ACH "Payment Due" cue — drop-ship uses
+    `paymentMethod: 'dropship'`); the invoice join selects `remarks` + the
+    amount/attempt fields and each row projects a `remarks` summary.
+  - `app.admin-orders.$id.jsx` — full detail (order info, customer info, tags,
+    line items + quantities/pricing, shipping + billing addresses, shipping
+    method, fulfillment + tracking numbers/URLs, order note + note attributes,
+    and additional Shopify metadata). It reuses the same best-effort
+    `syncFulfillmentsFromShopify` live-pull as the wholesale Order Details page;
+    new drop-ship orders now carry an `invoiceRef`, so that helper's QBO-memo
+    push (carrier/tracking) lands on the drop-ship invoice too. The loader
+    hard-guards with `isRetailCustomerEmail` so a wholesale order id cannot
+    resolve here (and vice versa).
+
+    **Line items data table (shared, sortable, printable).** The line-items
+    section on both Order Details pages (`app.orders.$id.jsx` and
+    `app.admin-orders.$id.jsx`) renders through one shared component,
+    `LineItemsTable` in `app/components/admin-ui.jsx`. It is a Polaris
+    `s-table` with **clickable, sortable column headers** (Product / SKU / Qty /
+    Unit price / Discount / Line total — `s-clickable` in each header, ▲/▼ on
+    the active column; the same header-toggle idiom the Orders/Admin-Orders
+    list pages use). Default sort is **Product A→Z**; clicking the active column
+    flips its direction, clicking a new column starts ascending. Sorting is
+    **client-side** over the loader-provided rows (the full line-item set is
+    already in hand — no loader round-trip) via a locale-aware `Intl.Collator`
+    for text columns and numeric compare for the rest, with an always-A→Z
+    tiebreak on product name. The component also exposes **Print** (opens a
+    clean, print-ready window of the current sorted order — opened
+    synchronously for popup-blocker safety, same pattern as the PDF-preview
+    windows) and **Export CSV** (downloads the current sorted order as a
+    BOM-prefixed UTF-8 CSV via a `Blob` + anchor click). Both pages keep their
+    own totals box as a sibling below the table (the wholesale page's
+    `invoiceCalc` breakdown vs. the admin page's `totals`) — only the
+    line-item table itself is shared. Pure Polaris `s-*`; the print window is a
+    separate generated document (not the admin-route DOM), so its inline styles
+    don't violate the no-CSS-in-admin-routes rule.
+
+    **Invoice view + actions (parity with the wholesale Order Details page).**
+    The detail page surfaces the full invoice the same way the wholesale page
+    does: an **Invoice & payment** summary (status / method / amounts / balance
+    / due date / attempt count) and a **QuickBooks invoice** panel that
+    **live-pulls** the QBO invoice (`getInvoice` + `projectQboInvoice`, the
+    pure projection extracted to `app/utils/qboInvoice.utils.js` and shared by
+    both pages) — itemized product lines with SKUs, the full
+    subtotal/discount/shipping/tax/fee/total breakdown, balance due, and a
+    link to **Open in QuickBooks** — plus an **Email history**, **Attempt
+    history**, and **Remarks** timeline. Three actions are wired to the shared
+    `/api/admin/orders/:id/*` endpoints (keyed on the order `_id`, which admin
+    orders have): **View invoice PDF** (`qbo-invoice-pdf`), **Send invoice**
+    email (`send-invoice`), and **Collect payment now** (`retry-payment`). The
+    retry-payment endpoint gained a drop-ship branch: when `invoice.isDropship`
+    it bypasses the wholesale per-customer vault/ACH resolution and injects the
+    configured `DROPSHIP_NMI_VAULT_ID` (mirroring the CRON's charge path), so
+    an admin can collect immediately instead of waiting for the monthly tick.
+    The wholesale-only manual actions (mark cheque paid, charge card fallback,
+    ACH retry, pause auto-charge/reminders) are intentionally absent — they
+    don't apply to the auto-collected drop-ship method.
+
+### 5.7 Drop-ship fulfillment status mirror (Wholesale → Retail)
+
+When the Wholesale Admin **fulfills** a drop-ship order (and on every later
+shipment change — tracking added, carrier change, **delivered** — plus
+**cancellation**), that status is mirrored back onto the **linked retail
+Shopify order** so the retail customer's order reflects the real fulfillment
+state. This is the reverse of the retail→wholesale order sync (§ inventory /
+drop-ship intake): wholesale notifies, ns-retail applies.
+
+**The mapping.** `dropship_mappings` (written at retail-order intake) is the
+cross-store link: `retailOrderId` / `retailOrderGid` / `retailShop` ↔
+`wholesaleOrderId` / `wholesaleOrderGid`. The mirror also writes a
+`retailFulfillmentSync` audit block on that doc — `lastSignature`, `lastEvent`,
+`lastStatus`, `lastSyncedAt`, `lastError`/`lastErrorAt`, `attempts`.
+
+**Trigger (wholesale).** Both fulfillment choke-points
+(`handleFulfillmentUpdate` webhook + `syncFulfillmentsFromShopify` live-pull)
+and `handleOrderCancelled` call
+`services/sync/fulfillmentSync.notifyRetailOfDropshipChange({ localOrder, event })`
+right after the existing `pushShippingToInvoice`. It is **gated** on a
+`DropshipMapping` existing for the wholesale order (so only retail-triggered
+drop-ship orders are mirrored — ordinary wholesale orders are skipped), and
+**deduped** on a content `signature` of the fulfillment state (sorted
+`fulfillments[]` + ship date + order-level status, or `cancelled:<ts>`): an
+unchanged signature short-circuits, so re-delivered webhooks / repeated
+Order-Details views never re-POST a duplicate or conflicting update. The call
+is **best-effort and never throws** — a retail outage can't break wholesale
+fulfillment capture. It POSTs to `${NS_RETAIL_API_BASE}/api/sync/wholesale-fulfillment`
+with the shared `x-sync-secret` (`RETAIL_SYNC_SECRET`), gated by
+`isFulfillmentSyncEnabled()` (`NS_RETAIL_API_BASE` + secret set). The POST is
+bounded by `NS_RETAIL_SYNC_TIMEOUT_MS` (default 10 s, `AbortSignal.timeout`) so
+a hung tunnel can't stall the webhook / page load / CRON tick.
+
+**Reliability — single backstop on the ns-retail side.** The push above fires
+the sync **once** per fulfillment change; if that single POST fails (ns-retail
+briefly down, the dev tunnel rotated, a transient 5xx) nothing re-fires it from
+here. Recovery is owned by **one** mechanism — the ns-retail **pull
+reconciler** (see "Pull-based backstop" below), which reads the wholesale
+fulfillment state straight from the shared Mongo DB and applies it without
+needing the tunnel. (An earlier wholesale-side retry CRON,
+`process-dropship-fulfillment-resync`, was **removed** — it only re-attempted
+the same flaky push and was redundant with the tunnel-independent pull
+reconciler.)
+
+> **Operational note.** The single most common cause of "fulfillment sync
+> stopped working" is `NS_RETAIL_API_BASE` (in wholesale's `.env`) pointing at a
+> **stale ns-retail tunnel** — Shopify CLI quick-tunnels (trycloudflare) rotate
+> their hostname on every `shopify app dev` restart, so the wholesale app keeps
+> POSTing to ns-retail's *previous* URL and every sync fails with
+> `network: fetch failed` / Cloudflare `530`. The fix is to update
+> `NS_RETAIL_API_BASE` to ns-retail's current `application_url` (and restart so
+> the env is re-read); the resync CRON then replays the backlog automatically.
+> Pin a stable URL (reserved ngrok domain / prod host) to avoid the rotation.
+
+**Pull-based backstop (ns-retail, tunnel-independent).** Because the push above
+depends on the wholesale→ns-retail tunnel being **up at the moment the
+wholesale order is fulfilled** — which it often isn't in dev (ns-retail not
+running / tunnel rotated → the push 530s and the retail order is left
+un-fulfilled) — ns-retail **also** reconciles by pulling. Both apps share one
+MongoDB and **ns-retail owns the retail Shopify Admin token**, so a CRON
+`reconcile-wholesale-fulfillments` (ns-retail
+`services/scheduler/jobs/processWholesaleFulfillmentReconcile.job.js` →
+`services/sync/wholesaleFulfillmentReconcile.reconcileWholesaleFulfillments`)
+reads the wholesale order's fulfillment state **directly from the shared DB**
+(read-only mirror `models/wholesaleOrder.server.js` over the wholesale
+`shopify_orders` collection) and fulfills the linked retail order **in-process**
+— no cross-app HTTP, no tunnel. It reuses the SAME `applyWholesaleFulfillment`
+the push receiver uses. Candidate gate: drop-ship mapping whose **wholesale
+order has a recorded fulfillment** AND whose **retail `cdo_orders` has none yet**
+(so it fulfills exactly once — the customer shipment email fires once — and
+never pre-emptively); `applyWholesaleFulfillment`'s open-fulfillment-order check
+prevents any double-fulfill if the push and pull race. This makes the push the
+fast path and the pull the reliable backstop. Cadence env-configurable
+(ns-retail `scheduler.config.js`): `CDO_FULFILLMENT_RECONCILE_CRON` (prod,
+default every 10 min) / `CDO_FULFILLMENT_RECONCILE_INTERVAL` (dev, e.g.
+`"1 minute"`). Cancellations stay push-only (they just tag the retail order).
+
+The reconciler also mirrors the **delivered milestone**, not just the first
+fulfillment: its candidate gate fires for either (a) the retail order not yet
+fulfilled → fulfill it, or (b) the wholesale order **delivered** while the retail
+order isn't → record delivery. It converges (skips once the retail side reflects
+the state) so the customer shipment email fires once and Shopify isn't churned
+between fulfillment and delivery.
+
+> **`deliveredAt` is authoritative for drop-ship delivery (retail side).** A
+> drop-ship order's RETAIL Shopify fulfillment never receives a real carrier
+> `delivered` scan — the WHOLESALE store ships + tracks it — so the delivered
+> state lives in `cdo_orders.fulfillments[].deliveredAt` (mirrored from
+> wholesale, first-write-wins). ns-retail's delivery derivation
+> (`app/utils/orderStatus.js` `deriveDeliveryStatus` / `deriveDeliveredAt`)
+> therefore treats a stamped `deliveredAt` as delivered **even when
+> `shipmentStatus` is blank** — important because a later carrier-less retail
+> `fulfillments/update` webhook can blank `shipmentStatus` back to `null` while
+> `deliveredAt` persists. Without this the retail Order List shows a delivered
+> drop-ship order as merely "shipped".
+
+**Native Shopify "Delivery status" (the merchant's Shopify admin Orders list).**
+The derivation above fixes ns-retail's OWN app UI. Shopify's **native** order
+list derives its "Delivery status" column from fulfillment **events**, not from
+tracking info — so a fulfillment created with only a tracking number sits at
+"Tracking added" forever. To mirror the delivered milestone onto the native
+column, `applyWholesaleFulfillment` pushes a **`fulfillmentEventCreate` with
+`status: DELIVERED`** (`happenedAt` = the wholesale delivery time) on the retail
+fulfillment when the wholesale order is delivered — gated on the fulfillment's
+`displayStatus` not already being `DELIVERED` (no duplicate events), best-effort
+(logged, never fatal). This needs the legacy **`write_fulfillments`** scope on
+the ns-retail app (distinct from the `*_fulfillment_orders` scopes that
+`fulfillmentCreate` uses) — granted via `access_scopes` in both
+`ns-retail/shopify.app*.toml`; **adding it requires a `shopify app deploy` /
+re-auth.** Until granted, the event call fails harmlessly and only the ns-retail
+app UI reflects delivery (via `deliveredAt`); after granting, the native Shopify
+order reads "Delivered" too.
+
+**Apply (ns-retail).** `POST /api/sync/wholesale-fulfillment`
+(`app/api/sync/wholesale-fulfillment.js`, shared-secret auth, module-level
+dedup, fire-and-forget) → `services/sync/wholesaleFulfillment.applyWholesaleFulfillment`:
+
+1. Resolve the `cdo_orders` doc by `{ shop: retailShop, shopifyOrderId: retailOrderGid }`
+   and get an admin client via `unauthenticated.admin(retailShop)`.
+2. **Fulfillment event** — query the retail order's `fulfillmentOrders` +
+   `fulfillments`. If any fulfillment order is OPEN/IN_PROGRESS/SCHEDULED →
+   `fulfillmentCreate` over all open fulfillment orders with the carrier +
+   tracking (`notifyCustomer: true` → Shopify emails the retail customer the
+   shipping confirmation). If none are open but a fulfillment already exists →
+   `fulfillmentTrackingInfoUpdate` on the latest fulfillment, notifying the
+   customer **only when the tracking number actually changed** (so carrier-
+   driven status-only pushes like "delivered" don't re-email each sync).
+3. Record the resulting RETAIL fulfillment id + tracking onto `cdo_orders` and
+   sync the retail QBO invoice via the existing `recordFulfillmentAndSync` (the
+   retail store's own `fulfillments/*` webhook firing from our mutation is then
+   a harmless idempotent re-run). Every step appends to
+   `cdo_orders.retailQbo.syncLog` (`wholesale_fulfillment_synced` /
+   `wholesale_fulfillment_failed` / `wholesale_fulfillment_noop`).
+4. **Cancellation event** — the retail order is **tagged** `wholesale-cancelled`
+   (a safe, non-destructive signal logged to `syncLog` as `wholesale_cancelled`).
+   We deliberately do **NOT** auto-cancel or refund the (paid) retail order —
+   that's a manual money decision.
+
+Used Shopify Admin mutations (validated against the schema; the `*V2` forms are
+deprecated): `fulfillmentCreate`, `fulfillmentTrackingInfoUpdate`, `tagsAdd`.
+Required scopes on the retail store: `write_merchant_managed_fulfillment_orders`
+(+ assigned/third-party variants) and `write_orders`.
+
+**Delivered milestone + delivery date.** "Delivered" is the carrier
+`shipment_status` (set by Shopify's carrier integration, not by us). When the
+wholesale order's fulfillment first reaches `delivered`, `applyFulfillmentToOrder`
+stamps `fulfillments[].deliveredAt` (first-detection-wins — prefers the webhook's
+`updated_at`, else now) and `recomputeDeliveredAt` sets the order-level
+`ShopifyOrder.deliveredAt` once **every** active shipment is delivered. That
+flips the sync signature → a POST fires carrying per-shipment + order-level
+`deliveredAt` (+ a `delivered` flag). On the retail side, because carrier
+`shipment_status` **cannot** be set via the Admin API, a delivered/status-only
+change (tracking number unchanged) **skips the Shopify mutation entirely** —
+re-sending the same tracking would be a pointless customer email — and instead
+records `shipmentStatus: 'delivered'` + `deliveredAt` straight onto
+`cdo_orders.fulfillments[]` via `recordFulfillmentAndSync` (logged as
+`wholesale_delivered`). The retail Orders list + detail **Delivery status** badge
+and delivery date are *derived* (`app/utils/orderStatus.deriveDeliveredAt`, which
+now prefers the synced `deliveredAt` over `updatedAt`), so they reflect the
+wholesale delivery state + date without trusting a single stored field. Dedup:
+the signature short-circuits an unchanged delivered state, and `deliveredAt` is
+first-write-wins on both sides, so repeated syncs never move the recorded date.
+
+**Config.** Wholesale: `NS_RETAIL_API_BASE` (+ existing `RETAIL_SYNC_SECRET`).
+ns-retail: existing `RETAIL_SYNC_SECRET` (+ an installed offline session for the
+retail shop, as the discount-sync endpoint already requires).
 
 ---
 
@@ -659,7 +1211,7 @@ If a request gets a `401` from QBO mid-call, the client force-refreshes and retr
 
 ### 7.2 Bootstrapping
 
-First run: `qbo_tokens` is empty. We seed from `QBO_REFRESH_TOKEN` env
+First run: `qbo_tokens` is empty. We seed from `QBO_WHOLESALE_REFRESH_TOKEN` env
 var (obtained once from the Intuit OAuth Playground), refresh
 immediately, and persist the resulting access + new refresh token. The
 env var can then be cleared — Mongo is the source of truth.
@@ -683,7 +1235,7 @@ POST /v3/company/{realmId}/invoice?minorversion=73
       "Amount": 23.16,
       "Description": "Wholesale pack",
       "SalesItemLineDetail": {
-        "ItemRef": { "value": "<QBO_DEFAULT_ITEM_ID>" },
+        "ItemRef": { "value": "<QBO_WHOLESALE_DEFAULT_ITEM_ID>" },
         "Qty": 4, "UnitPrice": 5.79
       }
     },
@@ -705,14 +1257,27 @@ POST /v3/company/{realmId}/invoice?minorversion=73
 ```
 
 Line items mirror Shopify's: per-product line + Shipping line + Tax
-line. Every line needs an `Item` reference — `QBO_DEFAULT_ITEM_ID`
+line. Every line needs an `Item` reference — `QBO_WHOLESALE_DEFAULT_ITEM_ID`
 (default `"1"`) is used unless `line.qboItemId` is set.
 
-`DueDate` is computed in this app as **order date + `INVOICE_TERMS_DAYS`**
-(default 15) by `invoice.utils.computeInvoiceDueDate`, then sent
-explicitly to QBO. This makes us the source of truth for terms and
-overrides any customer-level `SalesTerm` configured in QBO. The
-returned `DueDate` is captured on the local invoice as `qboDueDate`
+`DueDate` is computed in this app as **order date + per-method terms**,
+then sent explicitly to QBO. This makes us the source of truth for terms
+and overrides any customer-level `SalesTerm` configured in QBO. The term
+length is selected by the invoice's locked `paymentMethod` via
+`invoiceConfig.dueDaysForMethod`:
+
+| Payment method | Env var | Default |
+|---|---|---|
+| Cheque | `CHEQUE_DUE_DATE` | `INVOICE_TERMS_DAYS` (15) |
+| ACH | `ACH_DUE_DATE` | `INVOICE_TERMS_DAYS` (15) |
+| Card | `CARD_DUE_DATE` | `INVOICE_TERMS_DAYS` (15) |
+
+Each falls back to the generic `INVOICE_TERMS_DAYS` when its var is unset,
+so single-terms setups keep working. Example: order June 1 +
+`CHEQUE_DUE_DATE=15` → due June 16. The same per-method term feeds the
+local full-datetime `Invoice.dueAt` (plus `INVOICE_TERMS_MINUTES`). The
+date-only result is sent to QBO by `invoice.utils.computeInvoiceDueDate`;
+the returned `DueDate` is captured on the local invoice as `qboDueDate`
 ("YYYY-MM-DD" string) for display in the Order List + Order Details.
 
 If both `order.created_at` and `localOrder.receivedAt` are unparseable,
@@ -730,19 +1295,87 @@ which `BillAddr` on the customer payload also uses. If no address is
 on file at all, `ShipAddr` is omitted from the payload (QBO rejects
 empty address objects).
 
-`ShipDate` uses `order.created_at` (falling back to
-`localOrder.receivedAt`) formatted to `YYYY-MM-DD` via
-`invoice.utils.toYmd`. Shopify's `orders/create` webhook fires before
-fulfillment, so there's no real ship timestamp on the order yet — the
-order date is the closest meaningful "ship on or after" marker.
-Unparseable → omitted (QBO leaves the field blank on the rendered
-invoice).
+`ShipDate` is **omitted at invoice creation** — `orders/create` fires
+pre-fulfillment and there is no real ship timestamp yet. QBO leaves the
+field blank on the rendered invoice until a fulfillment arrives.
+`pushShippingToInvoice` populates it later from `ShopifyOrder.shippedAt`
+(the earliest fulfillment date, formatted `YYYY-MM-DD` via
+`invoice.utils.toYmd`) when a `fulfillments/create` or
+`fulfillments/update` webhook is received (§4.6).
 
-**Processing-fee line — applied at settlement, per actual method.**
-A `<Method> Processing Fee – <X>%` line is appended to the QBO invoice
-the moment a payment is processed. The fee is decided by the **actual
-settlement method**, not the customer's preference, and per-method
-rates are configurable:
+**Per-product Items (SKU column).** QBO sources an invoice's SKU column
+from the referenced **`Item.Sku`** — there is no per-line SKU field. So
+`createInvoice` resolves each **product** line's SKU to a per-product QBO
+**Item** carrying that SKU and sets `line.qboItemId` (which
+`qbo.utils.toInvoiceLine` already honors, falling back to
+`QBO_WHOLESALE_DEFAULT_ITEM_ID`). `qbo.service.findOrCreateItemBySku({ sku, name })`
+mirrors `findOrCreateCustomer`: cache (`qbo_item_maps`, `sku` unique) →
+`findItemBySku` (QL `WHERE Sku=…`) → `createItem` (`POST /item`,
+`Type:'Service'`, `Sku`, `IncomeAccountRef` derived once from the default
+item via `resolveIncomeAccountRef`, optional `QBO_WHOLESALE_INCOME_ACCOUNT_ID`
+fallback). **Best-effort + graceful** — a null/failed resolution or a line
+with no SKU leaves the line on the default item, so invoicing never breaks.
+`shopifyLinesToQboLines` carries `sku`+`name` on product lines; shipping /
+discount / processing-fee lines have no SKU and stay on the default item.
+The SKU is **not** put in the line Description (`formatLineDescription`
+returns name + vendor only) — it shows solely in QBO's dedicated SKU column
+via the item's `Sku`.
+
+> **Unique Item names (correctness).** QBO Item `Name` must be unique, and
+> products that share a display name but differ by SKU would otherwise
+> collide — making the second create fail and (wrongly) reuse the first
+> item, showing every line the first SKU. So `sanitizeItemName` appends the
+> SKU (`"Product (SKU)"`, ≤100 chars) → a distinct item per SKU; the
+> duplicate-Name fallback adopts an existing item **only when its `Sku`
+> matches**; and the cache stores `qboSku` so a hit is trusted only when
+> `qboSku === sku` — rows missing/mismatching it are re-resolved and
+> overwritten (self-heals any rows poisoned before this guard).
+
+Forward-only (existing invoices aren't backfilled); the SKU must exist on
+the Shopify variant.
+
+**Discount line.** When a Shopify order carries an aggregate
+`total_discounts > 0` (coupon / referral), `shopifyLinesToQboLines`
+emits a single QBO `DiscountLineDetail` line (`{ kind: 'discount' }` →
+`qbo.utils.toInvoiceLine`) so the QBO invoice total reconciles with
+Shopify's post-discount `total_price`. Without it the invoice would
+over-state by the discount amount. Ordering on the invoice line array:
+product lines → discount → shipping → processing fee.
+
+**Tax — summary row, not a line; sourced from Shopify.** Tax is **not**
+emitted as a product line. The order's `total_tax` (configured in
+**Shopify**, not QBO) is passed to `qbo.service.createInvoice` as
+`TxnTaxDetail.TotalTax`, which QBO renders in the invoice's summary
+"Tax" row (alongside Subtotal / Discount / Total) instead of in the
+Products section. It is **always sent** (even at `$0`) so the customer
+sees a tax figure on every invoice. By design **no QBO tax code
+(`TxnTaxCodeRef`) is applied** — tax authority lives in Shopify.
+
+> **Rendering caveat.** Whether QBO actually shows the row in its
+> template can depend on a tax code being present on the transaction,
+> not on `TotalTax` alone: a **non-zero** Shopify tax renders fine, but a
+> **$0.00** row may be omitted by QBO. Forcing a $0 row would require a
+> company-specific tax code (AST `"NON"`, or a 0%/exempt `TaxCode` id),
+> which we deliberately do not wire in. US automated-sales-tax companies
+> may also recompute and ignore the override. The app's own Order Details
+> totals panels always show the tax line regardless of QBO's rendering.
+
+> **Why only tax (and discount) reach the summary.** QBO renders the
+> customer invoice (emailed via `/invoice/{id}/send`, PDF via
+> `/invoice/{id}/pdf`); the app only feeds it a `Line[]` array plus a few
+> native fields. QBO's summary block has native slots **only** for
+> Subtotal, Discount (`DiscountLineDetail`), Tax (`TxnTaxDetail`), and
+> Total — there is **no API field for a shipping amount or a custom
+> processing-fee surcharge** (confirmed against the QBO Invoice entity:
+> `ShipMethodRef` / `ShipDate` / `ShipAddr` are metadata only, with no
+> freight/shipping-cost field). So **shipping and the processing fee
+> necessarily remain line items** in the Products section; only tax could
+> be moved into the summary without switching to an app-rendered invoice.
+
+**Processing-fee line — applied at creation for card / ACH; at
+settlement as the fallback.** A `<Method> Processing Fee – <X>%` line is
+added to the QBO invoice so the customer sees the full amount up front
+on the invoice they're emailed. Per-method rates are configurable:
 
 | Method  | Default rate | Env var |
 |---|---|---|
@@ -750,12 +1383,28 @@ rates are configurable:
 | ACH | `1%` | `INVOICE_FEE_RATE_ACH` |
 | Cheque | `0%` | `INVOICE_FEE_RATE_CHECK` |
 
-| Settlement path | Fee applied? |
+**At creation** (`invoice.service.createInvoiceForOrder`): for a card or
+ACH invoice (any non-zero rate), the fee is computed on the order's
+post-discount grand total (`order.total_price`) and pushed onto the QBO
+`Line` array before the create call, so `TotalAmt` (→ `amountDue`) is
+fee-inclusive from the start. The staging fields
+(`processingFeeAmount` / `processingFeeRate` / `processingFeeMethod`)
+and `processingFeeAppliedAt` are stamped at the same time. A cheque
+invoice (0%) gets **no** fee line and leaves `processingFeeAppliedAt`
+unset.
+
+**At settlement** (fallback): the table below shows which paths add the
+fee for invoices that did **not** get it at creation — the cheque → card
+admin override (a cheque invoice with no fee, settled by card, picks up
+the 3% card rate) and any legacy invoice created before fee-at-creation.
+Because every settlement path guards on `!processingFeeAppliedAt`, a
+card / ACH invoice that already carries the fee is never double-charged.
+
+| Settlement path | Fee applied at settlement? |
 |---|---|
-| CRON auto-charge (card-preferred customer) | ✓ card rate |
-| Admin **Retry payment** (card-preferred) | ✓ card rate |
+| CRON auto-charge / **Retry payment** (card or ACH, fee already at creation) | ✗ already on invoice |
 | Admin **Charge card on file** (cheque → card fallback) | ✓ card rate |
-| Admin **Mark ACH paid** (`kind='ach'`) | ✓ ACH rate |
+| Admin **Mark ACH paid** (`kind='ach'`, legacy / no fee yet) | ✓ ACH rate |
 | Admin **Mark cheque paid** (`kind='cheque'`) | ✗ (0% by default) |
 | Declined / errored card attempt | ✗ (only successful payments write the line) |
 
@@ -795,6 +1444,74 @@ confirmation modal before the actual settle endpoint fires.
 when a prior run already wrote the line (matches any method's
 "Processing Fee" description), adopts the SyncToken, and proceeds to
 `recordPayment` without double-adding.
+
+### 7.3.1 Payment-preference realignment (open-invoice sync)
+
+When a customer's payment preference changes (card / ACH / check), every
+**unpaid/open** invoice is realigned to the new method so its processing
+fee and payment terms match. Owned by
+`services/invoice/paymentPreference.service.applyPaymentPreferenceToOpenInvoices({ shop, email, newMethod, performedBy, source })`.
+
+**Eligibility.** `paymentStatus ∈ {pending, failed}` AND `amountPaid == 0`
+AND `qboCreationStatus:'created'` with a `qboInvoiceId`. Explicitly
+**excluded**: `partially_paid` / `paid` (money settled), `in_progress` /
+`awaiting_settlement` (a charge is mid-flight), `cancelled`. Re-validated
+per-invoice against the freshest state right before mutating.
+
+**Per-invoice steps** (try/catch isolated, mirrors
+`replayPendingOrdersForCustomer`):
+1. Skip if already on the new method, `amountPaid > 0`, status no longer
+   eligible, or `achSyncInProgress`.
+2. `base = amountDue − (processingFeeAmount || 0)` (the pre-fee total;
+   `amountPaid` is 0 so this is the full base).
+3. `newFee = computeProcessingFee({ baseAmount: base, method: newMethod })`
+   (null for check / 0%).
+4. Recompute due date from `dueDaysForMethod(newMethod)` against
+   `qboTxnDate || createdAt` → `qboDueDate` + local `dueAt`.
+5. **Rewrite the QBO invoice** via `qbo.service.setInvoiceProcessingFee({
+   qboInvoiceId, feeLine, dueDate })` — GET current, strip every
+   `/Processing Fee/i` line, append the new fee line (or none → fee
+   removed), sparse-POST the full `Line` array + `DueDate` with the
+   current `SyncToken`. QBO recomputes `TotalAmt`. The SyncToken is the
+   concurrency guard: a racing CRON charge invalidates it and the invoice
+   fails this run (isolated, retried on the next change).
+6. Persist locally: `paymentMethod`, fee fields (`processingFeeAmount/
+   Rate/Method`, `processingFeeAppliedAt` set when fee else null),
+   `amountDue = TotalAmt`, `qboSyncToken`, `qboDueDate`, `dueAt`. A
+   `failed` invoice resets to `pending` (`attemptCount=0`) so the new
+   method's auto-charge resumes.
+7. Append an `admin_action` remark recording `from → to` + fee delta + due
+   date + who.
+
+**After the loop**, `CustomerMap.paymentMethod` is mirrored to the new
+method (so the next order's invoice uses it immediately, not just after the
+order-intake re-sync), and one entry is appended to
+`WholesaleApplication.paymentMethodHistory[]` —
+`{ previousMethod, newMethod, invoiceCount, affectedInvoiceIds, changedAt,
+performedBy, source }` — the change-event audit log.
+
+**Triggers.**
+- **Customer self-service** — `/api/update-profile` detects a
+  `payment.method` change and calls the service **best-effort** (a QBO
+  failure never fails the profile save the customer just made); the summary
+  rides back in the response. `source:'customer'`, performedBy = email.
+- **Admin** — `POST /api/admin/customers/:id/payment-method` `{ method }`
+  saves the preference then realigns. `source:'admin'`, performedBy = admin
+  session email. Surfaced on the Customer detail page
+  (`app.customers.$id.jsx`) as a method selector + "Apply to open invoices"
+  button + a payment-method-history table.
+
+**Future orders** already pick up the latest preference — no scheduler
+change: `customer.service.ensureCustomerForOrder` re-reads
+`wholesale_applications.payment.method` at intake and PASS 1's
+`paymentMethod:{ $in:['card','ach'] }` filter adjusts automatically.
+
+**Limitations.** Switching an invoice to ACH sets the method but does not
+provision an NMI ACH billing profile; if `CustomerMap.nmiAchBillingId` is
+absent the scheduler's ACH charge skips with a reason (existing
+`resolveInvoiceVault` behavior). The immutable order-time snapshot
+`customerPaymentPreference` is intentionally **not** rewritten — only the
+operational `paymentMethod`.
 
 ### 7.4 Payment recording
 
@@ -1320,18 +2037,26 @@ than the default-billing card entry. `nmi.service.chargeCustomerVault`
 accepts both and threads them into transact.php's `customer_vault_id`
 + optional `billing_id` parameters.
 
-PASS 1.5 (reminder logger) now runs only over cheque-pending invoices
-and failed card/ACH invoices that exhausted retries. ACH no longer
-lands in PASS 1.5 as a pending row — it gets the active charge in
-PASS 1 instead, and lands here only if its `paymentStatus` flips to
-`'failed'` after `maxAttempts` declines. The legacy `cron_ach_reminder`
-remark kind is preserved on the Invoice schema for back-compat with
-rows logged before the change; new ACH activity lands as
-`cron_ach_attempt` (success / decline / error) in PASS 1.
+PASS 1.5 (payment follow-up logger) runs only over invoices whose
+`paymentStatus` is `'failed'` (card/ACH that exhausted retries). It logs
+a `cron_failed_followup` remark as part of this CRON's payment audit
+history — no charge, no customer notification.
+
+**Cheque reminders are NOT logged here.** Customer-facing payment
+reminders for unpaid cheque invoices are owned exclusively by the
+dedicated reminder CRON (`process-check-reminders` / services/reminder —
+§10.5), which sends the QBO ladder + recurring emails. This payment CRON
+is responsible only for charging, status updates, and payment/audit
+logs; keeping the concerns separate is what prevents the duplicate
+reminder entries that used to appear when PASS 1.5 also logged a
+`cron_cheque_reminder` every tick. The legacy `cron_cheque_reminder` /
+`cron_ach_reminder` remark kinds are preserved on the Invoice schema for
+back-compat with rows logged before this change; PASS 1.5 no longer
+emits them. New ACH activity lands as `cron_ach_attempt` (success /
+decline / error) in PASS 1.
 
 PASS 1.5 also carries the same `autoChargePaused: { $ne: true }` term —
-pausing is an explicit "leave this one alone" signal, and surfacing a
-recurring reminder for a paused invoice would defeat that intent.
+pausing is an explicit "leave this one alone" signal.
 
 `$ne: true` (not `false`) is deliberate so legacy rows without the field
 default to "not paused".
@@ -1542,7 +2267,7 @@ To represent this correctly the Invoice has a dedicated payment status
 | `pendingSettlementAmount` | Total amount submitted (base + fee component, if any) |
 | `pendingSettlementFeeAmount` | Fee component staged at submission; applied to QBO only on settle |
 | `pendingSettlementSince` | When we entered the awaiting_settlement state |
-| `pendingSettlementLastCheckedAt` | When PASS 1.7 last polled NMI (throttles the "still pending" remark) |
+| `pendingSettlementLastCheckedAt` | When the ACH status-sync CRON last polled NMI (throttles the "still pending" remark) |
 
 **Critical invariant** — `amountPaid` is NOT bumped on ACH approval.
 The in-flight amount lives on `pendingSettlementAmount` until
@@ -1558,9 +2283,23 @@ invoice with `amountPaid = 0` cannot mis-flip it back to `pending` and
 have the CRON re-submit a second ACH transaction while NMI is still
 processing the first.
 
+**Reconciliation runs in a dedicated CRON.** A separate, independent job
+— `process-ach-status-sync` (`services/payment/achStatusSync.service.js`)
+— polls NMI for every `awaiting_settlement` ACH invoice and reconciles its
+status. Its cadence is **environment-configurable** with no code change:
+production runs once per day (`ACH_SYNC_CRON`, default `0 3 * * *`), while
+testing runs every minute (`ACH_SYNC_INTERVAL`, e.g. `1 minute`) for rapid
+validation of status updates and reconciliation. When `ACH_SYNC_INTERVAL`
+is set it takes precedence over the cron; leave it unset in production. This is intentionally **separate from the payment-processing CRON**
+(`process-pending-payments`, which only charges) so there is a single owner
+of the `awaiting_settlement → paid/pending/failed` transition (no race) and
+so settlement is polled frequently rather than only on the twice-monthly
+charge ticks. *(Historically this was "PASS 1.7" inside the payment CRON;
+it was extracted into its own job.)*
+
 **State transitions** are owned exclusively by `checkAchSettlement`
-(`payment.service.js`), which the scheduler PASS 1.7 calls every
-tick:
+(`payment.service.js`), which the ACH status-sync CRON calls for each
+in-flight invoice:
 
 | NMI `condition` | Action | Result |
 |---|---|---|
@@ -1579,14 +2318,172 @@ tick:
   suggesting the admin void the ACH in NMI's dashboard first. We
   block the card fallback to avoid double-charging the customer if
   both transactions settle.
+- `POST /api/admin/orders/:id/sync-ach-status` — **on-demand sync**
+  (see below). Runs the same reconciliation as the CRON for this one
+  invoice so an admin doesn't have to wait for the next scheduled tick.
 
-**Remarks** are written by PASS 1.7 with kind `cron_ach_settlement_check`:
+**On-demand sync — "Sync ACH status" button.** The per-invoice
+reconciliation body is factored into `reconcileAchInvoice`
+(`services/payment/achStatusSync.service.js`), shared verbatim by the
+CRON sweep (`syncAchTransactionStatuses`) and the admin button so both
+do exactly the same thing — NMI lookup → `checkAchSettlement` → audit
+row + remark + critical-alert + "last sync" display fields. The button
+is rendered on Order Details **only for ACH invoices in
+`awaiting_settlement` with a `pendingSettlementTxnId`** (the exact set
+the CRON sweeps); for any other invoice the endpoint returns 409. The
+service entry point `manualSyncAchInvoice` takes an **atomic per-invoice
+lock** (`Invoice.findOneAndUpdate({ achSyncInProgress: { $ne: true } },
+{ $set: { achSyncInProgress: true } })`) before reconciling and releases
+it in a `finally` block, so a double-click — or an overlapping CRON tick
+— can never reconcile the same invoice twice at once (a blocked request
+gets a 409 "already in progress"). Every sync (CRON or manual, any
+outcome incl. still-pending) records the display fields `achSyncLastAt`
+/ `achSyncLastStatus` (normalized: settled / returned / voided / failed /
+pending_settlement / unknown / error) / `achSyncLastCondition` (raw NMI
+condition) / `achSyncLastSource` (`cron_ach_status_sync` |
+`admin_manual_sync`); a manual run also stamps `achSyncLastBy` (admin
+email). Order Details surfaces these as "Last ACH sync: <time> · <status
+badge> · via manual/scheduled sync". The manual remark text reads
+"Manual ACH status sync — …" (source `admin`) vs the CRON's "ACH status
+sync — …" (source `cron`); both reuse the `cron_ach_settlement_check`
+remark kind so the badge map is unchanged. A manual sync bypasses the
+once-per-day "still settling" remark throttle (the admin explicitly
+asked for an update).
+
+**Remarks** are written by the ACH status-sync CRON with kind
+`cron_ach_settlement_check`:
 
 - "settled" / "returned" log on every state change.
-- "still pending" logs at most once per `SETTLEMENT_REMARK_THROTTLE_MS`
+- "still pending" logs at most once per `STILL_PENDING_REMARK_THROTTLE_MS`
   (24h) so the Remarks panel doesn't flood during the normal wait
   window. The settlement check itself runs every tick — only the
   remark write is throttled.
+
+**Audit trail + return capture.** On every detected status CHANGE the
+sync CRON appends an `Invoice.achStatusHistory[]` entry (`status`,
+`previousStatus`, `nmiCondition`, `nmiTransactionId`, `returnCode`,
+`returnReason`, `amount`) — idempotent, since a no-change poll writes
+nothing. On a return/void it also persists the NACHA detail on the
+invoice itself (`achReturnCode`, `achReturnReason`, `achReturnedAt`) and
+raises a **critical admin alert** (`log.error('ach.alert', …)` + console
+banner, plus an optional outbound webhook when `ACH_ALERT_WEBHOOK_URL`
+is configured). A transaction still awaiting settlement past
+`ACH_SYNC_STUCK_DAYS` (default 5) raises a throttled "stuck" alert.
+
+### 9.6 Immediate Payment — self-pay link
+
+A 4th payment method, **`immediate`**, for customers who pay each invoice
+themselves, on demand, for the exact amount — no stored vault, never
+auto-charged. The QBO invoice they receive carries a clickable **payment
+link** leading to an in-app Collect.js page pre-set to the current outstanding
+balance. (Link only — the QR code was removed per request 2026-06-09.)
+
+**Durable in-app link.** The link baked into the invoice is **our** URL —
+`/pay/:token`. The base is `PAY_LINK_BASE_URL` (falls back to
+`SHOPIFY_APP_URL`) and **must be a stable public host**: the URL is frozen
+into the QBO invoice `CustomerMemo` at creation, so if the base changes the
+old links die. In production `SHOPIFY_APP_URL` is stable; in dev,
+`shopify app dev` rotates the trycloudflare tunnel each restart, so set
+`PAY_LINK_BASE_URL` to a stable tunnel/domain. The opaque token (and the
+`/pay/<token>` path) never changes — only the host — so an admin can heal an
+already-issued invoice with **"Refresh link on invoice"** on Order Details
+(`POST /api/admin/orders/:id/refresh-pay-link` → `refreshImmediatePayLink`,
+which rewrites the memo's `Pay online:` line to the current URL). The Order
+Details "Payment link" section also rebuilds a live link from the token + the
+current base, so admins always see/copy a working link.
+
+**Token.** `Invoice.payToken` is an opaque 256-bit random string
+(`payLink.utils.mintPayToken`). It carries **no amount** — the outstanding
+balance is always recomputed server-side (`amountDue − amountPaid`), which
+defeats amount tampering; the random space defeats enumeration. Minted in
+`createInvoiceForOrder` for `immediate` invoices (and retro-provisioned by
+`paymentPreference.service` when an open invoice is realigned to
+`immediate`).
+
+**On the QBO invoice.** The pay URL is appended to the `CustomerMemo` as a
+bare `Pay your invoice online:` label followed by the URL **alone on its own
+line** (QBO has no inline-image/button API; a bare URL auto-linkifies in the
+emailed invoice / PDF). Done in `createInvoiceForOrder` **before** the Phase-4
+`/send` so the first email already carries the link.
+
+**Guaranteeing a complete, un-truncated URL.** Two defects could previously
+emit an incomplete/invalid link, independent of the host:
+
+1. `buildPayLinkUrl` returned a host-less `/pay/<token>` when the base URL was
+   empty/misconfigured — a structurally invalid (relative) link. It now
+   **throws** unless the base is a complete absolute `http(s)://host`, so a
+   broken base fails loudly at issue time instead of baking a dead link into a
+   QBO memo for days. Display callers (Order Details loader) guard with
+   try/catch and surface the misconfig in a banner; the admin
+   `refresh-pay-link` endpoint returns the error as a 502.
+2. `setInvoicePayLinkMemo` built `base + payLinkBlock` then sliced the whole
+   string to QBO's 1000-char cap — truncating **from the end**, i.e. chopping
+   the pay URL itself when the base memo was long. Both the creation and
+   refresh paths now share `payLink.utils.appendPayLinkToMemo`, which trims the
+   **base memo** to fit the cap and always appends the pay-link block (label +
+   complete URL) intact.
+
+The token itself is hyphen-free **base62** (`mintPayToken`), so the token can
+never be split by a linkifier that breaks on `-`/`_`. The remaining truncation
+risk is purely cosmetic line-wrapping of a long **host** (a dev trycloudflare
+tunnel like `maintains-talked-cardiac-improved.trycloudflare.com` wraps and
+breaks at its hostname hyphens in the PDF) — solved operationally by setting
+`PAY_LINK_BASE_URL` to a short, stable, hyphen-free production host. The "URL
+alone on its own line" memo layout minimises this.
+
+**Payment flow (NMI Collect.js — single page):**
+
+```
+QBO invoice (Pay online: link)  →  GET /pay/:token  (api/pay/pay.jsx)
+   guard paid/cancelled/outstanding≤0 → friendly page (no form)
+   else: render NMI Collect.js card form (iframe fields) + "Pay $X"
+customer enters card → CollectJS tokenizes (card never hits our server)
+   → POST /pay/:token { paymentToken }  (same route's action)
+       amount = outstanding (recomputed SERVER-SIDE, client amount ignored)
+       chargeWithPaymentToken({ paymentToken, amount })  → NMI type=sale
+       approved → settleHostedPayment(...)  → 'paid'
+                → propagateSuccessfulPayment (QBO Payment + Shopify mark-paid)
+       declined/error → inline error, customer can re-enter card
+```
+
+Collect.js (NMI-hosted iframe fields) keeps card data off our servers
+(PCI SAQ A-EP) — the same mechanism the registration form uses to vault
+cards. The page loads `NMI_COLLECT_JS_URL` with `NMI_PUBLIC_KEY` as the
+publishable tokenization key. *(An earlier attempt used the NMI 3-Step
+Redirect API; its `form-url` is a POST target for your own card form, not a
+hosted UI to redirect to, so a plain browser redirect produced "ccnumber
+field is required" on completion — hence the Collect.js approach.)*
+
+Settlement is **idempotent**: `settleHostedPayment` atomically claims the NMI
+transaction id into `Invoice.payTransactionIds[]` (`$addToSet` guarded), so a
+resubmit settles exactly once; the amount is clamped to the outstanding
+balance so it can never overpay. A captured-but-unrecorded edge (NMI charged,
+bookkeeping then failed) still shows the customer success and is logged for
+reconciliation — we never tell a paying customer it failed.
+
+**Fee + due date.** `immediate` is a card-based hosted charge, so it carries
+the card-style fee `INVOICE_FEE_RATE_IMMEDIATE` (default 3%), baked into
+`amountDue` at creation exactly like card — the hosted charge therefore
+collects the full fee-inclusive amount. Due window: `IMMEDIATE_DUE_DATE`.
+
+**Scheduler.** No CRON change: PASS 1 auto-charge filters
+`paymentMethod ∈ {card, ach}` and the reminder CRON is cheque-only, so
+`immediate` invoices are auto-excluded from every sweep.
+
+**Admin.** Order Details renders a "Payment link" section (clickable link +
+copy button + **"Refresh link on invoice"** + payment-status badge).
+The preference is set via admin `POST /api/admin/customers/:id/payment-method`
+(`normalizePaymentMethod` + the model enums already accept `immediate`); the
+**registration-form UI for choosing Immediate Payment is intentionally out of
+scope here** and handled separately.
+
+**Config.** `NMI_COLLECT_JS_URL` (Collect.js script; per-environment default,
+overridable) + `NMI_PUBLIC_KEY` (publishable tokenization key, already
+configured for the registration form) + `PAY_LINK_BASE_URL` (stable link base;
+falls back to `SHOPIFY_APP_URL`). The one-time charge runs through
+`nmi.service.chargeWithPaymentToken` (`type=sale` + `payment_token`). Files:
+`services/payment/payLink.{utils,service}.js`, `app/api/pay/pay.jsx`,
+`app/api/admin/refresh-pay-link.js`, `app/components/pay-ui.jsx`.
 
 ---
 
@@ -1641,6 +2538,207 @@ or in prod:
 ```
 {scope:"scheduler","event":"scheduler.recurring_registered","mode":"cron","primary":"30 0 15 * *","secondary":"30 0 L * *","timezone":"America/Los_Angeles"}
 ```
+
+### 10.5 Check-payment reminder CRON (notification-only)
+
+A **separate job** — `process-check-reminders` — distinct from the
+payment-retry ticks. It only *notifies*; it never charges. Registered in
+`scheduler.service.ensureRecurring` (dev + prod) alongside the retry job.
+Cadence is the daily cron in production, or a fast `REMINDER_INTERVAL`
+sweep in dev/test (currently every minute).
+
+```
+REMINDER_CRON=0 2 * * *        # default: 02:00 daily (scheduler timezone)
+REMINDER_INTERVAL=1 minute     # dev/test override (Agenda "every" expression)
+REMINDER_USE_MINUTES=true      # TEST knob: use the MINUTE ladder, count minutes
+# Production (day) ladder — defaults:
+REMINDER_DAY_FIRST=9  REMINDER_DAY_SECOND=11  REMINDER_DAY_CARD=13
+# Testing (minute) ladder — defaults, live only when REMINDER_USE_MINUTES=true:
+REMINDER_MIN_FIRST=1  REMINDER_MIN_SECOND=3   REMINDER_MIN_CARD=4
+# Recurring cadence AFTER the final stage (repeats until paid):
+REMINDER_REPEAT_DAYS=2  REMINDER_REPEAT_MINUTES=1
+```
+
+**Code:** `services/reminder/reminder.service.js`
+(`processCheckPaymentReminders()`) + `reminder.config.js`; thin Agenda
+wrapper `services/scheduler/jobs/processCheckReminders.job.js`.
+
+**Eligibility filter** (the only invoices it touches):
+
+```js
+{ paymentMethod: 'check',
+  paymentStatus: { $in: ['pending', 'partially_paid'] },
+  qboCreationStatus: 'created',
+  qboInvoiceId: { $exists: true, $ne: null },
+  reminderPaused: { $ne: true } }
+```
+
+Once an invoice is paid it drops out of the `paymentStatus` set, so
+reminders stop automatically. `reminderPaused` is the admin mute switch
+(see "Pause control" below) — distinct from `autoChargePaused`, which
+gates the card auto-charge sweep, not email reminders.
+
+**Reminder ladder** (elapsed measured from `qboTxnDate`, fallback
+`createdAt`; the active threshold column is chosen by `REMINDER_USE_MINUTES`):
+
+| Stage | Prod threshold | Test threshold | Meaning |
+|---|---|---|---|
+| `first`  | 9 days  | 1 min | First payment reminder |
+| `second` | 11 days | 3 min | Second payment reminder |
+| `card`   | 13 days | 4 min | Final card-on-file notice (balance may be charged to card on file — admin does the charge) |
+| `recurring` | every 2 days *after* `card` | every 1 min *after* `card` | Repeats until paid — keeps reminding the customer the balance is still outstanding |
+
+Prod thresholds are env-tunable (`REMINDER_DAY_FIRST/SECOND/CARD`); the
+test ladder via `REMINDER_MIN_FIRST/SECOND/CARD`; the recurring cadence
+via `REMINDER_REPEAT_DAYS` (prod, default 2) / `REMINDER_REPEAT_MINUTES`
+(test, default 1).
+
+Stage keys are semantic (`first` / `second` / `card` / `recurring`),
+independent of the threshold value, so the same keys dedup correctly
+whether the day or minute ladder is live. (Legacy `day7` / `day9` /
+`day13` keys remain in the `paymentReminders[].stage` enum only for
+back-compat with old rows.)
+
+"Current level wins": each run sends only the highest-threshold named
+stage reached **and not yet sent**, so a CRON outage jumps straight to
+the most advanced reminder instead of replaying earlier ones. Each named
+stage fires at most once, in order.
+
+**Recurring phase:** once the final (`card`) stage has been sent and the
+invoice is still unpaid, the job keeps sending the `recurring` reminder,
+throttled to `recurringIntervalUnits()` (the `REMINDER_REPEAT_*` cadence)
+since the most recent reminder of any stage. This is independent of how
+often the CRON ticks — a daily cron with `REMINDER_REPEAT_DAYS=2` emails
+every other day; the every-minute test sweep with
+`REMINDER_REPEAT_MINUTES=1` emails each minute. `recurring` entries
+accumulate in `paymentReminders[]` (one per cycle) as the audit trail.
+Because a paid invoice leaves the eligibility filter, the recurring
+reminders stop automatically the moment the balance is settled.
+
+**Email:** triggers the QBO invoice email via
+`qbo.service.sendInvoiceEmail({ qboInvoiceId, sendTo: invoice.customerEmail })`
+(`POST /invoice/<id>/send`). QBO delivers the standard invoice email; the
+stage governs *our* logging/intent, not the email body.
+
+**Dedup + audit:**
+- `Invoice.paymentReminders[]` — one entry per stage (`{ stage, sentAt,
+  daysSinceOrder, recipient, status: 'sent'|'failed', qboEmailStatus,
+  errorMessage }`). Only a `sent` entry suppresses a stage; a `failed`
+  entry is retried on the next run.
+- `Invoice.emailEvents[]` — append a row with `source: 'payment_reminder'`
+  (surfaces in the Order Details "Email history" panel).
+- `Invoice.remarks[]` — append `kind: 'cron_payment_reminder'`
+  (operator timeline; distinct from the legacy log-only PASS 1.5
+  `cron_cheque_reminder`).
+
+**Pause control** (admin mute switch): the Order Details page exposes a
+**Pause / Resume auto email notifications** button (cheque invoices only),
+backed by `POST /api/admin/orders/:id/pause-reminders` +
+`/resume-reminders`. Pausing sets `Invoice.reminderPaused = true` (+
+`reminderPausedAt/By`, `reminderPauseNote`); the eligibility filter's
+`reminderPaused: { $ne: true }` clause then skips the invoice on every
+run until an admin resumes (`reminderResumeAt/By`). Both endpoints append
+an `admin_action` remark and are idempotent. This is independent of the
+auto-charge pause (`autoChargePaused`) — different flag, different sweep.
+
+**Guarantees:** never processes payments / charges methods; only Check
+invoices; idempotent per stage; safe to re-run; paid or paused invoices
+are skipped.
+
+### 10.6 Drop-ship payment CRON (`process-dropship-payments`)
+
+A **dedicated, independent job** — separate from the wholesale payment
+ticks — that collects the UNPAID QBO invoices created for the retail
+drop-ship customer (`DROPSHIP_RETAIL_CUSTOMER_EMAIL`). See §5.6 for how
+those invoices are created. Registered in
+`scheduler.service.ensureRecurring` **before** the `PAYMENT_RETRY_INTERVAL`
+dev-override early-return (like the ACH-sync job), so it runs in dev too.
+
+**Cadence** (per requirement):
+
+```
+DROPSHIP_PAYMENT_CRON=30 0 1 * *     # PRODUCTION default: once per month, 00:30 on the 1st (PAYMENT_SCHEDULE_TZ)
+DROPSHIP_PAYMENT_INTERVAL=2 minutes  # TESTING override: Agenda "every" expression (every 2 minutes)
+```
+
+**Collection target.** The synthetic drop-ship customer has no
+per-registration NMI vault, so the CRON charges a SINGLE configured vault:
+
+```
+DROPSHIP_NMI_VAULT_ID=<NMI customer vault id for the drop-ship account>
+```
+
+When unset, every invoice is skipped with a clear
+`no DROPSHIP_NMI_VAULT_ID configured` reason (recorded on a PaymentAttempt
++ a `cron_dropship_attempt` remark) — the job never silently no-ops.
+
+**NMI duplicate-transaction handling (shared-vault gotcha — GATEWAY CONFIG, not
+code).** Because every drop-ship invoice charges the SAME vault, two distinct
+orders that happen to cost the same amount look identical to NMI's gateway-level
+amount+card duplicate-transaction check, and the second sale is rejected with
+`Duplicate transaction REFID:…` (it surfaces as an errored
+`cron_dropship_attempt` remark). **This cannot be fixed from code on this
+processor.** NMI's only per-transaction lever is `dup_seconds`, and this
+processor forbids it both ways: `dup_seconds=0` (disable) →
+`Disabling Duplicate Check is not allowed for this processor` (code 300), and any
+positive `dup_seconds=N` (override the window) →
+`Overriding Duplicate Threshold is not allowed for this processor` (code 300).
+Sending `dup_seconds` at all therefore fails EVERY drop-ship charge (even
+unique-amount orders), so we deliberately **never send it** (see the comment in
+`chargeCustomerVault`). The resolution is operational: in the **NMI control
+panel** → *Settings → Transaction/Security Options → Duplicate Transaction
+Checking* for this MID, **disable it, shorten the window, or set it to key on
+order id**. We send a unique `orderid` per order
+(`invoice.shopifyOrderId || invoice._id`), so the order-id-keyed mode lets NMI
+distinguish distinct orders. Relaxing NMI's amount-based dup check is safe
+because a *same-invoice* double-charge is already impossible regardless:
+`chargeInvoice` flips the invoice to `in_progress` **before** the sale (PASS A
+only sweeps `pending`, and the admin "Collect payment now" excludes
+`in_progress`), and the claim-first unique `(shop, shopifyOrderId)` invoice index
+guarantees one invoice per order.
+
+**Code:** `services/dropship/dropshipPayment.service.collectDropshipPayments()`
++ `dropshipPayment.config.js`; thin Agenda wrapper
+`services/scheduler/jobs/processDropshipPayments.job.js` (concurrency:1).
+
+**Two passes per tick** (mirrors §11's PASS 1 + PASS 2, scoped to
+`isDropship: true`):
+
+- **PASS A — charge.** Sweeps
+  `{ isDropship: true, paymentStatus: 'pending', autoChargePaused: { $ne: true }, attemptCount < maxAttempts }`.
+  For each, it loads the invoice's `CustomerMap`, **injects**
+  `nmiCustomerVaultId = DROPSHIP_NMI_VAULT_ID` (config stays the single
+  source of truth; the id is never persisted on the map), and calls
+  `payment.service.chargeInvoice`. Because `paymentMethod: 'dropship'`
+  routes through the vault's default billing (no `billing_id`, like a
+  card sale), an approval runs the existing inline
+  `propagateSuccessfulPayment` → QBO `recordPayment` + Shopify
+  `orderMarkAsPaid` + local mirror (order → `completed`). Each attempt
+  appends a `cron_dropship_attempt` remark.
+- **PASS B — sync-retry.** Sweeps drop-ship invoices that were charged
+  (paid/in_progress) but whose QBO/Shopify sync is behind, and replays
+  `propagateSuccessfulPayment` only (never re-charges NMI).
+
+**Why a separate CRON (not the wholesale job).** Different cadence
+(monthly vs 15th + last), a single shared vault vs per-customer vaults,
+and a clean audit boundary. The wholesale `process-pending-payments`
+**excludes** drop-ship invoices from all three of its passes via
+`isDropship: { $ne: true }`, so the two jobs never race on the same rows.
+
+**Idempotency / duplicate prevention.** `chargeInvoice` skips
+paid/cancelled/in_progress invoices and holds the `in_progress` lock (the
+job is also `concurrency:1`), so overlapping ticks can't double-charge.
+`propagateSuccessfulPayment` records only the
+`amountPaid − qboRecordedTotal` delta, so QBO never books a duplicate
+Payment. Invoice creation is itself dedup'd by the claim-first unique
+`(shop, shopifyOrderId)` index (§13).
+
+**Known characteristic.** In production the job runs monthly, so a
+downstream-sync failure after a successful charge (rare — QBO/Shopify
+calls retry 3× inside `propagateSuccessfulPayment`) waits until the next
+monthly tick for PASS B to heal it. The failure is visible meanwhile on
+`Invoice.lastSyncError` + the remarks feed. The testing cadence (2 min)
+heals it almost immediately.
 
 ---
 
@@ -2094,7 +3192,7 @@ use, scheduler mode, and the result of index verification:
   --- QBO ---
   QBO_ENVIRONMENT           : sandbox
   QBO_API_BASE_URL          : https://sandbox-quickbooks.api.intuit.com
-  QBO_REFRESH_TOKEN (seed)  : set (40 chars)
+  QBO_WHOLESALE_REFRESH_TOKEN (seed)  : set (40 chars)
   --- NMI ---
   NMI_ENVIRONMENT           : sandbox
   NMI_API_URL               : https://sandbox.nmi.com/api/transact.php
@@ -2152,11 +3250,11 @@ required values throw immediately.
 | **QBO** | | |
 | `QBO_CLIENT_ID` | _required_ | Intuit OAuth2 client id |
 | `QBO_CLIENT_SECRET` | _required_ | Intuit OAuth2 client secret |
-| `QBO_REALM_ID` | _required_ | Company / realm to invoice into |
-| `QBO_REFRESH_TOKEN` | _required first run_ | Seed refresh token (from OAuth Playground) |
+| `QBO_WHOLESALE_REALM_ID` | _required_ | Company / realm to invoice into |
+| `QBO_WHOLESALE_REFRESH_TOKEN` | _required first run_ | Seed refresh token (from OAuth Playground) |
 | `QBO_ENVIRONMENT` | `sandbox` | `sandbox` or `production` |
 | `QBO_MINOR_VERSION` | `73` | API minor version |
-| `QBO_DEFAULT_ITEM_ID` | `1` | QBO Item Id for invoice lines |
+| `QBO_WHOLESALE_DEFAULT_ITEM_ID` | `1` | QBO Item Id for invoice lines |
 | `QBO_API_BASE_URL` | _auto_ | Override API host |
 | `QBO_OAUTH_TOKEN_URL` | _auto_ | Override OAuth endpoint |
 | **NMI** | | |
@@ -2165,15 +3263,22 @@ required values throw immediately.
 | `NMI_PUBLIC_KEY` | (optional) | Collect.js public key for hosted tokenization |
 | `NMI_API_URL` | _auto_ | Override transact.php URL |
 | `NMI_QUERY_URL` | _auto_ | Override query.php URL |
+| `NMI_COLLECT_JS_URL` | _auto_ | Collect.js script URL for the Immediate Payment self-pay page (§9.6). Auto-derived per environment (`secure`/`sandbox`); the page loads it with the publishable `NMI_PUBLIC_KEY` as the tokenization key. |
+| `PAY_LINK_BASE_URL` | `SHOPIFY_APP_URL` | Stable public base URL for the Immediate Payment link baked into the QBO invoice (§9.6). Pin this in dev (the trycloudflare tunnel rotates each restart, killing old links); unset in prod to use the stable `SHOPIFY_APP_URL`. |
 | `NMI_TEST_CCNUMBER` | (optional) | Dev test card number (sandbox only) |
 | `NMI_TEST_CCEXP` | (optional) | Dev test card expiry MMYY |
 | `NMI_TEST_CVV` | (optional) | Dev test card CVV |
 | **Invoicing** | | |
-| `INVOICE_TERMS_DAYS` | `15` | Days from order date to invoice due date — sent as `DueDate` to QBO (overrides any customer-level SalesTerm) |
+| `INVOICE_TERMS_DAYS` | `15` | Generic fallback: days from order date to invoice due date when no per-method override is set. Sent as `DueDate` to QBO (overrides any customer-level SalesTerm) |
+| `CHEQUE_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **cheque** invoices (§7.3) |
+| `ACH_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **ACH** invoices (§7.3) |
+| `CARD_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **card** invoices (§7.3) |
+| `IMMEDIATE_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **Immediate Payment** invoices (§9.6) |
 | `INVOICE_TERMS_MINUTES` | `0` | Extra minutes added on top of `INVOICE_TERMS_DAYS` for the local full-datetime `Invoice.dueAt` field. **Testing knob** — set to `1` to flag invoices Overdue ~1 minute after creation without waiting whole days. The QBO date-only `DueDate` ignores this offset (it still rounds to `termsDays`); only the local Order List "Overdue" indicator + cheque-reminder UI uses `dueAt`. |
-| `INVOICE_FEE_RATE_CARD` | `0.03` | Per-method processing fee (decimal): card. Appended as a line at settlement when an NMI card charge approves or the cheque → card admin fallback runs. `0` disables. |
-| `INVOICE_FEE_RATE_ACH` | `0.01` | Per-method processing fee (decimal): ACH. Appended on `kind='ach'` manual receipts. `0` disables. |
+| `INVOICE_FEE_RATE_CARD` | `0.03` | Per-method processing fee (decimal): card. Added as a line at invoice creation for card invoices (and at settlement for the cheque → card admin fallback / legacy invoices). `0` disables. |
+| `INVOICE_FEE_RATE_ACH` | `0.01` | Per-method processing fee (decimal): ACH. Added as a line at invoice creation for ACH invoices (and on legacy `kind='ach'` manual receipts). `0` disables. |
 | `INVOICE_FEE_RATE_CHECK` | `0` | Per-method processing fee (decimal): cheque. Defaults to no fee. |
+| `INVOICE_FEE_RATE_IMMEDIATE` | `0.03` | Per-method processing fee (decimal): Immediate Payment (hosted card charge). Baked into `amountDue` at creation like card (§9.6). `0` disables. |
 | **Payments** | | |
 | `PAYMENT_CHARGE_IMMEDIATELY` | `false` | `true` = NMI charge in webhook process |
 | `PAYMENT_MAX_RETRY_ATTEMPTS` | `6` | Cap on NMI charge attempts per invoice |
@@ -2181,6 +3286,18 @@ required values throw immediately.
 | `PAYMENT_RETRY_CRON_PRIMARY` | `30 0 15 * *` | Primary monthly cron expression |
 | `PAYMENT_RETRY_CRON_SECONDARY` | `30 0 L * *` | Secondary monthly cron expression |
 | `PAYMENT_RETRY_INTERVAL` | (unset) | Dev override, e.g. `30 seconds` |
+| **ACH status-sync CRON** | | |
+| `ACH_SYNC_CRON` | `0 3 * * *` | Production cron for the dedicated ACH status-sync job (once per day at 03:00) |
+| `ACH_SYNC_INTERVAL` | (unset) | Testing override, e.g. `1 minute` — runs the sweep every minute; takes precedence over `ACH_SYNC_CRON` when set |
+| `ACH_SYNC_STUCK_DAYS` | `5` | Days awaiting settlement before a "stuck" admin alert |
+| `ACH_ALERT_WEBHOOK_URL` | (unset) | Optional outbound webhook for critical ACH alerts (off unless set) |
+| **Drop-ship (retail customer)** | | |
+| `DROPSHIP_RETAIL_CUSTOMER_EMAIL` | `famixu@denipl.com` | Email of the synthetic retail drop-ship customer. Orders from it get an unpaid QBO invoice + are collected by the drop-ship CRON (§5.6, §10.6) |
+| `DROPSHIP_RETAIL_CUSTOMER_TAG` | `ns-retail-internal` | Shopify tag used to resolve / create the synthetic drop-ship customer |
+| `DROPSHIP_NMI_VAULT_ID` | (unset) | **Required for collection.** The single NMI customer vault the drop-ship CRON charges for every drop-ship invoice. When unset, the CRON skips with a clear reason |
+| `DROPSHIP_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **drop-ship** invoices |
+| `DROPSHIP_PAYMENT_CRON` | `30 0 1 * *` | Production cron for the drop-ship payment CRON (once per month, 00:30 on the 1st) |
+| `DROPSHIP_PAYMENT_INTERVAL` | (unset) | Testing override, e.g. `2 minutes` — runs collection every 2 minutes; takes precedence over `DROPSHIP_PAYMENT_CRON` when set |
 | **HTTP retries** | | |
 | `HTTP_RETRY_ATTEMPTS` | `4` | Per-request retry cap (QBO + NMI) |
 | `HTTP_RETRY_BASE_MS` | `500` | Base backoff |
@@ -2205,7 +3322,7 @@ All in MongoDB, single database from `MONGODB_URI`.
 | `qbo_tokens` | `models/qboToken.server.js` | One row per realm — current access + refresh token |
 | `customer_maps` | `models/customerMap.server.js` | Shopify email ↔ QBO customer ↔ NMI vault; carries `paymentMethod` preference |
 | `shopify_orders` | `models/order.server.js` | Local mirror of every received Shopify order |
-| `invoices` | `models/invoice.server.js` | Local invoice mirror + sync state; carries `paymentMethod` (active, mutable), `customerPaymentPreference` (immutable order-time snapshot), `paymentSettledVia` + `paymentSettledAt` (recorded on each successful payment), `qboDueDate`, `manualPayments[]` ledger, `remarks[]` ledger (append-only CRON + admin follow-up entries — `kind` ∈ `cron_card_attempt` / `cron_cheque_reminder` / `cron_failed_followup` / `admin_action` / `system_note`; powers the Order List **Remarks** column), and the auto-charge pause control (`autoChargePaused` Boolean + `autoChargePausedAt` / `autoChargePausedBy` / `autoChargePauseNote` / `autoChargeResumeAt` / `autoChargeResumedBy` — §9.2.1) |
+| `invoices` | `models/invoice.server.js` | Local invoice mirror + sync state; carries `paymentMethod` (active, mutable), `customerPaymentPreference` (immutable order-time snapshot), `paymentSettledVia` + `paymentSettledAt` (recorded on each successful payment), `qboDueDate`, `manualPayments[]` ledger, `remarks[]` ledger (append-only CRON + admin follow-up entries — `kind` ∈ `cron_card_attempt` / `cron_cheque_reminder` / `cron_failed_followup` / `admin_action` / `system_note`; powers the Order List **Remarks** column), and the auto-charge pause control (`autoChargePaused` Boolean + `autoChargePausedAt` / `autoChargePausedBy` / `autoChargePauseNote` / `autoChargeResumeAt` / `autoChargeResumedBy` — §9.2.1), and the email-reminder pause control (`reminderPaused` Boolean + `reminderPausedAt` / `reminderPausedBy` / `reminderPauseNote` / `reminderResumeAt` / `reminderResumedBy` — §10.5) |
 | `payment_attempts` | `models/paymentAttempt.server.js` | Append-only charge ledger (NMI + manual cheque receipts as `outcome: 'manual_paid'`) |
 | `wholesale_applications` | `models/wholesaleApplication.server.js` | Wholesale signups (pre-existing) |
 
@@ -2271,7 +3388,7 @@ POST /v3/company/{realmId}/invoice?minorversion=73
               "SalesItemLineDetail": { "ItemRef": { "value": "1" },
                                        "Qty": 4, "UnitPrice": 5.79 } } ],
   "DocNumber": "1021", "CustomerMemo": { "value": "Shopify order #1021" },
-  "DueDate": "2026-06-05", "ShipDate": "2026-05-21",
+  "DueDate": "2026-06-05",
   "ShipAddr": { "Line1": "123 Main St", "City": "Austin",
                 "CountrySubDivisionCode": "TX", "PostalCode": "78701",
                 "Country": "US" } }
@@ -2370,7 +3487,7 @@ when no real card is available. Production env scrubs them.
 
 Get an initial refresh token from Intuit's OAuth Playground
 (https://developer.intuit.com/app/developer/playground) using the
-sandbox company. Paste it into `QBO_REFRESH_TOKEN`. The first call
+sandbox company. Paste it into `QBO_WHOLESALE_REFRESH_TOKEN`. The first call
 exchanges it for an access token; subsequent calls use the persisted
 token in `qbo_tokens`.
 
@@ -2441,7 +3558,7 @@ Failed".
 
 `QBO token refresh failed: invalid_grant` from
 `refreshAccessToken`. Re-fetch a fresh refresh token from the Intuit
-OAuth Playground and replace `QBO_REFRESH_TOKEN` in env. The next call
+OAuth Playground and replace `QBO_WHOLESALE_REFRESH_TOKEN` in env. The next call
 will reseed `qbo_tokens`.
 
 ### 22.4 Boot reports `[boot] index MISSING — Invoice unique (shop, shopifyOrderId)`
@@ -2551,7 +3668,7 @@ cp .env.example .env   # fill in QBO + NMI credentials
 Required env values for first boot:
 - `MONGODB_URI`
 - Shopify credentials (`SHOPIFY_API_KEY`, etc — managed by Shopify CLI)
-- `QBO_CLIENT_ID`, `QBO_CLIENT_SECRET`, `QBO_REALM_ID`, `QBO_REFRESH_TOKEN`
+- `QBO_CLIENT_ID`, `QBO_CLIENT_SECRET`, `QBO_WHOLESALE_REALM_ID`, `QBO_WHOLESALE_REFRESH_TOKEN`
 - `NMI_SECURITY_KEY`
 
 ```bash
@@ -2573,8 +3690,8 @@ the embedded admin once to trigger registration. Outcome is logged.
 ### 23.3 Production deployment checklist
 
 - [ ] `NMI_ENVIRONMENT=production` and `NMI_SECURITY_KEY` is the production key
-- [ ] `QBO_ENVIRONMENT=production` and `QBO_REALM_ID` is the production realm
-- [ ] `QBO_REFRESH_TOKEN` is set from a production OAuth Playground exchange
+- [ ] `QBO_ENVIRONMENT=production` and `QBO_WHOLESALE_REALM_ID` is the production realm
+- [ ] `QBO_WHOLESALE_REFRESH_TOKEN` is set from a production OAuth Playground exchange
 - [ ] `NMI_TEST_CCNUMBER`, `NMI_TEST_CCEXP`, `NMI_TEST_CVV` are **unset** (boot logs confirm scrubbing if accidentally set)
 - [ ] `PAYMENT_CHARGE_IMMEDIATELY=false`
 - [ ] `PAYMENT_RETRY_INTERVAL=` (empty) — cron takes over
@@ -2626,3 +3743,156 @@ the embedded admin once to trigger registration. Outcome is logged.
 - **Backfill job** — replay the Shopify orders/list for a date range
   into the local pipeline. Useful when subscribing to `orders/create`
   for the first time after operating without webhooks.
+
+## 25. Practitioner Portal (CDO referral dashboard) — MOVED to ns-retail
+
+> **Moved out of this app on 2026-06-08.** The Practitioner Portal is a
+> CDO-program feature, and the sibling **`ns-retail`** app owns and writes the
+> `cdo_*` collections it reads. The entire feature — the Customer Account UI
+> extension AND its `/api/portal/*` backend + `cdo.portal.service.js` — now
+> lives in `ns-retail`, reading the real cdo models there instead of the
+> read-only mirrors this app used to carry. **Canonical spec: `ns-retail/docs/payout.md §18`.**
+> The section below is retained for historical context only; the code it
+> describes no longer exists in the wholesale workspace.
+
+A storefront self-service dashboard for **CDO practitioners** (approved
+wholesale customers who hold a referral code). It is a **read-only view**
+over data that the sibling **`ns-retail`** app writes — the wholesale app
+never generates commissions or payouts; it only surfaces them. Delivered
+as Phase 1 (foundation) on 2026-06-08.
+
+### 25.1 The CDO data model (shared MongoDB collections)
+
+`ns-retail` owns and writes these collections in the same database
+(`MONGODB_URI`). The wholesale app reads them through `strict:false`
+mirror models that are explicitly flagged read-only (same convention as
+the pre-existing `cdo_practitioner_codes` mirror — see `cdoPractitionerCode.server.js`).
+
+| Collection | Mirror model | Holds | Key fields used here |
+|---|---|---|---|
+| `cdo_practitioner_codes` | `cdoPractitionerCode.server.js` (pre-existing) | Referral codes | `practitionerId`, `code`, `discountPercent`, `commissionRate`, `status`, `isPrimary` |
+| `cdo_orders` | `cdoOrder.server.js` | Attributed retail orders | `practitionerId`, `referralCode`, `customerEmail`, `pricing.total` / `amount`, `commissionAmount`, `placedAt`, `lineItems[]` |
+| `cdo_commissions` | `cdoCommission.server.js` | Per-order commission | `practitionerId`, `orderName`, `amount`, `rate`, `status` (`pending`/`paid`), `payoutStatus` (`paid`/`failed`/`paused`), `earnedAt` |
+| `cdo_payouts` | `cdoPayout.server.js` | Payout records | `practitionerId`, `amount`, `method`, `status`, `reference`, `qboBillId`, `paidAt` |
+| `cdo_referrals` | `cdoReferral.server.js` | Referred patients | `practitionerId`, `referredEmail`, `referredName`, `referralCode`, `status`, `referredAt`, `convertedAt` |
+| `cdo_applications` | `cdoApplication.server.js` | Patient applications | `applicantType`, `referral{}`, `customerId`, `email`, `submittedAt` |
+
+> **Maintenance rule:** these collections are owned by `ns-retail`. If its
+> schema changes, the mirrors here only need updating when the portal
+> starts depending on a new field — `strict:false` keeps reads working
+> regardless. Never write to these collections from the wholesale app.
+
+### 25.2 The tenant key (how identity resolves)
+
+The single linkage that makes the whole portal work and stay isolated:
+
+```
+wholesale_applications._id   ===   practitionerId (across every cdo_* collection)
+wholesale_applications.customerId   ===   gid://shopify/Customer/<id>
+```
+
+So a logged-in customer is mapped to their CDO data as:
+
+```
+Customer-account UI extension calls shopify.sessionToken.get() → signed JWT
+  → fetch(`${api_base_url}/api/portal/*`, { Authorization: Bearer <jwt> })
+  → authenticate.public.customerAccount(request)  // verifies JWT sig/aud/exp → { sessionToken, cors }
+  → sessionToken.sub  ===  gid://shopify/Customer/<id>   (present iff logged in + protected-data access)
+  → WholesaleApplication.findOne({ customerId: sessionToken.sub, status: 'approved' })
+  → practitionerId = String(application._id)
+  → every cdo_* query is scoped { practitionerId }
+```
+
+The mapping lives in
+`services/cdo/cdo.portal.service.js#resolvePractitionerByCustomerGid` (the
+guard performs the JWT verification, then passes `sessionToken.sub`).
+
+### 25.3 Security model (core requirement)
+
+- **Identity is never trusted from the client.** `practitionerId` is
+  re-derived server-side on *every* request from the Shopify-signed
+  session-token `sub` claim (verified by `authenticate.public.customerAccount`,
+  built into `@shopify/shopify-app-react-router`). No `practitionerId`/`email`
+  from the query or body is ever used for scoping.
+- Auth outcomes the extension branches on:
+  - **401** (no/invalid/expired token, or `sub` claim absent because the
+    buyer isn't logged in / protected-data access not granted) → extension
+    shows a "sign in required" notice.
+  - **403** (logged in, but not an approved `WholesaleApplication`) →
+    extension shows an "access restricted" notice.
+- All endpoints are GET/read-only and share the `app/api/portal/_guard.js`
+  `portalLoader` wrapper (DB connect → `authenticate.public.customerAccount`
+  → resolve `sub` → error-map → handler → `cors(res)`).
+- **CORS:** the extension runs in a null-origin Web Worker and sends an
+  `Authorization` header, so its `fetch` is "non-simple" → the browser issues
+  an `OPTIONS` preflight (carrying no auth). Each portal route's `action`
+  (`portalAction`) answers the preflight with a 204 + CORS headers; success
+  responses are wrapped by the library `cors` helper, error responses carry
+  `sendResponse`'s wildcard `Access-Control-Allow-Origin: *`.
+- **Prerequisites:** Shopify *new customer accounts* + *protected customer
+  data access* (the `sub` claim is only present when the app may read
+  customer data).
+
+### 25.4 Endpoints (called by the extension at `${api_base_url}/api/portal/*`)
+
+Thin handlers in `app/api/portal/*`, registered in `app/routes.js`. All
+business logic is in `services/cdo/cdo.portal.service.js`.
+
+| Endpoint | Service fn | Returns |
+|---|---|---|
+| `GET /me` | `getProfile` | practitioner name/email/primary code (bootstrap) |
+| `GET /summary` | `getSummary` | summary cards (patients, revenue, commission buckets, active codes) |
+| `GET /revenue?from&to` | `getRevenue` | revenue: this month / last month / current year / lifetime + optional range |
+| `GET /customers?search&page&pageSize` | `getReferredCustomers` | referred patients + per-customer total orders & LTV (joins `cdo_orders` by email) |
+| `GET /commissions?status&from&to&page&pendingOnly` | `getCommissions` | commission list + totals; `pendingOnly=1` → earned-but-unpaid view |
+| `GET /payouts?status&from&to&page` | `getPayouts` | payout history |
+| `GET /referrals` | `getReferralCodes` | codes + per-code usage (referrals/orders/revenue/commission) |
+| `GET /discounts` | `getDiscounts` | discounts derived from codes (type/value/status/usage) |
+
+Commission buckets: **paid** = `payoutStatus==='paid'`; **pending** =
+`status==='pending'`; **awaiting payout** = `status==='paid' &&
+payoutStatus!=='paid'`; **failed** = `payoutStatus==='failed'`. Per-code
+commission is summed from `cdo_orders.commissionAmount` (commissions link
+to orders, not codes). Money values are rounded to 2 dp server-side
+(`round2`) to strip float noise.
+
+### 25.5 Frontend (Customer Account UI extension, full-page)
+
+`extensions/practitioner-portal-account/` is a Customer Account UI
+extension (`type = "ui_extension"`, api_version `2025-10`), built and
+deployed by the Shopify CLI (`shopify app dev` / `deploy`) — there is no
+separate Vite step.
+
+- **`shopify.extension.toml`**: single `[[extensions.targeting]]` →
+  `target = "customer-account.page.render"`, `module =
+  "./src/PractitionerPortal.jsx"`; `[extensions.capabilities] network_access
+  = true`; one `[extensions.settings]` field `api_base_url` (the app backend
+  base URL, set per environment in the customer-account editor; read at
+  runtime via `shopify.settings.value.api_base_url`).
+- **Runtime/UI**: Preact (`@shopify/ui-extensions/preact`, `render(<App/>,
+  document.body)`) + **Polaris web components** (`s-page`, `s-section`,
+  `s-grid`, `s-stack`, `s-text`, `s-heading`, `s-badge`, `s-button`,
+  `s-banner`, `s-spinner`, `s-text-field`, `s-select`, `s-divider`). The
+  sandbox forbids arbitrary HTML/CSS, so **tables are built from `s-grid`**
+  (`src/ui.jsx#Table`) and the UI inherits the merchant's branding.
+- **Files**: `src/PractitionerPortal.jsx` (entry + auth bootstrap via
+  `/api/portal/me` + local-state tab nav: overview / patients / commissions /
+  pending / payouts / referrals / discounts), `src/api.js` (fetch wrapper —
+  reads `api_base_url`, attaches a fresh `shopify.sessionToken.get()` Bearer
+  per call, parses the `{status,message,result}` envelope), `src/sections.jsx`
+  (the seven sections), `src/ui.jsx` (`useResource` hook, `Table`, `StatCards`,
+  `StatusBadge`, `Pagination`), `src/format.js` (Intl formatters).
+- **Merchant step**: add the page to the customer-account navigation menu and
+  set `api_base_url` (full-page targets allow direct linking by default).
+
+### 25.6 Out of scope / limitations (later phases)
+
+- **CSV export is not available on this surface.** The extension runs in a
+  sandboxed Web Worker with no DOM/Blob, so a client-side download is
+  impossible (and a plain `<link>` can't carry the Bearer token). A later
+  phase can add a server endpoint emitting CSV behind a short-lived signed
+  URL. (The removed storefront theme-block portal had client-side CSV.)
+- Commission / payout **generation** — owned by `ns-retail`.
+- Live **Shopify Discount API** objects — Phase 1 derives the Discounts
+  section from practitioner codes (`discountPercent`, status, usage).
+- Charts / graphs — Phase 1 is cards + tables only.

@@ -1,5 +1,10 @@
-const STEPS = ["About you", "Address & tax", "Payment"];
-const TIME_ESTIMATES = ["About 4 minutes", "About 2 minutes", "About 1 minute"];
+const STEPS = ["About you", "Address & tax", "Payment", "W-9 form"];
+const TIME_ESTIMATES = [
+  "About 4 minutes",
+  "About 2 minutes",
+  "About 1 minute",
+  "About 1 minute",
+];
 
 export default function StepIndicator({ currentStep, onStepClick }) {
   return (

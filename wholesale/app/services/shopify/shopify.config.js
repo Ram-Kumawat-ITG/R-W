@@ -5,8 +5,10 @@
 
 import { readEnv } from '../../utils/env.utils'
 
+const appUrl = readEnv('SHOPIFY_APP_URL', { fallback: '' })
+
 export const shopifyConfig = {
-  appUrl: readEnv('SHOPIFY_APP_URL', { fallback: '' }),
+  appUrl,
   // Used to build the registration form's storefront-proxy URL.
   appProxy: readEnv('SHOPIFY_APP_PROXY', { fallback: 'wholesale-application' }),
 }

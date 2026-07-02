@@ -5,6 +5,9 @@ import { fullSchema } from "./schema/full.schema";
 import { step1Fields } from "./schema/step1.schema";
 import { step2Fields } from "./schema/step2.schema";
 import { step3Fields } from "./schema/step3.schema";
+// step4Fields exists in ./schema/step4.schema but isn't triggered separately —
+// Step 4 only has a Submit button (no Continue), so full-schema validation via
+// yupResolver covers w9.* on submit.
 import { buildFormData } from "./utils/buildFormData";
 import ApiService from "./services/ApiService";
 import { useStepValidation } from "./hooks/useStepValidation";
@@ -12,6 +15,7 @@ import StepIndicator from "./components/StepIndicator";
 import Step1AboutYou from "./components/Step1AboutYou";
 import Step2AddressTax from "./components/Step2AddressTax";
 import Step3Payment from "./components/Step3Payment";
+import Step4W9 from "./components/Step4W9";
 import { CREDENTIALS, REFERRALS } from "./constants";
 import "./styles/variables.css";
 import "./styles/registration-form.css";
@@ -73,7 +77,49 @@ const defaultValues = {
     achAccountNumber: "",
     achAccountType: "",
   },
+  // Commission payout — ALWAYS required for every practitioner. The
+  // `enabled` field stays in the data model for back-compat with older
+  // docs and future opt-out flows, but defaults to true here.
+  //
+  // `payoutMethod` defaults to 'ach' so existing bank-flow registrations
+  // need zero behaviour change. Check fields default to empty + the
+  // "Use shipping address" toggle defaults to true (most common case).
+  commission: {
+    enabled: true,
+    payoutMethod: "ach",
+    useSamePaymentAccount: false,
+    bankAccountName: "",
+    bankRoutingNumber: "",
+    bankAccountNumber: "",
+    bankAccountType: "",
+    check: {
+      payableTo: "",
+      useBillingAddress: true,
+      mailingAddress: {
+        line1: "",
+        line2: "",
+        city: "",
+        state: "",
+        zip: "",
+        country: "",
+      },
+    },
+  },
   signature: { drawn: null },
+  // Step 4 — W-9 form. legalName auto-fills from firstName + lastName on
+  // mount (see Step4W9.jsx). Tax classification is required; sub-fields
+  // (llcClassification / otherClassification) gate on selection. There is
+  // NO separate W-9 signature field here — the Step 3 signature serves
+  // dual purpose (terms + W-9 cert). Backend copies it into w9.signature
+  // at save time for audit clarity.
+  w9: {
+    legalName: "",
+    taxClassification: "",
+    llcClassification: "",
+    otherClassification: "",
+    exemptPayeeCode: "",
+    fatcaCode: "",
+  },
   subscribeNews: false,
   termsAccepted: false,
 };
@@ -214,7 +260,12 @@ function FormBody({ onBack }) {
   };
 
   const next = async () => {
-    const fields = currentStep === 1 ? step1Fields : step2Fields;
+    const fieldsByStep = {
+      1: step1Fields,
+      2: step2Fields,
+      3: step3Fields,
+    };
+    const fields = fieldsByStep[currentStep] || step1Fields;
     const ok = await validateStep(fields);
     if (!ok) {
       console.warn(
@@ -227,7 +278,7 @@ function FormBody({ onBack }) {
     setToast(null);
     setErrorBanner(null);
     clearErrors();
-    setCurrentStep((s) => Math.min(s + 1, 3));
+    setCurrentStep((s) => Math.min(s + 1, 4));
     if (typeof window !== "undefined")
       window.scrollTo({ top: 0, behavior: "smooth" });
   };
@@ -288,15 +339,75 @@ function FormBody({ onBack }) {
         cardPayload.achAccountType = values.payment.achAccountType;
       }
 
-      const payload = { ...values, payment: cardPayload };
+      // Commission payout — ALWAYS included (required for every practitioner).
+      // Branch on payoutMethod so we only forward fields for the selected
+      // method. The server also wipes the unused branch defensively, but
+      // sending a clean payload makes the wire shape match what was filled.
+      //
+      // useSamePaymentAccount is a UI-only flag (already used to mirror
+      // payment ACH values into the commission fields client-side) and
+      // isn't persisted on its own.
+      const payoutMethod =
+        values.commission.payoutMethod === "check" ? "check" : "ach";
+      const commissionPayload =
+        payoutMethod === "ach"
+          ? {
+              enabled: true,
+              payoutMethod: "ach",
+              bankAccountName: values.commission.bankAccountName,
+              bankRoutingNumber: values.commission.bankRoutingNumber,
+              bankAccountNumber: values.commission.bankAccountNumber,
+              bankAccountLast4: (
+                values.commission.bankAccountNumber || ""
+              ).slice(-4),
+              bankAccountType: values.commission.bankAccountType,
+              sourcedFromPaymentAch: Boolean(
+                values.commission.useSamePaymentAccount &&
+                  values.payment.method === "ach",
+              ),
+            }
+          : {
+              enabled: true,
+              payoutMethod: "check",
+              check: {
+                payableTo: values.commission.check?.payableTo || "",
+                useBillingAddress: Boolean(
+                  values.commission.check?.useBillingAddress,
+                ),
+                mailingAddress: values.commission.check?.useBillingAddress
+                  ? null // server fills from billingAddress
+                  : { ...(values.commission.check?.mailingAddress || {}) },
+              },
+            };
 
-      // Signature handled separately so we can attach the PNG as a File
+      // W-9 payload — data fields only. No signature here: the Step 3
+      // signature serves dual purpose (terms + W-9 cert). Backend mirrors
+      // the uploaded signature URL into w9.signature at save time.
+      const w9Payload = {
+        legalName: values.w9?.legalName || "",
+        taxClassification: values.w9?.taxClassification || "",
+        llcClassification: values.w9?.llcClassification || "",
+        otherClassification: values.w9?.otherClassification || "",
+        exemptPayeeCode: values.w9?.exemptPayeeCode || "",
+        fatcaCode: values.w9?.fatcaCode || "",
+      };
+
+      const payload = {
+        ...values,
+        payment: cardPayload,
+        commission: commissionPayload,
+        w9: w9Payload,
+      };
+
+      // ONE signature uploaded — Step 3. The backend duplicates it into
+      // w9.signature server-side so the W-9 sub-doc still has an
+      // auditable signature reference without asking the user to sign twice.
       const fd = buildFormData({ ...payload, signature: undefined });
       if (values.signature?.drawn) {
         fd.append("signatureFile", values.signature.drawn, "signature.png");
       }
 
-      const data = await ApiService.submitRegistration(fd);
+      await ApiService.submitRegistration(fd);
       setSuccessView(true);
     } catch (err) {
       const fieldErrors = err?.responseData?.result?.fieldErrors;
@@ -401,6 +512,12 @@ function FormBody({ onBack }) {
                 clearErrors={clearErrors}
               />
             )}
+            {/*
+              Step 3 stays MOUNTED across steps 3 + 4 (hidden via inline style
+              when not active) so the Collect.js card iframe doesn't tear
+              down and lose its tokenization context. Step 4 is rendered
+              normally — it has no third-party iframe to preserve.
+            */}
             <div
               style={
                 currentStep !== 3
@@ -422,6 +539,16 @@ function FormBody({ onBack }) {
                 collectTokenResolverRef={collectTokenResolverRef}
               />
             </div>
+            {currentStep === 4 && (
+              <Step4W9
+                control={control}
+                errors={errors}
+                setValue={setValue}
+                isSubmitted={isSubmitted}
+                onEditStep1={() => setCurrentStep(1)}
+                onEditStep2={() => setCurrentStep(2)}
+              />
+            )}
 
             <div className="rf-actions">
               {currentStep === 1 ? (
@@ -439,7 +566,7 @@ function FormBody({ onBack }) {
                   Back
                 </button>
               )}
-              {currentStep < 3 ? (
+              {currentStep < 4 ? (
                 <button
                   type="button"
                   className="rf-btn rf-btn-primary"

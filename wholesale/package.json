@@ -4,8 +4,11 @@
   "scripts": {
     "build": "react-router build",
     "build:theme": "npm --prefix registration-form run build",
-    "predeploy": "npm run build:theme",
+    "sync:extension-app-url": "node scripts/sync-extension-app-url.js",
+    "predeploy": "npm run sync:extension-app-url && npm run build:theme",
+    "predev": "npm run sync:extension-app-url",
     "dev": "shopify app dev",
+    "dev:local": "shopify app dev --config localhost --use-localhost",
     "config:link": "shopify app config link",
     "generate": "shopify app generate",
     "deploy": "shopify app deploy",

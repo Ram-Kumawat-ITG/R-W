@@ -2,10 +2,9 @@ import { Outlet, useLoaderData, useNavigate } from "react-router";
 import { authenticate } from "../shopify.server";
 import {
   getPractitionerProfile,
+  getPractitionerHold,
   createPractitionerCode,
-  updatePractitionerCode,
-  deletePractitionerCode,
-  setPrimaryPractitionerCode,
+  setPractitionerCodeStatus,
 } from "../services/cdo/cdo.service";
 import CustomerTabs from "../components/cdo/CustomerTabs";
 import StatusBadge from "../components/cdo/StatusBadge";
@@ -18,10 +17,12 @@ import { formatDateTime } from "../utils/format";
 //     the sub-tab bar.
 //   - Child routes (_index, commissions, downline, network, sales,
 //     payments, transactions, settings) render into the <Outlet />.
-//   - This file owns the `action` IMPLEMENTATION for referral-code CRUD
-//     used by the Details tab — co-located here so a single form
-//     submission can dispatch to any of the create / update / delete /
-//     set-primary code operations via an `_action` field.
+//   - This file owns the `action` IMPLEMENTATION for referral-code
+//     pause/resume used by the Details tab — co-located here so the form
+//     submission can dispatch the `set-code-status` operation via an
+//     `_action` field. (Code create / edit / delete / set-primary were
+//     removed from this page — codes are created by practitioners in the
+//     Practitioner Portal; this page is pause/resume oversight only.)
 //
 // NOTE on routing: React Router runs a submission's action on the LEAF
 // matched route. For the URL `/app/cdo-program/customers/:id` the leaf is
@@ -41,7 +42,8 @@ export const loader = async ({ request, params }) => {
   if (!profile) {
     throw new Response("Practitioner not found", { status: 404 });
   }
-  return { profile };
+  const hold = await getPractitionerHold(params.id);
+  return { profile, hold };
 };
 
 export const action = async ({ request, params }) => {
@@ -54,15 +56,19 @@ export const action = async ({ request, params }) => {
 
   try {
     switch (op) {
+      // Create a referral code (admin). Discount % is OPTIONAL (blank → 0% /
+      // attribution-only; a discount also creates the backing Shopify discount
+      // on this retail store). NO commission field — commission is configured
+      // per product vendor (Settings → Commission Configuration), so codes are
+      // always created without a practitioner-level commission rate (inherits
+      // null; vendor config drives the amount).
       case "create-code": {
         const created = await createPractitionerCode({
           practitionerId: params.id,
           code: formData.get("code"),
           discountPercent: parseFractionField(formData.get("discountPercent")),
-          commissionRate: parseFractionField(formData.get("commissionRate")),
-          isPrimary: formData.get("isPrimary") === "true",
-          note: formData.get("note"),
           actor,
+          shop: session?.shop,
         });
         return {
           status: "success",
@@ -70,49 +76,28 @@ export const action = async ({ request, params }) => {
           message: `Code ${created.code} created`,
         };
       }
-      case "update-code": {
-        const updates = {
+      // Pause / resume — flips the DB status AND deactivates/reactivates the
+      // backing Shopify discount (cdo.service delegates to cdo.discount.service),
+      // so a paused code genuinely stops applying on the storefront. Referral
+      // tracking + earned commissions are untouched (immutable history).
+      case "set-code-status": {
+        const status = String(formData.get("status") || "").trim();
+        const updated = await setPractitionerCodeStatus({
           practitionerId: params.id,
           codeId: formData.get("codeId"),
+          status,
           actor,
-        };
-        // Only forward fields the form actually carried so we don't
-        // accidentally null a field the admin didn't touch.
-        if (formData.has("code")) updates.code = formData.get("code");
-        if (formData.has("discountPercent"))
-          updates.discountPercent = parseFractionField(formData.get("discountPercent"));
-        if (formData.has("commissionRate"))
-          updates.commissionRate = parseFractionField(formData.get("commissionRate"));
-        if (formData.has("status")) updates.status = formData.get("status");
-        if (formData.has("note")) updates.note = formData.get("note");
-        const updated = await updatePractitionerCode(updates);
-        return {
-          status: "success",
-          op,
-          message: `Code ${updated.code} updated`,
-        };
-      }
-      case "delete-code": {
-        await deletePractitionerCode({
-          practitionerId: params.id,
-          codeId: formData.get("codeId"),
+          // The backing Shopify discount lives on THIS (retail) store — pass
+          // the logged-in shop so the toggle targets the right Admin API.
+          shop: session?.shop,
         });
         return {
           status: "success",
           op,
-          message: "Referral code deleted",
-        };
-      }
-      case "set-primary-code": {
-        const primary = await setPrimaryPractitionerCode({
-          practitionerId: params.id,
-          codeId: formData.get("codeId"),
-          actor,
-        });
-        return {
-          status: "success",
-          op,
-          message: `Primary code set to ${primary.code}`,
+          message:
+            status === "paused"
+              ? `Code ${updated.code} paused`
+              : `Code ${updated.code} resumed`,
         };
       }
       default:
@@ -132,21 +117,22 @@ export const action = async ({ request, params }) => {
   }
 };
 
-// The form fields surface percentage VALUES (e.g. "10" for 10%).
-// `cdo_practitioner_codes` stores fractions (0.10). Convert here so
-// service-layer normalisers only deal with one representation.
+// The Discount % / Commission % form fields surface percentage VALUES (e.g.
+// "20" for 20%); `cdo_practitioner_codes` stores fractions (0.20). Convert
+// here so the service-layer normalisers only deal with one representation.
+// Blank → null (optional: blank discount → 0%, blank commission → inherit).
 function parseFractionField(raw) {
   if (raw == null || raw === "") return null;
   const n = Number(raw);
   if (!Number.isFinite(n)) return null;
   // Heuristic: values > 1 are interpreted as percentages, ≤ 1 as
   // pre-converted fractions. Keeps the API forgiving — admins typing
-  // "0.1" or "10" both land at 0.10.
+  // "0.2" or "20" both land at 0.20.
   return n > 1 ? n / 100 : n;
 }
 
 export default function CdoCustomerDetailLayout() {
-  const { profile } = useLoaderData();
+  const { profile, hold } = useLoaderData();
   const navigate = useNavigate();
 
   const initials =
@@ -154,9 +140,12 @@ export default function CdoCustomerDetailLayout() {
     profile.email?.[0]?.toUpperCase() ||
     "?";
 
+  // Show just the numeric portion of the Shopify GID (strip gid://shopify/Customer/)
+  const shortId = profile.customerId ? profile.customerId.split("/").pop() : null;
+
   return (
     <>
-      <s-box paddingBlockEnd="base">
+      <s-box paddingBlockEnd="small-200">
         <s-button
           variant="tertiary"
           icon="arrow-left"
@@ -166,43 +155,76 @@ export default function CdoCustomerDetailLayout() {
         </s-button>
       </s-box>
 
-      <s-section padding="none">
-        <s-box padding="base">
-          <s-stack direction="block" gap="base">
-            <s-stack direction="inline" gap="base" alignItems="center">
-              <s-avatar initials={initials} size="large" />
-              <s-stack direction="block" gap="none">
-                <s-heading>
-                  {profile.name || profile.email || "Practitioner"}
-                </s-heading>
-                {profile.email && (
-                  <s-text tone="subdued">{profile.email}</s-text>
-                )}
-                <s-stack direction="inline" gap="small-200" alignItems="center">
-                  <StatusBadge status={profile.status} />
-                  {profile.businessName && (
-                    <s-text tone="subdued">· {profile.businessName}</s-text>
-                  )}
-                  {profile.customerId && (
-                    <s-text tone="subdued">· ID {profile.customerId}</s-text>
-                  )}
-                </s-stack>
-                {profile.submittedAt && (
-                  <s-text tone="subdued">
-                    Registered {formatDateTime(profile.submittedAt)}
-                    {profile.country ? ` · From ${profile.country}` : ""}
-                  </s-text>
-                )}
-              </s-stack>
-            </s-stack>
-          </s-stack>
-        </s-box>
-      </s-section>
+      {/* Practitioner hero card */}
+      <div style={{
+        background: "#fff",
+        border: "1px solid #e1e3e5",
+        borderRadius: "8px",
+        overflow: "hidden",
+        marginBottom: "20px",
+      }}>
+        {/* Teal accent strip */}
+        <div style={{ height: "4px", background: "linear-gradient(90deg, #00a47c 0%, #007c59 100%)" }} />
 
-      <s-box paddingBlockStart="base">
-        <CustomerTabs practitionerId={profile.id} />
-      </s-box>
+        <div style={{ padding: "20px 24px", display: "flex", alignItems: "flex-start", gap: "16px" }}>
+          <s-avatar initials={initials} size="large" />
 
+          <div style={{ flex: 1, minWidth: 0 }}>
+            {/* Name + status badges */}
+            <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "8px", marginBottom: "4px" }}>
+              <span style={{ fontSize: "20px", fontWeight: "600", color: "#303030", lineHeight: "1.3" }}>
+                {profile.name || profile.email || "Practitioner"}
+              </span>
+              <StatusBadge status={profile.status} />
+              <s-badge tone={hold?.paused ? "warning" : "success"}>
+                {hold?.paused ? "Payouts paused" : "Payouts active"}
+              </s-badge>
+            </div>
+
+            {/* Email */}
+            {profile.email && (
+              <div style={{ fontSize: "14px", color: "#6d7175", marginBottom: "10px" }}>
+                {profile.email}
+              </div>
+            )}
+
+            {/* Compact metadata row */}
+            <div style={{ display: "flex", flexWrap: "wrap", rowGap: "4px", columnGap: "20px", fontSize: "13px", color: "#8c9196" }}>
+              {profile.businessName && <span>{profile.businessName}</span>}
+              {shortId && <span>Customer #{shortId}</span>}
+              {profile.submittedAt && (
+                <span>Registered {formatDateTime(profile.submittedAt)}</span>
+              )}
+              {profile.country && <span>From {profile.country}</span>}
+            </div>
+          </div>
+        </div>
+
+        {/* Paused payouts warning strip */}
+        {hold?.paused && (
+          <div style={{
+            background: "#fff3cd",
+            borderTop: "1px solid #f5e197",
+            padding: "10px 24px",
+            fontSize: "13px",
+            color: "#856404",
+            display: "flex",
+            alignItems: "flex-start",
+            gap: "8px",
+          }}>
+            <span style={{ flexShrink: 0 }}>⚠</span>
+            <span>
+              Commission payouts paused
+              {hold.pausedBy ? ` by ${hold.pausedBy}` : ""}
+              {hold.pausedAt ? ` on ${formatDateTime(hold.pausedAt)}` : ""}
+              {hold.note ? ` — ${hold.note}` : ""}.{" "}
+              Commissions still accrue; manage on the Settings tab.
+            </span>
+          </div>
+        )}
+      </div>
+
+      <CustomerTabs practitionerId={profile.id} />
       <Outlet />
     </>
   );

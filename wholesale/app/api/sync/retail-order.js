@@ -1,7 +1,7 @@
 import connectDB from '../../services/APIService/mongo.service'
 import { sendResponse } from '../../services/APIService/api.service'
 import { syncConfig, isSyncEnabled } from '../../services/sync/sync.config'
-import { deductWholesaleInventoryForOrder } from '../../services/sync/inventory.sync'
+import { processRetailOrderForDropShip } from '../../services/dropship/dropship.service'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('api.sync.retail_order')
@@ -69,9 +69,19 @@ export async function action({ request }) {
 
   // Fire-and-forget — return 200 immediately so the retail webhook doesn't
   // time out waiting for GraphQL + inventory adjustments to complete.
-  deductWholesaleInventoryForOrder(order, wholesaleShop)
-    .then(() => log.info('done', { orderId: order.id }))
-    .catch((err) => log.error('failed', { orderId: order.id, err }))
+  // DISABLED 2026-06-04 pending drop-ship rollout (would double-deduct).
+  // deductWholesaleInventoryForOrder(order, wholesaleShop)
+  //   .then(() => log.info('done', { orderId: order.id }))
+  //   .catch((err) => log.error('failed', { orderId: order.id, err }))
+
+  // Drop-ship orchestration (Phase A: foundation; Phase B will add the
+  // actual wholesale Draft Order creation). Fire-and-forget — the
+  // orchestrator self-handles errors and never throws upward.
+  const retailShop = url.searchParams.get('retail_shop') || null
+  processRetailOrderForDropShip({ order, wholesaleShop, retailShop }).catch(
+    (err) =>
+      log.error('dropship.unhandled', { orderId: order.id, err: err?.message || err }),
+  )
 
   return sendResponse(200, 'success', 'Received', { orderId: order.id })
 }

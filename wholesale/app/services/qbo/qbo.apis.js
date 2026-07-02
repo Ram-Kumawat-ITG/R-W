@@ -31,7 +31,7 @@ async function bootstrapTokenDocFromEnv() {
   // token, then immediately refresh to populate access token + new refresh.
   if (!qboConfig.bootstrapRefreshToken) {
     throw new PermanentError(
-      'QBO has no stored token and QBO_REFRESH_TOKEN is empty. ' +
+      'QBO has no stored token and QBO_WHOLESALE_REFRESH_TOKEN is empty. ' +
         'Seed an initial refresh token via the Intuit OAuth Playground.',
     )
   }

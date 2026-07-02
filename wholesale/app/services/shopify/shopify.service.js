@@ -29,6 +29,7 @@ import {
   QUERY_ALL_WEBHOOK_SUBSCRIPTIONS,
   QUERY_CUSTOMER_TAGS,
   QUERY_FILE_BY_ID,
+  QUERY_ORDER_FULFILLMENTS,
 } from "./shopify.queries";
 import {
   MUTATION_ORDER_MARK_AS_PAID,
@@ -46,7 +47,7 @@ import {
   executeGraphQL,
   executeMutation,
   shopifyRestPost,
-} from './shopify.apis'
+} from './shopify.apis.server'
 import { createLogger } from '../../utils/logger.utils'
 import { PermanentError, TransientError } from '../../utils/retry.utils'
 
@@ -427,6 +428,53 @@ export async function getCustomerTags({ shop, customerId }) {
   const tags = json?.data?.customer?.tags;
   if (!Array.isArray(tags)) return [];
   return tags;
+}
+
+// Live pull of an order's fulfillments + tracking from Shopify Admin
+// GraphQL. The fallback the Order Details loader uses so shipment tracking
+// renders even when the fulfillments/* webhooks were missed or never
+// subscribed (protected-topic approval gate), and for orders fulfilled
+// before the subscription existed (webhooks don't backfill).
+//
+// Accepts an `admin` client (request context) OR resolves an offline one
+// from `shop`. Returns a normalized shape:
+//   { displayFulfillmentStatus, fulfillments: [{ fulfillmentId,
+//     trackingNumber, trackingCompany, shopifyTrackingUrl, shipmentStatus,
+//     status, fulfilledAt, estimatedDeliveryAt }] }
+// — the same per-fulfillment shape order.service applies to the order doc.
+// Returns null when the order can't be read.
+export async function getOrderFulfillments({ admin, shop, shopifyOrderId }) {
+  if (!shopifyOrderId) throw new Error("getOrderFulfillments: shopifyOrderId is required");
+  let client = admin;
+  if (!client) {
+    if (!shop) throw new Error("getOrderFulfillments: shop or admin is required");
+    const res = await getUnauthenticatedAdmin(shop);
+    client = res.admin;
+  }
+  const gid = toOrderGid(shopifyOrderId);
+  const json = await executeGraphQL(client, QUERY_ORDER_FULFILLMENTS, { id: gid });
+  const order = json?.data?.order;
+  if (!order) return null;
+  const fulfillments = (order.fulfillments || []).map((f) => {
+    const t = (Array.isArray(f.trackingInfo) && f.trackingInfo[0]) || {};
+    return {
+      // Match the webhook's numeric fulfillment id (strip the gid prefix).
+      fulfillmentId: String(f.id || "").split("/").pop(),
+      trackingNumber: t.number || null,
+      trackingCompany: t.company || null,
+      shopifyTrackingUrl: t.url || null,
+      // displayStatus is the carrier-driven shipment status enum; lower-case
+      // it to match our SHIPMENT_STATUS_LABEL keys (in_transit, delivered…).
+      shipmentStatus: f.displayStatus ? String(f.displayStatus).toLowerCase() : null,
+      status: f.status ? String(f.status).toLowerCase() : null,
+      fulfilledAt: f.createdAt || null,
+      estimatedDeliveryAt: f.estimatedDeliveryAt || null,
+    };
+  });
+  return {
+    displayFulfillmentStatus: order.displayFulfillmentStatus || null,
+    fulfillments,
+  };
 }
 
 // Convenience predicate used by the order orchestrator's approval gate.

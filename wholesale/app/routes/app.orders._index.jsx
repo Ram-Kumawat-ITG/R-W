@@ -3,13 +3,15 @@ import {
   useLoaderData,
   useNavigate,
   useNavigation,
-  useSearchParams,
+  useRevalidator,
 } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import connectDB from "../services/APIService/mongo.service";
 import ShopifyOrder from "../models/order.server";
 import Invoice from "../models/invoice.server";
+import { RETAIL_CUSTOMER_EMAIL } from "../services/dropship/dropship.config";
+import { carrierDisplayName } from "../utils/shipping.constants";
 import { ProcessingBadge, PaymentMethodShortText } from "../components/admin-ui";
 import {
   formatAmount,
@@ -20,57 +22,174 @@ import { PAYMENT_METHOD_SHORT } from "../utils/payment.constants";
 
 const PAGE_SIZE = 15;
 
-// Filter chips. Two kinds:
-//   - processingStatus filters drive a ShopifyOrder.processingStatus query
-//   - invoice-side filters (overdue / pending_cheque / failed_payments)
-//     run against the Invoice collection first; matching invoice _ids
-//     then narrow the ShopifyOrder query via _id $in. The `scope` field
-//     tells the loader which path to take.
-const STATUS_FILTERS = [
-  { id: "all", label: "All", scope: "order" },
-  { id: "scheduled", label: "Scheduled", scope: "order" },
-  { id: "pending_approval", label: "Pending approval", scope: "order" },
-  { id: "failed", label: "Failed", scope: "order" },
-  { id: "completed", label: "Completed", scope: "order" },
-  { id: "cancelled", label: "Cancelled", scope: "order" },
-  { id: "rejected", label: "Rejected", scope: "order" },
-  { id: "overdue", label: "Overdue", scope: "invoice" },
-  { id: "pending_cheque", label: "Pending cheque", scope: "invoice" },
-  { id: "failed_payments", label: "Failed payments", scope: "invoice" },
+// ── Advanced filter model ─────────────────────────────────────────────
+//
+// The Orders list is driven by a full multi-field filter form (free-text +
+// dropdowns + date range + amount range) whose values all combine with AND.
+// Every control is backed by a URL search param of the same name, so a
+// filtered view is shareable / bookmarkable and survives a refresh.
+//
+// Filters span two collections:
+//   - order-scoped  (orderNumber / customer / status / date / amount) are
+//     queried directly on ShopifyOrder.
+//   - invoice-scoped (paymentStatus / method / flag) are resolved against the
+//     Invoice collection first; the matching invoice _ids then narrow the
+//     ShopifyOrder query via `invoiceRef $in`. All invoice-scoped clauses are
+//     AND-ed into ONE Invoice query (buildInvoiceQuery) so several can apply
+//     at once — the old single-select chip model could only ever express one.
+const FILTER_KEYS = [
+  "orderNumber",
+  "customer",
+  "status",
+  "paymentStatus",
+  "method",
+  "flag",
+  "amountMin",
+  "amountMax",
+  "dateFrom",
+  "dateTo",
 ];
-const INVOICE_FILTER_IDS = new Set(
-  STATUS_FILTERS.filter((f) => f.scope === "invoice").map((f) => f.id),
-);
 
-// Build the Invoice-side filter for the three invoice-scoped chips.
-// `now` is the cutoff for the overdue comparison. We prefer `dueAt`
-// (full datetime, set on new invoices via INVOICE_TERMS_MINUTES) and
-// fall back to `qboDueDate` (date-only YYYY-MM-DD, set on every
-// invoice for QBO) so legacy / pre-`dueAt` rows still get flagged.
-function buildInvoiceFilter(filterId, shop, now) {
-  if (filterId === "overdue") {
-    const todayYmd = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-    return {
-      shop,
+// Order processing-status options (ShopifyOrder.processingStatus). Only the
+// states a wholesale order can actually surface in are offered — admin_order
+// / dropship_invoiced live on the dedicated Admin Orders page and are
+// excluded from this list entirely.
+const ORDER_STATUS_OPTIONS = [
+  { value: "", label: "Any" },
+  { value: "pending_approval", label: "Pending approval" },
+  { value: "scheduled", label: "Scheduled" },
+  { value: "invoiced", label: "Invoiced" },
+  { value: "completed", label: "Completed" },
+  { value: "failed", label: "Failed" },
+  { value: "rejected", label: "Rejected" },
+  { value: "cancelled", label: "Cancelled" },
+];
+
+// Invoice payment-status options (Invoice.paymentStatus).
+const PAYMENT_STATUS_OPTIONS = [
+  { value: "", label: "Any" },
+  { value: "pending", label: "Pending" },
+  { value: "in_progress", label: "In progress" },
+  { value: "awaiting_settlement", label: "Awaiting settlement" },
+  { value: "partially_paid", label: "Partially paid" },
+  { value: "paid", label: "Paid" },
+  { value: "failed", label: "Failed" },
+  { value: "cancelled", label: "Cancelled" },
+];
+
+// Preferred-method options. Filters on the immutable order-time
+// `customerPaymentPreference` snapshot (falling back to `paymentMethod` for
+// legacy invoices) so the result reflects what the customer chose at order
+// time, not the mutable cheque→card override.
+const METHOD_OPTIONS = [
+  { value: "", label: "Any" },
+  { value: "card", label: "Card" },
+  { value: "ach", label: "ACH" },
+  { value: "check", label: "Cheque" },
+];
+
+// Quick invoice flags — composite predicates that don't map to a single
+// field. Carries over the old "Overdue / Pending cheque / Failed payments"
+// chips into the advanced form.
+const FLAG_OPTIONS = [
+  { value: "", label: "Any" },
+  { value: "overdue", label: "Overdue" },
+  { value: "pending_cheque", label: "Pending cheque / ACH" },
+  { value: "failed_payments", label: "Failed payments" },
+];
+
+// Sort controls.
+const SORT_OPTIONS = [
+  { value: "receivedAt", label: "Order date" },
+  { value: "totalAmount", label: "Amount" },
+  { value: "completedAt", label: "Completed date" },
+];
+const SORT_FIELDS = new Set(SORT_OPTIONS.map((o) => o.value));
+const DIR_OPTIONS = [
+  { value: "desc", label: "Descending" },
+  { value: "asc", label: "Ascending" },
+];
+
+// value → label maps for the select-backed filters, used to render the
+// active-filter summary chips in human-readable form.
+const OPTION_LABELS = {
+  status: Object.fromEntries(ORDER_STATUS_OPTIONS.map((o) => [o.value, o.label])),
+  paymentStatus: Object.fromEntries(
+    PAYMENT_STATUS_OPTIONS.map((o) => [o.value, o.label]),
+  ),
+  method: Object.fromEntries(METHOD_OPTIONS.map((o) => [o.value, o.label])),
+  flag: Object.fromEntries(FLAG_OPTIONS.map((o) => [o.value, o.label])),
+};
+// Short field labels for the active-filter summary chips.
+const FILTER_FIELD_LABELS = {
+  orderNumber: "Order #",
+  customer: "Customer",
+  status: "Status",
+  paymentStatus: "Payment",
+  method: "Method",
+  flag: "Flag",
+  amountMin: "Min $",
+  amountMax: "Max $",
+  dateFrom: "From",
+  dateTo: "To",
+};
+
+// Read the active filter values out of the URL search params. Only keys that
+// carry a value are returned, so `Object.keys(filters).length` doubles as the
+// "is any filter active?" signal.
+function readFilters(sp) {
+  const out = {};
+  for (const k of FILTER_KEYS) {
+    const v = (sp.get(k) || "").trim();
+    if (v) out[k] = v;
+  }
+  return out;
+}
+
+function ymd(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+// Build ONE Invoice query that ANDs together every active invoice-scoped
+// filter (paymentStatus / method / flag). Returns null when none apply.
+// `now` is the cutoff for the overdue comparison; we prefer the full-datetime
+// `dueAt` and fall back to the date-only `qboDueDate` for legacy invoices.
+function buildInvoiceQuery(f, shop, now) {
+  const clauses = [];
+
+  if (f.paymentStatus) clauses.push({ paymentStatus: f.paymentStatus });
+
+  if (f.method) {
+    clauses.push({
+      $or: [
+        { customerPaymentPreference: f.method },
+        { customerPaymentPreference: { $exists: false }, paymentMethod: f.method },
+        { customerPaymentPreference: null, paymentMethod: f.method },
+      ],
+    });
+  }
+
+  if (f.flag === "overdue") {
+    const todayYmd = ymd(now);
+    clauses.push({
       paymentStatus: { $in: ["pending", "failed", "in_progress"] },
       $or: [
         { dueAt: { $lt: now } },
         { dueAt: { $exists: false }, qboDueDate: { $lt: todayYmd, $ne: null } },
         { dueAt: null, qboDueDate: { $lt: todayYmd, $ne: null } },
       ],
-    };
-  }
-  if (filterId === "pending_cheque") {
-    return {
-      shop,
+    });
+  } else if (f.flag === "pending_cheque") {
+    clauses.push({
       paymentStatus: { $in: ["pending", "failed"] },
       paymentMethod: { $in: ["check", "ach"] },
-    };
+    });
+  } else if (f.flag === "failed_payments") {
+    clauses.push({ paymentStatus: "failed" });
   }
-  if (filterId === "failed_payments") {
-    return { shop, paymentStatus: "failed" };
-  }
-  return null;
+
+  if (clauses.length === 0) return null;
+  return { shop, $and: clauses };
 }
 
 export const loader = async ({ request }) => {
@@ -78,47 +197,89 @@ export const loader = async ({ request }) => {
   await connectDB();
 
   const url = new URL(request.url);
-  const status = url.searchParams.get("status") || "all";
-  const q = (url.searchParams.get("q") || "").trim();
-  const page = Math.max(1, Number(url.searchParams.get("page") || 1));
+  const sp = url.searchParams;
+  const filters = readFilters(sp);
+  const page = Math.max(1, Number(sp.get("page") || 1));
+  const sort = SORT_FIELDS.has(sp.get("sort")) ? sp.get("sort") : "receivedAt";
+  const dir = sp.get("dir") === "asc" ? "asc" : "desc";
+  const now = new Date();
 
-  const filter = { shop: session.shop };
+  // Exclude Admin Orders (placed by the retail drop-ship customer) from the
+  // wholesale Orders list entirely — they live in the dedicated Admin Orders
+  // page and never enter the QBO/NMI pipeline. `$ne` still matches orders with
+  // a null/absent customerEmail, so ordinary wholesale orders are unaffected.
+  const filter = {
+    shop: session.shop,
+    customerEmail: { $ne: RETAIL_CUSTOMER_EMAIL },
+  };
+  // Compound order-scoped clauses go into `$and` so they can coexist with the
+  // base `customerEmail $ne` (two conditions on the same field) and with each
+  // other.
+  const and = [];
 
-  // Invoice-side filters: resolve via Invoice.find first so we get the
-  // matching invoice _ids, then constrain the ShopifyOrder query to
-  // orders linked to those invoices via invoiceRef. Done as a separate
-  // step (rather than a $lookup) to keep the existing flat query shape
-  // and re-use the same pagination / count code paths.
-  let invoiceFilterMatched = null;
-  if (INVOICE_FILTER_IDS.has(status)) {
-    const invFilter = buildInvoiceFilter(status, session.shop, new Date());
-    const matched = await Invoice.find(invFilter).select("_id").lean();
-    invoiceFilterMatched = matched.map((m) => m._id);
-    filter.invoiceRef = { $in: invoiceFilterMatched };
-  } else if (status !== "all") {
-    filter.processingStatus = status;
+  if (filters.orderNumber) {
+    const re = new RegExp(escapeRegex(filters.orderNumber), "i");
+    and.push({
+      $or: [
+        { shopifyOrderNumber: re },
+        { shopifyOrderName: re },
+        { shopifyOrderId: filters.orderNumber }, // exact id paste
+      ],
+    });
+  }
+  if (filters.customer) {
+    and.push({ customerEmail: new RegExp(escapeRegex(filters.customer), "i") });
+  }
+  if (filters.status) filter.processingStatus = filters.status;
+
+  // Order-date range (receivedAt), inclusive on both ends.
+  const dateFrom = parseDateOnly(filters.dateFrom);
+  const dateTo = parseDateOnly(filters.dateTo);
+  if (dateFrom || dateTo) {
+    const range = {};
+    if (dateFrom) range.$gte = startOfDay(dateFrom);
+    if (dateTo) {
+      const end = new Date(dateTo);
+      end.setHours(23, 59, 59, 999);
+      range.$lte = end;
+    }
+    filter.receivedAt = range;
   }
 
-  if (q) {
-    // Match by order number, order name, or customer email. Case-insensitive.
-    const re = new RegExp(escapeRegex(q), "i");
-    filter.$or = [
-      { shopifyOrderNumber: re },
-      { shopifyOrderName: re },
-      { customerEmail: re },
-      { shopifyOrderId: q }, // exact match for numeric id paste
-    ];
+  // Amount range (totalAmount).
+  const amountMin = Number(filters.amountMin);
+  const amountMax = Number(filters.amountMax);
+  const hasMin = filters.amountMin && Number.isFinite(amountMin);
+  const hasMax = filters.amountMax && Number.isFinite(amountMax);
+  if (hasMin || hasMax) {
+    const range = {};
+    if (hasMin) range.$gte = amountMin;
+    if (hasMax) range.$lte = amountMax;
+    filter.totalAmount = range;
   }
+
+  // Invoice-scoped filters (paymentStatus / method / flag): resolve the
+  // matching invoice _ids first, then narrow the order query via invoiceRef.
+  // Kept as a separate step (not a $lookup) so the flat pagination query
+  // shape is preserved.
+  const invoiceQuery = buildInvoiceQuery(filters, session.shop, now);
+  if (invoiceQuery) {
+    const matched = await Invoice.find(invoiceQuery).select("_id").lean();
+    filter.invoiceRef = { $in: matched.map((m) => m._id) };
+  }
+
+  if (and.length) filter.$and = and;
 
   const total = await ShopifyOrder.countDocuments(filter);
   const rows = await ShopifyOrder.find(filter)
-    .sort({ receivedAt: -1 })
+    .sort({ [sort]: dir === "asc" ? 1 : -1 })
     .skip((page - 1) * PAGE_SIZE)
     .limit(PAGE_SIZE)
     .select(
       "shopifyOrderId shopifyOrderNumber shopifyOrderName customerEmail " +
         "currency totalAmount processingStatus paymentStatus paidAt " +
-        "qboInvoiceId invoiceRef receivedAt completedAt processingError rejectionCode",
+        "qboInvoiceId invoiceRef receivedAt completedAt processingError rejectionCode " +
+        "fulfillmentStatus shippedAt deliveredAt fulfillments",
     )
     .lean();
 
@@ -137,43 +298,6 @@ export const loader = async ({ request }) => {
       .lean();
     for (const inv of invoices) invoiceById.set(inv._id.toString(), inv);
   }
-
-  // Aggregate counts per status for the chip badges. Two passes — one
-  // grouped on ShopifyOrder.processingStatus (covers the order-scoped
-  // chips) and three independent count queries on Invoice (covers the
-  // invoice-scoped chips). Both respect the search filter so the counts
-  // reflect what the user is actually looking at.
-  const orderCountFilter = { shop: session.shop };
-  if (q) orderCountFilter.$or = filter.$or;
-  const counts = await ShopifyOrder.aggregate([
-    { $match: orderCountFilter },
-    { $group: { _id: "$processingStatus", n: { $sum: 1 } } },
-  ]);
-  const countByStatus = { all: 0 };
-  for (const c of counts) {
-    countByStatus[c._id] = c.n;
-    countByStatus.all += c.n;
-  }
-  // Invoice-scoped chip counts. When a search term is active we constrain
-  // by order-id matches first so the count tracks what's actually shown.
-  const invoiceShopFilter = { shop: session.shop };
-  let invoiceCountOrderIds = null;
-  if (q) {
-    const qOrderIds = await ShopifyOrder.find(orderCountFilter)
-      .select("invoiceRef")
-      .lean();
-    invoiceCountOrderIds = qOrderIds.map((o) => o.invoiceRef).filter(Boolean);
-    invoiceShopFilter._id = { $in: invoiceCountOrderIds };
-  }
-  const nowForFilters = new Date();
-  const invoiceCountQueries = STATUS_FILTERS.filter(
-    (f) => f.scope === "invoice",
-  ).map(async (f) => {
-    const filterDoc = buildInvoiceFilter(f.id, session.shop, nowForFilters);
-    if (q) filterDoc._id = invoiceShopFilter._id;
-    countByStatus[f.id] = await Invoice.countDocuments(filterDoc);
-  });
-  await Promise.all(invoiceCountQueries);
 
   return {
     rows: rows.map((r) => {
@@ -194,6 +318,20 @@ export const loader = async ({ request }) => {
         completedAt: r.completedAt || null,
         processingError: r.processingError || null,
         rejectionCode: r.rejectionCode || null,
+        fulfillmentStatus: r.fulfillmentStatus || null,
+        shippedAt: r.shippedAt || null,
+        deliveredAt: r.deliveredAt || null,
+        // First fulfillment with a tracking URL — used for the Delivery
+        // column link. Formatted server-side so shipping.constants stays
+        // out of the browser bundle.
+        primaryTracking: (() => {
+          const f = (r.fulfillments || []).find((f) => f.trackingUrl || f.trackingNumber);
+          if (!f) return null;
+          return {
+            carrier: carrierDisplayName(f.carrierKey, f.trackingCompany),
+            trackingUrl: f.trackingUrl || null,
+          };
+        })(),
         invoice: inv
           ? {
               paymentStatus: inv.paymentStatus,
@@ -231,9 +369,9 @@ export const loader = async ({ request }) => {
     total,
     page,
     pageSize: PAGE_SIZE,
-    status,
-    q,
-    countByStatus,
+    filters,
+    sort,
+    dir,
   };
 };
 
@@ -264,13 +402,11 @@ function isOverdueByInvoice(invoice, now) {
 }
 
 export default function OrdersList() {
-  const { rows, total, page, pageSize, status, q, countByStatus } =
-    useLoaderData();
+  const { rows, total, page, pageSize, filters, sort, dir } = useLoaderData();
   const navigate = useNavigate();
   const navigation = useNavigation();
+  const revalidator = useRevalidator();
   const shopify = useAppBridge();
-  const [searchParams, setSearchParams] = useSearchParams();
-  const [searchInput, setSearchInput] = useState(q || "");
   const loadedToastShown = useRef(false);
 
   // One-time toast on first mount.
@@ -280,92 +416,226 @@ export default function OrdersList() {
     shopify?.toast?.show(`Loaded ${total} ${total === 1 ? "order" : "orders"}`);
   }, [total, shopify]);
 
-  const tableLoading = navigation.state === "loading";
+  const tableLoading = navigation.state === "loading" || revalidator.state !== "idle";
+  const refreshLoading = revalidator.state !== "idle";
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
-
-  // Mutate URL search params — this re-runs the loader and re-renders.
-  const updateParams = (next) => {
-    const merged = new URLSearchParams(searchParams);
-    for (const [k, v] of Object.entries(next)) {
-      if (v === null || v === "" || v === undefined) merged.delete(k);
-      else merged.set(k, String(v));
-    }
-    // Whenever filters change, reset to page 1 (unless explicitly setting page).
-    if (!("page" in next)) merged.delete("page");
-    setSearchParams(merged);
-  };
-
-  const onStatusChip = (id) => updateParams({ status: id === "all" ? null : id });
-  const onSearchSubmit = (e) => {
-    e?.preventDefault?.();
-    updateParams({ q: searchInput.trim() || null });
-  };
-  const onSearchClear = () => {
-    setSearchInput("");
-    updateParams({ q: null });
-  };
-
   const firstShown = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const lastShown = Math.min(page * pageSize, total);
 
+  // ── Filter form state ───────────────────────────────────────────────
+  //
+  // `draft` is the local, editable copy of the form. A ref MIRRORS it
+  // (updated synchronously in the change handler) so "Apply filters" always
+  // reads the freshest values — even for a control that commits its value on
+  // `blur`, which fires just before the button's click. Polaris s-* controls
+  // vary in whether they emit `input` or `change`, so each control binds BOTH
+  // and we read from the ref rather than a possibly-stale state closure.
+  const EMPTY_DRAFT = {
+    orderNumber: "", customer: "", status: "", paymentStatus: "",
+    method: "", flag: "", amountMin: "", amountMax: "", dateFrom: "", dateTo: "",
+    sort: "receivedAt", dir: "desc",
+  };
+  const [draft, setDraft] = useState(() => ({
+    ...EMPTY_DRAFT,
+    ...filters,
+    sort,
+    dir,
+  }));
+  const draftRef = useRef(draft);
+
+  const set = (k) => (e) => {
+    const v = e?.currentTarget?.value ?? "";
+    draftRef.current = { ...draftRef.current, [k]: v };
+    setDraft((d) => ({ ...d, [k]: v }));
+  };
+  const bind = (k) => ({ value: draft[k], onInput: set(k), onChange: set(k) });
+
+  // Navigate with the given param object — empties are dropped so the URL
+  // (and therefore the loader query) only carries the active filters.
+  const goto = (next) => {
+    const params = new URLSearchParams();
+    for (const [k, v] of Object.entries(next)) {
+      if (v !== "" && v != null) params.set(k, String(v));
+    }
+    navigate(`?${params.toString()}`);
+  };
+
+  const applyFilters = () => goto({ ...draftRef.current, page: "1" });
+  const resetFilters = () => {
+    draftRef.current = { ...EMPTY_DRAFT };
+    setDraft({ ...EMPTY_DRAFT });
+    navigate("?");
+  };
+  const setPage = (p) => goto({ ...filters, sort, dir, page: String(p) });
+
+  // Active-filter summary chips. Each is individually removable; clicking the
+  // chip (or its ✕) drops just that one filter and re-queries.
+  const activeChips = FILTER_KEYS.filter((k) => filters[k]).map((k) => {
+    const raw = filters[k];
+    const label = OPTION_LABELS[k]?.[raw] ?? raw;
+    return { key: k, text: `${FILTER_FIELD_LABELS[k]}: ${label}` };
+  });
+  const hasActiveFilter = activeChips.length > 0;
+
+  const removeFilter = (key) => {
+    const next = { ...filters, sort, dir, page: "1" };
+    delete next[key];
+    draftRef.current = { ...draftRef.current, [key]: "" };
+    setDraft((d) => ({ ...d, [key]: "" }));
+    goto(next);
+  };
+
   return (
     <s-page inlineSize="large" heading="Orders">
+      <s-section heading="Filters">
+        <s-stack direction="block" gap="base">
+          {/* Responsive auto-fill grid: each control gets ≥220px and the row
+              re-flows to as many columns as fit, so it reads as a tidy form
+              on desktop and stacks to one column on mobile. */}
+          <s-grid
+            gap="base"
+            gridTemplateColumns="repeat(auto-fill, minmax(220px, 1fr))"
+          >
+            <s-text-field
+              label="Order number"
+              placeholder="#1001"
+              {...bind("orderNumber")}
+            />
+            <s-text-field
+              label="Customer email"
+              placeholder="name@example.com"
+              {...bind("customer")}
+            />
+            <s-select label="Order status" {...bind("status")}>
+              {ORDER_STATUS_OPTIONS.map((o) => (
+                <s-option key={o.value} value={o.value}>
+                  {o.label}
+                </s-option>
+              ))}
+            </s-select>
+            <s-select label="Payment status" {...bind("paymentStatus")}>
+              {PAYMENT_STATUS_OPTIONS.map((o) => (
+                <s-option key={o.value} value={o.value}>
+                  {o.label}
+                </s-option>
+              ))}
+            </s-select>
+            <s-select label="Preferred method" {...bind("method")}>
+              {METHOD_OPTIONS.map((o) => (
+                <s-option key={o.value} value={o.value}>
+                  {o.label}
+                </s-option>
+              ))}
+            </s-select>
+            <s-select label="Quick flag" {...bind("flag")}>
+              {FLAG_OPTIONS.map((o) => (
+                <s-option key={o.value} value={o.value}>
+                  {o.label}
+                </s-option>
+              ))}
+            </s-select>
+            <s-number-field
+              label="Min amount"
+              placeholder="0.00"
+              {...bind("amountMin")}
+            />
+            <s-number-field
+              label="Max amount"
+              placeholder="0.00"
+              {...bind("amountMax")}
+            />
+            <s-date-field label="From date" {...bind("dateFrom")} />
+            <s-date-field label="To date" {...bind("dateTo")} />
+            <s-select label="Sort by" {...bind("sort")}>
+              {SORT_OPTIONS.map((o) => (
+                <s-option key={o.value} value={o.value}>
+                  {o.label}
+                </s-option>
+              ))}
+            </s-select>
+            <s-select label="Direction" {...bind("dir")}>
+              {DIR_OPTIONS.map((o) => (
+                <s-option key={o.value} value={o.value}>
+                  {o.label}
+                </s-option>
+              ))}
+            </s-select>
+          </s-grid>
+
+          <s-stack direction="inline" gap="base" alignItems="center" wrap>
+            <s-button
+              variant="primary"
+              onClick={applyFilters}
+              {...(tableLoading ? { loading: true } : {})}
+            >
+              Apply filters
+            </s-button>
+            <s-button variant="tertiary" onClick={resetFilters}>
+              Reset
+            </s-button>
+            <s-button
+              variant="tertiary"
+              icon="refresh"
+              onClick={() => revalidator.revalidate()}
+              {...(refreshLoading ? { loading: true } : {})}
+            >
+              Refresh
+            </s-button>
+            {hasActiveFilter && (
+              <s-text tone="subdued">
+                {activeChips.length} filter
+                {activeChips.length === 1 ? "" : "s"} applied
+              </s-text>
+            )}
+          </s-stack>
+
+          {/* Active-filter summary — one removable chip per applied filter so
+              admins can see exactly what's narrowing the list and drop any
+              single one without rebuilding the whole form. */}
+          {hasActiveFilter && (
+            <s-stack direction="inline" gap="small-200" alignItems="center" wrap>
+              {activeChips.map((c) => (
+                <s-clickable-chip
+                  key={c.key}
+                  removable
+                  accessibilityLabel={`Remove filter ${c.text}`}
+                  onClick={() => removeFilter(c.key)}
+                  onRemove={() => removeFilter(c.key)}
+                >
+                  {c.text}
+                </s-clickable-chip>
+              ))}
+            </s-stack>
+          )}
+        </s-stack>
+      </s-section>
+
       <s-section padding="none">
         <s-box padding="base">
-          <s-stack direction="block" gap="base">
-            <form onSubmit={onSearchSubmit}>
-              <s-stack direction="inline" gap="small-200" alignItems="end">
-                <s-search-field
-                  label="Search"
-                  labelAccessibilityVisibility="exclusive"
-                  placeholder="Search by order #, name, customer email"
-                  value={searchInput}
-                  onInput={(e) => setSearchInput(e?.currentTarget?.value ?? "")}
-                />
-                <s-button variant="primary" type="submit">
-                  Search
-                </s-button>
-                {q && (
-                  <s-button variant="tertiary" onClick={onSearchClear}>
-                    Clear
-                  </s-button>
-                )}
-              </s-stack>
-            </form>
-            <s-stack direction="inline" gap="small-200">
-              {STATUS_FILTERS.map((f) => {
-                const active = status === f.id;
-                const n = countByStatus[f.id] ?? 0;
-                return (
-                  <s-clickable-chip
-                    key={f.id}
-                    color={active ? "strong" : "base"}
-                    accessibilityLabel={`Filter by ${f.label}`}
-                    onClick={() => onStatusChip(f.id)}
-                  >
-                    {f.label} ({n})
-                  </s-clickable-chip>
-                );
-              })}
-            </s-stack>
-          </s-stack>
+          <s-text tone="subdued">
+            {total === 0
+              ? "No orders"
+              : `Showing ${firstShown}–${lastShown} of ${total} order${
+                  total === 1 ? "" : "s"
+                }`}
+          </s-text>
         </s-box>
 
         {rows.length === 0 ? (
           <s-box padding="large-500">
             <s-stack direction="block" gap="base" alignItems="center" justifyContent="center">
-              <s-text>{q ? "🔍" : "📭"}</s-text>
+              <s-text>{hasActiveFilter ? "🔍" : "📭"}</s-text>
               <s-heading>
-                {q ? "No matches" : status === "all" ? "No orders yet" : "No orders in this status"}
+                {hasActiveFilter ? "No matching orders" : "No orders yet"}
               </s-heading>
               <s-paragraph tone="subdued">
-                {q
-                  ? `No orders match "${q}". Try a different keyword or clear the search.`
-                  : status === "all"
-                    ? "Orders received via the Shopify webhook will appear here."
-                    : "Try changing the status filter."}
+                {hasActiveFilter
+                  ? "No orders match the current filters. Try broadening or clearing them."
+                  : "Orders received via the Shopify webhook will appear here."}
               </s-paragraph>
-              {q && <s-button onClick={onSearchClear}>Clear search</s-button>}
+              {hasActiveFilter && (
+                <s-button onClick={resetFilters}>Clear all filters</s-button>
+              )}
             </s-stack>
           </s-box>
         ) : (
@@ -380,11 +650,8 @@ export default function OrdersList() {
               <s-table-header>Settled via</s-table-header>
               <s-table-header>Settled at</s-table-header>
               <s-table-header>Due</s-table-header>
-              <s-table-header>Remarks</s-table-header>
-              <s-table-header>Order date</s-table-header>
-              {/* Dedicated action column — replaces the previous
-                  whole-row click navigation. See the inline comment on
-                  the View button below for the rationale. */}
+              <s-table-header>Shipping status</s-table-header>
+              <s-table-header>Delivery status</s-table-header>
               <s-table-header>Actions</s-table-header>
             </s-table-header-row>
             <s-table-body>
@@ -402,13 +669,18 @@ export default function OrdersList() {
                 return (
                   <s-table-row key={r.id}>
                     <s-table-cell>
-                      <s-text>{orderLabel}</s-text>
+                      <s-stack direction="block" gap="none">
+                        <s-text>{orderLabel}</s-text>
+                        {r.receivedAt && (
+                          <s-text tone="subdued">
+                            {new Date(r.receivedAt).toLocaleDateString()}
+                          </s-text>
+                        )}
+                      </s-stack>
                     </s-table-cell>
                     <s-table-cell>{r.customerEmail || "—"}</s-table-cell>
                     <s-table-cell>
-                      {r.totalAmount != null
-                        ? formatAmount(r.totalAmount, r.currency)
-                        : "—"}
+                      <AmountCell order={r} />
                     </s-table-cell>
                     <s-table-cell>
                       <ProcessingBadge
@@ -438,15 +710,10 @@ export default function OrdersList() {
                       <DueDateCell invoice={r.invoice} />
                     </s-table-cell>
                     <s-table-cell>
-                      <RemarksCell
-                        invoice={r.invoice}
-                        currency={r.currency}
-                      />
+                      <ShippingStatusCell order={r} />
                     </s-table-cell>
                     <s-table-cell>
-                      {r.receivedAt
-                        ? new Date(r.receivedAt).toLocaleString()
-                        : "—"}
+                      <DeliveryStatusCell order={r} />
                     </s-table-cell>
                     <s-table-cell>
                       <s-button
@@ -479,7 +746,7 @@ export default function OrdersList() {
                 <s-button
                   variant="tertiary"
                   disabled={page <= 1}
-                  onClick={() => updateParams({ page: page - 1 })}
+                  onClick={() => setPage(page - 1)}
                   icon="arrow-left"
                 >
                   Previous
@@ -490,7 +757,7 @@ export default function OrdersList() {
                 <s-button
                   variant="tertiary"
                   disabled={page >= totalPages}
-                  onClick={() => updateParams({ page: page + 1 })}
+                  onClick={() => setPage(page + 1)}
                 >
                   Next
                 </s-button>
@@ -500,6 +767,38 @@ export default function OrdersList() {
         )}
       </s-section>
     </s-page>
+  );
+}
+
+// Amount cell — shows the fee-inclusive grand total the customer will be
+// charged. Prefers Invoice.amountDue (which now bakes in the processing fee
+// for card / ACH invoices) over the Shopify order total. When the two differ
+// (a fee was added) we surface the pre-fee Shopify total as a subdued
+// subtitle so admins can see both at a glance. Falls back to the Shopify
+// total for orders with no invoice yet.
+function AmountCell({ order }) {
+  const shopifyTotal = order.totalAmount;
+  const invoiceTotal = order.invoice?.amountDue;
+  const currency = order.currency;
+  if (invoiceTotal == null) {
+    return (
+      <s-text>
+        {shopifyTotal != null ? formatAmount(shopifyTotal, currency) : "—"}
+      </s-text>
+    );
+  }
+  const feeAdded =
+    shopifyTotal != null &&
+    Number(invoiceTotal).toFixed(2) !== Number(shopifyTotal).toFixed(2);
+  return (
+    <s-stack direction="block" gap="none">
+      <s-text>{formatAmount(invoiceTotal, currency)}</s-text>
+      {feeAdded && (
+        <s-text tone="subdued">
+          incl. fee · {formatAmount(shopifyTotal, currency)} order
+        </s-text>
+      )}
+    </s-stack>
   );
 }
 
@@ -584,88 +883,84 @@ function SettledAtCell({ invoice }) {
   return <s-text>{new Date(invoice.paymentSettledAt).toLocaleString()}</s-text>;
 }
 
-// Render the Remarks cell — latest follow-up note from Invoice.remarks[]
-// plus a cheque-specific overdue warning. Strategy:
-//   1. Cheque/ACH pending invoices ALWAYS get a "Payment Due — $X"
-//      reminder line, even before CRON has logged anything, so admins
-//      can spot manual-collection work at a glance.
-//   2. Overdue (qboDueDate < today AND unpaid) renders in critical
-//      tone with an "Overdue" flag.
-//   3. The most recent remark message (from CRON ticks or admin
-//      actions) is shown underneath with its timestamp.
-//   4. A "+N more" count points to Order Details for the full ledger.
-//
-// Paid invoices show "—" unless a remark exists (still useful for the
-// post-payment audit trail).
-function RemarksCell({ invoice, currency }) {
-  if (!invoice) return <s-text tone="subdued">—</s-text>;
-  const outstanding = Number(
-    ((invoice.amountDue ?? 0) - (invoice.amountPaid ?? 0)).toFixed(2),
-  );
-  const isUnpaid =
-    invoice.paymentStatus !== "paid" && invoice.paymentStatus !== "cancelled";
-  const isManual =
-    invoice.paymentMethod === "check" || invoice.paymentMethod === "ach";
-  // Prefer the full-datetime dueAt (driven by INVOICE_TERMS_MINUTES so
-  // the testing knob can flip invoices overdue within minutes); fall
-  // back to the QBO date-only field for older invoices that pre-date
-  // dueAt.
-  const overdue = isUnpaid && isOverdueByInvoice(invoice, new Date());
-  const latest = invoice.latestRemark;
-  const moreCount = Math.max(0, (invoice.remarkCount || 0) - 1);
+// Fulfillment / shipping status for the Order List — left of the two new
+// shipping columns. Shows the Shopify fulfilment state + shipped date.
+function ShippingStatusCell({ order }) {
+  const { fulfillmentStatus, shippedAt, processingStatus } = order;
 
-  // Nothing to surface — paid + no historical remark — render the dash.
-  if (!isUnpaid && !latest) {
+  if (processingStatus === "cancelled" && !shippedAt) {
     return <s-text tone="subdued">—</s-text>;
   }
 
-  // Synthetic header line for unpaid cheque/ACH invoices. CRON adds its
-  // own reminder remark on each tick; this static line is the always-on
-  // collections cue so the column is meaningful even before CRON has
-  // run for the first time.
-  const showChequeWarning = isUnpaid && isManual;
-  const showFailedWarning = invoice.paymentStatus === "failed";
-  const methodLabel =
-    invoice.paymentMethod === "ach" ? "ACH" : invoice.paymentMethod === "check" ? "Cheque" : null;
+  if (fulfillmentStatus === "fulfilled" || (shippedAt && !fulfillmentStatus)) {
+    return (
+      <s-stack direction="block" gap="none">
+        {shippedAt && (
+          <s-text tone="subdued">{new Date(shippedAt).toLocaleDateString()}</s-text>
+        )}
+        <s-badge tone="success">Fulfilled</s-badge>
+      </s-stack>
+    );
+  }
 
-  return (
-    <s-stack direction="block" gap="none">
-      {showChequeWarning && (
-        <>
-          <s-text tone="critical">
-            <strong>Payment Due — {formatAmount(outstanding, currency)}</strong>
-          </s-text>
-          <s-text tone={overdue ? "critical" : "subdued"}>
-            {methodLabel} pending{overdue ? " · OVERDUE" : ""}
-          </s-text>
-        </>
-      )}
-      {showFailedWarning && !showChequeWarning && (
-        <>
-          <s-text tone="critical">
-            <strong>Payment Failed — {formatAmount(outstanding, currency)}</strong>
-          </s-text>
-          <s-text tone="critical">
-            {invoice.attemptCount}/{invoice.maxAttempts} attempts
-          </s-text>
-        </>
-      )}
-      {latest && (
-        <s-text tone="subdued">
-          {latest.message}
-          {latest.createdAt
-            ? ` · ${new Date(latest.createdAt).toLocaleDateString()}`
-            : ""}
-        </s-text>
-      )}
-      {moreCount > 0 && (
-        <s-text tone="subdued">+{moreCount} more (see Order)</s-text>
-      )}
-      {!showChequeWarning && !showFailedWarning && !latest && (
-        <s-text tone="subdued">—</s-text>
-      )}
-    </s-stack>
-  );
+  if (fulfillmentStatus === "partial") {
+    return (
+      <s-stack direction="block" gap="none">
+        {shippedAt && (
+          <s-text tone="subdued">{new Date(shippedAt).toLocaleDateString()}</s-text>
+        )}
+        <s-badge tone="warning">Partially fulfilled</s-badge>
+      </s-stack>
+    );
+  }
+
+  return <s-badge tone="warning">Unfulfilled</s-badge>;
+}
+
+// Carrier delivery status for the Order List — right of the two new shipping
+// columns. Shows whether the parcel has been delivered, is in transit, or
+// hasn't shipped yet. Delivered date and a tracking deep-link are surfaced
+// when available.
+function DeliveryStatusCell({ order }) {
+  const { deliveredAt, shippedAt, primaryTracking } = order;
+
+  if (deliveredAt) {
+    return (
+      <s-stack direction="block" gap="none">
+        <s-text tone="subdued">{new Date(deliveredAt).toLocaleDateString()}</s-text>
+        <s-badge tone="success">Delivered</s-badge>
+      </s-stack>
+    );
+  }
+
+  if (primaryTracking) {
+    return (
+      <s-stack direction="block" gap="none">
+        {shippedAt && (
+          <s-text tone="subdued">{new Date(shippedAt).toLocaleDateString()}</s-text>
+        )}
+        <s-badge tone="info">In transit</s-badge>
+        {primaryTracking.trackingUrl ? (
+          <s-link url={primaryTracking.trackingUrl} external>
+            {primaryTracking.carrier} ↗
+          </s-link>
+        ) : (
+          <s-text tone="subdued">{primaryTracking.carrier}</s-text>
+        )}
+      </s-stack>
+    );
+  }
+
+  if (shippedAt) {
+    return (
+      <s-stack direction="block" gap="none">
+        <s-text tone="subdued">{new Date(shippedAt).toLocaleDateString()}</s-text>
+        <s-badge tone="info">Shipped</s-badge>
+      </s-stack>
+    );
+  }
+
+  return <s-badge>Not shipped</s-badge>;
 }
 
 // Render the QBO due date for an invoice. Highlights overdue + unpaid in

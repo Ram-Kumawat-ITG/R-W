@@ -37,7 +37,12 @@ const addressSchema = new mongoose.Schema(
 // under. Mirrors the resolved shape from cdo.service.validateReferralCode.
 const referralSchema = new mongoose.Schema(
   {
-    code: { type: String, uppercase: true, trim: true },
+    // LOWERCASE to match the cdo_practitioner_codes catalogue (`code` is
+    // lowercase there). Previously this snapshot forced UPPERCASE while the
+    // catalogue forced lowercase, so the two collections stored the same code
+    // in opposite case — joins only worked via case-insensitive regex. The
+    // canonical form is now lowercase everywhere (see utils/referralCode.js).
+    code: { type: String, lowercase: true, trim: true },
     codeId: String,
     practitionerId: String,
     practitionerSource: {
@@ -80,6 +85,26 @@ const cdoApplicationSchema = new mongoose.Schema(
     // with no (valid) referral code. Indexed on practitionerId so we can
     // list a practitioner's referred customers.
     referral: { type: referralSchema, default: null },
+
+    // History of prior referral codes this customer used before upgrading.
+    // Entries are appended by upsertCustomerApplication() when the active code changes.
+    referralHistory: {
+      type: [
+        new mongoose.Schema(
+          {
+            code: { type: String, lowercase: true, trim: true },
+            practitionerId: String,
+            practitionerName: String,
+            practitionerEmail: { type: String, lowercase: true },
+            discountPercent: { type: Number, default: null },
+            commissionRate: { type: Number, default: null },
+            replacedAt: { type: Date, default: Date.now },
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
 
     status: {
       type: String,

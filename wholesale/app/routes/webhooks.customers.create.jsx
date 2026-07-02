@@ -4,13 +4,17 @@ import {
   getUnauthenticatedAdmin,
   executeGraphQL,
   executeMutation,
-} from "../services/shopify/shopify.apis";
+} from "../services/shopify/shopify.apis.server";
 import { QUERY_CUSTOMER_TAGS } from "../services/shopify/shopify.queries";
 import {
   MUTATION_CUSTOMER_DELETE,
   MUTATION_CUSTOMER_UPDATE,
 } from "../services/shopify/shopify.mutations";
 import { createLogger } from "../utils/logger.utils";
+import connectDB from "../services/APIService/mongo.service";
+import WholesaleApplication from "../models/wholesaleApplication.server";
+import { syncPractitionerToRetail } from "../services/retailSync/practitioner.service";
+import { dropshipConfig } from "../services/dropship/dropship.config";
 
 const log = createLogger("webhook.customers_create");
 
@@ -43,6 +47,31 @@ function parseTagsField(tags) {
 function hasTag(tags, target) {
   const t = target.toLowerCase();
   return tags.some((x) => String(x).trim().toLowerCase() === t);
+}
+
+// Mirror this approved wholesale practitioner to the retail Shopify store
+// via services/retailSync/practitioner.service. Best-effort — failures
+// never propagate to the webhook handler.
+async function mirrorToRetail({ shop, customerId, email }) {
+  try {
+    await connectDB();
+    const customerGid = `gid://shopify/Customer/${customerId}`;
+    const application = await WholesaleApplication.findOne({
+      customerId: customerGid,
+      shop,
+    }).lean();
+    if (!application) {
+      log.warn("retail_sync.no_application", { customerId, email });
+      return;
+    }
+    await syncPractitionerToRetail({ application, action: "create" });
+  } catch (err) {
+    log.error("retail_sync.create_failed", {
+      customerId,
+      email,
+      err: err?.message || String(err),
+    });
+  }
 }
 
 export const loader = async () => {
@@ -115,6 +144,8 @@ export const action = async ({ request }) => {
       customerId,
       email: customerEmail,
     });
+    // Mirror this practitioner to the retail Shopify store. Fire-and-forget.
+    mirrorToRetail({ shop, customerId, email: customerEmail }).catch(() => {});
     return new Response(null, { status: 200 });
   }
 
@@ -148,11 +179,40 @@ export const action = async ({ request }) => {
           customerId,
           email: customerEmail,
         });
+        // Mirror late-approved practitioner to retail.
+        mirrorToRetail({
+          shop,
+          customerId,
+          email: customerEmail,
+        }).catch(() => {});
         return;
       }
 
       const orderCount = Number(live.numberOfOrders || 0);
       const stillNoApprovedTag = !hasTag(liveTags, APPROVED_TAG);
+
+      // Whitelist the synthetic drop-ship customer created by
+      // dropship.service.ensureNsRetailCustomer. It carries the
+      // ns-retail-internal tag (NOT Approved) by design — it's a B2B
+      // anchor for retail-triggered orders, not a practitioner
+      // application. Without this guard the deletion below removes it
+      // immediately after creation, breaking the in-process GID cache
+      // and causing draftOrderCreate to fail with "Record is invalid"
+      // on subsequent drop-ship orders.
+      if (
+        (customerEmail &&
+          customerEmail === dropshipConfig.retailCustomerEmail) ||
+        hasTag(liveTags, dropshipConfig.retailCustomerTag)
+      ) {
+        console.log(
+          `[webhook] keeping drop-ship internal customer ${customerId} (email=${customerEmail})`,
+        );
+        log.info("kept.dropship_internal", {
+          customerId,
+          email: customerEmail,
+        });
+        return;
+      }
 
       if (orderCount === 0 && stillNoApprovedTag) {
         // Safe to delete — no orders attached.

@@ -1,6 +1,8 @@
 import connectDB from "../db/mongo.server";
 import CdoApplication from "../models/cdoApplication.server";
 import CdoPractitionerCode from "../models/cdoPractitionerCode.server";
+import CdoReferral from "../models/cdoReferral.server";
+import { checkPatientBinding } from "../services/cdo/cdo.service";
 import { authenticate } from "../shopify.server";
 
 function json(status, body) {
@@ -118,13 +120,58 @@ export async function action({ request }) {
     }
   }
 
+  // ── Permanent patient↔practitioner binding ──────────────────────────
+  // A returning patient may only sign up under the practitioner they're
+  // already associated with. If this email is already bound to a DIFFERENT
+  // practitioner, reject the code — the relationship is permanent. Same
+  // practitioner (a different / updated code) is allowed and falls through.
+  if (verifiedCodeDoc) {
+    try {
+      const verdict = await checkPatientBinding({
+        email,
+        practitionerId: verifiedCodeDoc.practitionerId
+          ? String(verifiedCodeDoc.practitionerId)
+          : null,
+      });
+      if (!verdict.ok) {
+        return json(409, {
+          status: "error",
+          message: "You are already associated with another practitioner",
+          result: {
+            fieldErrors: [
+              {
+                field: "practitionerCode",
+                message:
+                  "You are already associated with another practitioner",
+              },
+            ],
+          },
+        });
+      }
+    } catch (err) {
+      // Don't block signup on a transient binding-lookup failure.
+      console.error(
+        "[api.signup-form] binding check failed (non-fatal):",
+        err?.message || err,
+      );
+    }
+  }
+
   // ── Build the Shopify customerCreate input ──────────────────────────
   // Tags include the verified code (per user spec: "save it on customer
   // tag not in metafield"). Format: code:<the-code>. Future order webhooks
   // grep tags for `code:*` to attribute commissions.
+  //
+  // We ALSO tag the customer with the practitioner's bare email so the
+  // admin can filter "all patients referred by drjohn@example.com" in
+  // Shopify admin's customer list. Bare email (no prefix) per locked
+  // decision 2026-06-04.
   const tags = ["Signup-Self"];
   if (verifiedCode) {
     tags.push(`code:${verifiedCode}`);
+    if (verifiedCodeDoc?.practitionerEmail) {
+      tags.push(verifiedCodeDoc.practitionerEmail);
+    }
   }
 
   const customerInput = {
@@ -237,6 +284,50 @@ export async function action({ request }) {
         `[api.signup-form] saved cdo_application ${appDoc._id} for ${email}` +
           (referralSnapshot ? ` referredBy=${referralSnapshot.practitionerEmail}` : ""),
       );
+
+      // ── cdo_referrals lifecycle row ──────────────────────────────────
+      // Signup with a valid code IS the conversion event in this flow
+      // (the patient is now a Shopify customer attributed to the
+      // practitioner). Upsert keyed on (shop, referralCode, referredEmail)
+      // so the later orders/create webhook (upsertReferralConversion)
+      // is idempotent — it'll just update orderId on first order.
+      if (referralSnapshot) {
+        try {
+          const now = new Date();
+          await CdoReferral.findOneAndUpdate(
+            {
+              shop: shopDomain,
+              referralCode: referralSnapshot.code,
+              referredEmail: email,
+            },
+            {
+              $set: {
+                status: "converted",
+                convertedAt: now,
+                referredName: `${firstName} ${lastName}`.trim(),
+              },
+              $setOnInsert: {
+                shop: shopDomain,
+                practitionerId: referralSnapshot.practitionerId,
+                practitionerEmail: referralSnapshot.practitionerEmail,
+                practitionerName: referralSnapshot.practitionerName,
+                referralCode: referralSnapshot.code,
+                referredEmail: email,
+                referredAt: now,
+              },
+            },
+            { upsert: true, new: true },
+          );
+          console.log(
+            `[api.signup-form] cdo_referrals upserted code=${referralSnapshot.code} email=${email}`,
+          );
+        } catch (err) {
+          console.error(
+            "[api.signup-form] cdo_referrals upsert failed (non-fatal):",
+            err?.message || err,
+          );
+        }
+      }
     } catch (err) {
       console.error(
         "[api.signup-form] cdo_application save failed (non-fatal):",

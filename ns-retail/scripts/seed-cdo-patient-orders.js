@@ -12,7 +12,7 @@
 // After running this:
 //   1. Open CDO Program → Payouts → "Generate payout batch".
 //      A payout for Durgesh (~$65) appears as "Awaiting approval".
-//   2. Approve it. (Execute posts to QBO — needs CDO_QBO_* connected.)
+//   2. Approve it. (Execute posts to QBO — needs QBO_* / QBO_RETAIL_* connected.)
 //
 // Run with:  npm run seed:cdo-orders
 //            npm run seed:cdo-orders -- --clear

@@ -1,7 +1,7 @@
 import connectDB from '../../services/APIService/mongo.service'
 import { sendResponse } from '../../services/APIService/api.service'
 import { syncConfig, isSyncEnabled } from '../../services/sync/sync.config'
-import { syncWholesaleRestockFromRetail } from '../../services/sync/inventory.sync'
+import { syncWholesaleRestockFromRetail } from '../../services/sync/inventory.sync.server'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('api.sync.retail_inventory_update')

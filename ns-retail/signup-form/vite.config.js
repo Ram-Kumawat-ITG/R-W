@@ -7,6 +7,10 @@ import { resolve } from 'path'
 // must resolve through the storefront CDN (handled by the Liquid block).
 export default defineConfig({
   plugins: [react()],
+  // Read .env from the ns-retail/ root so signup-form picks up the same
+  // env vars the React Router server uses. Only variables prefixed
+  // VITE_* are exposed to the client bundle (Vite security default).
+  envDir: resolve(__dirname, '..'),
   // JS-emitted asset URLs resolve via window.__SIGNUP_ASSET_BASE__ (set by the
   // Liquid block from Shopify's asset_url filter). CSS-emitted URLs stay
   // relative — the CSS file lives next to its assets on the CDN.

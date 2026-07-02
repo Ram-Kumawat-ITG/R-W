@@ -102,6 +102,7 @@ export async function createCustomerVault({ profile, paymentDetails, billingId }
     last_name: profile.lastName,
     company: profile.companyName,
     phone: profile.phone,
+    email: profile.email,
   }
   // Optional caller-supplied billing_id for the initial billing record.
   // If omitted, NMI auto-assigns one (priority 1). Required when you plan
@@ -194,6 +195,7 @@ export async function addBillingToCustomerVault({
     if (profile.lastName) params.last_name = profile.lastName
     if (profile.companyName) params.company = profile.companyName
     if (profile.phone) params.phone = profile.phone
+    if (profile.email) params.email = profile.email
     if (profile.billingAddress) {
       Object.assign(params, {
         address1: profile.billingAddress.line1,
@@ -242,6 +244,95 @@ export async function addBillingToCustomerVault({
     throw err
   }
   log.info('vault.add_billing.success', { customerVaultId, billingId })
+  return billingId
+}
+
+// Update an EXISTING billing record on a Customer Vault in place (the
+// billing_id stays the same; only the payment method changes). Used by
+// the profile-update flow when a practitioner submits new card data via
+// the customer-account extension's plain text inputs.
+//
+// NMI action: `customer_vault=update_billing`.
+//
+// `paymentDetails` accepts the same shape as addBillingToCustomerVault:
+//   { paymentToken }                              ← Collect.js
+//   { cardNumber, cardExpiry: 'MMYY', cardCvv? } ← raw PAN (PCI scope!)
+//   { achRouting, achAccount, achAccountType }   ← echeck
+//
+// PCI WARNING: when called with raw card data the caller is sending the
+// PAN through this server. Make sure the caller has stripped raw card
+// fields from any persisted Mongo write and from any log line.
+export async function updateBillingInCustomerVault({
+  customerVaultId,
+  billingId,
+  profile,
+  paymentDetails,
+}) {
+  if (!customerVaultId) {
+    throw new Error('updateBillingInCustomerVault: customerVaultId is required')
+  }
+  if (!billingId) {
+    throw new Error('updateBillingInCustomerVault: billingId is required')
+  }
+
+  const params = {
+    customer_vault: 'update_billing',
+    customer_vault_id: String(customerVaultId),
+    billing_id: String(billingId),
+  }
+
+  if (profile) {
+    if (profile.firstName) params.first_name = profile.firstName
+    if (profile.lastName) params.last_name = profile.lastName
+    if (profile.companyName) params.company = profile.companyName
+    if (profile.phone) params.phone = profile.phone
+    if (profile.email) params.email = profile.email
+    if (profile.billingAddress) {
+      Object.assign(params, {
+        address1: profile.billingAddress.line1,
+        address2: profile.billingAddress.line2,
+        city: profile.billingAddress.city,
+        state: profile.billingAddress.state,
+        zip: profile.billingAddress.zip,
+        country: profile.billingAddress.country,
+      })
+    }
+  }
+
+  if (paymentDetails?.paymentToken) {
+    params.payment_token = paymentDetails.paymentToken
+  } else if (paymentDetails?.cardNumber) {
+    params.ccnumber = paymentDetails.cardNumber
+    params.ccexp = paymentDetails.cardExpiry
+    if (paymentDetails.cardCvv) params.cvv = paymentDetails.cardCvv
+  } else if (paymentDetails?.achAccount) {
+    params.payment = 'check'
+    params.checkname =
+      paymentDetails.checkName ||
+      `${profile?.firstName || ''} ${profile?.lastName || ''}`.trim()
+    params.checkaba = paymentDetails.achRouting
+    params.checkaccount = paymentDetails.achAccount
+    params.account_type = paymentDetails.achAccountType || 'checking'
+  } else {
+    throw new Error(
+      'updateBillingInCustomerVault: paymentDetails must include a card or ACH payment method',
+    )
+  }
+
+  log.info('vault.update_billing.request', {
+    customerVaultId,
+    billingId,
+    hasCard: Boolean(paymentDetails?.paymentToken || paymentDetails?.cardNumber),
+    hasAch: Boolean(paymentDetails?.achAccount),
+  })
+  const res = await nmiTransact(params, { sensitiveKeys: NMI_SENSITIVE_PARAMS })
+  if (res.response !== '1') {
+    const err = new Error(`NMI update_billing failed: ${res.responsetext || 'unknown'}`)
+    err.permanent = true
+    err.nmiResponse = res
+    throw err
+  }
+  log.info('vault.update_billing.success', { customerVaultId, billingId })
   return billingId
 }
 
@@ -311,6 +402,13 @@ export async function chargeCustomerVault({ customerVaultId, amount, currency, o
     order_description: invoiceNumber ? `Invoice ${invoiceNumber}` : undefined,
   }
   if (billingId) params.billing_id = String(billingId)
+  // NOTE: we intentionally do NOT send NMI's `dup_seconds`. Some processors
+  // (incl. this account's) reject it outright — "Overriding Duplicate Threshold
+  // is not allowed for this processor" (code 300), which would fail EVERY charge,
+  // not just true duplicates. NMI's duplicate-transaction window is controlled
+  // gateway-side; for the shared drop-ship vault, configure "Duplicate
+  // Transaction Checking" in the NMI control panel (disable it, shorten the
+  // window, or key it on order id — we send a unique `orderid` per order).
 
   console.log(
     `\n[NMI charge] vault=${customerVaultId}${billingId ? ` billing=${billingId}` : ''} ` +
@@ -328,6 +426,48 @@ export async function chargeCustomerVault({ customerVaultId, amount, currency, o
     responseCode: result.responseCode,
     responseText: result.responseText,
     authCode: result.authCode,
+  })
+  return result
+}
+
+// ── Collect.js one-time charge (Immediate Payment self-pay) ──────────
+//
+// Charge a single payment_token produced by Collect.js on the public
+// /pay/:token page. Collect.js tokenizes the card client-side (card data
+// never touches our server); we then run a one-time `type=sale` for the
+// EXACT amount the server computed. No vault is created — this is a pure
+// one-off charge. Returns the same outcome shape as chargeCustomerVault
+// (classifyNmiResponse) so settlement code treats it like any other sale.
+export async function chargeWithPaymentToken({ paymentToken, amount, currency, orderId, invoiceNumber }) {
+  if (!paymentToken) throw new Error('chargeWithPaymentToken: paymentToken is required')
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw new Error(`chargeWithPaymentToken: amount must be > 0, got ${amount}`)
+  }
+
+  const params = {
+    type: 'sale',
+    payment_token: paymentToken,
+    amount: amount.toFixed(2),
+    currency: currency || 'USD',
+    orderid: orderId,
+    order_description: invoiceNumber ? `Invoice ${invoiceNumber}` : undefined,
+  }
+
+  console.log(`\n[NMI charge:token] amount=$${amount.toFixed(2)} order=${orderId}`)
+  log.info('charge_token.request', { amount, orderId, invoiceNumber })
+
+  const res = await nmiTransact(params, { sensitiveKeys: ['payment_token'] })
+  const result = classifyNmiResponse(res)
+
+  console.log(
+    `[NMI charge:token] outcome=${result.outcome.toUpperCase()} txn=${result.transactionId || '-'} ` +
+      `code=${result.responseCode} "${result.responseText}"`,
+  )
+  log.info('charge_token.response', {
+    outcome: result.outcome,
+    transactionId: result.transactionId,
+    responseCode: result.responseCode,
+    responseText: result.responseText,
   })
   return result
 }

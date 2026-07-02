@@ -1,4 +1,3 @@
-import { useState } from "react";
 import {
   useLoaderData,
   useNavigation,
@@ -11,7 +10,8 @@ import {
   countCustomers,
 } from "../services/qbo/qbo.service";
 import { escapeQboQuery } from "../services/qbo/qbo.utils";
-import { formatAmount } from "../utils/format.utils";
+import { formatAmount, fmtDueDate, initialsOf } from "../utils/format.utils";
+import { AdvancedFilters } from "../components/admin-ui";
 
 const PAGE_SIZE = 50;
 
@@ -22,6 +22,51 @@ const STATUS_FILTERS = [
   { id: "active", label: "Active", where: "Active = true" },
   { id: "inactive", label: "Inactive", where: "Active = false" },
 ];
+
+// Balance filter chips — whether the customer currently owes QBO money.
+const BALANCE_FILTERS = [
+  { id: "all", label: "All", where: null },
+  { id: "with_balance", label: "With balance", where: "Balance > '0'" },
+  { id: "no_balance", label: "No balance", where: "Balance = '0'" },
+];
+
+// Config for the shared <AdvancedFilters> card. Options mirror STATUS_FILTERS
+// / BALANCE_FILTERS so the loader's where-clause mapping stays the single
+// source of truth.
+const FILTER_FIELDS = [
+  {
+    key: "q",
+    label: "Search",
+    type: "text",
+    placeholder: "Name, company, or email",
+  },
+  {
+    key: "status",
+    label: "Status",
+    type: "select",
+    options: STATUS_FILTERS.map((s) => ({ value: s.id, label: s.label })),
+  },
+  {
+    key: "balance",
+    label: "Balance",
+    type: "select",
+    options: BALANCE_FILTERS.map((b) => ({ value: b.id, label: b.label })),
+  },
+  { key: "dateFrom", label: "Customer since (from)", type: "date" },
+  { key: "dateTo", label: "Customer since (to)", type: "date" },
+];
+const FILTER_DEFAULTS = { status: "all", balance: "all" };
+
+const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
+// MetaData.CreateTime is a documented QBO QL filter/orderby field (unlike
+// most metadata paths); each bound is applied only when well-formed so a
+// hand-edited URL can't inject a raw expression.
+function buildCreatedDateWhere(from, to) {
+  const parts = [];
+  if (YMD_RE.test(from)) parts.push(`MetaData.CreateTime >= '${from}'`);
+  if (YMD_RE.test(to)) parts.push(`MetaData.CreateTime <= '${to}T23:59:59'`);
+  return parts.length ? parts.join(" AND ") : null;
+}
 
 // Build a QBO QL WHERE predicate that matches the admin's free-text
 // search against name, email, and company name. Returns null when the
@@ -51,13 +96,33 @@ export const loader = async ({ request }) => {
   const url = new URL(request.url);
   const q = (url.searchParams.get("q") || "").trim();
   const status = url.searchParams.get("status") || "all";
+  const balance = url.searchParams.get("balance") || "all";
+  const dateFrom = (url.searchParams.get("dateFrom") || "").trim();
+  const dateTo = (url.searchParams.get("dateTo") || "").trim();
   const page = Math.max(1, Number(url.searchParams.get("page") || 1));
   const startPosition = (page - 1) * PAGE_SIZE + 1;
 
+  const commonState = {
+    page,
+    pageSize: PAGE_SIZE,
+    q,
+    status,
+    balance,
+    dateFrom,
+    dateTo,
+  };
+
   const statusWhere =
     STATUS_FILTERS.find((s) => s.id === status)?.where || null;
+  const balanceWhere =
+    BALANCE_FILTERS.find((b) => b.id === balance)?.where || null;
   const searchWhere = buildSearchWhere(q);
-  const where = combineWhere(statusWhere, searchWhere);
+  const where = combineWhere(
+    statusWhere,
+    balanceWhere,
+    buildCreatedDateWhere(dateFrom, dateTo),
+    searchWhere,
+  );
 
   // Page + total in parallel — QBO's list response only carries the
   // returned-on-this-page count, not the grand total.
@@ -68,23 +133,17 @@ export const loader = async ({ request }) => {
     ]);
 
     return {
+      ...commonState,
       rows: page1.entities.map(projectCustomer),
       total,
-      page,
-      pageSize: PAGE_SIZE,
-      q,
-      status,
       error: null,
     };
   } catch (e) {
     console.error("[qbo/customers] loader failed:", e?.message || e);
     return {
+      ...commonState,
       rows: [],
       total: 0,
-      page,
-      pageSize: PAGE_SIZE,
-      q,
-      status,
       error: e?.message || "Failed to load QBO customers",
     };
   }
@@ -110,18 +169,29 @@ function projectCustomer(c) {
 }
 
 export default function QboCustomers() {
-  const { rows, total, page, pageSize, q, status, error } = useLoaderData();
+  const {
+    rows,
+    total,
+    page,
+    pageSize,
+    q,
+    status,
+    balance,
+    dateFrom,
+    dateTo,
+    error,
+  } = useLoaderData();
   const navigation = useNavigation();
   const revalidator = useRevalidator();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [searchInput, setSearchInput] = useState(q);
 
-  const tableLoading = navigation.state === "loading";
   const refreshing = revalidator.state !== "idle";
+  const tableLoading = navigation.state === "loading" || refreshing;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const firstShown = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const lastShown = Math.min(page * pageSize, total);
 
+  // Pagination only — filter navigation is owned by <AdvancedFilters>.
   const updateParams = (next) => {
     const merged = new URLSearchParams(searchParams);
     for (const [k, v] of Object.entries(next)) {
@@ -132,62 +202,18 @@ export default function QboCustomers() {
     setSearchParams(merged);
   };
 
-  const onStatusChip = (id) => updateParams({ status: id === "all" ? null : id });
-  const onSearchSubmit = (e) => {
-    e?.preventDefault?.();
-    updateParams({ q: searchInput.trim() || null });
-  };
-  const onSearchClear = () => {
-    setSearchInput("");
-    updateParams({ q: null });
-  };
-
   return (
-    <s-section heading={`Customers (${total})`}>
-      <s-stack direction="block" gap="base">
-        <form onSubmit={onSearchSubmit}>
-          <s-stack direction="inline" gap="small-200" alignItems="end">
-            <s-search-field
-              label="Search"
-              labelAccessibilityVisibility="exclusive"
-              placeholder="Search by name, company, or email"
-              value={searchInput}
-              onInput={(e) => setSearchInput(e?.currentTarget?.value ?? "")}
-            />
-            <s-button variant="primary" type="submit">
-              Search
-            </s-button>
-            {q && (
-              <s-button variant="tertiary" onClick={onSearchClear}>
-                Clear
-              </s-button>
-            )}
-            <s-button
-              variant="secondary"
-              onClick={() => revalidator.revalidate()}
-              {...(refreshing ? { loading: true } : {})}
-            >
-              Refresh
-            </s-button>
-          </s-stack>
-        </form>
-
-        <s-stack direction="inline" gap="small-200">
-          {STATUS_FILTERS.map((f) => {
-            const active = status === f.id;
-            return (
-              <s-clickable-chip
-                key={f.id}
-                color={active ? "strong" : "base"}
-                accessibilityLabel={`Filter by ${f.label}`}
-                onClick={() => onStatusChip(f.id)}
-              >
-                {f.label}
-              </s-clickable-chip>
-            );
-          })}
-        </s-stack>
-
+    <>
+      <AdvancedFilters
+        fields={FILTER_FIELDS}
+        values={{ q, status, balance, dateFrom, dateTo }}
+        defaults={FILTER_DEFAULTS}
+        onRefresh={() => revalidator.revalidate()}
+        refreshing={refreshing}
+        applying={tableLoading}
+      />
+      <s-section heading={`Customers (${total})`}>
+        <s-stack direction="block" gap="base">
         {error && (
           <s-banner tone="critical" heading="Could not load customers">
             <s-paragraph>{error}</s-paragraph>
@@ -216,10 +242,11 @@ export default function QboCustomers() {
             <s-table-header-row>
               <s-table-header>Customer name</s-table-header>
               <s-table-header>Email</s-table-header>
+              <s-table-header>Phone</s-table-header>
               <s-table-header>Company</s-table-header>
               <s-table-header>Customer ID</s-table-header>
               <s-table-header>Balance</s-table-header>
-              <s-table-header>Payment terms</s-table-header>
+              <s-table-header>Customer since</s-table-header>
               <s-table-header>Status</s-table-header>
             </s-table-header-row>
             <s-table-body>
@@ -231,16 +258,32 @@ export default function QboCustomers() {
                   `Customer ${c.id}`;
                 return (
                   <s-table-row key={c.id}>
-                    <s-table-cell>{name}</s-table-cell>
+                    <s-table-cell>
+                      <s-stack direction="inline" gap="small-200" alignItems="center">
+                        <s-avatar
+                          size="small-200"
+                          initials={initialsOf(name)}
+                          alt={name}
+                        />
+                        <s-text>{name}</s-text>
+                      </s-stack>
+                    </s-table-cell>
                     <s-table-cell>{c.email || "—"}</s-table-cell>
+                    <s-table-cell>{c.phone || "—"}</s-table-cell>
                     <s-table-cell>{c.companyName || "—"}</s-table-cell>
                     <s-table-cell>#{c.id}</s-table-cell>
                     <s-table-cell>
-                      {c.balance != null
-                        ? formatAmount(c.balance, c.currency)
-                        : "—"}
+                      {c.balance != null ? (
+                        <s-text tone={c.balance > 0 ? "critical" : undefined}>
+                          {formatAmount(c.balance, c.currency)}
+                        </s-text>
+                      ) : (
+                        "—"
+                      )}
                     </s-table-cell>
-                    <s-table-cell>{c.paymentTerms || "—"}</s-table-cell>
+                    <s-table-cell>
+                      {c.createdAt ? fmtDueDate(c.createdAt) : "—"}
+                    </s-table-cell>
                     <s-table-cell>
                       <s-badge tone={c.active ? "success" : "default"}>
                         {c.active ? "Active" : "Inactive"}
@@ -285,7 +328,8 @@ export default function QboCustomers() {
             </s-stack>
           </s-stack>
         )}
-      </s-stack>
-    </s-section>
+        </s-stack>
+      </s-section>
+    </>
   );
 }
