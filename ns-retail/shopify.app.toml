@@ -5,8 +5,6 @@ name = "NS-Retail"
 application_url = "https://r-w.onrender.com"
 embedded = true
 
-[build]
-automatically_update_urls_on_dev = true
 
 [webhooks]
 api_version = "2026-07"
@@ -30,3 +28,7 @@ redirect_urls = [ "https://r-w.onrender.com/api/auth" ]
 url = "https://r-w.onrender.com"
 subpath = "retail-signup"
 prefix = "apps"
+
+[build]
+automatically_update_urls_on_dev = false
+

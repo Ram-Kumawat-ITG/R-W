@@ -54,6 +54,7 @@ redirect_urls = [ "https://natural-solutions-wholesale.onrender.com/api/auth" ]
 url = "https://natural-solutions-wholesale.onrender.com"
 subpath = "wholesale-application"
 prefix = "apps"
- 
+
 [build]
-automatically_update_urls_on_dev = true
+automatically_update_urls_on_dev = false
+ 
