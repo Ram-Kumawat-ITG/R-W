@@ -30,6 +30,12 @@ export default [
   // Internal cross-repo endpoint: wholesale proxies vendor bill PDF requests here.
   route("/api/cdo/bill-pdf", "api/cdo/bill-pdf.js"),
   route("/api/cdo/checkout-validate-code", "api/cdo/checkout-validate-code.js"),
+  // On-demand Processing Fee variant provisioning. POST { price }
+  // returns { gid } for a variant at that exact cent-precise price,
+  // creating it (and LRU-evicting an old one if the product is at
+  // capacity) as needed. Called from the checkout extension via
+  // FullPageApi.getFeeVariant().
+  route("/api/cdo/fee-variant", "api/cdo/fee-variant.js"),
   // Apply a validated referral code to the cart and immediately tag the
   // Shopify customer. Called from the checkout UI extension when the buyer
   // applies a code. Tags the customer so the code becomes the default for

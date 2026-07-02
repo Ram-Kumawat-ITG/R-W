@@ -36,7 +36,9 @@ api_access = false
 # Gives your extension access to make external network calls, using the
 # JavaScript `fetch()` API. Learn more:
 # https://shopify.dev/docs/api/checkout-ui-extensions/latest/configuration#network-access
-# network_access = true
+# REQUIRED: the checkout extension POSTs to /api/cdo/fee-variant on the
+# wholesale app backend to resolve an exact-price Processing Fee variant.
+network_access = true
 
 # Merchant settings removed 2026-06-29 — variant GID + fee rate now
 # hardcoded as constants in src/Checkout.jsx for simplicity. Re-enable
