@@ -8,7 +8,7 @@ import { authenticate } from "../shopify.server";
 import { listNmiTransactions } from "../services/nmi/nmi.service";
 // fromNmiDate lives in nmi.utils.js — see that file for why.
 import { fromNmiDate } from "../services/nmi/nmi.utils";
-import { formatAmount } from "../utils/format.utils";
+import { formatAmount, initialsOf } from "../utils/format.utils";
 import { AdvancedFilters } from "../components/admin-ui";
 
 const PAGE_SIZE = 50;
@@ -351,11 +351,18 @@ export default function NmiRefunds() {
                     </s-stack>
                   </s-table-cell>
                   <s-table-cell>
-                    <s-stack direction="block" gap="none">
-                      <s-text>{r.customerName || "—"}</s-text>
-                      {r.email && (
-                        <s-text tone="subdued">{r.email}</s-text>
-                      )}
+                    <s-stack direction="inline" gap="small-200" alignItems="center">
+                      <s-avatar
+                        size="small-200"
+                        initials={initialsOf(r.customerName)}
+                        alt={r.customerName || "Customer"}
+                      />
+                      <s-stack direction="block" gap="none">
+                        <s-text>{r.customerName || "—"}</s-text>
+                        {r.email && (
+                          <s-text tone="subdued">{r.email}</s-text>
+                        )}
+                      </s-stack>
                     </s-stack>
                   </s-table-cell>
                   <s-table-cell>

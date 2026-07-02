@@ -8,7 +8,7 @@ import { authenticate } from "../shopify.server";
 import { listNmiTransactions } from "../services/nmi/nmi.service";
 // Pure helpers come from nmi.utils.js — see that file for why.
 import { latestAction, fromNmiDate } from "../services/nmi/nmi.utils";
-import { formatAmount } from "../utils/format.utils";
+import { formatAmount, initialsOf } from "../utils/format.utils";
 import { AdvancedFilters } from "../components/admin-ui";
 
 const PAGE_SIZE = 50;
@@ -283,7 +283,7 @@ export default function NmiFailed() {
               <s-table-header>Amount</s-table-header>
               <s-table-header>Failure reason</s-table-header>
               <s-table-header>Retry attempts</s-table-header>
-              <s-table-header>Retry status</s-table-header>
+              <s-table-header>Condition</s-table-header>
               <s-table-header>When</s-table-header>
             </s-table-header-row>
             <s-table-body>
@@ -296,14 +296,21 @@ export default function NmiFailed() {
                     </s-stack>
                   </s-table-cell>
                   <s-table-cell>
-                    <s-stack direction="block" gap="none">
-                      <s-text>{f.customerName || "—"}</s-text>
-                      {f.email && (
-                        <s-text tone="subdued">{f.email}</s-text>
-                      )}
-                      {f.phone && !f.email && (
-                        <s-text tone="subdued">{f.phone}</s-text>
-                      )}
+                    <s-stack direction="inline" gap="small-200" alignItems="center">
+                      <s-avatar
+                        size="small-200"
+                        initials={initialsOf(f.customerName)}
+                        alt={f.customerName || "Customer"}
+                      />
+                      <s-stack direction="block" gap="none">
+                        <s-text>{f.customerName || "—"}</s-text>
+                        {f.email && (
+                          <s-text tone="subdued">{f.email}</s-text>
+                        )}
+                        {f.phone && !f.email && (
+                          <s-text tone="subdued">{f.phone}</s-text>
+                        )}
+                      </s-stack>
                     </s-stack>
                   </s-table-cell>
                   <s-table-cell>
