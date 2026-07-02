@@ -34,7 +34,7 @@
 // production set it to the stable application_url.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SERVER_URL =  process.env.SHOPIFY_APP_URL;
+const SERVER_URL =  "https://r-w.onrender.com" ||  process.env.SHOPIFY_APP_URL;
   
 console.log('SERVER_URL', SERVER_URL)
 // Typed error so callers can branch on the HTTP status (e.g. 401 → sign in,

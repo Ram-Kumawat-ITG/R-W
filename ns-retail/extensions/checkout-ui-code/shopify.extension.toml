@@ -7,7 +7,7 @@ api_version = "2026-04"
 name = "checkout-ui-code"
 handle = "checkout-ui-code"
 type = "ui_extension"
-uid = "2e611719-7d43-f632-9bdc-75ae2ffe3570011822b3"
+uid = "2e611719-7d43-4632-9bdc-75ae2ffe3570"
 
 [[extensions.targeting]]
 module = "./src/Checkout.jsx"
