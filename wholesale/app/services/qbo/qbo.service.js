@@ -640,6 +640,32 @@ export async function countCustomers({ where } = {}) {
   return runCountQuery({ entity: 'Customer', where })
 }
 
+// Invoice queries can't filter on the referenced customer's name directly
+// (CustomerRef is an id-only reference field in QBO QL), so a customer-name
+// filter resolves matching Customer ids first, then the caller ANDs
+// `CustomerRef IN (...)` onto the Invoice WHERE clause.
+export async function findCustomerIdsByName(name, { maxResults = 100 } = {}) {
+  const v = escapeQboQuery(String(name || '').trim())
+  if (!v) return []
+  const stmt = `SELECT Id FROM Customer WHERE DisplayName LIKE '%${v}%' MAXRESULTS ${maxResults}`
+  const res = await qbo.query(stmt)
+  const entities = res?.QueryResponse?.Customer || []
+  return entities.map((c) => c.Id)
+}
+
+// Shared "filter by customer name" fragment for any entity carrying a
+// CustomerRef (Invoice, Payment, ...). Returns null when the filter is
+// inactive, or an always-false `Id = '0'` sentinel when the name matches no
+// customer — callers AND this onto their own WHERE clause rather than
+// silently dropping an unmatched filter.
+export async function buildCustomerRefWhere(name) {
+  const trimmed = String(name || '').trim()
+  if (!trimmed) return null
+  const ids = await findCustomerIdsByName(trimmed)
+  if (ids.length === 0) return "Id = '0'"
+  return `CustomerRef IN (${ids.map((id) => `'${id}'`).join(', ')})`
+}
+
 export async function listInvoices({ pageSize, startPosition, where, orderBy } = {}) {
   return runListQuery({
     entity: 'Invoice',

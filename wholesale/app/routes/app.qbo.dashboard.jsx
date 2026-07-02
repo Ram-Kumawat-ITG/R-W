@@ -1,7 +1,33 @@
 import { useLoaderData, useNavigate, useRevalidator } from "react-router";
 import { authenticate } from "../shopify.server";
-import { getDashboardSnapshot } from "../services/qbo/qbo.service";
-import { formatAmount, fmtDueDate } from "../utils/format.utils";
+import {
+  getDashboardSnapshot,
+  getInvoiceWebUrl,
+} from "../services/qbo/qbo.service";
+import { derivePaymentMethod, linkedInvoiceIds } from "../services/qbo/qbo.utils";
+import { formatAmount, fmtDueDate, initialsOf } from "../utils/format.utils";
+
+// Pre-project the raw QBO Payment entities the loader gets back into the
+// exact shape the table renders, resolving payment method + invoice deep
+// links here (server-side) rather than in the component — importing
+// qbo.service into render code drags its config/env chain into the
+// client bundle (see the "client render must never import from
+// svc.service.js" project rule).
+function projectRecentPayment(p) {
+  return {
+    id: p.Id,
+    customerName: p.CustomerRef?.name || null,
+    totalAmount: p.TotalAmt != null ? Number(p.TotalAmt) : null,
+    currency: p.CurrencyRef?.value || "USD",
+    paymentMethod: derivePaymentMethod(p.PaymentMethodRef?.name, p.PaymentRefNum),
+    paymentRef: p.PaymentRefNum || null,
+    txnDate: p.TxnDate || null,
+    linkedInvoices: linkedInvoiceIds(p).map((id) => ({
+      id,
+      url: getInvoiceWebUrl(id),
+    })),
+  };
+}
 
 // QBO Dashboard tab — analytics overview pulled live from the QBO API.
 //
@@ -17,7 +43,13 @@ export const loader = async ({ request }) => {
   await authenticate.admin(request);
   try {
     const snapshot = await getDashboardSnapshot();
-    return { snapshot, fatalError: null };
+    return {
+      snapshot: {
+        ...snapshot,
+        recentPayments: (snapshot.recentPayments || []).map(projectRecentPayment),
+      },
+      fatalError: null,
+    };
   } catch (e) {
     // A fatal error here means the underlying QBO client couldn't
     // refresh the token at all — none of the partial-failure handling
@@ -203,24 +235,58 @@ export default function QboDashboard() {
               <s-table-header>Amount</s-table-header>
               <s-table-header>Method</s-table-header>
               <s-table-header>Reference</s-table-header>
+              <s-table-header>Applied to invoice</s-table-header>
               <s-table-header>Date</s-table-header>
             </s-table-header-row>
             <s-table-body>
               {recentPayments.map((p) => (
                 <s-table-row
-                  key={p.Id}
+                  key={p.id}
                   onClick={() => navigate("/app/qbo/transactions")}
                 >
-                  <s-table-cell>#{p.Id}</s-table-cell>
-                  <s-table-cell>{p.CustomerRef?.name || "—"}</s-table-cell>
+                  <s-table-cell>#{p.id}</s-table-cell>
                   <s-table-cell>
-                    {p.TotalAmt != null
-                      ? formatAmount(p.TotalAmt, p.CurrencyRef?.value || "USD")
+                    <s-stack direction="inline" gap="small-200" alignItems="center">
+                      <s-avatar
+                        size="small-200"
+                        initials={initialsOf(p.customerName)}
+                        alt={p.customerName || "Customer"}
+                      />
+                      <s-text>{p.customerName || "—"}</s-text>
+                    </s-stack>
+                  </s-table-cell>
+                  <s-table-cell>
+                    {p.totalAmount != null
+                      ? formatAmount(p.totalAmount, p.currency)
                       : "—"}
                   </s-table-cell>
-                  <s-table-cell>{p.PaymentMethodRef?.name || "—"}</s-table-cell>
-                  <s-table-cell>{p.PaymentRefNum || "—"}</s-table-cell>
-                  <s-table-cell>{fmtDueDate(p.TxnDate) || "—"}</s-table-cell>
+                  <s-table-cell>
+                    {p.paymentMethod ? (
+                      <s-badge tone="neutral">{p.paymentMethod}</s-badge>
+                    ) : (
+                      <s-text tone="subdued">—</s-text>
+                    )}
+                  </s-table-cell>
+                  <s-table-cell>{p.paymentRef || "—"}</s-table-cell>
+                  <s-table-cell>
+                    {p.linkedInvoices.length > 0 ? (
+                      <s-stack direction="block" gap="none">
+                        {p.linkedInvoices.map((inv) => (
+                          <s-link
+                            key={inv.id}
+                            href={inv.url}
+                            target="_blank"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            #{inv.id}
+                          </s-link>
+                        ))}
+                      </s-stack>
+                    ) : (
+                      <s-text tone="subdued">—</s-text>
+                    )}
+                  </s-table-cell>
+                  <s-table-cell>{fmtDueDate(p.txnDate) || "—"}</s-table-cell>
                 </s-table-row>
               ))}
             </s-table-body>
@@ -238,9 +304,11 @@ export default function QboDashboard() {
             <s-table-header-row>
               <s-table-header>Invoice</s-table-header>
               <s-table-header>Customer</s-table-header>
+              <s-table-header>Invoice date</s-table-header>
               <s-table-header>Total</s-table-header>
               <s-table-header>Balance</s-table-header>
               <s-table-header>Status</s-table-header>
+              <s-table-header>Sent</s-table-header>
               <s-table-header>Due date</s-table-header>
             </s-table-header-row>
             <s-table-body>
@@ -258,6 +326,14 @@ export default function QboDashboard() {
                   : status === "Partial" ? "info"
                   : status === "Voided" ? "default"
                   : "warning";
+                const sentTone =
+                  inv.EmailStatus === "EmailSent" ? "success"
+                  : inv.EmailStatus === "NeedToSend" ? "warning"
+                  : "default";
+                const sentLabel =
+                  inv.EmailStatus === "EmailSent" ? "Sent"
+                  : inv.EmailStatus === "NeedToSend" ? "Pending"
+                  : "Not set";
                 return (
                   <s-table-row
                     key={inv.Id}
@@ -266,7 +342,17 @@ export default function QboDashboard() {
                     <s-table-cell>
                       {inv.DocNumber ? `#${inv.DocNumber}` : `#${inv.Id}`}
                     </s-table-cell>
-                    <s-table-cell>{inv.CustomerRef?.name || "—"}</s-table-cell>
+                    <s-table-cell>
+                      <s-stack direction="inline" gap="small-200" alignItems="center">
+                        <s-avatar
+                          size="small-200"
+                          initials={initialsOf(inv.CustomerRef?.name)}
+                          alt={inv.CustomerRef?.name || "Customer"}
+                        />
+                        <s-text>{inv.CustomerRef?.name || "—"}</s-text>
+                      </s-stack>
+                    </s-table-cell>
+                    <s-table-cell>{fmtDueDate(inv.TxnDate) || "—"}</s-table-cell>
                     <s-table-cell>
                       {total > 0
                         ? formatAmount(total, inv.CurrencyRef?.value || "USD")
@@ -277,6 +363,9 @@ export default function QboDashboard() {
                     </s-table-cell>
                     <s-table-cell>
                       <s-badge tone={statusTone}>{status}</s-badge>
+                    </s-table-cell>
+                    <s-table-cell>
+                      <s-badge tone={sentTone}>{sentLabel}</s-badge>
                     </s-table-cell>
                     <s-table-cell>{fmtDueDate(inv.DueDate) || "—"}</s-table-cell>
                   </s-table-row>
