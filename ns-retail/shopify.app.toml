@@ -2,7 +2,7 @@
 
 client_id = "79f6038c639d31f8da67ad5d6a036fb4"
 name = "NS-Retail"
-application_url = "https://9113-14-195-73-179.ngrok-free.app"
+application_url = "https://r-w.onrender.com"
 embedded = true
 
 [build]
@@ -24,9 +24,9 @@ api_version = "2026-07"
 scopes = "read_customers,write_customers,write_metaobject_definitions,write_metaobjects,write_products"
 
 [auth]
-redirect_urls = [ "https://9113-14-195-73-179.ngrok-free.app/api/auth" ]
+redirect_urls = [ "https://r-w.onrender.com/api/auth" ]
 
 [app_proxy]
-url = "https://9113-14-195-73-179.ngrok-free.app"
+url = "https://r-w.onrender.com"
 subpath = "retail-signup"
 prefix = "apps"
