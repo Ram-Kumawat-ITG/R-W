@@ -29,9 +29,10 @@
 //
 // SERVER_URL — the absolute base URL of the ns-retail app backend, baked in
 // here (the extension's Web Worker sandbox has no `process.env`, so the URL
-// must live in the source). `shopify app dev` mints a NEW trycloudflare tunnel
-// on every start, so paste the current tunnel URL here when it rotates; in
-// production set it to the stable application_url.
+// must live in the source). `npm run sync:extension-app-url` (wired into the
+// `predev`/`predeploy` hooks — see scripts/sync-extension-app-url.js) keeps
+// this literal in sync with the current dev tunnel / production application_url
+// automatically; you should not need to hand-edit it.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SERVER_URL =  "https://r-w.onrender.com" ||  process.env.SHOPIFY_APP_URL;
