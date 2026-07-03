@@ -35,7 +35,7 @@
 // automatically; you should not need to hand-edit it.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SERVER_URL = "https://issn-sole-slot-definition.trycloudflare.com"
+const SERVER_URL = "https://issn-sole-slot-definition.trycloudflare.com" 
 // Typed error so callers can branch on the HTTP status (e.g. 401 → sign in,
 // 403 → access restricted) and still read the server message + body.
 export class ApiError extends Error {
