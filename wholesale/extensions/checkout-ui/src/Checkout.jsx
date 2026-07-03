@@ -50,7 +50,6 @@
 //      backend to that product's numeric ID.
 //   3. shopify app deploy.
 
-import '@shopify/ui-extensions/preact'
 import { render } from 'preact'
 import { signal, useSignalEffect } from '@preact/signals'
 import FullPageApi from '../../services/FullPageApi.jsx'

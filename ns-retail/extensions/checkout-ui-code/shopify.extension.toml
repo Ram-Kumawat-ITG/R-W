@@ -29,12 +29,10 @@ network_access = true
 # locally it is auto-granted.
 block_progress = true
 
-# ── App URL bridge ──────────────────────────────────────────────────
-# The admin app (app/routes/app.jsx loader) writes the current app URL
-# to a shop metafield in the $app:cdo namespace on every admin load.
-# Subscribing here makes that metafield available to this extension at
-# runtime via shopify.appMetafields.value — so we can compose fetch URLs
-# without hardcoding anything.
-[[extensions.metafields]]
-namespace = "$app:cdo"
-key = "app_url"
+# ── App URL sourcing (2026-07-02) ───────────────────────────────────
+# The app URL is now baked into the extension bundle at BUILD time via
+# extensions/services/FullPageApi.jsx (reads process.env.SHOPIFY_APP_URL
+# from .env — esbuild substitutes it during `shopify app deploy`). The
+# previous $app:cdo / app_url shop-metafield bridge was removed since
+# the build-time constant covers the same need with fewer moving parts
+# (no more admin-must-be-opened prerequisite + no per-shop write).

@@ -1,4 +1,3 @@
-import "@shopify/ui-extensions/preact";
 import { useBuyerJourneyIntercept } from "@shopify/ui-extensions/checkout/preact";
 import { render } from "preact";
 import { useEffect } from "preact/hooks";
