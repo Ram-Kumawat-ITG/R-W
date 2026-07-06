@@ -4,8 +4,9 @@
   "scripts": {
     "build": "react-router build",
     "build:theme": "npm --prefix registration-form run build",
+    "build:portal": "npm --prefix practitioner-portal run build",
     "sync:extension-app-url": "node scripts/sync-extension-app-url.js",
-    "predeploy": "npm run sync:extension-app-url && npm run build:theme",
+    "predeploy": "npm run sync:extension-app-url && npm run build:theme && npm run build:portal",
     "predev": "npm run sync:extension-app-url",
     "dev": "shopify app dev",
     "dev:local": "shopify app dev --config localhost --use-localhost",
