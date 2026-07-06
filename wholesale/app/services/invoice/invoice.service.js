@@ -144,7 +144,7 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
     }
   }
   // Due date is selected by the invoice's locked paymentMethod, per the
-  // production billing rules (ACH = due on receipt; Card = billing-cycle
+  // production billing rules (ACH and Card both use the same billing-cycle
   // date, 1st-15th → the 15th, 16th-EOM → month end; Check = N business
   // days) — see resolveInvoiceDueDate / computeDueDateForMethod. Sending
   // DueDate explicitly makes us the source of truth and overrides any QBO

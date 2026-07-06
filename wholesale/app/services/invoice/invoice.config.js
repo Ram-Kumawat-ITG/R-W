@@ -22,8 +22,10 @@ export const invoiceConfig = {
 
   // Per-payment-method due-date RULES (not a flat day-count — see
   // `computeDueDateForMethod` in invoice.utils.js for the actual math):
-  //   - ach   → due on receipt (same day as the order date). No env knob;
-  //     there is nothing to configure.
+  //   - ach   → billing-cycle date: orders placed the 1st–15th are due the
+  //     15th of that month; orders placed the 16th–end-of-month are due
+  //     the last day of that month. Same rule as card. No env knob — this
+  //     is a fixed business rule, not a day-count.
   //   - card  → billing-cycle date: orders placed the 1st–15th are due the
   //     15th of that month; orders placed the 16th–end-of-month are due
   //     the last day of that month. No env knob — this is a fixed

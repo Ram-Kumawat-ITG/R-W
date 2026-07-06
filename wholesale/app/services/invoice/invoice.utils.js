@@ -62,10 +62,11 @@ export function addBusinessDays(date, n) {
   return d
 }
 
-// Card billing-cycle due date: orders placed the 1st–15th are due on the
-// 15th of that month; orders placed the 16th–end-of-month are due on the
-// last day of that month. Returns a new Date at the same time-of-day as
-// `date` (callers format with toYmd / add termsMinutes as needed).
+// Billing-cycle due date (shared by card AND ach): orders placed the
+// 1st–15th are due on the 15th of that month; orders placed the
+// 16th–end-of-month are due on the last day of that month. Returns a new
+// Date at the same time-of-day as `date` (callers format with toYmd /
+// add termsMinutes as needed).
 export function computeCardBillingDueDate(date) {
   const d = date instanceof Date ? new Date(date) : new Date(date)
   const day = d.getDate()
@@ -81,7 +82,8 @@ export function computeCardBillingDueDate(date) {
 
 // Resolve the invoice due date + full-datetime dueAt for a given payment
 // method, per the production billing rules:
-//   - ach   → due on receipt (same day as the order/invoice date).
+//   - ach   → billing-cycle date: 1st–15th → due the 15th; 16th–EOM → due
+//             the last day of the month (same rule as card).
 //   - card  → billing-cycle date: 1st–15th → due the 15th; 16th–EOM → due
 //             the last day of the month.
 //   - check → `businessDays` business days (Mon–Fri) after the order date.
@@ -95,9 +97,7 @@ export function computeDueDateForMethod(baseDate, method, { businessDays, termsD
   if (!Number.isFinite(base.getTime())) return { dueDate: null, dueAt: null }
 
   let due
-  if (method === 'ach') {
-    due = new Date(base)
-  } else if (method === 'card') {
+  if (method === 'ach' || method === 'card') {
     due = computeCardBillingDueDate(base)
   } else if (method === 'check') {
     due = addBusinessDays(base, Number.isFinite(businessDays) ? businessDays : 10)

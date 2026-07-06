@@ -54,7 +54,7 @@ function printBootBanner() {
   console.log("  --- Invoicing ---");
   console.log(`  INVOICE_TERMS_DAYS        : ${invoiceConfig.termsDays} (generic fallback)`);
   console.log(
-    `  Due-date rules by method  : ach=on receipt ` +
+    `  Due-date rules by method  : ach=billing-cycle(1-15→15th, 16-EOM→month end) ` +
       `card=billing-cycle(1-15→15th, 16-EOM→month end) ` +
       `check=${invoiceConfig.checkDueBusinessDays} business days`,
   );
