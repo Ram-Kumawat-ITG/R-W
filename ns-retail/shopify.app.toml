@@ -18,7 +18,6 @@ api_version = "2026-07"
   uri = "/webhooks/app/scopes_update"
 
   
-
   [[webhooks.subscriptions]]
   topics = [ "orders/create" ]
   uri = "/webhooks/orders/create"
@@ -35,5 +34,5 @@ subpath = "retail-signup"
 prefix = "apps"
 
 [build]
-automatically_update_urls_on_dev = false
+automatically_update_urls_on_dev = no
 

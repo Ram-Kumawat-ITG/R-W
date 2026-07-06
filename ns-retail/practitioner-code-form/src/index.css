@@ -1,0 +1,86 @@
+/* Scoped under .pcf so styles never bleed into the merchant theme. */
+
+.pcf {
+  margin: 1rem 0;
+  padding: 1rem;
+  border: 1px solid #e5e5e5;
+  border-radius: 8px;
+  background: #fafafa;
+  font-family: inherit;
+  color: #1a1a1a;
+}
+
+.pcf__label {
+  display: block;
+  margin: 0 0 0.5rem;
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.pcf__row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: stretch;
+  flex-wrap: wrap;
+}
+
+.pcf__input {
+  flex: 1 1 200px;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  font-size: 0.95rem;
+  font-family: inherit;
+  background: #fff;
+  color: #1a1a1a;
+}
+
+.pcf__input:focus {
+  outline: 2px solid #4a90e2;
+  outline-offset: -1px;
+  border-color: #4a90e2;
+}
+
+.pcf__input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.pcf__button {
+  padding: 0.6rem 1.2rem;
+  border: none;
+  border-radius: 6px;
+  background: #1a1a1a;
+  color: #fff;
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 0.95rem;
+  font-family: inherit;
+  white-space: nowrap;
+  transition: background-color 120ms ease;
+}
+
+.pcf__button:hover:not(:disabled) {
+  background: #333;
+}
+
+.pcf__button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.pcf__status {
+  margin: 0.6rem 0 0;
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+
+.pcf__status--success {
+  color: #0a7d0a;
+  font-weight: 500;
+}
+
+.pcf__status--error {
+  color: #b02020;
+  font-weight: 500;
+}
