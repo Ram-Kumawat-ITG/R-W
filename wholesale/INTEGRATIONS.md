@@ -1260,25 +1260,29 @@ Line items mirror Shopify's: per-product line + Shipping line + Tax
 line. Every line needs an `Item` reference — `QBO_WHOLESALE_DEFAULT_ITEM_ID`
 (default `"1"`) is used unless `line.qboItemId` is set.
 
-`DueDate` is computed in this app as **order date + per-method terms**,
-then sent explicitly to QBO. This makes us the source of truth for terms
-and overrides any customer-level `SalesTerm` configured in QBO. The term
-length is selected by the invoice's locked `paymentMethod` via
-`invoiceConfig.dueDaysForMethod`:
+`DueDate` is computed in this app per **fixed, method-specific billing
+rules** (not a flat day-count), then sent explicitly to QBO. This makes
+us the source of truth for terms and overrides any customer-level
+`SalesTerm` configured in QBO. The rule is selected by the invoice's
+locked `paymentMethod` via `invoice.config.resolveInvoiceDueDate` →
+`invoice.utils.computeDueDateForMethod`:
 
-| Payment method | Env var | Default |
+| Payment method | Rule | Env var |
 |---|---|---|
-| Cheque | `CHEQUE_DUE_DATE` | `INVOICE_TERMS_DAYS` (15) |
-| ACH | `ACH_DUE_DATE` | `INVOICE_TERMS_DAYS` (15) |
-| Card | `CARD_DUE_DATE` | `INVOICE_TERMS_DAYS` (15) |
+| ACH | Due on receipt — same day as the order date. | none |
+| Card | Billing-cycle date: orders placed the **1st–15th** are due the **15th** of that month; orders placed the **16th–end-of-month** are due the **last day** of that month. | none |
+| Cheque | **N business days** (Mon–Fri, no holiday calendar) after the order date. | `CHEQUE_DUE_DATE` (default `10`) |
 
-Each falls back to the generic `INVOICE_TERMS_DAYS` when its var is unset,
-so single-terms setups keep working. Example: order June 1 +
-`CHEQUE_DUE_DATE=15` → due June 16. The same per-method term feeds the
-local full-datetime `Invoice.dueAt` (plus `INVOICE_TERMS_MINUTES`). The
-date-only result is sent to QBO by `invoice.utils.computeInvoiceDueDate`;
-the returned `DueDate` is captured on the local invoice as `qboDueDate`
-("YYYY-MM-DD" string) for display in the Order List + Order Details.
+Example: a card order placed July 3 → due July 15; a card order placed
+July 20 → due July 31. A cheque order placed Friday July 3 with the
+default 10 business days → due Friday July 17. Any other payment method
+(currently just `dropship`) still uses the generic calendar-day fallback
+(`invoiceConfig.dueDaysByMethod`, defaulting to `INVOICE_TERMS_DAYS`).
+The resolved due date also feeds the local full-datetime `Invoice.dueAt`
+(plus the testing-only `INVOICE_TERMS_MINUTES` offset). The date-only
+result is sent to QBO; the returned `DueDate` is captured on the local
+invoice as `qboDueDate` ("YYYY-MM-DD" string) for display in the Order
+List + Order Details.
 
 If both `order.created_at` and `localOrder.receivedAt` are unparseable,
 we omit `DueDate` from the request and QBO falls back to its own
@@ -3270,9 +3274,7 @@ required values throw immediately.
 | `NMI_TEST_CVV` | (optional) | Dev test card CVV |
 | **Invoicing** | | |
 | `INVOICE_TERMS_DAYS` | `15` | Generic fallback: days from order date to invoice due date when no per-method override is set. Sent as `DueDate` to QBO (overrides any customer-level SalesTerm) |
-| `CHEQUE_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **cheque** invoices (§7.3) |
-| `ACH_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **ACH** invoices (§7.3) |
-| `CARD_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **card** invoices (§7.3) |
+| `CHEQUE_DUE_DATE` | `10` | **Business days** (Mon–Fri) from order date → due date for **cheque** invoices (§7.3). ACH (due on receipt) and Card (billing-cycle date) have no env knob — they're fixed business rules, not day-counts. |
 | `IMMEDIATE_DUE_DATE` | `INVOICE_TERMS_DAYS` | Days from order date → due date for **Immediate Payment** invoices (§9.6) |
 | `INVOICE_TERMS_MINUTES` | `0` | Extra minutes added on top of `INVOICE_TERMS_DAYS` for the local full-datetime `Invoice.dueAt` field. **Testing knob** — set to `1` to flag invoices Overdue ~1 minute after creation without waiting whole days. The QBO date-only `DueDate` ignores this offset (it still rounds to `termsDays`); only the local Order List "Overdue" indicator + cheque-reminder UI uses `dueAt`. |
 | `INVOICE_FEE_RATE_CARD` | `0.03` | Per-method processing fee (decimal): card. Added as a line at invoice creation for card invoices (and at settlement for the cheque → card admin fallback / legacy invoices). `0` disables. |

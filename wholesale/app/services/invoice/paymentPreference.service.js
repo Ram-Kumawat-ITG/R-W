@@ -30,12 +30,10 @@ import Invoice from '../../models/invoice.server'
 import CustomerMap from '../../models/customerMap.server'
 import WholesaleApplication from '../../models/wholesaleApplication.server'
 import { setInvoiceProcessingFee } from '../qbo/qbo.service'
-import { invoiceConfig, dueDaysForMethod } from './invoice.config'
+import { invoiceConfig, resolveInvoiceDueDate } from './invoice.config'
 import {
   computeProcessingFee,
   buildProcessingFeeLine,
-  computeInvoiceDueDate,
-  computeInvoiceDueAt,
 } from './invoice.utils'
 import { appendInvoiceRemark } from './invoice.service'
 import { normalizePaymentMethod } from '../customer/customer.utils'
@@ -199,12 +197,11 @@ async function realignOneInvoice({ invoiceId, method, performedBy, source }) {
   })
   const feeLine = newFee ? buildProcessingFeeLine({ ...newFee, baseAmount: base }) : null
 
-  // New per-method due date. Basis = the invoice's QBO txn date, falling
+  // New per-method due date (ACH = on receipt, Card = billing-cycle date,
+  // Check = N business days). Basis = the invoice's QBO txn date, falling
   // back to its creation timestamp.
-  const termsDays = dueDaysForMethod(method)
   const basis = invoice.qboTxnDate || invoice.createdAt
-  const newDueDate = computeInvoiceDueDate(basis, termsDays)
-  const newDueAt = computeInvoiceDueAt(basis, termsDays, invoiceConfig.termsMinutes)
+  const { dueDate: newDueDate, dueAt: newDueAt } = resolveInvoiceDueDate(basis, method)
 
   // Rewrite the QBO invoice (fee line + due date) FIRST — if QBO rejects
   // (e.g. stale SyncToken from a concurrent CRON charge) we throw before

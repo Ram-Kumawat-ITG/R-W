@@ -29,13 +29,10 @@ import {
   recordOrderTransaction as recordShopifyOrderTransaction,
 } from '../shopify/shopify.service'
 import { paymentConfig } from '../payment/payment.config'
-import { invoiceConfig, dueDaysForMethod } from './invoice.config'
+import { invoiceConfig, resolveInvoiceDueDate } from './invoice.config'
 import {
   syncWithRetry,
   shopifyLinesToQboLines,
-  computeInvoiceDueDate,
-  computeInvoiceDueAt,
-  toYmd,
   computeProcessingFee,
   buildProcessingFeeLine,
   findExistingProcessingFeeLine,
@@ -146,25 +143,19 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
       )
     }
   }
-  // Due date = order date + per-method terms. The term length is
-  // selected by the invoice's locked paymentMethod (cheque →
-  // CHEQUE_DUE_DATE, ACH → ACH_DUE_DATE, card → CARD_DUE_DATE; each
-  // falls back to INVOICE_TERMS_DAYS). Sending DueDate explicitly makes
-  // us the source of truth and overrides any QBO customer-level
-  // SalesTerm. Falls back to localOrder.receivedAt if Shopify's
-  // created_at is missing; if both are unparseable, we omit DueDate
-  // and let QBO compute it from its own defaults.
+  // Due date is selected by the invoice's locked paymentMethod, per the
+  // production billing rules (ACH = due on receipt; Card = billing-cycle
+  // date, 1st-15th → the 15th, 16th-EOM → month end; Check = N business
+  // days) — see resolveInvoiceDueDate / computeDueDateForMethod. Sending
+  // DueDate explicitly makes us the source of truth and overrides any QBO
+  // customer-level SalesTerm. Falls back to localOrder.receivedAt if
+  // Shopify's created_at is missing; if both are unparseable, we omit
+  // DueDate and let QBO compute it from its own defaults.
   const orderDateBasis = order?.created_at || localOrder?.receivedAt
-  const termsDays = dueDaysForMethod(invoice.paymentMethod)
-  const dueDate = computeInvoiceDueDate(orderDateBasis, termsDays)
-  const dueAt = computeInvoiceDueAt(
-    orderDateBasis,
-    termsDays,
-    invoiceConfig.termsMinutes,
-  )
+  const { dueDate, dueAt } = resolveInvoiceDueDate(orderDateBasis, invoice.paymentMethod)
   console.log(
     `[invoice] dueDate = ${dueDate || '(QBO default)'} ` +
-      `(order date ${orderDateBasis || '(unknown)'} + ${termsDays} days [method=${invoice.paymentMethod}]` +
+      `(order date ${orderDateBasis || '(unknown)'}, method=${invoice.paymentMethod}` +
       (invoiceConfig.termsMinutes ? ` + ${invoiceConfig.termsMinutes} min` : '') +
       `) dueAt = ${dueAt ? dueAt.toISOString() : '(none)'}`,
   )
