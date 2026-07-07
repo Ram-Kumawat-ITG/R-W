@@ -48,6 +48,35 @@
 // The FIRST add is unavoidable but happens right after address entry,
 // BEFORE the buyer has picked a shipping method — no visible reset.
 
+// ─────────────────────────────────────────────────────────────────────────
+// ⚠️ DISABLED ON GROW PLAN — processing fee moved to carrier service
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Migrated 2026-07-06. Shopify custom-app UI extensions on the core
+// checkout steps (information / shipping / payment) are Plus-only per
+// Shopify's docs, so this extension NEVER rendered on the Grow-plan
+// retail store — even though the bundle deployed successfully and
+// network access was granted.
+//
+// Replacement: the 3% fee is now bundled into every shipping rate via
+// the carrier-service callback at `app/api/shipping/rates.js`. Customer
+// sees a single shipping line whose price includes the fee, with the
+// fee amount + calculation basis disclosed in the rate description
+// (e.g. "USPS Ground (incl. handling + 3% processing fee $29.27)").
+//
+// This file is INTENTIONALLY KEPT in the codebase:
+//   • Zero cost on Grow (Shopify silently doesn't render it).
+//   • If the store ever upgrades to Shopify Plus, un-disable by
+//     restoring the ORIGINAL default export at the bottom of this file
+//     (`render(<ProcessingFee />, document.body)`) — the full
+//     <ProcessingFee /> component below is preserved intact.
+//   • The `/api/cdo/fee-variant` backend endpoint stays live for
+//     legacy variant cleanup / future re-enable; no orphaned code.
+//
+// DO NOT DELETE without confirming rates.js processing-fee logic is
+// still active — they're the two halves of the same flow.
+// ─────────────────────────────────────────────────────────────────────────
+
 import '@shopify/ui-extensions/preact'
 import { render } from 'preact'
 import { signal, useSignalEffect } from '@preact/signals'
@@ -85,9 +114,24 @@ function formatPrice(n) {
   return (Math.round(n * 100) / 100).toFixed(2)
 }
 
+// ── Active default export (no-op on Grow) ─────────────────────────────
+// Renders nothing. On Plus stores, replace this with the original body:
+//   export default async () => { render(<ProcessingFee />, document.body); }
 export default async () => {
-  render(<ProcessingFee />, document.body)
+  // No-op on Grow. See disable banner above. Fee lives in rates.js now.
 }
+
+// ── Original implementation (preserved — DO NOT REMOVE) ───────────────
+// The full <ProcessingFee /> component below is the code that ran on the
+// checkout UI when the store was on Shopify Plus (or a dev store with
+// Plus features). Kept as live code (not commented out) so the linter /
+// type-checker still validate it and it stays in build-shape — but
+// nothing calls it at runtime because the default export above is a
+// no-op. To re-activate on a future Plus upgrade, change the default
+// export back to `render(<ProcessingFee />, document.body)` — no other
+// edits should be needed. Also revert the fee calculation in
+// `app/api/shipping/rates.js` (undo the 2026-07-06 migration) so the
+// fee isn't double-charged (once in shipping + once as a cart line).
 
 function ProcessingFee() {
   useSignalEffect(() => {

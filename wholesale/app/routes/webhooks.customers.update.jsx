@@ -100,21 +100,33 @@ export const action = async ({ request }) => {
         return;
       }
 
+      // ⚠️ DISABLED (2026-07-06) — wholesale → retail practitioner mirror
+      // was turned off per the product decision that wholesale
+      // practitioners should NOT auto-create ns-retail customers. See
+      // the banner in webhooks.customers.create.jsx for the full
+      // rationale + re-enable steps.
+      log.info("retail_sync.update_skipped_disabled", {
+        customerId,
+        email: customerEmail,
+      });
+
+      // ── Original implementation (preserved) ───────────────────────
       // Apply any incoming changes from the Shopify payload to the
       // in-memory WholesaleApplication snapshot before syncing — the
       // Mongo doc may not have been refreshed for an admin-UI edit.
-      const merged = {
-        ...application,
-        firstName: payload.first_name || application.firstName,
-        lastName: payload.last_name || application.lastName,
-        email: payload.email || application.email,
-        phone: payload.phone || application.phone,
-      };
-
-      await syncPractitionerToRetail({
-        application: merged,
-        action: "update",
-      });
+      //
+      // const merged = {
+      //   ...application,
+      //   firstName: payload.first_name || application.firstName,
+      //   lastName: payload.last_name || application.lastName,
+      //   email: payload.email || application.email,
+      //   phone: payload.phone || application.phone,
+      // };
+      //
+      // await syncPractitionerToRetail({
+      //   application: merged,
+      //   action: "update",
+      // });
     } catch (err) {
       log.error("retail_sync.update_failed", {
         customerId,

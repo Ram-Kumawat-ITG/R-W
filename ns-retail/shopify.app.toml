@@ -34,5 +34,5 @@ subpath = "retail-signup"
 prefix = "apps"
 
 [build]
-automatically_update_urls_on_dev = no
+automatically_update_urls_on_dev = fase
 
