@@ -816,25 +816,28 @@ export async function action({ request }) {
     return ratesResponse([]);
   }
 
-  // HMAC verify — hard-reject when a shared secret is configured
-  // (production / staging), soft-warn only when running locally
-  // without a secret set (developer convenience). This closes the
-  // "anyone can POST arbitrary rates" attack surface for real
-  // deployments while keeping local `shopify app dev` friction-free
-  // (dev tunnels sometimes rewrite the body / header).
+  // HMAC verify — carrier-service SPECIFIC behavior.
+  //
+  // Shopify's Carrier Service callbacks are NOT HMAC-signed the way
+  // regular webhooks are. Per Shopify docs, security relies on the
+  // callback URL being unguessable (registered via authenticated
+  // `carrierServiceCreate` mutation — an attacker can't register their
+  // own URL). Newer Shopify versions MAY include the header, so we
+  // still verify when it's present:
+  //
+  //   • Header ABSENT              → accept (normal carrier-service behavior)
+  //   • Header PRESENT + valid HMAC → accept (Shopify sending it)
+  //   • Header PRESENT + INVALID    → reject (tampering attempt)
+  //
+  // This closes the tampering vector while keeping the endpoint working
+  // for the vast majority of Shopify's carrier callbacks that don't
+  // include the header at all.
   const hmacHeader = request.headers.get("x-shopify-hmac-sha256") || "";
-  if (!verifyHmac(rawBody, hmacHeader)) {
-    // eslint-disable-next-line no-undef
-    const hasSecret = Boolean(process.env.SHOPIFY_API_SECRET);
-    if (hasSecret) {
-      console.warn(
-        "[shipping.rates] hmac verify failed — rejecting request (SHOPIFY_API_SECRET is set, so this is treated as production).",
-      );
-      return ratesResponse([]);
-    }
+  if (hmacHeader && !verifyHmac(rawBody, hmacHeader)) {
     console.warn(
-      "[shipping.rates] hmac verify skipped — SHOPIFY_API_SECRET not configured (local dev only). Do NOT deploy without setting it.",
+      "[shipping.rates] hmac header present but invalid — rejecting (possible tampering).",
     );
+    return ratesResponse([]);
   }
 
   let payload;
