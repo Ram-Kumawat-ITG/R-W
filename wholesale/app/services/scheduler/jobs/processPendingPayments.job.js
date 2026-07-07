@@ -9,6 +9,7 @@ import {
   chargeInvoice,
   propagateSuccessfulPayment,
 } from '../../payment/payment.service'
+import { notifyPaymentFailure } from '../../payment/paymentFailureNotification.service'
 import { createLogger } from '../../../utils/logger.utils'
 
 // Cap on the per-run `errors[]` detail list persisted to CronBatchRun —
@@ -18,6 +19,18 @@ const MAX_BATCH_ERROR_DETAILS = 20
 
 export const PROCESS_PENDING_PAYMENTS_JOB = 'process-pending-payments'
 const log = createLogger('job.pending_payments')
+
+// A chargeInvoice() `skip` isn't always a customer-facing failure — e.g. an
+// ACH sale still settling is normal in-flight processing, not something to
+// email a "Payment Failed" notice about. Declined/errored charge attempts
+// are always notifiable; skips are notifiable unless the reason matches one
+// of these known non-failure cases.
+const NON_FAILURE_SKIP_PATTERNS = [/awaiting ach settlement/i, /^invoice already/i]
+function isNotifiableFailure(result) {
+  if (!result.skipped) return true // declined / errored — always notify
+  const reason = result.reason || ''
+  return !NON_FAILURE_SKIP_PATTERNS.some((pattern) => pattern.test(reason))
+}
 
 // Fires on the 15th and last day of each month. Walks every pending
 // invoice and attempts a single NMI charge. Each attempt mutates the
@@ -190,6 +203,27 @@ export function registerProcessPendingPaymentsJob(agenda) {
                 qboInvoiceId: invoice.qboInvoiceId,
                 message: `Error: ${result.error || result.responseText || 'unknown'}`,
               })
+            }
+          }
+
+          // Customer-facing "Payment Failed" notification — best-effort,
+          // isolated in its own try/catch so an email/SMTP problem can
+          // never interrupt the batch or affect the payment outcome
+          // already persisted above. Skipped for approved charges and for
+          // skip-reasons that aren't actually a failure (ACH still
+          // settling is normal in-flight processing, not something to
+          // alarm the customer over).
+          if (result.outcome !== 'approved' && isNotifiableFailure(result)) {
+            try {
+              await notifyPaymentFailure({
+                invoice,
+                reason: result.responseText || result.error || result.reason || null,
+                customerName: await resolvePractitionerName(invoice.customerEmail),
+              })
+            } catch (notifyErr) {
+              // notifyPaymentFailure already catches internally and never
+              // throws — this is belt-and-suspenders only.
+              log.error('payment_failure_email.unexpected', { invoiceId: invId, err: notifyErr })
             }
           }
 
