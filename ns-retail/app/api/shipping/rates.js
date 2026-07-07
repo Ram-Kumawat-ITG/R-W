@@ -101,6 +101,80 @@ function tieredMarkupCents(qty) {
   return CONFIG.handlingMarkupCents.fourPlusItems;
 }
 
+// ── Discount detection from the carrier-service payload ──────────────
+//
+// Shopify's carrier-service callback DOES NOT reliably surface applied
+// discount codes / automatic discounts in a single canonical field —
+// different Shopify versions + themes populate different keys, and
+// sometimes NONE of them. Without accounting for the discount, the 3%
+// processing fee is calculated on the pre-discount subtotal and the
+// customer over-pays the fee (small but real — $0.45 on a $15 discount).
+//
+// We probe the payload for every field we've seen actually populated,
+// in order of reliability. First non-zero win. Returns discount in
+// CENTS. Returns 0 when no discount info is available in the payload —
+// in that case the fee falls back to computing on the raw subtotal,
+// matching the previous (pre-discount-aware) behavior exactly.
+//
+// Returns { cents, source } so the per-rate log can show which field
+// was used, making it easy to diagnose payload shape drift over time.
+function detectCartDiscountCents(rate, realItems) {
+  // Field 1: `rate.total_discounts` — integer cents, top-level. Newer
+  //          versions of the carrier-service payload set this. Most
+  //          reliable when present.
+  const topLevel = Number(rate?.total_discounts);
+  if (Number.isFinite(topLevel) && topLevel > 0) {
+    return { cents: Math.round(topLevel), source: "rate.total_discounts" };
+  }
+
+  // Field 2: sum of `items[].discount_allocations[].amount` — per-line
+  //          allocations of a cart-level discount. Shopify sends these
+  //          as strings in dollars (e.g. "5.00") on some themes, and
+  //          cents on others — heuristic: values > 100 are treated as
+  //          cents, everything smaller is treated as dollars.
+  let allocSum = 0;
+  for (const it of realItems || []) {
+    for (const alloc of it?.discount_allocations || []) {
+      const raw = Number(alloc?.amount ?? alloc?.discount_amount);
+      if (!Number.isFinite(raw) || raw <= 0) continue;
+      allocSum += raw > 100 ? raw : raw * 100;
+    }
+  }
+  if (allocSum > 0) {
+    return {
+      cents: Math.round(allocSum),
+      source: "items[].discount_allocations",
+    };
+  }
+
+  // Field 3: derive from `rate.subtotal_price` (post-discount cart
+  //          total that Shopify sometimes sends alongside the items)
+  //          vs the sum of items[].price × quantity. If the two
+  //          differ, the delta IS the applied discount (in cents).
+  const subtotalFromRate = Number(rate?.subtotal_price);
+  if (Number.isFinite(subtotalFromRate) && subtotalFromRate > 0) {
+    const itemsSum = (realItems || []).reduce(
+      (s, it) =>
+        s + (Number(it?.price) || 0) * (Number(it?.quantity) || 0),
+      0,
+    );
+    // Some themes send subtotal_price in dollars, others cents.
+    // Normalize to cents by matching against itemsSum's magnitude.
+    const subtotalCents =
+      subtotalFromRate < itemsSum / 10
+        ? Math.round(subtotalFromRate * 100)
+        : Math.round(subtotalFromRate);
+    if (subtotalCents > 0 && subtotalCents < itemsSum) {
+      return {
+        cents: itemsSum - subtotalCents,
+        source: "rate.subtotal_price (derived)",
+      };
+    }
+  }
+
+  return { cents: 0, source: "none" };
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────
 
 function ratesResponse(rates) {
@@ -254,7 +328,9 @@ function buildTaxCacheKey({ destination, realItems, subtotalCents }) {
   const zip = String(destination?.postal_code || destination?.zip || "").slice(0, 5);
   const country = String(destination?.country_code || destination?.country || "US").toUpperCase();
   // Include item variant ids so tax varies with product mix (some
-  // products may be tax-exempt).
+  // products may be tax-exempt). Subtotal is already discount-adjusted
+  // by the caller, so a discount-applied cart naturally caches under
+  // a different key than the same items un-discounted.
   const variants = (realItems || [])
     .map((it) => `${it.variant_id || it.product_id}:${it.quantity}`)
     .sort()
@@ -929,12 +1005,28 @@ export async function action({ request }) {
   // Added on top of every real carrier quote.
   const baseCents = tieredMarkupCents(totalQty);
 
-  // Cart subtotal in CENTS (Shopify sends prices in cents already). Used
-  // as the fee-base component that doesn't depend on shipping choice.
-  const cartSubtotalCents = realItems.reduce(
+  // Cart subtotal in CENTS. First compute the raw items-sum, then
+  // subtract any applied discount so the 3% processing fee is charged
+  // on what the CUSTOMER actually owes for the merchandise — not the
+  // pre-discount list total (which would over-charge the fee by
+  // 3% × discountAmount).
+  const rawItemsSumCents = realItems.reduce(
     (sum, it) => sum + (Number(it?.price) || 0) * (Number(it?.quantity) || 0),
     0,
   );
+  const cartDiscount = detectCartDiscountCents(rate, realItems);
+  const discountCents = cartDiscount.cents;
+  const cartSubtotalCents = Math.max(0, rawItemsSumCents - discountCents);
+
+  if (discountCents > 0) {
+    console.log(
+      `[shipping.rates] applied cart discount detected · rawItemsSum=$${(rawItemsSumCents / 100).toFixed(2)} · discount=−$${(discountCents / 100).toFixed(2)} · discountSource=${cartDiscount.source} · net subtotal=$${(cartSubtotalCents / 100).toFixed(2)}`,
+    );
+  } else {
+    console.log(
+      `[shipping.rates] no cart discount detected in payload (source=${cartDiscount.source}); fee will use raw subtotal=$${(cartSubtotalCents / 100).toFixed(2)}`,
+    );
+  }
 
   // Tax resolution — Shopify's live tax API is the ONLY source. We
   // call `draftOrderCalculate` with the cart + destination and use the
@@ -1026,11 +1118,13 @@ export async function action({ request }) {
     ├─ Handling markup:      $${(baseCents / 100).toFixed(2)} (tier: ${totalQty <= 2 ? "1-2 items" : totalQty === 3 ? "3 items" : "4+ items"})
     ├─ Free-shipping active: ${isFreeShipping ? "YES → shipping zeroed" : "no"}
     ├─ Shipping (final):     $${(shippingCents / 100).toFixed(2)} ${isFreeShipping ? "(free)" : "(raw + handling)"}
-    ├─ Cart subtotal:        $${(cartSubtotalCents / 100).toFixed(2)}
+    ├─ Raw items sum:        $${(rawItemsSumCents / 100).toFixed(2)}
+    ├─ Cart discount:        ${discountCents > 0 ? `−$${(discountCents / 100).toFixed(2)} (source: ${cartDiscount.source})` : "$0.00 (none)"}
+    ├─ Cart subtotal (net):  $${(cartSubtotalCents / 100).toFixed(2)}
     ├─ Base tax on subtotal: $${(baseTaxCents / 100).toFixed(2)} (source: ${taxSource})
     ├─ Shipping tax:         $${(shippingTaxCents / 100).toFixed(2)} (rate ${(taxRate * 100).toFixed(3)}% × shipping)
     ├─ Total tax:            $${taxUsd}
-    ├─ Fee base:             $${(feeBaseCents / 100).toFixed(2)} (subtotal + shipping + tax)
+    ├─ Fee base:             $${(feeBaseCents / 100).toFixed(2)} (net subtotal + shipping + tax)
     ├─ Processing fee (3%):  $${feeUsd}
     └─ Final rate to Shopify: $${(finalCents / 100).toFixed(2)}`,
       );
