@@ -527,15 +527,23 @@ export function PaymentsSection({ onAuthError }) {
 
 // ── CDO (referral / discount) ────────────────────────────────────────────────
 const USAGE_COLUMNS = [
-  { key: 'orderName', label: 'Order', width: '25%', render: (r) => <span className="cp-strong">{r.orderName}</span> },
-  { key: 'placedAt', label: 'Date', width: '20%', render: (r) => formatDate(r.placedAt) },
+  { key: 'orderName', label: 'Order', width: '18%', render: (r) => <span className="cp-strong">{r.orderName}</span> },
+  { key: 'placedAt', label: 'Date', width: '16%', render: (r) => formatDate(r.placedAt) },
   {
     key: 'discountCodes',
     label: 'Code used',
-    width: '25%',
+    width: '18%',
     render: (r) => (r.discountCodes || []).map((c) => c.code).join(', ') || '—',
   },
-  { key: 'amount', label: 'Order total', width: '20%', align: 'right', render: (r) => formatMoney(r.amount, r.currency) },
+  { key: 'discountPercent', label: 'Discount %', width: '14%', align: 'right', render: (r) => formatPercent(r.discountPercent) },
+  {
+    key: 'amountSaved',
+    label: 'Amount saved',
+    width: '16%',
+    align: 'right',
+    render: (r) => <span className="cp-strong">{formatMoney(r.amountSaved, r.currency)}</span>,
+  },
+  { key: 'amount', label: 'Order total', width: '18%', align: 'right', render: (r) => formatMoney(r.amount, r.currency) },
 ]
 
 export function CdoSection({ onAuthError }) {
@@ -546,6 +554,8 @@ export function CdoSection({ onAuthError }) {
 
   const d = data || {}
   if (!d.attributed) return null // shouldn't render — the shell hides this tab for unattributed customers
+
+  const a = d.analytics || {}
 
   return (
     <SectionShell heading="Customer Discount Offer" description="Your active practitioner discount and usage history.">
@@ -558,6 +568,30 @@ export function CdoSection({ onAuthError }) {
           <span className="cp-strong">{formatPercent(d.discountPercent)}</span>
         </Field>
         <Field label="Enrolled since">{formatDate(d.linkedAt)}</Field>
+      </div>
+
+      <div>
+        <h3 className="cp-subheading">Your benefits</h3>
+        <p className="cp-muted">What your {formatPercent(d.discountPercent)} discount has actually saved you.</p>
+        <StatCards
+          cards={[
+            { label: 'Total saved', value: formatMoney(a.totalSaved, a.currency), tone: 'green' },
+            { label: 'Orders discounted', value: formatNumber(a.totalOrders), tone: 'blue' },
+            { label: 'Average savings / order', value: formatMoney(a.averageSavingsPerOrder, a.currency), tone: 'purple' },
+            { label: 'You paid', value: formatMoney(a.totalSpend, a.currency), tone: 'neutral' },
+          ]}
+        />
+        {a.totalOrders > 0 ? (
+          <Banner tone="info">
+            <p>
+              Without your practitioner discount, those {formatNumber(a.totalOrders)} order
+              {a.totalOrders === 1 ? '' : 's'} would have cost{' '}
+              <strong>{formatMoney(a.totalWithoutDiscount, a.currency)}</strong> — you saved{' '}
+              <strong>{formatMoney(a.totalSaved, a.currency)}</strong> by using code{' '}
+              <strong>{d.code}</strong>.
+            </p>
+          </Banner>
+        ) : null}
       </div>
 
       <div>

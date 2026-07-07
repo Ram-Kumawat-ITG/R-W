@@ -332,7 +332,7 @@ export async function getCdoInfo(customerId) {
   if (!application?.referral) return { attributed: false };
 
   const { referral } = application;
-  const usage = await CdoOrder.find({
+  const orders = await CdoOrder.find({
     "customer.shopifyCustomerId": customerId,
     "discountCodes.code": referral.code,
   })
@@ -340,19 +340,53 @@ export async function getCdoInfo(customerId) {
     .sort({ placedAt: -1 })
     .lean();
 
+  let totalSaved = 0;
+  let totalSpend = 0;
+  let currency = "USD";
+  const usage = orders.map((o) => {
+    // Dollars actually saved on THIS order via the bound code — summed in
+    // case Shopify ever records the same code as more than one line
+    // (it shouldn't, but this stays correct either way). `o.amount` is
+    // Shopify's total_price (post-discount, what the customer actually
+    // paid), so amountSaved is on top of that, not deducted from it.
+    const amountSaved = (o.discountCodes || [])
+      .filter((c) => c.code === referral.code)
+      .reduce((sum, c) => sum + (c.amount || 0), 0);
+    totalSaved += amountSaved;
+    totalSpend += o.amount || 0;
+    if (o.currency) currency = o.currency;
+    return {
+      orderName: o.orderName || o.orderNumber || "—",
+      placedAt: o.placedAt || o.createdAt || null,
+      discountCodes: o.discountCodes || [],
+      amount: o.amount || 0,
+      currency: o.currency || "USD",
+      discountPercent: referral.discountPercent || 0,
+      amountSaved,
+    };
+  });
+
+  const totalOrders = usage.length;
+
   return {
     attributed: true,
     practitionerName: referral.practitionerName || null,
     discountPercent: referral.discountPercent || 0,
     code: referral.code,
     linkedAt: referral.linkedAt || null,
-    usage: usage.map((o) => ({
-      orderName: o.orderName || o.orderNumber || "—",
-      placedAt: o.placedAt || o.createdAt || null,
-      discountCodes: o.discountCodes || [],
-      amount: o.amount || 0,
-      currency: o.currency || "USD",
-    })),
+    usage,
+    // "Benefits of using your discount" — lifetime totals across every
+    // order that used the bound code.
+    analytics: {
+      totalOrders,
+      totalSaved,
+      totalSpend,
+      // What they would have paid with no discount at all — the plain-
+      // language number for "here's the benefit you got".
+      totalWithoutDiscount: totalSpend + totalSaved,
+      averageSavingsPerOrder: totalOrders > 0 ? totalSaved / totalOrders : 0,
+      currency,
+    },
   };
 }
 
