@@ -72,7 +72,6 @@ export default [
   route("/api/client-portal/orders", "api/client-portal/orders.js"),
   route("/api/client-portal/order", "api/client-portal/order.js"),
   route("/api/client-portal/invoice-pdf", "api/client-portal/invoice-pdf.js"),
-  route("/api/client-portal/payments", "api/client-portal/payments.js"),
   route("/api/client-portal/cdo", "api/client-portal/cdo.js"),
   route("/api/client-portal/profile", "api/client-portal/profile.js"),
   // Shopify Carrier Service callback — receives the cart origin + destination

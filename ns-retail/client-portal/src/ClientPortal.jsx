@@ -1,12 +1,11 @@
 import { useCallback, useEffect, useState } from 'react'
 import { apiGet, ApiError } from './services/ApiService.jsx'
 import { Loading, Banner, Tabs } from './ui.jsx'
-import { DashboardSection, OrdersSection, PaymentsSection, CdoSection, ProfileSection } from './sections.jsx'
+import { DashboardSection, OrdersSection, CdoSection, ProfileSection } from './sections.jsx'
 
 const BASE_TABS = [
   { id: 'dashboard', label: 'Dashboard' },
   { id: 'orders', label: 'Orders' },
-  { id: 'payments', label: 'Payment History' },
   { id: 'profile', label: 'Profile' },
 ]
 const CDO_TAB = { id: 'cdo', label: 'CDO' }
@@ -61,7 +60,7 @@ export default function ClientPortal({ loggedIn, loginPageUrl }) {
           <Banner tone="warning">
             <p>
               Please <a href={loginPageUrl || '/account/login'}>sign in to your account</a> to view your
-              orders, payments, and account details.
+              orders and account details.
             </p>
           </Banner>
         </div>
@@ -116,7 +115,6 @@ export default function ClientPortal({ loggedIn, loginPageUrl }) {
 
         {tab === 'dashboard' && <DashboardSection onAuthError={onAuthError} onViewOrders={() => setTab('orders')} />}
         {tab === 'orders' && <OrdersSection onAuthError={onAuthError} />}
-        {tab === 'payments' && <PaymentsSection onAuthError={onAuthError} />}
         {tab === 'cdo' && dashboard?.attributed && <CdoSection onAuthError={onAuthError} />}
         {tab === 'profile' && <ProfileSection onAuthError={onAuthError} />}
       </div>

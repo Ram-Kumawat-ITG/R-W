@@ -113,10 +113,14 @@ export function DashboardSection({ onAuthError, onViewOrders }) {
       <StatCards
         cards={[
           { label: 'Total orders', value: formatNumber(d.orderCount), tone: 'blue' },
+          { label: 'Orders this month', value: formatNumber(d.ordersThisMonth), tone: 'blue' },
+          { label: 'Fulfilled', value: `${formatNumber(d.fulfilledCount)}/${formatNumber(d.orderCount)}`, tone: 'green' },
+          { label: 'Cancelled orders', value: formatNumber(d.cancelledCount), tone: d.cancelledCount > 0 ? 'amber' : 'neutral' },
           { label: 'Lifetime spend', value: formatMoney(d.lifetimeSpend, d.currency), tone: 'green' },
           { label: 'This month', value: formatMoney(d.thisMonthSpend, d.currency), tone: 'green' },
           { label: 'Average order', value: formatMoney(d.averageOrderValue, d.currency), tone: 'purple' },
           { label: 'Pending payments', value: formatNumber(d.pendingCount), tone: d.pendingCount > 0 ? 'amber' : 'neutral' },
+          { label: 'First order', value: formatDate(d.firstOrderAt), tone: 'neutral' },
           { label: 'Last order', value: formatDate(d.lastOrderAt), tone: 'neutral' },
         ]}
       />
@@ -169,14 +173,31 @@ const LINE_ITEM_COLUMNS = [
 
 export function OrderDetailSection({ orderId, onBack, onAuthError }) {
   const { data, loading, error, reload } = useResource('order', { id: orderId }, onAuthError)
+  const [pdfBusy, setPdfBusy] = useState(false)
+  const [pdfError, setPdfError] = useState('')
+
+  const handleViewInvoice = async () => {
+    setPdfError('')
+    setPdfBusy(true)
+    const result = await openInvoicePdf(orderId)
+    setPdfBusy(false)
+    if (!result.ok) setPdfError(result.message)
+  }
 
   return (
     <SectionShell heading="Order detail">
-      <div className="cp-inline">
+      <div className="cp-inline cp-inline--between">
         <button type="button" className="cp-btn cp-btn--secondary" onClick={onBack}>
           ← Back to orders
         </button>
+        {data?.hasInvoice ? (
+          <button type="button" className="cp-btn cp-btn--primary" disabled={pdfBusy} onClick={handleViewInvoice}>
+            {pdfBusy ? 'Loading…' : `View invoice${data.docNumber ? ` ${data.docNumber}` : ''}`}
+          </button>
+        ) : null}
       </div>
+
+      {pdfError ? <ErrorBanner message={pdfError} /> : null}
 
       {loading && !data ? (
         <Loading />
@@ -202,6 +223,9 @@ export function OrderDetailSection({ orderId, onBack, onAuthError }) {
             </Field>
             <Field label="Delivery">
               <StatusBadge value={data.deliveryStatus} />
+            </Field>
+            <Field label="Invoice">
+              {data.invoiceStatus ? <StatusBadge value={data.invoiceStatus} /> : <span className="cp-muted">Processing</span>}
             </Field>
           </div>
 
@@ -272,6 +296,8 @@ export function OrdersSection({ onAuthError, initialOrderId, onOrderIdConsumed }
   const [draft, setDraft] = useState(EMPTY_ORDER_FILTERS)
   const [applied, setApplied] = useState(EMPTY_ORDER_FILTERS)
   const [page, setPage] = useState(1)
+  const [pdfBusyId, setPdfBusyId] = useState(null)
+  const [pdfError, setPdfError] = useState('')
   const { data, loading, error, reload } = useResource(
     'orders',
     { ...applied, page, pageSize: 10 },
@@ -292,6 +318,7 @@ export function OrdersSection({ onAuthError, initialOrderId, onOrderIdConsumed }
   }
 
   const rows = data?.rows || []
+  const summary = data?.summary || {}
   const setField = (k) => (e) => setDraft((p) => ({ ...p, [k]: e.target.value }))
   const FILTER_KEYS = ['financialStatus', 'fulfillmentStatus', 'search', 'dateFrom', 'dateTo']
   const draftMatchesApplied = FILTER_KEYS.every((k) => draft[k] === applied[k])
@@ -308,16 +335,56 @@ export function OrdersSection({ onAuthError, initialOrderId, onOrderIdConsumed }
     setPage(1)
   }
 
+  const handleViewInvoice = async (orderId) => {
+    setPdfError('')
+    setPdfBusyId(orderId)
+    const result = await openInvoicePdf(orderId)
+    setPdfBusyId(null)
+    if (!result.ok) setPdfError(result.message)
+  }
+
   const columns = [
-    { key: 'orderName', label: 'Order', width: '18%', render: (r) => <span className="cp-strong">{r.orderName}</span> },
-    { key: 'placedAt', label: 'Date', width: '18%', render: (r) => formatDate(r.placedAt) },
-    { key: 'amount', label: 'Amount', width: '16%', align: 'right', render: (r) => formatMoney(r.amount, r.currency) },
-    { key: 'financialStatus', label: 'Payment', width: '18%', render: (r) => <StatusBadge value={r.financialStatus} /> },
-    { key: 'fulfillmentStatus', label: 'Fulfillment', width: '18%', render: (r) => <StatusBadge value={r.shippingStatus || r.fulfillmentStatus} /> },
+    { key: 'orderName', label: 'Order', width: '15%', render: (r) => <span className="cp-strong">{r.orderName}</span> },
+    { key: 'placedAt', label: 'Date', width: '14%', render: (r) => formatDate(r.placedAt) },
+    { key: 'amount', label: 'Amount', width: '13%', align: 'right', render: (r) => formatMoney(r.amount, r.currency) },
+    { key: 'financialStatus', label: 'Payment', width: '14%', render: (r) => <StatusBadge value={r.financialStatus} /> },
+    { key: 'fulfillmentStatus', label: 'Fulfillment', width: '15%', render: (r) => <StatusBadge value={r.shippingStatus || r.fulfillmentStatus} /> },
+    {
+      key: 'invoice',
+      label: '',
+      width: '19%',
+      render: (r) =>
+        r.hasInvoice ? (
+          <button
+            type="button"
+            className="cp-btn cp-btn--secondary"
+            disabled={pdfBusyId === r.id}
+            onClick={(e) => {
+              e.stopPropagation()
+              handleViewInvoice(r.id)
+            }}
+          >
+            {pdfBusyId === r.id ? 'Loading…' : `View invoice${r.docNumber ? ` ${r.docNumber}` : ''}`}
+          </button>
+        ) : (
+          <span className="cp-muted">—</span>
+        ),
+    },
   ]
 
   return (
     <SectionShell heading="Orders" description="Your current and past orders. Click a row to see full details.">
+      <StatCards
+        cards={[
+          { label: 'Total orders', value: formatNumber(summary.totalOrders), tone: 'blue' },
+          { label: 'Total spend', value: formatMoney(summary.totalSpend, summary.currency), tone: 'neutral' },
+          { label: 'Fulfilled', value: `${formatNumber(summary.fulfilledCount)}/${formatNumber(summary.totalOrders)}`, tone: 'green' },
+          { label: 'Cancelled orders', value: formatNumber(summary.cancelledCount), tone: summary.cancelledCount > 0 ? 'amber' : 'neutral' },
+        ]}
+      />
+
+      {pdfError ? <ErrorBanner message={pdfError} /> : null}
+
       <div className="cp-stack">
         <div className="cp-field-grid cp-field-grid--2">
           <label className="cp-field">
@@ -385,157 +452,27 @@ export function OrdersSection({ onAuthError, initialOrderId, onOrderIdConsumed }
   )
 }
 
-// ── Payment history ──────────────────────────────────────────────────────────
-const PAYMENT_FINANCIAL_STATUSES = [
-  { value: 'paid', label: 'Paid' },
-  { value: 'pending', label: 'Pending' },
-  { value: 'partially_paid', label: 'Partially paid' },
-  { value: 'refunded', label: 'Refunded' },
-]
-const EMPTY_PAYMENT_FILTERS = { financialStatus: '', dateFrom: '', dateTo: '' }
-
-export function PaymentsSection({ onAuthError }) {
-  const [page, setPage] = useState(1)
-  const [draft, setDraft] = useState(EMPTY_PAYMENT_FILTERS)
-  const [applied, setApplied] = useState(EMPTY_PAYMENT_FILTERS)
-  const [pdfBusyId, setPdfBusyId] = useState(null)
-  const [pdfError, setPdfError] = useState('')
-  const { data, loading, error, reload } = useResource(
-    'payments',
-    { ...applied, page, pageSize: 10 },
-    onAuthError,
-  )
-  const rows = data?.rows || []
-  const summary = data?.summary || {}
-
-  // "View invoice" opens the order's real QBO-rendered invoice PDF in a
-  // new browser tab — never a redirect to QBO's hosted portal.
-  const handleViewInvoice = async (orderId) => {
-    setPdfError('')
-    setPdfBusyId(orderId)
-    const result = await openInvoicePdf(orderId)
-    setPdfBusyId(null)
-    if (!result.ok) setPdfError(result.message)
-  }
-
-  const setField = (k) => (e) => setDraft((p) => ({ ...p, [k]: e.target.value }))
-  const PAYMENT_FILTER_KEYS = ['financialStatus', 'dateFrom', 'dateTo']
-  const draftMatchesApplied = PAYMENT_FILTER_KEYS.every((k) => draft[k] === applied[k])
-  const hasDraft = PAYMENT_FILTER_KEYS.some((k) => draft[k])
-  const hasApplied = PAYMENT_FILTER_KEYS.some((k) => applied[k])
-
-  const applyFilters = () => {
-    setApplied({ ...draft })
-    setPage(1)
-  }
-  const resetFilters = () => {
-    setDraft(EMPTY_PAYMENT_FILTERS)
-    setApplied(EMPTY_PAYMENT_FILTERS)
-    setPage(1)
-  }
-
-  const columns = [
-    { key: 'orderName', label: 'Order', width: '18%', render: (r) => <span className="cp-strong">{r.orderName}</span> },
-    { key: 'placedAt', label: 'Date', width: '16%', render: (r) => formatDate(r.placedAt) },
-    { key: 'amount', label: 'Amount', width: '14%', align: 'right', render: (r) => formatMoney(r.amount, r.currency) },
-    { key: 'financialStatus', label: 'Payment', width: '14%', render: (r) => <StatusBadge value={r.financialStatus} /> },
-    {
-      key: 'invoiceStatus',
-      label: 'Invoice',
-      width: '20%',
-      render: (r) => (r.invoiceStatus ? <StatusBadge value={r.invoiceStatus} /> : <span className="cp-muted">Processing</span>),
-    },
-    {
-      key: 'details',
-      label: 'Details',
-      width: '18%',
-      render: (r) => (
-        <button
-          type="button"
-          className="cp-btn cp-btn--secondary"
-          disabled={pdfBusyId === r.id}
-          onClick={(e) => {
-            e.stopPropagation()
-            handleViewInvoice(r.id)
-          }}
-        >
-          {pdfBusyId === r.id ? 'Loading…' : `View invoice${r.docNumber ? ` #${r.docNumber}` : ''}`}
-        </button>
-      ),
-    },
-  ]
-
-  return (
-    <SectionShell heading="Payment history" description="Payment status and invoice details for each of your orders.">
-      <StatCards
-        cards={[
-          { label: 'Total paid', value: formatMoney(summary.totalPaid, summary.currency), tone: 'green' },
-          { label: 'Total pending', value: formatMoney(summary.totalPending, summary.currency), tone: summary.totalPending > 0 ? 'amber' : 'neutral' },
-          { label: 'Total invoiced', value: formatMoney(summary.totalInvoiced, summary.currency), tone: 'blue' },
-        ]}
-      />
-
-      {pdfError ? <ErrorBanner message={pdfError} /> : null}
-
-      <div className="cp-stack">
-        <div className="cp-field-grid cp-field-grid--2">
-          <label className="cp-field">
-            <span>Payment status</span>
-            <select value={draft.financialStatus} onChange={setField('financialStatus')}>
-              <option value="">Any</option>
-              {PAYMENT_FINANCIAL_STATUSES.map((o) => (
-                <option key={o.value} value={o.value}>{o.label}</option>
-              ))}
-            </select>
-          </label>
-          <label className="cp-field">
-            <span>From date</span>
-            <input type="date" value={draft.dateFrom} onChange={setField('dateFrom')} />
-          </label>
-          <label className="cp-field">
-            <span>To date</span>
-            <input type="date" value={draft.dateTo} onChange={setField('dateTo')} />
-          </label>
-        </div>
-        <div className="cp-inline">
-          <button type="button" className="cp-btn cp-btn--primary" disabled={draftMatchesApplied || loading} onClick={applyFilters}>
-            Apply
-          </button>
-          <button type="button" className="cp-btn cp-btn--secondary" disabled={!hasDraft && !hasApplied} onClick={resetFilters}>
-            Reset
-          </button>
-        </div>
-      </div>
-
-      {error ? (
-        <ErrorBanner message={error} onRetry={reload} />
-      ) : loading && rows.length === 0 ? (
-        <Loading />
-      ) : (
-        <div className="cp-stack">
-          <Table
-            columns={columns}
-            rows={rows}
-            empty={hasApplied ? 'No payments match these filters.' : 'No payment history yet.'}
-          />
-          <Pagination page={data?.page || 1} totalPages={data?.pageCount || 1} total={data?.total || 0} loading={loading} onPage={setPage} />
-        </div>
-      )}
-    </SectionShell>
-  )
-}
-
 // ── CDO (referral / discount) ────────────────────────────────────────────────
+// A single order can carry more than one CDO code (e.g. right after a
+// practitioner switch) — `codes[]` lists every matched code on that order,
+// so both "Code used" and "Discount %" render one line per code rather
+// than assuming a single flat rate.
 const USAGE_COLUMNS = [
   { key: 'orderName', label: 'Order', width: '18%', render: (r) => <span className="cp-strong">{r.orderName}</span> },
   { key: 'placedAt', label: 'Date', width: '16%', render: (r) => formatDate(r.placedAt) },
   {
-    key: 'discountCodes',
+    key: 'codes',
     label: 'Code used',
     width: '18%',
-    render: (r) => (r.discountCodes || []).map((c) => c.code).join(', ') || '—',
+    render: (r) => (r.codes || []).map((c) => c.code).join(', ') || '—',
   },
-  { key: 'discountPercent', label: 'Discount %', width: '14%', align: 'right', render: (r) => formatPercent(r.discountPercent) },
+  {
+    key: 'discountPercent',
+    label: 'Discount %',
+    width: '14%',
+    align: 'right',
+    render: (r) => (r.codes || []).map((c) => formatPercent(c.discountPercent)).join(', ') || '—',
+  },
   {
     key: 'amountSaved',
     label: 'Amount saved',
@@ -561,18 +498,28 @@ export function CdoSection({ onAuthError }) {
     <SectionShell heading="Customer Discount Offer" description="Your active practitioner discount and usage history.">
       <div className="cp-payout-grid">
         <Field label="Practitioner">{d.practitionerName || '—'}</Field>
-        <Field label="Discount code">
+        <Field label="Active discount code">
           <span className="cp-strong">{d.code}</span>
         </Field>
-        <Field label="Discount">
+        <Field label="Current discount">
           <span className="cp-strong">{formatPercent(d.discountPercent)}</span>
         </Field>
         <Field label="Enrolled since">{formatDate(d.linkedAt)}</Field>
       </div>
 
+      {d.priorCodes && d.priorCodes.length > 0 ? (
+        <Banner tone="info">
+          <p>
+            You&rsquo;ve also previously used {formatNumber(d.priorCodes.length)} earlier code
+            {d.priorCodes.length === 1 ? '' : 's'} — <strong>{d.priorCodes.map((c) => c.code).join(', ')}</strong>.
+            The benefits and usage history below include savings from all of your codes, past and current.
+          </p>
+        </Banner>
+      ) : null}
+
       <div>
         <h3 className="cp-subheading">Your benefits</h3>
-        <p className="cp-muted">What your {formatPercent(d.discountPercent)} discount has actually saved you.</p>
+        <p className="cp-muted">What your CDO discount(s) have actually saved you, lifetime.</p>
         <StatCards
           cards={[
             { label: 'Total saved', value: formatMoney(a.totalSaved, a.currency), tone: 'green' },
@@ -584,11 +531,10 @@ export function CdoSection({ onAuthError }) {
         {a.totalOrders > 0 ? (
           <Banner tone="info">
             <p>
-              Without your practitioner discount, those {formatNumber(a.totalOrders)} order
+              Without your practitioner discount{d.priorCodes?.length ? 's' : ''}, those {formatNumber(a.totalOrders)} order
               {a.totalOrders === 1 ? '' : 's'} would have cost{' '}
               <strong>{formatMoney(a.totalWithoutDiscount, a.currency)}</strong> — you saved{' '}
-              <strong>{formatMoney(a.totalSaved, a.currency)}</strong> by using code{' '}
-              <strong>{d.code}</strong>.
+              <strong>{formatMoney(a.totalSaved, a.currency)}</strong> in total.
             </p>
           </Banner>
         ) : null}

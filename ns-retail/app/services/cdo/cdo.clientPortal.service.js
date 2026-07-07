@@ -85,6 +85,15 @@ export async function getDashboard(customerId) {
               ],
             },
           },
+          ordersThisMonth: {
+            $sum: { $cond: [{ $gte: [{ $ifNull: ["$placedAt", "$createdAt"] }, monthStart] }, 1, 0] },
+          },
+          fulfilledCount: {
+            $sum: { $cond: [{ $eq: ["$fulfillmentStatus", "fulfilled"] }, 1, 0] },
+          },
+          cancelledCount: {
+            $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] },
+          },
         },
       },
     ]),
@@ -109,6 +118,9 @@ export async function getDashboard(customerId) {
     firstOrderAt: null,
     currency: "USD",
     thisMonthSpend: 0,
+    ordersThisMonth: 0,
+    fulfilledCount: 0,
+    cancelledCount: 0,
   };
   const orderCount = stats.orderCount || 0;
   const lifetimeSpend = stats.lifetimeSpend || 0;
@@ -118,6 +130,9 @@ export async function getDashboard(customerId) {
     lifetimeSpend,
     averageOrderValue: orderCount > 0 ? lifetimeSpend / orderCount : 0,
     thisMonthSpend: stats.thisMonthSpend || 0,
+    ordersThisMonth: stats.ordersThisMonth || 0,
+    fulfilledCount: stats.fulfilledCount || 0,
+    cancelledCount: stats.cancelledCount || 0,
     pendingCount: pendingCount || 0,
     currency: stats.currency || "USD",
     lastOrderAt: stats.lastOrderAt || null,
@@ -155,15 +170,59 @@ export async function getOrders(
   const size = clampPageSize(pageSize);
   const pageNum = clampPage(page);
 
-  const [total, rows] = await Promise.all([
+  const [total, rows, summaryAgg] = await Promise.all([
     CdoOrder.countDocuments(query),
     CdoOrder.find(query)
       .sort({ placedAt: -1, _id: -1 })
       .skip((pageNum - 1) * size)
       .limit(size)
-      .select("orderName orderNumber amount currency financialStatus fulfillmentStatus fulfillments placedAt createdAt")
+      .select(
+        "orderName orderNumber amount currency financialStatus fulfillmentStatus fulfillments placedAt createdAt retailQbo",
+      )
       .lean(),
+    // Analytics stat cards reflect the SAME filters as the list below (so
+    // "how much did I spend this quarter" works when a date range is
+    // applied), just without pagination.
+    CdoOrder.aggregate([
+      { $match: query },
+      {
+        $group: {
+          _id: null,
+          totalOrders: { $sum: 1 },
+          totalSpend: { $sum: { $ifNull: ["$amount", 0] } },
+          totalPaid: {
+            $sum: { $cond: [{ $eq: ["$financialStatus", "paid"] }, { $ifNull: ["$amount", 0] }, 0] },
+          },
+          totalPending: {
+            $sum: {
+              $cond: [
+                { $in: ["$financialStatus", ["pending", "partially_paid"]] },
+                { $ifNull: ["$amount", 0] },
+                0,
+              ],
+            },
+          },
+          fulfilledCount: {
+            $sum: { $cond: [{ $eq: ["$fulfillmentStatus", "fulfilled"] }, 1, 0] },
+          },
+          cancelledCount: {
+            $sum: { $cond: [{ $eq: ["$status", "cancelled"] }, 1, 0] },
+          },
+          currency: { $first: "$currency" },
+        },
+      },
+    ]),
   ]);
+
+  const summary = summaryAgg[0] || {
+    totalOrders: 0,
+    totalSpend: 0,
+    totalPaid: 0,
+    totalPending: 0,
+    fulfilledCount: 0,
+    cancelledCount: 0,
+    currency: "USD",
+  };
 
   return {
     rows: rows.map((r) => ({
@@ -175,11 +234,25 @@ export async function getOrders(
       fulfillmentStatus: r.fulfillmentStatus || null,
       shippingStatus: deriveShippingStatus(r),
       placedAt: r.placedAt || r.createdAt || null,
+      // Invoice info — surfaced here (list) and on the order detail page
+      // instead of a separate Payment History tab.
+      invoiceStatus: r.retailQbo?.invoiceStatus || null, // 'open' | 'paid' | null (sync pending/not started)
+      docNumber: r.retailQbo?.qboInvoiceDocNumber || null, // already carries its own "#", e.g. "#1414"
+      hasInvoice: !!r.retailQbo?.qboInvoiceId,
     })),
     total,
     page: pageNum,
     pageSize: size,
     pageCount: Math.max(1, Math.ceil(total / size)),
+    summary: {
+      totalOrders: summary.totalOrders || 0,
+      totalSpend: summary.totalSpend || 0,
+      totalPaid: summary.totalPaid || 0,
+      totalPending: summary.totalPending || 0,
+      fulfilledCount: summary.fulfilledCount || 0,
+      cancelledCount: summary.cancelledCount || 0,
+      currency: summary.currency || "USD",
+    },
   };
 }
 
@@ -214,6 +287,10 @@ export async function getOrderDetail(customerId, orderId) {
     pricing: o.pricing || null,
     billingAddress: o.billingAddress || null,
     shippingAddress: o.shippingAddress || null,
+    invoiceStatus: o.retailQbo?.invoiceStatus || null,
+    docNumber: o.retailQbo?.qboInvoiceDocNumber || null,
+    hasInvoice: !!o.retailQbo?.qboInvoiceId,
+    paidAt: o.retailQbo?.paymentAppliedAt || null,
   };
 }
 
@@ -251,90 +328,42 @@ export async function getOrderInvoicePdf(customerId, orderId) {
   }
 }
 
-export async function getPaymentHistory(customerId, { page, pageSize, financialStatus, dateFrom, dateTo } = {}) {
-  await connectDB();
-  const query = { "customer.shopifyCustomerId": customerId };
-  if (financialStatus) query.financialStatus = financialStatus;
-  const dateRange = dateRangeClause(dateFrom, dateTo);
-  if (dateRange) query.placedAt = dateRange;
-
-  const size = clampPageSize(pageSize);
-  const pageNum = clampPage(page);
-
-  const [total, rows, summaryAgg] = await Promise.all([
-    CdoOrder.countDocuments(query),
-    CdoOrder.find(query)
-      .sort({ placedAt: -1, _id: -1 })
-      .skip((pageNum - 1) * size)
-      .limit(size)
-      .select("orderName orderNumber amount currency financialStatus placedAt createdAt retailQbo")
-      .lean(),
-    // Summary stat cards reflect the SAME filters as the list below (so
-    // "how much did I pay this quarter" works when a date range is
-    // applied), just without pagination.
-    CdoOrder.aggregate([
-      { $match: query },
-      {
-        $group: {
-          _id: null,
-          totalPaid: {
-            $sum: { $cond: [{ $eq: ["$financialStatus", "paid"] }, { $ifNull: ["$amount", 0] }, 0] },
-          },
-          totalPending: {
-            $sum: {
-              $cond: [
-                { $in: ["$financialStatus", ["pending", "partially_paid"]] },
-                { $ifNull: ["$amount", 0] },
-                0,
-              ],
-            },
-          },
-          totalInvoiced: { $sum: { $ifNull: ["$amount", 0] } },
-          currency: { $first: "$currency" },
-        },
-      },
-    ]),
-  ]);
-
-  const summary = summaryAgg[0] || { totalPaid: 0, totalPending: 0, totalInvoiced: 0, currency: "USD" };
-
-  return {
-    rows: rows.map((r) => ({
-      id: r._id.toString(),
-      orderName: r.orderName || r.orderNumber || "—",
-      amount: r.amount || 0,
-      currency: r.currency || "USD",
-      financialStatus: r.financialStatus || null,
-      placedAt: r.placedAt || r.createdAt || null,
-      invoiceStatus: r.retailQbo?.invoiceStatus || null, // 'open' | 'paid' | null (sync pending/not started)
-      invoiceUrl: r.retailQbo?.invoiceUrl || null,
-      docNumber: r.retailQbo?.qboInvoiceDocNumber || null,
-      paidAt: r.retailQbo?.paymentAppliedAt || null,
-    })),
-    total,
-    page: pageNum,
-    pageSize: size,
-    pageCount: Math.max(1, Math.ceil(total / size)),
-    summary: {
-      totalPaid: summary.totalPaid || 0,
-      totalPending: summary.totalPending || 0,
-      totalInvoiced: summary.totalInvoiced || 0,
-      currency: summary.currency || "USD",
-    },
-  };
-}
-
 // Returns { attributed:false } for a customer with no active practitioner
 // referral — the frontend hides the CDO tab entirely on that shape.
+//
+// A customer can carry MORE than one CDO discount code over their
+// lifetime — `referral` is only the CURRENTLY active one; `referralHistory[]`
+// holds every prior code they used before switching/upgrading (see
+// cdo.service.upsertCustomerApplication). Shopify also allows more than one
+// discount code to apply to the SAME order. Both cases are handled here:
+// usage/analytics cover every known code (current + history), and a single
+// order's `codes[]` can list more than one matched code with its own
+// percent + dollar amount.
 export async function getCdoInfo(customerId) {
   await connectDB();
-  const application = await CdoApplication.findOne({ customerId }).select("referral").lean();
+  const application = await CdoApplication.findOne({ customerId })
+    .select("referral referralHistory")
+    .lean();
   if (!application?.referral) return { attributed: false };
 
   const { referral } = application;
+
+  // Every code this customer has ever been bound to, keyed by lowercase
+  // code (the canonical form both cdo_applications and cdo_orders use).
+  // The CURRENT code wins on a key collision (shouldn't happen, but a
+  // customer can't be re-linked to the exact same code as their own
+  // history — this is just defensive).
+  const codeMap = new Map();
+  for (const h of application.referralHistory || []) {
+    if (!h.code) continue;
+    codeMap.set(h.code, { discountPercent: h.discountPercent || 0, practitionerName: h.practitionerName || null });
+  }
+  codeMap.set(referral.code, { discountPercent: referral.discountPercent || 0, practitionerName: referral.practitionerName || null });
+  const knownCodes = [...codeMap.keys()];
+
   const orders = await CdoOrder.find({
     "customer.shopifyCustomerId": customerId,
-    "discountCodes.code": referral.code,
+    "discountCodes.code": { $in: knownCodes },
   })
     .select("orderName orderNumber placedAt createdAt discountCodes amount currency")
     .sort({ placedAt: -1 })
@@ -344,24 +373,26 @@ export async function getCdoInfo(customerId) {
   let totalSpend = 0;
   let currency = "USD";
   const usage = orders.map((o) => {
-    // Dollars actually saved on THIS order via the bound code — summed in
-    // case Shopify ever records the same code as more than one line
-    // (it shouldn't, but this stays correct either way). `o.amount` is
-    // Shopify's total_price (post-discount, what the customer actually
-    // paid), so amountSaved is on top of that, not deducted from it.
-    const amountSaved = (o.discountCodes || [])
-      .filter((c) => c.code === referral.code)
-      .reduce((sum, c) => sum + (c.amount || 0), 0);
+    // One entry per matched code on THIS order — an order can carry more
+    // than one CDO code (e.g. combined with a legacy code right after a
+    // practitioner switch), each with its own percent + dollar amount.
+    const codes = (o.discountCodes || [])
+      .filter((c) => codeMap.has(c.code))
+      .map((c) => ({
+        code: c.code,
+        discountPercent: codeMap.get(c.code).discountPercent,
+        amountSaved: c.amount || 0,
+      }));
+    const amountSaved = codes.reduce((sum, c) => sum + c.amountSaved, 0);
     totalSaved += amountSaved;
     totalSpend += o.amount || 0;
     if (o.currency) currency = o.currency;
     return {
       orderName: o.orderName || o.orderNumber || "—",
       placedAt: o.placedAt || o.createdAt || null,
-      discountCodes: o.discountCodes || [],
       amount: o.amount || 0,
       currency: o.currency || "USD",
-      discountPercent: referral.discountPercent || 0,
+      codes,
       amountSaved,
     };
   });
@@ -374,9 +405,16 @@ export async function getCdoInfo(customerId) {
     discountPercent: referral.discountPercent || 0,
     code: referral.code,
     linkedAt: referral.linkedAt || null,
+    // Exposed so the UI can note "you've also used N earlier code(s)" —
+    // usage/analytics already cover them, this is just for context.
+    priorCodes: (application.referralHistory || []).map((h) => ({
+      code: h.code,
+      discountPercent: h.discountPercent || 0,
+      replacedAt: h.replacedAt || null,
+    })),
     usage,
     // "Benefits of using your discount" — lifetime totals across every
-    // order that used the bound code.
+    // order that used ANY of this customer's known CDO codes.
     analytics: {
       totalOrders,
       totalSaved,
