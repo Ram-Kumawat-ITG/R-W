@@ -65,6 +65,19 @@ export function fmtDueDate(qboDueDate) {
   })
 }
 
+// Render a millisecond duration as a short human string ("340ms", "2.4s",
+// "1m 05s"). Used for CRON batch processing-time display. Returns "—" for
+// null/undefined/negative input.
+export function formatDuration(ms) {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return '—'
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  const totalSeconds = ms / 1000
+  if (totalSeconds < 60) return `${totalSeconds.toFixed(1)}s`
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = Math.round(totalSeconds % 60)
+  return `${minutes}m ${String(seconds).padStart(2, '0')}s`
+}
+
 // First letter of the first two words of a name, for an <s-avatar>
 // fallback. "?" for empty/missing names.
 export function initialsOf(name) {

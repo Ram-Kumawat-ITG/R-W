@@ -46,6 +46,73 @@ export function computeInvoiceDueAt(baseDate, termsDays, termsMinutes) {
   return d
 }
 
+// Add N business days (Mon–Fri; no holiday calendar) to a date, returning
+// a new Date at local midnight of the resulting day. Used for the Check
+// due date ("10 business days"). N=0 returns the same calendar day.
+export function addBusinessDays(date, n) {
+  const d = date instanceof Date ? new Date(date) : new Date(date)
+  const days = Number.isFinite(n) ? Math.trunc(n) : 0
+  let remaining = Math.abs(days)
+  const step = days < 0 ? -1 : 1
+  while (remaining > 0) {
+    d.setDate(d.getDate() + step)
+    const dow = d.getDay() // 0=Sun, 6=Sat
+    if (dow !== 0 && dow !== 6) remaining -= 1
+  }
+  return d
+}
+
+// Billing-cycle due date (shared by card AND ach): orders placed the
+// 1st–15th are due on the 15th of that month; orders placed the
+// 16th–end-of-month are due on the last day of that month. Returns a new
+// Date at the same time-of-day as `date` (callers format with toYmd /
+// add termsMinutes as needed).
+export function computeCardBillingDueDate(date) {
+  const d = date instanceof Date ? new Date(date) : new Date(date)
+  const day = d.getDate()
+  const due = new Date(d)
+  if (day <= 15) {
+    due.setDate(15)
+  } else {
+    // Day 0 of next month = last day of this month.
+    due.setMonth(due.getMonth() + 1, 0)
+  }
+  return due
+}
+
+// Resolve the invoice due date + full-datetime dueAt for a given payment
+// method, per the production billing rules:
+//   - ach   → billing-cycle date: 1st–15th → due the 15th; 16th–EOM → due
+//             the last day of the month (same rule as card).
+//   - card  → billing-cycle date: 1st–15th → due the 15th; 16th–EOM → due
+//             the last day of the month.
+//   - check → `businessDays` business days (Mon–Fri) after the order date.
+//   - anything else (e.g. dropship) → generic `termsDays` calendar days,
+//     the pre-existing behavior.
+// Returns { dueDate, dueAt } — dueDate is a "YYYY-MM-DD" string (or null
+// if baseDate is unparseable), dueAt is a full Date (or null).
+export function computeDueDateForMethod(baseDate, method, { businessDays, termsDays, termsMinutes } = {}) {
+  if (baseDate == null) return { dueDate: null, dueAt: null }
+  const base = baseDate instanceof Date ? new Date(baseDate) : new Date(baseDate)
+  if (!Number.isFinite(base.getTime())) return { dueDate: null, dueAt: null }
+
+  let due
+  if (method === 'ach' || method === 'card') {
+    due = computeCardBillingDueDate(base)
+  } else if (method === 'check') {
+    due = addBusinessDays(base, Number.isFinite(businessDays) ? businessDays : 10)
+  } else {
+    due = new Date(base)
+    due.setDate(due.getDate() + (Number.isFinite(termsDays) ? termsDays : 0))
+  }
+
+  const dueAt = new Date(due)
+  const mins = Number.isFinite(termsMinutes) ? Math.trunc(termsMinutes) : 0
+  if (mins) dueAt.setMinutes(dueAt.getMinutes() + mins)
+
+  return { dueDate: toYmd(due), dueAt }
+}
+
 // Each downstream sync gets its own retry. Failures are isolated so one
 // dead system doesn't block the others. PermanentError bypasses retry.
 export async function syncWithRetry(label, fn) {

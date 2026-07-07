@@ -12,7 +12,11 @@ import ShopifyOrder from "../models/order.server";
 import Invoice from "../models/invoice.server";
 import { RETAIL_CUSTOMER_EMAIL } from "../services/dropship/dropship.config";
 import { carrierDisplayName } from "../utils/shipping.constants";
-import { ProcessingBadge, PaymentMethodShortText } from "../components/admin-ui";
+import {
+  ProcessingBadge,
+  PaymentMethodShortText,
+  OrdersTabBar,
+} from "../components/admin-ui";
 import {
   formatAmount,
   parseDateOnly,
@@ -487,6 +491,8 @@ export default function OrdersList() {
 
   return (
     <s-page inlineSize="large" heading="Orders">
+      <OrdersTabBar active="orders" />
+
       <s-section heading="Filters">
         <s-stack direction="block" gap="base">
           {/* Responsive auto-fill grid: each control gets ≥220px and the row

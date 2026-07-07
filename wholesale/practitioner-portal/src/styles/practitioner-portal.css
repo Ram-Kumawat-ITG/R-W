@@ -1,0 +1,769 @@
+/* Practitioner Portal — scoped styles. Only stylesheet for this workspace
+   (mirrors registration-form/src/styles/registration-form.css's convention
+   of keeping all CSS in one file, no inline style={{}} props). */
+
+/* Brand colors match wholesale/registration-form/src/styles/variables.css
+   (--color-primary: #c8102e / --color-primary-hover: #a30d26) — the same
+   values login_email_check.liquid and the registration form use, so the
+   portal reads as native to this storefront's theme rather than a generic
+   default. Each Vite workspace keeps its own scoped copy (project
+   convention), so this isn't dynamically shared via CSS custom properties
+   across bundles that may not both be loaded on a given page. */
+:root {
+  --portal-ink: #1f1f1f;
+  --portal-muted: #6b7280;
+  --portal-muted-2: #9aa1ac;
+  --portal-border: #e6e8ec;
+  --portal-border-soft: #f0f1f4;
+  --portal-surface: #ffffff;
+  --portal-surface-tint: #f7f8fa;
+  --portal-brand: #c8102e;
+  --portal-brand-dark: #a30d26;
+  --portal-brand-tint: #fbe9eb;
+  --portal-radius: 12px;
+  --portal-radius-sm: 8px;
+  --portal-shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.06);
+  --portal-shadow-md: 0 4px 12px rgba(16, 24, 40, 0.08);
+}
+
+.portal-page,
+.portal-page * {
+  box-sizing: border-box;
+}
+
+/* The storefront theme sets its own (often large/variable) body font-size —
+   without an explicit reset here, any portal element that doesn't declare
+   its own font-size silently inherits the theme's ambient size instead of
+   ours, which is what caused labels/values to render oversized. Establishing
+   a fixed base + line-height on the root container gives every undeclared
+   descendant (labels, plain <p>/<span>, dialog copy, etc.) a sane inherited
+   default regardless of the theme it's dropped into. */
+.portal-page {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 32px 20px 80px;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--portal-ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+.portal-page p,
+.portal-page span,
+.portal-page label,
+.portal-page button,
+.portal-page input,
+.portal-page select,
+.portal-page a {
+  font-size: inherit;
+  font-family: inherit;
+}
+
+/* ── Header ───────────────────────────────────────────────────────────── */
+
+.portal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+}
+
+.portal-header__eyebrow {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--portal-brand);
+  margin: 0 0 6px;
+}
+
+.portal-page__heading {
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0;
+  line-height: 1.2;
+}
+
+.portal-welcome {
+  font-size: 15px;
+  color: var(--portal-muted);
+  margin: 6px 0 0;
+}
+
+.portal-welcome strong {
+  color: var(--portal-ink);
+  font-weight: 600;
+}
+
+.portal-avatar {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--portal-brand), var(--portal-brand-dark));
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 16px;
+  flex: none;
+  box-shadow: var(--portal-shadow);
+}
+
+.portal-muted {
+  color: var(--portal-muted);
+}
+
+.portal-strong {
+  font-weight: 600;
+}
+
+.portal-subheading {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0 0 4px;
+  letter-spacing: -0.005em;
+}
+
+.portal-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.portal-stack--tight {
+  gap: 6px;
+}
+
+.portal-stack--loose {
+  gap: 28px;
+}
+
+.portal-inline {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.portal-inline--tight {
+  gap: 8px;
+}
+
+.portal-inline--end {
+  justify-content: flex-end;
+}
+
+/* ── Tabs ─────────────────────────────────────────────────────────────── */
+
+.portal-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  background: var(--portal-surface-tint);
+  border: 1px solid var(--portal-border-soft);
+  border-radius: 999px;
+  width: fit-content;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.portal-tab {
+  background: none;
+  border: none;
+  border-radius: 999px;
+  padding: 9px 18px;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--portal-muted);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.portal-tab:hover {
+  color: var(--portal-ink);
+  background: rgba(20, 22, 26, 0.04);
+}
+
+.portal-tab.is-active {
+  color: #fff;
+  background: var(--portal-ink);
+  box-shadow: var(--portal-shadow);
+}
+
+/* ── Section shell ────────────────────────────────────────────────────── */
+
+.portal-section {
+  padding-top: 8px;
+}
+
+.portal-section__heading {
+  font-size: 19px;
+  font-weight: 700;
+  margin: 0 0 4px;
+  letter-spacing: -0.01em;
+}
+
+.portal-section > .portal-muted:first-of-type {
+  font-size: 14px;
+}
+
+/* ── Stat cards ───────────────────────────────────────────────────────── */
+
+.portal-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.portal-stat-card {
+  position: relative;
+  border: 1px solid var(--portal-border-soft);
+  border-radius: var(--portal-radius);
+  background: var(--portal-surface);
+  padding: 16px 18px;
+  box-shadow: var(--portal-shadow);
+  overflow: hidden;
+  transition: box-shadow 0.15s ease, transform 0.15s ease;
+}
+
+.portal-stat-card::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: var(--portal-accent, var(--portal-border));
+}
+
+.portal-stat-card:hover {
+  box-shadow: var(--portal-shadow-md);
+  transform: translateY(-1px);
+}
+
+.portal-stat-card--blue { --portal-accent: #3b82f6; }
+.portal-stat-card--green { --portal-accent: #22c55e; }
+.portal-stat-card--amber { --portal-accent: #f59e0b; }
+.portal-stat-card--purple { --portal-accent: #8b5cf6; }
+.portal-stat-card--neutral { --portal-accent: #cbd0d8; }
+
+.portal-stat-card__label {
+  font-size: 12.5px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.portal-stat-card__value {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+}
+
+.portal-stat-card__sub {
+  font-size: 12.5px;
+  margin-top: 5px;
+}
+
+/* ── Fields ───────────────────────────────────────────────────────────── */
+
+.portal-field-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.portal-field-grid--2 {
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+}
+
+.portal-field-grid--3 {
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+}
+
+.portal-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.portal-field > span {
+  font-weight: 600;
+  color: var(--portal-ink);
+}
+
+.portal-field input,
+.portal-field select {
+  padding: 9px 12px;
+  border: 1px solid var(--portal-border);
+  border-radius: var(--portal-radius-sm);
+  font-size: 14px;
+  font-family: inherit;
+  background: var(--portal-surface);
+  color: var(--portal-ink);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.portal-field input:hover,
+.portal-field select:hover {
+  border-color: #c7cbd3;
+}
+
+.portal-field input:focus,
+.portal-field select:focus {
+  outline: none;
+  border-color: var(--portal-brand);
+  box-shadow: 0 0 0 3px var(--portal-brand-tint);
+}
+
+/* ── Buttons ──────────────────────────────────────────────────────────── */
+
+.portal-btn {
+  padding: 9px 16px;
+  border-radius: var(--portal-radius-sm);
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background-color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease, transform 0.05s ease;
+}
+
+.portal-btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.portal-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.portal-btn--primary {
+  background: var(--portal-brand);
+  color: #fff;
+  box-shadow: var(--portal-shadow);
+}
+
+.portal-btn--primary:hover:not(:disabled) {
+  background: var(--portal-brand-dark);
+}
+
+.portal-btn--secondary {
+  background: var(--portal-surface);
+  border-color: var(--portal-border);
+  color: var(--portal-ink);
+}
+
+.portal-btn--secondary:hover:not(:disabled) {
+  background: var(--portal-surface-tint);
+  border-color: #c7cbd3;
+}
+
+/* ── Banners ──────────────────────────────────────────────────────────── */
+
+.portal-banner {
+  display: flex;
+  gap: 12px;
+  border-radius: var(--portal-radius);
+  padding: 16px 18px;
+  border: 1px solid transparent;
+}
+
+.portal-banner__icon {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  color: #fff;
+}
+
+.portal-banner__body {
+  min-width: 0;
+}
+
+.portal-banner h3 {
+  margin: 0 0 4px;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.portal-banner p {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.portal-banner__action {
+  margin-top: 10px;
+}
+
+.portal-banner a {
+  color: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+}
+
+.portal-banner--info {
+  background: #eff5ff;
+  border-color: #d3e3fd;
+  color: #1e429f;
+}
+.portal-banner--info .portal-banner__icon { background: #3b82f6; }
+
+.portal-banner--warning {
+  background: #fffaeb;
+  border-color: #fde3a7;
+  color: #92400e;
+}
+.portal-banner--warning .portal-banner__icon { background: #f59e0b; }
+
+.portal-banner--critical {
+  background: #fef2f2;
+  border-color: #fbd0d0;
+  color: #99231f;
+}
+.portal-banner--critical .portal-banner__icon { background: #ef4444; }
+
+/* ── Badges ───────────────────────────────────────────────────────────── */
+
+.portal-badge {
+  display: inline-flex;
+  align-items: center;
+  /* Prevents the pill from stretching to fill its container's width when it
+     sits inside a flex column (e.g. .portal-stack--tight in a table cell) —
+     without this, align-items:stretch on the parent blows the badge up to
+     the full column width instead of hugging its text. */
+  align-self: flex-start;
+  flex: none;
+  gap: 5px;
+  padding: 3px 10px 3px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+.portal-badge__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.portal-badge--neutral {
+  background: #f1f2f5;
+  color: #3f4551;
+}
+.portal-badge--neutral .portal-badge__dot { background: #9aa1ac; }
+
+.portal-badge--success {
+  background: #e7f9ee;
+  color: #146c3f;
+}
+.portal-badge--success .portal-badge__dot { background: #22c55e; }
+
+.portal-badge--warning {
+  background: #fef3c7;
+  color: #92400e;
+}
+.portal-badge--warning .portal-badge__dot { background: #f59e0b; }
+
+.portal-badge--critical {
+  background: #fee2e2;
+  color: #991b1b;
+}
+.portal-badge--critical .portal-badge__dot { background: #ef4444; }
+
+/* ── Table ────────────────────────────────────────────────────────────── */
+
+.portal-table-wrap {
+  border: 1px solid var(--portal-border-soft);
+  border-radius: var(--portal-radius);
+  overflow: hidden;
+  box-shadow: var(--portal-shadow);
+}
+
+.portal-table-scroll {
+  overflow-x: auto;
+}
+
+.portal-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+  background: var(--portal-surface);
+}
+
+/* Applied whenever a table's columns declare an explicit `width` — gives
+   every column a fixed, predictable share of the row instead of the
+   browser's default auto-layout (which sizes each column purely off its
+   widest cell and can leave some columns cramped and others oddly wide). */
+.portal-table--fixed {
+  table-layout: fixed;
+}
+
+.portal-table--fixed td,
+.portal-table--fixed th {
+  overflow-wrap: break-word;
+}
+
+.portal-table th {
+  text-align: left;
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 700;
+  color: var(--portal-muted);
+  padding: 12px 14px;
+  background: var(--portal-surface-tint);
+  border-bottom: 1px solid var(--portal-border-soft);
+  white-space: nowrap;
+}
+
+/* `.portal-table th` above (class + element) outranks a bare `.portal-table__cell--right`
+   class selector in specificity, so a right-aligned header would silently stay
+   left-aligned while its data cells aligned right — headers and values then
+   look mismatched instead of forming a clean column. Qualifying with `th`/`td`
+   matches that specificity so the override actually wins. */
+.portal-table th.portal-table__cell--right,
+.portal-table td.portal-table__cell--right {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.portal-table th.portal-table__cell--center,
+.portal-table td.portal-table__cell--center {
+  text-align: center;
+}
+
+.portal-table td {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--portal-border-soft);
+  vertical-align: top;
+}
+
+.portal-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.portal-table tbody tr:nth-child(even) td {
+  background: #fbfbfc;
+}
+
+.portal-table tr.is-clickable {
+  cursor: pointer;
+}
+
+.portal-table tr.is-clickable:hover td {
+  background: var(--portal-brand-tint);
+}
+
+.portal-table__chevron {
+  width: 24px;
+  text-align: center;
+  color: var(--portal-muted-2);
+  font-size: 12px;
+}
+
+.portal-table__expanded-row td {
+  background: var(--portal-surface-tint) !important;
+  padding: 14px 14px 18px 28px;
+}
+
+/* ── Empty state ──────────────────────────────────────────────────────── */
+
+.portal-empty {
+  text-align: center;
+  padding: 40px 20px;
+  border: 1px dashed var(--portal-border);
+  border-radius: var(--portal-radius);
+  color: var(--portal-muted);
+  font-size: 14px;
+  background: var(--portal-surface-tint);
+}
+
+/* ── Payout card ──────────────────────────────────────────────────────── */
+
+.portal-card {
+  border: 1px solid var(--portal-border-soft);
+  border-radius: var(--portal-radius);
+  padding: 20px 22px;
+  background: var(--portal-surface);
+  box-shadow: var(--portal-shadow);
+}
+
+/* Fixed 3-column layout regardless of viewport width — auto-fill grids
+   spread out to fill the full row on wide screens, which is what made the
+   payout card's fields look sparse/misaligned. Falls back to 2 then 1
+   column on narrower screens (see the responsive block at the end). */
+.portal-payout-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  column-gap: 20px;
+  row-gap: 18px;
+}
+
+.portal-field-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.portal-field-block__label {
+  font-size: 11.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--portal-muted);
+}
+
+.portal-field-block__value {
+  font-size: 14px;
+  color: var(--portal-ink);
+  overflow-wrap: anywhere;
+}
+
+.portal-field-block__value--mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  color: var(--portal-muted);
+}
+
+.portal-details-body {
+  margin-top: 12px;
+}
+
+details > summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--portal-brand);
+  list-style: none;
+}
+
+details > summary::-webkit-details-marker {
+  display: none;
+}
+
+details > summary::before {
+  content: '▸ ';
+}
+
+details[open] > summary::before {
+  content: '▾ ';
+}
+
+/* ── Pagination ───────────────────────────────────────────────────────── */
+
+.portal-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+}
+
+/* ── Loading / spinner ────────────────────────────────────────────────── */
+
+.portal-loading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 24px 0;
+}
+
+.portal-spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--portal-border);
+  border-top-color: var(--portal-brand);
+  border-radius: 50%;
+  animation: portal-spin 0.7s linear infinite;
+}
+
+@keyframes portal-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ── Dialog (Create referral code) ───────────────────────────────────── */
+
+.portal-dialog {
+  border: none;
+  border-radius: 16px;
+  padding: 24px;
+  max-width: 440px;
+  width: 90vw;
+  box-shadow: 0 20px 60px rgba(16, 24, 40, 0.2);
+}
+
+.portal-dialog::backdrop {
+  background: rgba(16, 18, 22, 0.5);
+  backdrop-filter: blur(2px);
+}
+
+.portal-dialog__actions {
+  margin-top: 22px;
+  padding-top: 16px;
+  border-top: 1px solid var(--portal-border-soft);
+}
+
+/* ── Auth / status screens (sign-in, denied, error) ──────────────────── */
+
+.portal-status-screen {
+  max-width: 480px;
+  margin: 40px auto 0;
+  text-align: center;
+}
+
+.portal-status-screen .portal-banner {
+  text-align: left;
+}
+
+/* ── Responsive ───────────────────────────────────────────────────────── */
+
+@media (max-width: 720px) {
+  .portal-payout-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  .portal-page {
+    padding: 20px 14px 56px;
+  }
+
+  .portal-page__heading {
+    font-size: 22px;
+  }
+
+  .portal-field-grid--2,
+  .portal-field-grid--3 {
+    grid-template-columns: 1fr;
+  }
+
+  .portal-payout-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .portal-stat-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .portal-inline--end {
+    justify-content: flex-start;
+  }
+}

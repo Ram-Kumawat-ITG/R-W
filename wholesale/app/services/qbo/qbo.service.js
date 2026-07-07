@@ -367,6 +367,41 @@ export async function setInvoiceProcessingFee({ qboInvoiceId, feeLine = null, du
   return updated
 }
 
+// One-off cleanup for the removed Immediate Payment feature (2026-06-30):
+// strips the trailing "Pay your invoice online: <url>" / legacy "Pay
+// online: <url>" block from an already-created QBO invoice's CustomerMemo.
+// The feature stopped baking this block into NEW invoices back in 2026-06-30,
+// but invoices created before that (and still-open invoices whose method was
+// later realigned, which only rewrites the fee line + DueDate, not the memo)
+// kept the stale block. Used by scripts/strip-invoice-pay-links.js against
+// every Invoice with a legacy `payToken`. No-op (returns null) if the current
+// memo has no pay-link block.
+const PAY_LINK_MEMO_REGEX = /\n*Pay (?:online:|your invoice online:)[\s\S]*$/i
+
+export async function stripPayLinkMemo({ qboInvoiceId }) {
+  if (!qboInvoiceId) throw new Error('stripPayLinkMemo: qboInvoiceId is required')
+  const current = await getInvoice(qboInvoiceId)
+  if (!current?.Id) throw new Error(`stripPayLinkMemo: QBO invoice ${qboInvoiceId} not found`)
+  const existingMemo = current.CustomerMemo?.value || ''
+  const cleaned = existingMemo.replace(PAY_LINK_MEMO_REGEX, '').trimEnd()
+  if (cleaned === existingMemo) return null // nothing to strip
+  const payload = {
+    Id: String(current.Id),
+    SyncToken: String(current.SyncToken),
+    sparse: true,
+    CustomerMemo: { value: cleaned },
+  }
+  console.log(
+    `[QBO invoice] stripPayLinkMemo Id=${current.Id} — removing pay-link block ` +
+      `(SyncToken=${current.SyncToken})`,
+  )
+  const res = await qbo.post('/invoice', payload)
+  const updated = res?.Invoice
+  if (!updated?.Id) throw new Error('QBO invoice update returned no Id')
+  console.log(`[QBO invoice] stripPayLinkMemo DONE Id=${updated.Id} SyncToken=${updated.SyncToken}`)
+  return updated
+}
+
 // Marker that delimits the auto-managed shipping block inside an invoice's
 // CustomerMemo, so repeated writes replace (not duplicate) it. Anything the
 // invoice already had above this marker (e.g. "Shopify order #1140") is

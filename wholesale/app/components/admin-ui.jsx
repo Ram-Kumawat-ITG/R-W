@@ -196,6 +196,47 @@ export function PaymentMethodShortText({ method }) {
   return <s-text>{PAYMENT_METHOD_SHORT[method] || method}</s-text>;
 }
 
+// ── Orders section tab bar ──────────────────────────────────────────
+//
+// Two sibling top-level routes — `app.orders._index.jsx` ("Practitioner
+// Orders", the existing order list) and `app.orders.cron-batch.jsx`
+// ("CRON Batch") — presented as tabs of one "Orders" section. Deliberately
+// NOT a file-based nested layout (no `app.orders.jsx`): React Router's
+// flat-routes convention would then also absorb the existing
+// `app.orders.$id.jsx` (Order Details) as a child of that layout, wrapping
+// the detail page in these tabs too, which makes no sense for a single-
+// order view. Same sibling-routes shape as the Admin Orders family
+// (`_index` / `$id` / `batch`, no shared `app.admin-orders.jsx`). Shares
+// the `<s-clickable-chip>` idiom from the QBO/NMI section tab bars —
+// Polaris web components don't ship a dedicated `s-tabs` element.
+const ORDERS_TABS = [
+  { id: "orders", label: "Practitioner Orders", path: "/app/orders" },
+  { id: "cron-batch", label: "CRON Batch", path: "/app/orders/cron-batch" },
+];
+
+export function OrdersTabBar({ active }) {
+  const navigate = useNavigate();
+  return (
+    <s-box paddingBlockEnd="base">
+      <s-stack direction="inline" gap="small-200" wrap>
+        {ORDERS_TABS.map((t) => {
+          const isActive = active === t.id;
+          return (
+            <s-clickable-chip
+              key={t.id}
+              color={isActive ? "strong" : "base"}
+              accessibilityLabel={`Open ${t.label} tab`}
+              onClick={() => navigate(t.path)}
+            >
+              {isActive ? <strong>{t.label}</strong> : t.label}
+            </s-clickable-chip>
+          );
+        })}
+      </s-stack>
+    </s-box>
+  );
+}
+
 // ── Advanced filter form ────────────────────────────────────────────
 //
 // A reusable, config-driven filter card shared by every admin list page

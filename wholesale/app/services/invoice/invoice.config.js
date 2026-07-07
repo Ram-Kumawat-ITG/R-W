@@ -3,6 +3,7 @@
 // (late-fee schedules, etc.) have a natural home.
 
 import { readInt, readNumber } from '../../utils/env.utils'
+import { computeDueDateForMethod } from './invoice.utils'
 
 // Generic default terms (days) — the fallback used by any payment method
 // that has no method-specific override configured below.
@@ -19,17 +20,25 @@ export const invoiceConfig = {
   // `dueDaysByMethod` (see below) and resolved with `dueDaysForMethod`.
   termsDays: DEFAULT_TERMS_DAYS,
 
-  // Per-payment-method due-date terms (days from the order/invoice date).
-  // The due date is computed at invoice creation from the invoice's
-  // locked `paymentMethod`:
-  //   cheque → CHEQUE_DUE_DATE, ACH → ACH_DUE_DATE, card → CARD_DUE_DATE.
-  // Each falls back to INVOICE_TERMS_DAYS when its env var is unset, so
-  // existing single-terms setups keep working. Example: order June 1 +
-  // CHEQUE_DUE_DATE=15 → due June 16. Resolve via `dueDaysForMethod`.
+  // Per-payment-method due-date RULES (not a flat day-count — see
+  // `computeDueDateForMethod` in invoice.utils.js for the actual math):
+  //   - ach   → billing-cycle date: orders placed the 1st–15th are due the
+  //     15th of that month; orders placed the 16th–end-of-month are due
+  //     the last day of that month. Same rule as card. No env knob — this
+  //     is a fixed business rule, not a day-count.
+  //   - card  → billing-cycle date: orders placed the 1st–15th are due the
+  //     15th of that month; orders placed the 16th–end-of-month are due
+  //     the last day of that month. No env knob — this is a fixed
+  //     business rule, not a day-count.
+  //   - check → CHEQUE_DUE_DATE **business days** (Mon–Fri, no holiday
+  //     calendar) after the order date. Default 10 (per the production
+  //     requirement: "Check: 10 business days").
+  // `dueDaysByMethod` below is only consulted as the generic calendar-day
+  // fallback for methods with no dedicated rule above (currently just
+  // `dropship`) — resolved via `dueDaysForMethod`.
+  checkDueBusinessDays: readInt('CHEQUE_DUE_DATE', 10),
+
   dueDaysByMethod: {
-    check: readInt('CHEQUE_DUE_DATE', DEFAULT_TERMS_DAYS),
-    ach: readInt('ACH_DUE_DATE', DEFAULT_TERMS_DAYS),
-    card: readInt('CARD_DUE_DATE', DEFAULT_TERMS_DAYS),
     // Drop-ship — invoices for the retail drop-ship customer, collected by
     // the dedicated process-dropship-payments CRON (production: once per
     // month). The due window is independent of the wholesale terms; defaults
@@ -76,4 +85,18 @@ export function dueDaysForMethod(paymentMethod) {
   const byMethod = invoiceConfig.dueDaysByMethod
   const days = byMethod?.[paymentMethod]
   return Number.isFinite(days) ? days : invoiceConfig.termsDays
+}
+
+// Resolve { dueDate, dueAt } for an invoice given its locked payment
+// method + order-date basis, per the production billing rules (see
+// `dueDaysByMethod` comment above / `computeDueDateForMethod` in
+// invoice.utils.js). This is the one call site every creation / realign
+// path should use — it wires in the configured business-day count +
+// testing `termsMinutes` offset so the rules stay centralized here.
+export function resolveInvoiceDueDate(baseDate, paymentMethod) {
+  return computeDueDateForMethod(baseDate, paymentMethod, {
+    businessDays: invoiceConfig.checkDueBusinessDays,
+    termsDays: dueDaysForMethod(paymentMethod),
+    termsMinutes: invoiceConfig.termsMinutes,
+  })
 }

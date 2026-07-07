@@ -822,6 +822,25 @@ Shopify "partial"/"restocked"). Kept in sync automatically by the subscribed
 
 ## 18. Practitioner Portal (Customer Account UI extension)
 
+> **⚠️ SUPERSEDED 2026-07-03 — the canonical Practitioner Portal has moved back
+> to `wholesale` as a Theme App Extension** (React + Vite, wholesale storefront,
+> App Proxy + `logged_in_customer_id` auth — see `wholesale/CLAUDE.md`'s
+> 2026-07-03 changelog entry for the full rationale and file list). This
+> section now describes the **legacy** implementation, which is still live in
+> this repo pending manual verification of the new one. **Do not build new
+> features against this version** — port them to `wholesale/practitioner-portal/`
+> + `wholesale/app/services/cdo/cdo.portal.service.js` instead.
+>
+> **Nothing in this app's data layer changed** — `cdo_orders`/`cdo_commissions`/
+> `cdo_payouts`/`cdo_referrals` are still OWNED and WRITTEN here; the wholesale
+> portal only reads them via new read-only mirror models. Once the wholesale
+> version is verified in production, decommission this section's artifacts:
+> `ns-retail/extensions/practitioner-portal-account/`, `ns-retail/app/api/portal/*`,
+> `ns-retail/app/services/cdo/cdo.portal.service.js`, and their 8 route
+> registrations in `ns-retail/app/routes.js` — but KEEP the owning `cdo_*`
+> models and `cdo.service.js` (the CDO admin dashboard + order-ingestion
+> pipeline depend on them independently of the portal).
+
 Self-service dashboard for CDO practitioners, rendered **inside the Shopify
 customer account** as a full-page UI extension. Read aggregations over the
 `cdo_*` collections this app owns, plus the referral self-service **write** path

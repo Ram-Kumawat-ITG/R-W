@@ -53,26 +53,55 @@ const MUTATION_DISCOUNT_CREATE = /* GraphQL */ `
   }
 `;
 
-function buildShopifyDiscountUrl(shop, code) {
+export function buildShopifyDiscountUrl(shop, code) {
   return `https://${shop}/discount/${encodeURIComponent(code)}`;
 }
 
+const MUTATION_DISCOUNT_ACTIVATE = /* GraphQL */ `
+  mutation ActivatePractitionerDiscount($id: ID!) {
+    discountCodeActivate(id: $id) {
+      codeDiscountNode { id }
+      userErrors { field message code }
+    }
+  }
+`;
+
+const MUTATION_DISCOUNT_DEACTIVATE = /* GraphQL */ `
+  mutation DeactivatePractitionerDiscount($id: ID!) {
+    discountCodeDeactivate(id: $id) {
+      codeDiscountNode { id }
+      userErrors { field message code }
+    }
+  }
+`;
+
+function isDuplicateError(userErrors) {
+  return userErrors.some((e) =>
+    String(e?.message || "")
+      .toLowerCase()
+      .includes("already exists"),
+  );
+}
+
 /**
- * Create a matching Shopify discount object on the retail store for a
+ * Create a basic percentage code discount on the retail store for a
  * practitioner code. Direct retail Admin GraphQL call via the offline
  * access token in RETAIL_ADMIN_ACCESS_TOKEN — no HTTP hop through ns-retail.
- *
- * Best-effort: returns { shopifyDiscountId, shopifyDiscountUrl } on success;
- * returns { shopifyDiscountId: null, shopifyDiscountUrl: null } on failure
- * after logging. The caller never aborts code creation on a discount failure.
  *
  * @param {object} args
  * @param {string} args.code
  * @param {number} args.discountPercent  fraction (0.10 = 10%)
  * @param {string} [args.practitionerName]
- * @returns {Promise<{ shopifyDiscountId: string|null, shopifyDiscountUrl: string|null }>}
+ * @returns {Promise<
+ *   | { ok: true,  duplicate: false, shopifyDiscountId: string|null, shopifyDiscountUrl: string }
+ *   | { ok: true,  duplicate: true,  shopifyDiscountId: null,        shopifyDiscountUrl: string }
+ *   | { ok: false, error: string, userErrors?: Array }
+ * >}
+ *   `duplicate: true` means the code already exists on the retail store (the
+ *   discount is usable, but we didn't create it) — callers decide whether
+ *   that's a soft success or a conflict.
  */
-async function createShopifyDiscountForCode({
+export async function createRetailDiscount({
   code,
   discountPercent,
   practitionerName,
@@ -81,17 +110,18 @@ async function createShopifyDiscountForCode({
     console.warn(
       "[cdo] skipping retail discount creation — RETAIL_SHOP_DOMAIN or RETAIL_ADMIN_ACCESS_TOKEN missing",
     );
-    return { shopifyDiscountId: null, shopifyDiscountUrl: null };
+    return { ok: false, error: "Retail store credentials not configured" };
   }
+  if (!code) return { ok: false, error: "code required" };
   if (
     !Number.isFinite(discountPercent) ||
     discountPercent <= 0 ||
     discountPercent > 1
   ) {
-    console.warn(
-      `[cdo] skipping retail discount creation for "${code}" — invalid discountPercent ${discountPercent}`,
-    );
-    return { shopifyDiscountId: null, shopifyDiscountUrl: null };
+    return {
+      ok: false,
+      error: `invalid discountPercent ${discountPercent} (expected a fraction between 0 and 1)`,
+    };
   }
 
   const title = practitionerName
@@ -131,7 +161,7 @@ async function createShopifyDiscountForCode({
       console.error(
         `[cdo] retail discount create HTTP ${res.status} for "${code}": ${text.slice(0, 200)}`,
       );
-      return { shopifyDiscountId: null, shopifyDiscountUrl: null };
+      return { ok: false, error: `Retail store HTTP ${res.status}` };
     }
     const data = await res.json();
     if (data?.errors?.length) {
@@ -139,43 +169,110 @@ async function createShopifyDiscountForCode({
         `[cdo] retail discount GraphQL errors for "${code}":`,
         JSON.stringify(data.errors).slice(0, 300),
       );
-      return { shopifyDiscountId: null, shopifyDiscountUrl: null };
+      return { ok: false, error: "Discount creation failed" };
     }
     const errs = data?.data?.discountCodeBasicCreate?.userErrors || [];
     if (errs.length) {
-      // If the code already exists on retail Shopify, treat as soft success —
-      // return the shareable URL even though we have no node id.
-      const isDuplicate = errs.some((e) =>
-        String(e?.message || "")
-          .toLowerCase()
-          .includes("already exists"),
-      );
-      if (isDuplicate) {
-        const url = buildShopifyDiscountUrl(RETAIL_SHOP_DOMAIN, code);
+      if (isDuplicateError(errs)) {
         console.log(
           `[cdo] retail discount "${code}" already exists — URL returned, no node id`,
         );
-        return { shopifyDiscountId: null, shopifyDiscountUrl: url };
+        return {
+          ok: true,
+          duplicate: true,
+          shopifyDiscountId: null,
+          shopifyDiscountUrl: buildShopifyDiscountUrl(RETAIL_SHOP_DOMAIN, code),
+        };
       }
       console.error(
         `[cdo] retail discountCodeBasicCreate userErrors for "${code}":`,
         errs.map((e) => `${(e.field || []).join(".")}: ${e.message}`).join("; "),
       );
-      return { shopifyDiscountId: null, shopifyDiscountUrl: null };
+      return {
+        ok: false,
+        error: errs.map((e) => e.message).join("; "),
+        userErrors: errs,
+      };
     }
     const nodeId =
       data?.data?.discountCodeBasicCreate?.codeDiscountNode?.id || null;
-    const url = buildShopifyDiscountUrl(RETAIL_SHOP_DOMAIN, code);
     console.log(
       `[cdo] created retail discount code="${code}" percent=${discountPercent} id=${nodeId}`,
     );
-    return { shopifyDiscountId: nodeId, shopifyDiscountUrl: url };
+    return {
+      ok: true,
+      duplicate: false,
+      shopifyDiscountId: nodeId,
+      shopifyDiscountUrl: buildShopifyDiscountUrl(RETAIL_SHOP_DOMAIN, code),
+    };
   } catch (err) {
     console.error(
       `[cdo] retail discount create threw for "${code}":`,
       err?.message || err,
     );
-    return { shopifyDiscountId: null, shopifyDiscountUrl: null };
+    return { ok: false, error: "Discount creation failed" };
+  }
+}
+
+/**
+ * Activate or deactivate an existing retail discount by its node id. Used by
+ * the Practitioner Portal's pause/resume referral-code flow. Direct retail
+ * Admin GraphQL call via RETAIL_ADMIN_ACCESS_TOKEN — no HTTP hop through
+ * ns-retail.
+ *
+ * @param {object} args
+ * @param {string} args.discountId  gid://shopify/DiscountCodeNode/...
+ * @param {boolean} args.active     true → activate, false → deactivate
+ * @returns {Promise<{ ok: boolean, error?: string }>}
+ */
+export async function setRetailDiscountActive({ discountId, active }) {
+  if (!RETAIL_SHOP_DOMAIN || !RETAIL_ADMIN_ACCESS_TOKEN) {
+    return { ok: false, error: "Retail store credentials not configured" };
+  }
+  if (!discountId) return { ok: false, error: "discountId required" };
+
+  const mutation = active ? MUTATION_DISCOUNT_ACTIVATE : MUTATION_DISCOUNT_DEACTIVATE;
+  const field = active ? "discountCodeActivate" : "discountCodeDeactivate";
+
+  try {
+    const res = await fetch(
+      `https://${RETAIL_SHOP_DOMAIN}/admin/api/${RETAIL_API_VERSION}/graphql.json`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": RETAIL_ADMIN_ACCESS_TOKEN,
+        },
+        body: JSON.stringify({ query: mutation, variables: { id: discountId } }),
+      },
+    );
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      console.error(
+        `[cdo] retail discount toggle HTTP ${res.status} for "${discountId}": ${text.slice(0, 200)}`,
+      );
+      return { ok: false, error: `Retail store HTTP ${res.status}` };
+    }
+    const data = await res.json();
+    if (data?.errors?.length) {
+      console.error(
+        `[cdo] retail discount toggle GraphQL errors for "${discountId}":`,
+        JSON.stringify(data.errors).slice(0, 300),
+      );
+      return { ok: false, error: "Discount update failed" };
+    }
+    const userErrors = data?.data?.[field]?.userErrors || [];
+    if (userErrors.length) {
+      return { ok: false, error: userErrors.map((e) => e.message).join("; ") };
+    }
+    console.log(`[cdo] retail discount toggle ok id=${discountId} active=${active}`);
+    return { ok: true };
+  } catch (err) {
+    console.error(
+      `[cdo] retail discount toggle threw for "${discountId}":`,
+      err?.message || err,
+    );
+    return { ok: false, error: "Discount update failed" };
   }
 }
 
@@ -297,26 +394,29 @@ export async function generatePractitionerCode({
   // can re-trigger discount creation manually from the CDO admin if
   // shopifyDiscountId stays null. discountPercent is read from the row
   // we just created so a future per-tier change (10/20/30%) flows through.
-  const { shopifyDiscountId, shopifyDiscountUrl } =
-    await createShopifyDiscountForCode({
-      code: created.code,
-      discountPercent: created.discountPercent,
-      practitionerName: fullName,
-    });
+  const disc = await createRetailDiscount({
+    code: created.code,
+    discountPercent: created.discountPercent,
+    practitionerName: fullName,
+  });
 
-  if (shopifyDiscountId || shopifyDiscountUrl) {
+  if (disc.ok && (disc.shopifyDiscountId || disc.shopifyDiscountUrl)) {
     await CdoPractitionerCode.updateOne(
       { _id: created._id },
       {
         $set: {
-          shopifyDiscountId: shopifyDiscountId || null,
-          shopifyDiscountUrl: shopifyDiscountUrl || null,
+          shopifyDiscountId: disc.shopifyDiscountId || null,
+          shopifyDiscountUrl: disc.shopifyDiscountUrl || null,
         },
       },
     );
     // Reflect on the in-memory `created` doc so callers see the URL.
-    created.shopifyDiscountId = shopifyDiscountId || null;
-    created.shopifyDiscountUrl = shopifyDiscountUrl || null;
+    created.shopifyDiscountId = disc.shopifyDiscountId || null;
+    created.shopifyDiscountUrl = disc.shopifyDiscountUrl || null;
+  } else if (!disc.ok) {
+    console.warn(
+      `[cdo] retail discount not created for auto-generated code "${created.code}": ${disc.error}`,
+    );
   }
 
   return {

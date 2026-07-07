@@ -1,0 +1,43 @@
+{% assign bundle_url = 'practitioner-portal-bundle.js' | asset_url %}
+{% assign asset_base = bundle_url | split: 'practitioner-portal-bundle.js' | first %}
+
+<script>
+  window.__PORTAL_EXT_ASSET_BASE__ = {{ asset_base | json }};
+</script>
+
+{{ 'practitioner-portal-bundle.css' | asset_url | stylesheet_tag }}
+
+<div id="portal-root"
+  data-proxy-base="{{ block.settings.proxy_base }}"
+  data-login-page-url="{{ block.settings.login_page_url }}"
+  data-support-email="{{ block.settings.support_email }}"></div>
+
+<script src="{{ 'practitioner-portal-bundle.js' | asset_url }}" type="module"></script>
+
+{% schema %}
+{
+  "name": "Practitioner Portal",
+  "target": "section",
+  "settings": [
+    {
+      "type": "text",
+      "id": "proxy_base",
+      "label": "App proxy subpath",
+      "default": "wholesale-application",
+      "info": "Must match shopify.app.toml [app_proxy].subpath"
+    },
+    {
+      "type": "url",
+      "id": "login_page_url",
+      "label": "Login page URL",
+      "info": "Where unauthenticated visitors are sent to sign in"
+    },
+    {
+      "type": "text",
+      "id": "support_email",
+      "label": "Support email",
+      "info": "Shown on the access-denied screen"
+    }
+  ]
+}
+{% endschema %}
