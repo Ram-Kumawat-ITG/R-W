@@ -37,7 +37,7 @@
 
 const SERVER_URL =  "https://r-w.onrender.com" ||  process.env.SHOPIFY_APP_URL;
   
-console.log('SERVER_URL', SERVER_URL)
+console.log('SERVER_dURL', SERVER_URL)
 // Typed error so callers can branch on the HTTP status (e.g. 401 → sign in,
 // 403 → access restricted) and still read the server message + body.
 export class ApiError extends Error {
