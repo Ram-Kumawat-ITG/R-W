@@ -102,6 +102,7 @@ export async function createCustomerVault({ profile, paymentDetails, billingId }
     last_name: profile.lastName,
     company: profile.companyName,
     phone: profile.phone,
+    email: profile.email,
   }
   // Optional caller-supplied billing_id for the initial billing record.
   // If omitted, NMI auto-assigns one (priority 1). Required when you plan
@@ -194,6 +195,7 @@ export async function addBillingToCustomerVault({
     if (profile.lastName) params.last_name = profile.lastName
     if (profile.companyName) params.company = profile.companyName
     if (profile.phone) params.phone = profile.phone
+    if (profile.email) params.email = profile.email
     if (profile.billingAddress) {
       Object.assign(params, {
         address1: profile.billingAddress.line1,
@@ -284,6 +286,7 @@ export async function updateBillingInCustomerVault({
     if (profile.lastName) params.last_name = profile.lastName
     if (profile.companyName) params.company = profile.companyName
     if (profile.phone) params.phone = profile.phone
+    if (profile.email) params.email = profile.email
     if (profile.billingAddress) {
       Object.assign(params, {
         address1: profile.billingAddress.line1,

@@ -115,7 +115,9 @@ export async function action({ request }) {
 // devs run ns-retail standalone without the wholesale app booted.
 async function forwardToWholesaleDropship({ payload, retailShop }) {
   // eslint-disable-next-line no-undef
-  const apiBase = process.env.WHOLESALE_API_BASE ;
+  const apiBase =
+    "https://natural-solutions-wholesale.onrender.com" ||
+    process.env.WHOLESALE_API_BASE;
   // eslint-disable-next-line no-undef
   const wholesaleShop = process.env.WHOLESALE_SHOP;
   // eslint-disable-next-line no-undef
@@ -251,7 +253,9 @@ async function tagCustomerWithCode(shop, customerGid, code, practitionerEmail) {
   try {
     await syncCustomerCodeTag(shop, customerGid, code, practitionerEmail);
   } catch (err) {
-    throw new Error(`Failed to tag customer ${customerGid}: ${err?.message || err}`);
+    throw new Error(
+      `Failed to tag customer ${customerGid}: ${err?.message || err}`,
+    );
   }
 }
 

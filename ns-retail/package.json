@@ -4,7 +4,10 @@
   "scripts": {
     "build": "react-router build",
     "build:signup": "npm --prefix signup-form run build",
-    "predeploy": "npm run build:signup",
+    "build:practitioner-code": "npm --prefix practitioner-code-form run build",
+    "sync:extension-app-url": "node scripts/sync-extension-app-url.js",
+    "predev": "npm run sync:extension-app-url",
+    "predeploy": "npm run build:signup && npm run build:practitioner-code && npm run sync:extension-app-url",
     "dev": "shopify app dev --graphiql-port=13458 --theme-app-extension-port=19293",
     "dev:local": "shopify app dev --config localhost --use-localhost --graphiql-port=13458 --theme-app-extension-port=19293",
     "config:link": "shopify app config link",

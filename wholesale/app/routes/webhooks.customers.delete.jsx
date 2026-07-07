@@ -37,17 +37,29 @@ export async function action({ request }) {
   }).lean();
 
   if (application) {
+    // ⚠️ DISABLED (2026-07-06) — wholesale → retail practitioner mirror
+    // was turned off per the product decision that wholesale
+    // practitioners should NOT auto-create ns-retail customers. See
+    // the banner in webhooks.customers.create.jsx for the full
+    // rationale + re-enable steps. The Mongo doc is still deleted
+    // below (step 2) so wholesale-side state stays clean.
+    log.info("retail_sync.delete_skipped_disabled", {
+      customerId,
+      applicationId: String(application._id),
+    });
+
+    // ── Original implementation (preserved) ─────────────────────────
     // 1. Soft-delete on retail BEFORE removing the Mongo doc.
-    try {
-      await syncPractitionerToRetail({ application, action: "delete" });
-    } catch (err) {
-      log.error("retail_sync.delete_failed", {
-        customerId,
-        applicationId: String(application._id),
-        err: err?.message || String(err),
-      });
-      // Continue — see file header.
-    }
+    // try {
+    //   await syncPractitionerToRetail({ application, action: "delete" });
+    // } catch (err) {
+    //   log.error("retail_sync.delete_failed", {
+    //     customerId,
+    //     applicationId: String(application._id),
+    //     err: err?.message || String(err),
+    //   });
+    //   // Continue — see file header.
+    // }
   } else {
     log.info("no_application_found_for_delete", { customerId });
   }

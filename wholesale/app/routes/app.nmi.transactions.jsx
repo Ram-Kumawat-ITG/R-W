@@ -8,7 +8,7 @@ import { authenticate } from "../shopify.server";
 import { listNmiTransactions } from "../services/nmi/nmi.service";
 // Pure helpers come from nmi.utils.js — see that file for why.
 import { latestAction, fromNmiDate } from "../services/nmi/nmi.utils";
-import { formatAmount } from "../utils/format.utils";
+import { formatAmount, initialsOf } from "../utils/format.utils";
 import { AdvancedFilters } from "../components/admin-ui";
 
 const PAGE_SIZE = 50;
@@ -272,14 +272,12 @@ export default function NmiTransactions() {
           <s-table loading={tableLoading}>
             <s-table-header-row>
               <s-table-header>Transaction</s-table-header>
-              <s-table-header>Type</s-table-header>
+              <s-table-header>Action</s-table-header>
               <s-table-header>Customer</s-table-header>
               <s-table-header>Amount</s-table-header>
               <s-table-header>Outcome</s-table-header>
               <s-table-header>Processor response</s-table-header>
-              <s-table-header>Batch</s-table-header>
-              <s-table-header>Settlement</s-table-header>
-              <s-table-header>Retries</s-table-header>
+              <s-table-header>Condition</s-table-header>
               <s-table-header>References</s-table-header>
               <s-table-header>When</s-table-header>
             </s-table-header-row>
@@ -294,13 +292,27 @@ export default function NmiTransactions() {
                       </s-badge>
                     </s-stack>
                   </s-table-cell>
-                  <s-table-cell>{tx.actionType}</s-table-cell>
                   <s-table-cell>
                     <s-stack direction="block" gap="none">
-                      <s-text>{tx.customerName || "—"}</s-text>
-                      {tx.email && (
-                        <s-text tone="subdued">{tx.email}</s-text>
+                      <s-text>{tx.actionType}</s-text>
+                      {tx.retryCount > 1 && (
+                        <s-badge tone="warning">{tx.retryCount}x retried</s-badge>
                       )}
+                    </s-stack>
+                  </s-table-cell>
+                  <s-table-cell>
+                    <s-stack direction="inline" gap="small-200" alignItems="center">
+                      <s-avatar
+                        size="small-200"
+                        initials={initialsOf(tx.customerName)}
+                        alt={tx.customerName || "Customer"}
+                      />
+                      <s-stack direction="block" gap="none">
+                        <s-text>{tx.customerName || "—"}</s-text>
+                        {tx.email && (
+                          <s-text tone="subdued">{tx.email}</s-text>
+                        )}
+                      </s-stack>
                     </s-stack>
                   </s-table-cell>
                   <s-table-cell>
@@ -322,30 +334,9 @@ export default function NmiTransactions() {
                     </s-stack>
                   </s-table-cell>
                   <s-table-cell>
-                    {tx.batchId ? (
-                      <s-stack direction="block" gap="none">
-                        <s-text>Batch {tx.batchId}</s-text>
-                        {tx.processorBatchId && tx.processorBatchId !== tx.batchId && (
-                          <s-text tone="subdued">
-                            Processor {tx.processorBatchId}
-                          </s-text>
-                        )}
-                      </s-stack>
-                    ) : (
-                      "—"
-                    )}
-                  </s-table-cell>
-                  <s-table-cell>
                     <s-badge tone={CONDITION_TONE[tx.condition] || "default"}>
                       {CONDITION_LABEL[tx.condition] || tx.condition || "—"}
                     </s-badge>
-                  </s-table-cell>
-                  <s-table-cell>
-                    {tx.retryCount > 1 ? (
-                      <s-badge tone="warning">{tx.retryCount}x</s-badge>
-                    ) : (
-                      <s-text tone="subdued">—</s-text>
-                    )}
                   </s-table-cell>
                   <s-table-cell>
                     <s-stack direction="block" gap="none">
@@ -355,7 +346,10 @@ export default function NmiTransactions() {
                       {tx.authCode && (
                         <s-text tone="subdued">Auth {tx.authCode}</s-text>
                       )}
-                      {!tx.orderId && !tx.authCode && (
+                      {tx.batchId && (
+                        <s-text tone="subdued">Batch {tx.batchId}</s-text>
+                      )}
+                      {!tx.orderId && !tx.authCode && !tx.batchId && (
                         <s-text tone="subdued">—</s-text>
                       )}
                     </s-stack>

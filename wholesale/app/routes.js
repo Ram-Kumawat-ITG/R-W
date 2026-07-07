@@ -35,6 +35,13 @@ export default [
   // Registered with Shopify via the `carrierServiceCreate` GraphQL mutation
   // (one-time per store; the callbackUrl must point HERE).
   route("/api/shipping/rates", "api/shipping/rates.js"),
+  // On-demand Processing Fee variant provisioning. POST { price }
+  // returns { gid } for a variant at that exact cent-precise price,
+  // creating it (and LRU-evicting an old one if the product is at
+  // capacity) as needed. Called from the checkout-ui extension via
+  // FullPageApi.getFeeVariant(). Mirrors
+  // ns-retail/app/api/cdo/fee-variant.js.
+  route("/api/cdo/fee-variant", "api/cdo/fee-variant.js"),
   route("/api/admin/customers", "api/admin/customers.js"),
   route("/api/admin/customers/:id", "api/admin/customer.js"),
   route("/api/admin/customers/:id/decline", "api/admin/decline.js"),

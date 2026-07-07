@@ -11,6 +11,7 @@ import { listNmiCustomerVaults } from "../services/nmi/nmi.service";
 // helpers are split out (avoids dragging process.env into the client
 // bundle via nmi.config.js).
 import { fromNmiDate } from "../services/nmi/nmi.utils";
+import { initialsOf } from "../utils/format.utils";
 import { AdvancedFilters } from "../components/admin-ui";
 
 const PAGE_SIZE = 50;
@@ -155,6 +156,7 @@ function projectCustomer(c) {
   // fall back to id so Pattern C responses don't render rows with a
   // blank Vault ID column.
   const vaultId = c.customer_vault_id || c.id || null;
+  const location = [c.city, c.state || c.country].filter(Boolean).join(", ");
   return {
     id: vaultId,
     firstName: c.first_name || null,
@@ -162,6 +164,7 @@ function projectCustomer(c) {
     email: c.email || null,
     phone: c.phone || null,
     company: c.company || null,
+    location: location || null,
     methodType: method.type,
     methodLabel: method.label,
     methodDetail: method.detail,
@@ -271,8 +274,9 @@ export default function NmiCustomers() {
               <s-table-header>Vault ID</s-table-header>
               <s-table-header>Customer</s-table-header>
               <s-table-header>Email</s-table-header>
+              <s-table-header>Phone</s-table-header>
+              <s-table-header>Location</s-table-header>
               <s-table-header>Payment method</s-table-header>
-              <s-table-header>Card / ACH detail</s-table-header>
               <s-table-header>Created</s-table-header>
               <s-table-header>Status</s-table-header>
             </s-table-header-row>
@@ -286,28 +290,41 @@ export default function NmiCustomers() {
                   <s-table-row key={c.id}>
                     <s-table-cell>#{c.id}</s-table-cell>
                     <s-table-cell>
-                      <s-stack direction="block" gap="none">
-                        <s-text>{name}</s-text>
-                        {c.company && (
-                          <s-text tone="subdued">{c.company}</s-text>
-                        )}
+                      <s-stack direction="inline" gap="small-200" alignItems="center">
+                        <s-avatar
+                          size="small-200"
+                          initials={initialsOf(name)}
+                          alt={name}
+                        />
+                        <s-stack direction="block" gap="none">
+                          <s-text>{name}</s-text>
+                          {c.company && (
+                            <s-text tone="subdued">{c.company}</s-text>
+                          )}
+                        </s-stack>
                       </s-stack>
                     </s-table-cell>
                     <s-table-cell>{c.email || "—"}</s-table-cell>
+                    <s-table-cell>{c.phone || "—"}</s-table-cell>
+                    <s-table-cell>{c.location || "—"}</s-table-cell>
                     <s-table-cell>
-                      <s-badge
-                        tone={
-                          c.methodType === "card"
-                            ? "info"
-                            : c.methodType === "ach"
-                              ? "warning"
-                              : "default"
-                        }
-                      >
-                        {c.methodLabel}
-                      </s-badge>
+                      <s-stack direction="block" gap="none">
+                        <s-badge
+                          tone={
+                            c.methodType === "card"
+                              ? "info"
+                              : c.methodType === "ach"
+                                ? "warning"
+                                : "default"
+                          }
+                        >
+                          {c.methodLabel}
+                        </s-badge>
+                        {c.methodType !== "none" && c.methodDetail && (
+                          <s-text tone="subdued">{c.methodDetail}</s-text>
+                        )}
+                      </s-stack>
                     </s-table-cell>
-                    <s-table-cell>{c.methodDetail || "—"}</s-table-cell>
                     <s-table-cell>
                       {c.createdAt
                         ? new Date(c.createdAt).toLocaleDateString()

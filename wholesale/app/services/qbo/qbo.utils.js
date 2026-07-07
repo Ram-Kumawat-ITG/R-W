@@ -11,6 +11,38 @@ export function truncate(s, max) {
   return s.length > max ? `${s.slice(0, max)}… (+${s.length - max} chars)` : s
 }
 
+// Our own QBO `Payment` records never set PaymentMethodRef (qbo.service's
+// recordPayment only writes CustomerRef/TotalAmt/PaymentRefNum/Line), so
+// that field is always blank for wholesale-created payments. The actual
+// method is recoverable from the PaymentRefNum shape: manual receipts are
+// tagged `<kind>:<ref>` (e.g. "cheque:985210", "ach:TX123" — see
+// invoice.service.recordManualPayment), while CRON/admin card+ACH charges
+// via NMI store the bare numeric gateway transaction id. Shared by the QBO
+// Dashboard and Transactions tabs so both render the same derived label.
+export function derivePaymentMethod(paymentMethodRefName, paymentRef) {
+  if (paymentMethodRefName) return paymentMethodRefName
+  if (!paymentRef) return null
+  const prefixed = /^(cheque|check|ach|card)\s*:/i.exec(paymentRef)
+  if (prefixed) {
+    const kind = prefixed[1].toLowerCase()
+    if (kind === 'ach') return 'ACH'
+    if (kind === 'card') return 'Card'
+    return 'Cheque'
+  }
+  if (/^\d+$/.test(paymentRef)) return 'Card / ACH (NMI)'
+  return null
+}
+
+// A QBO Payment's "linked transactions" are the invoices it pays.
+export function linkedInvoiceIds(payment) {
+  if (!Array.isArray(payment?.Line)) return []
+  return payment.Line.flatMap((l) =>
+    (l.LinkedTxn || [])
+      .filter((t) => t.TxnType === 'Invoice')
+      .map((t) => t.TxnId),
+  )
+}
+
 // Project our normalized address shape into QBO's PhysicalAddress shape.
 // Returns undefined when there's nothing usable so callers can omit the
 // field from the payload entirely (QBO rejects empty address objects).

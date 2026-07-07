@@ -42,26 +42,137 @@
 // Any carrier whose env vars aren't set is silently skipped — no errors.
 
 import crypto from "node:crypto";
+import { unauthenticated } from "../../shopify.server";
 
-// ── Tunables ────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+// CONFIG — every tunable value lives here, single source of truth. Edit
+// this block to change fees / thresholds / markup / caching behaviour —
+// no code hunting elsewhere in the file. All values are DYNAMIC in the
+// sense that tax / shipping / customer address come from live Shopify
+// data; only these operational constants are declared here.
+// ═══════════════════════════════════════════════════════════════════════
+const CONFIG = {
+  // Processing fee — fraction of (subtotal + shipping + tax) charged
+  // as a payment-processing surcharge, bundled into every shipping
+  // rate returned to Shopify. Set to 0 to disable the fee entirely.
+  processingFeeRate: 0.03, // 3 %
 
-// Retail handling markup, tiered by total cart quantity. The product
-// owner's spec (mirrored 1:1 with wholesale on 2026-06-25):
-//
-//   1–2 products → +$2
-//   3 products   → +$3
-//   4 or more    → +$5
-//
-// Cents on the wire. Replaces the prior `totalQty × PER_ITEM_CENTS`
-// linear formula. The drop-ship reverse-calc in
-// wholesale/app/services/dropship/dropship.service.js must mirror this
-// function — when a retail order is cloned onto wholesale, this exact
-// markup is subtracted so the wholesale shipping line carries the real
-// carrier cost only.
+  // Handling markup added to every non-free shipping option, tiered
+  // by total cart quantity (values in CENTS on the wire).
+  // The drop-ship reverse-calc in wholesale/app/services/dropship/*.js
+  // must mirror these numbers — keep them in sync across repos.
+  handlingMarkupCents: {
+    upTo2Items: 200, // +$2 for 1-2 items
+    threeItems: 300, // +$3 for 3 items
+    fourPlusItems: 500, // +$5 for 4+ items
+  },
+
+  // Free-shipping rule (both conditions must hold to trigger $0
+  // shipping). Vendor match is case-insensitive + trimmed.
+  freeShipping: {
+    vendor: "Natural Solutions",
+    thresholdUsd: 500,
+  },
+
+  // Shopify tax API (draftOrderCalculate) tuning. Cache lets us
+  // reuse the same tax figure for a given cart+address combo without
+  // re-hitting the Admin API on every re-render. Timeout bounds the
+  // callback so a slow API doesn't stall the whole checkout — on
+  // timeout we fall through with 0 tax (fee based on subtotal +
+  // shipping only, no state guessing).
+  shopifyTax: {
+    cacheTtlMs: 5 * 60 * 1000, // 5 min
+    // Bumped 3 → 5 sec (2026-07-06) — Shopify's draftOrderCalculate
+    // occasionally takes 3-4 sec under load; 5 sec still leaves
+    // 5 sec buffer under Shopify's 10-sec carrier-callback budget.
+    timeoutMs: 5000, // 5 sec
+    // Hard cap on the in-process cache so unique cart+address combos
+    // don't grow the Map unbounded on long-running instances (memory
+    // safety). Oldest entry evicted on overflow (insertion-order LRU).
+    cacheMaxEntries: 1000,
+  },
+};
+
+// Handling-markup resolver — reads `CONFIG.handlingMarkupCents`. The
+// drop-ship reverse-calc in wholesale mirrors this tiering exactly.
 function tieredMarkupCents(qty) {
-  if (qty <= 2) return 200;
-  if (qty === 3) return 300;
-  return 500;
+  if (qty <= 2) return CONFIG.handlingMarkupCents.upTo2Items;
+  if (qty === 3) return CONFIG.handlingMarkupCents.threeItems;
+  return CONFIG.handlingMarkupCents.fourPlusItems;
+}
+
+// ── Discount detection from the carrier-service payload ──────────────
+//
+// Shopify's carrier-service callback DOES NOT reliably surface applied
+// discount codes / automatic discounts in a single canonical field —
+// different Shopify versions + themes populate different keys, and
+// sometimes NONE of them. Without accounting for the discount, the 3%
+// processing fee is calculated on the pre-discount subtotal and the
+// customer over-pays the fee (small but real — $0.45 on a $15 discount).
+//
+// We probe the payload for every field we've seen actually populated,
+// in order of reliability. First non-zero win. Returns discount in
+// CENTS. Returns 0 when no discount info is available in the payload —
+// in that case the fee falls back to computing on the raw subtotal,
+// matching the previous (pre-discount-aware) behavior exactly.
+//
+// Returns { cents, source } so the per-rate log can show which field
+// was used, making it easy to diagnose payload shape drift over time.
+function detectCartDiscountCents(rate, realItems) {
+  // Field 1: `rate.total_discounts` — integer cents, top-level. Newer
+  //          versions of the carrier-service payload set this. Most
+  //          reliable when present.
+  const topLevel = Number(rate?.total_discounts);
+  if (Number.isFinite(topLevel) && topLevel > 0) {
+    return { cents: Math.round(topLevel), source: "rate.total_discounts" };
+  }
+
+  // Field 2: sum of `items[].discount_allocations[].amount` — per-line
+  //          allocations of a cart-level discount. Shopify sends these
+  //          as strings in dollars (e.g. "5.00") on some themes, and
+  //          cents on others — heuristic: values > 100 are treated as
+  //          cents, everything smaller is treated as dollars.
+  let allocSum = 0;
+  for (const it of realItems || []) {
+    for (const alloc of it?.discount_allocations || []) {
+      const raw = Number(alloc?.amount ?? alloc?.discount_amount);
+      if (!Number.isFinite(raw) || raw <= 0) continue;
+      allocSum += raw > 100 ? raw : raw * 100;
+    }
+  }
+  if (allocSum > 0) {
+    return {
+      cents: Math.round(allocSum),
+      source: "items[].discount_allocations",
+    };
+  }
+
+  // Field 3: derive from `rate.subtotal_price` (post-discount cart
+  //          total that Shopify sometimes sends alongside the items)
+  //          vs the sum of items[].price × quantity. If the two
+  //          differ, the delta IS the applied discount (in cents).
+  const subtotalFromRate = Number(rate?.subtotal_price);
+  if (Number.isFinite(subtotalFromRate) && subtotalFromRate > 0) {
+    const itemsSum = (realItems || []).reduce(
+      (s, it) =>
+        s + (Number(it?.price) || 0) * (Number(it?.quantity) || 0),
+      0,
+    );
+    // Some themes send subtotal_price in dollars, others cents.
+    // Normalize to cents by matching against itemsSum's magnitude.
+    const subtotalCents =
+      subtotalFromRate < itemsSum / 10
+        ? Math.round(subtotalFromRate * 100)
+        : Math.round(subtotalFromRate);
+    if (subtotalCents > 0 && subtotalCents < itemsSum) {
+      return {
+        cents: itemsSum - subtotalCents,
+        source: "rate.subtotal_price (derived)",
+      };
+    }
+  }
+
+  return { cents: 0, source: "none" };
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -144,6 +255,199 @@ function addBusinessDaysIso(daysFromToday) {
 // converted inline within fetchDHLRates.
 function gramsToLb(grams) {
   return Math.max(0.1, Math.round(((Number(grams) || 0) / 453.592) * 10) / 10);
+}
+
+// ── Processing fee (bundled into shipping rate) ────────────────────────
+//
+// Migrated 2026-07-06 from the Grow-plan-blocked checkout UI extension
+// (`extensions/processing-fee/`) into the carrier-service callback. The
+// fee is bundled into every returned shipping rate so it flows through
+// naturally at checkout without any Plus-only Shopify surface.
+//
+// Formula:
+//   shipping    = free-shipping ? 0 : (real carrier rate + handling markup)
+//   tax         = Shopify's live tax on this cart+destination (see
+//                 `calculateShopifyTax` — draftOrderCalculate mutation).
+//                 Fallback = 0 if the API is unreachable.
+//   feeBase     = subtotal + shipping + tax
+//   fee         = feeBase × CONFIG.processingFeeRate
+//   rate to Shopify = shipping + fee
+//
+// Free-shipping interaction: fee STILL applies when free-shipping fires
+// (shipping is $0 but the 3% processing fee is not — merchant still
+// collects the fee on NS-only $500+ carts). See CONFIG.freeShipping.
+//
+// Tax handling: Shopify's own `draftOrderCalculate` mutation is the sole
+// tax source — no more hardcoded state-rate tables. If the API fails /
+// times out the fee is calculated on (subtotal + shipping) only (no
+// static state guessing). Rely on Shopify's tax config for accuracy.
+
+// ── Shopify Tax API (draftOrderCalculate) ─────────────────────────────
+//
+// Live tax calculation using Shopify's own tax engine. This is more
+// accurate than the static US_STATE_TAX_RATES lookup because it honors:
+//   • City / county / special-district add-ons (not just state)
+//   • Product taxability rules (some categories tax-exempt)
+//   • Marketplace facilitator laws
+//   • Customer tax-exempt status (if configured on the customer record)
+//
+// Trade-off: adds a 200-500ms Shopify Admin GraphQL call per callback.
+// Mitigated by (a) an in-memory cache keyed on the tax-affecting inputs
+// (state, zip, product mix, subtotal) with a 5-min TTL, and (b) a 3-sec
+// timeout that falls back to the static lookup on slow / failed calls.
+//
+// Rate limit consideration: `draftOrderCalculate` costs ~10-20 points.
+// Shopify's GraphQL bucket is 50 points/sec, so we can safely handle up
+// to ~3 fresh checkouts per second before rate-limit risk. Cache hits
+// consume nothing.
+
+// Shop domain — resolved per-request in the action handler (Shopify
+// sends `X-Shopify-Shop-Domain` header on the webhook, which is the
+// most reliable source; env vars are a fallback for local dev where
+// the header may be missing). Kept as a function rather than a module
+// constant so a multi-environment deploy correctly routes each request
+// to its own shop.
+function resolveShopDomain(request) {
+  const fromHeader = String(
+    request?.headers?.get?.("x-shopify-shop-domain") || "",
+  ).trim();
+  if (fromHeader) return fromHeader;
+  return (
+    // eslint-disable-next-line no-undef
+    process.env.RETAIL_SHOP_DOMAIN ||
+    // eslint-disable-next-line no-undef
+    process.env.SHOPIFY_SHOP ||
+    ""
+  );
+}
+
+const _shopifyTaxCache = new Map(); // key → { taxCents, cachedAt }
+
+function buildTaxCacheKey({ destination, realItems, subtotalCents }) {
+  const state = String(destination?.province_code || destination?.province || "").toUpperCase();
+  const zip = String(destination?.postal_code || destination?.zip || "").slice(0, 5);
+  const country = String(destination?.country_code || destination?.country || "US").toUpperCase();
+  // Include item variant ids so tax varies with product mix (some
+  // products may be tax-exempt). Subtotal is already discount-adjusted
+  // by the caller, so a discount-applied cart naturally caches under
+  // a different key than the same items un-discounted.
+  const variants = (realItems || [])
+    .map((it) => `${it.variant_id || it.product_id}:${it.quantity}`)
+    .sort()
+    .join(",");
+  return `${country}|${state}|${zip}|${subtotalCents}|${variants}`;
+}
+
+const MUTATION_DRAFT_ORDER_CALCULATE = `#graphql
+  mutation DraftOrderCalculateForTax($input: DraftOrderInput!) {
+    draftOrderCalculate(input: $input) {
+      calculatedDraftOrder {
+        totalTaxSet {
+          shopMoney {
+            amount
+            currencyCode
+          }
+        }
+        taxLines {
+          title
+          rate
+          ratePercentage
+          priceSet {
+            shopMoney { amount }
+          }
+        }
+      }
+      userErrors { field message }
+    }
+  }
+`;
+
+// Calculate the exact Shopify tax for the given cart + destination.
+// Returns { taxCents, source } on success or null on failure — caller
+// falls back to the static state-lookup rate.
+async function calculateShopifyTax({ shop, destination, realItems, subtotalCents }) {
+  if (!shop) return null;
+  if (!realItems?.length) return null;
+
+  // Cache hit — return instantly (no Shopify call).
+  const cacheKey = buildTaxCacheKey({ destination, realItems, subtotalCents });
+  const cached = _shopifyTaxCache.get(cacheKey);
+  if (cached && Date.now() - cached.cachedAt < CONFIG.shopifyTax.cacheTtlMs) {
+    return { taxCents: cached.taxCents, source: "shopify_cached" };
+  }
+
+  // Build the input — Shopify draftOrderCalculate needs variantId in
+  // GID form; carrier-service payload sends numeric variant_id.
+  const lineItems = realItems
+    .filter((it) => it?.variant_id)
+    .map((it) => ({
+      variantId: `gid://shopify/ProductVariant/${it.variant_id}`,
+      quantity: Number(it.quantity) || 1,
+    }));
+  if (!lineItems.length) return null;
+
+  const input = {
+    shippingAddress: {
+      address1: destination?.address1 || "",
+      city: destination?.city || "",
+      provinceCode:
+        destination?.province_code || destination?.province || undefined,
+      countryCode:
+        destination?.country_code || destination?.country || "US",
+      zip: destination?.postal_code || destination?.zip || "",
+    },
+    lineItems,
+  };
+  // Drop empty provinceCode — Shopify rejects "" for that field.
+  if (!input.shippingAddress.provinceCode) {
+    delete input.shippingAddress.provinceCode;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CONFIG.shopifyTax.timeoutMs);
+  try {
+    const { admin } = await unauthenticated.admin(shop);
+    const res = await admin.graphql(MUTATION_DRAFT_ORDER_CALCULATE, {
+      variables: { input },
+      signal: controller.signal,
+    });
+    const body = await res.json();
+    clearTimeout(timer);
+
+    const userErrors = body?.data?.draftOrderCalculate?.userErrors || [];
+    if (userErrors.length) {
+      console.warn(
+        "[shipping.rates] draftOrderCalculate userErrors:",
+        JSON.stringify(userErrors),
+      );
+      return null;
+    }
+    const taxAmountUsd = Number(
+      body?.data?.draftOrderCalculate?.calculatedDraftOrder?.totalTaxSet
+        ?.shopMoney?.amount,
+    );
+    if (!Number.isFinite(taxAmountUsd)) return null;
+    const taxCents = Math.round(taxAmountUsd * 100);
+
+    // Cache for CONFIG.shopifyTax.cacheTtlMs. Bounded to
+    // `cacheMaxEntries` — on overflow we drop the OLDEST entry
+    // (Map preserves insertion order, so the first key is the
+    // oldest by insertion time — approximates LRU cheaply).
+    if (_shopifyTaxCache.size >= CONFIG.shopifyTax.cacheMaxEntries) {
+      const oldestKey = _shopifyTaxCache.keys().next().value;
+      if (oldestKey !== undefined) _shopifyTaxCache.delete(oldestKey);
+    }
+    _shopifyTaxCache.set(cacheKey, { taxCents, cachedAt: Date.now() });
+
+    return { taxCents, source: "shopify_live" };
+  } catch (err) {
+    clearTimeout(timer);
+    console.warn(
+      "[shipping.rates] Shopify tax API failed — falling back to state lookup:",
+      err?.message || err,
+    );
+    return null;
+  }
 }
 
 // In-memory OAuth token cache keyed by carrier. Most direct-carrier APIs
@@ -588,14 +892,37 @@ export async function action({ request }) {
     return ratesResponse([]);
   }
 
-  // HMAC verify — log in dev, harden later.
+  // HMAC verify — LOG-ONLY (never reject).
+  //
+  // Per Shopify docs, Carrier Service callbacks are NOT HMAC-signed
+  // the same way regular webhooks are. Security for this endpoint
+  // relies on the callback URL being unguessable + only registerable
+  // via authenticated `carrierServiceCreate` mutation (attacker can't
+  // point Shopify at their own URL). Empirically we DO sometimes see
+  // an `X-Shopify-Hmac-Sha256` header on the request, but its value
+  // often doesn't match a webhook-secret HMAC — likely because either
+  // (a) it's set by a proxy (Cloudflare / Render), (b) Shopify's
+  // carrier signing uses a different secret than SHOPIFY_API_SECRET,
+  // or (c) the SHOPIFY_API_SECRET env var is stale.
+  //
+  // Hard-rejecting on a mismatch breaks production checkout (customer
+  // sees "no shipping available"). So we verify FOR AUDIT ONLY — the
+  // result is logged but the request is always accepted. If a real
+  // tampering pattern shows up in logs, tighten this then.
+  //
+  // History:
+  //   2026-07-06 — added hard-reject when secret is set → broke
+  //                production carrier callbacks (both no-header AND
+  //                invalid-header cases rejected legitimate Shopify
+  //                requests).
+  //   2026-07-07 — reverted to log-only. Do NOT re-add hard-reject
+  //                without confirming Shopify actually signs THIS
+  //                endpoint with SHOPIFY_API_SECRET.
   const hmacHeader = request.headers.get("x-shopify-hmac-sha256") || "";
-  if (!verifyHmac(rawBody, hmacHeader)) {
+  if (hmacHeader && !verifyHmac(rawBody, hmacHeader)) {
     console.warn(
-      "[shipping.rates] hmac mismatch or missing — accepting in dev",
+      "[shipping.rates] hmac header present but did not match SHOPIFY_API_SECRET — accepting anyway (carrier-service callbacks aren't standard-signed; see 2026-07-07 hotfix note).",
     );
-    // PROD HARDENING: uncomment to reject unsigned requests.
-    // return ratesResponse([])
   }
 
   let payload;
@@ -631,11 +958,105 @@ export async function action({ request }) {
     `[shipping.rates] inbound: ${rate.items.length} line(s) (${feeLinesExcluded} processing-fee excluded), realQty=${totalQty}, dest=${rate.destination?.country}/${rate.destination?.province}/${rate.destination?.postal_code}`,
   );
 
+  // ── 1a. Free-shipping rule (retail store) ─────────────────────────
+  //
+  // Mirrors wholesale/app/api/shipping/rates.js §1a. Both conditions must
+  // hold:
+  //   (a) Every line item's vendor is exactly "Natural Solutions"
+  //       (case-insensitive, trimmed — guards against trailing spaces in
+  //       admin-typed vendor names).
+  //   (b) Cart subtotal (sum of items[].price * quantity, pre-discount)
+  //       is >= $500 USD.
+  //
+  // When both are met, the real carrier rate + handling markup are both
+  // zeroed and the service_name is decorated so the customer sees why.
+  // Customer still picks Ground vs Priority vs Express — they're all
+  // shown at $0 with their respective delivery windows so the pick has
+  // meaning. Pre-discount subtotal is by design: Shopify's carrier-
+  // service payload doesn't expose post-discount totals.
+  //
+  // Vendor + threshold both come from CONFIG (top of file).
+  const allItemsNaturalSolutions =
+    realItems.length > 0 &&
+    realItems.every(
+      (it) =>
+        (it?.vendor || "").trim().toLowerCase() ===
+        CONFIG.freeShipping.vendor.toLowerCase(),
+    );
+  const cartSubtotalUsd =
+    realItems.reduce(
+      (sum, it) =>
+        sum + (Number(it?.price) || 0) * (Number(it?.quantity) || 0),
+      0,
+    ) / 100;
+  const isFreeShipping =
+    allItemsNaturalSolutions &&
+    cartSubtotalUsd >= CONFIG.freeShipping.thresholdUsd;
+
+  if (isFreeShipping) {
+    console.log(
+      `[shipping.rates] FREE shipping ELIGIBLE — vendor=NS × ${realItems.length} line(s), subtotal=$${cartSubtotalUsd.toFixed(2)}`,
+    );
+  }
+
   // ── 2. Fetch live rates from all configured direct carriers ──────────
   // Handling markup is TIERED by total cart quantity (see `tieredMarkupCents`):
   //   1–2 items → +$2, 3 → +$3, 4+ → +$5.
   // Added on top of every real carrier quote.
   const baseCents = tieredMarkupCents(totalQty);
+
+  // Cart subtotal in CENTS. First compute the raw items-sum, then
+  // subtract any applied discount so the 3% processing fee is charged
+  // on what the CUSTOMER actually owes for the merchandise — not the
+  // pre-discount list total (which would over-charge the fee by
+  // 3% × discountAmount).
+  const rawItemsSumCents = realItems.reduce(
+    (sum, it) => sum + (Number(it?.price) || 0) * (Number(it?.quantity) || 0),
+    0,
+  );
+  const cartDiscount = detectCartDiscountCents(rate, realItems);
+  const discountCents = cartDiscount.cents;
+  const cartSubtotalCents = Math.max(0, rawItemsSumCents - discountCents);
+
+  if (discountCents > 0) {
+    console.log(
+      `[shipping.rates] applied cart discount detected · rawItemsSum=$${(rawItemsSumCents / 100).toFixed(2)} · discount=−$${(discountCents / 100).toFixed(2)} · discountSource=${cartDiscount.source} · net subtotal=$${(cartSubtotalCents / 100).toFixed(2)}`,
+    );
+  } else {
+    console.log(
+      `[shipping.rates] no cart discount detected in payload (source=${cartDiscount.source}); fee will use raw subtotal=$${(cartSubtotalCents / 100).toFixed(2)}`,
+    );
+  }
+
+  // Tax resolution — Shopify's live tax API is the ONLY source. We
+  // call `draftOrderCalculate` with the cart + destination and use the
+  // returned totalTax as our tax number (city/county/product rules all
+  // honored). Result is cached per (cart, address) for 5 min.
+  //
+  // On failure / timeout / non-US → tax = 0, fee is calculated on
+  // (subtotal + shipping) only. No static state-rate guessing — the
+  // operator should fix the Shopify API integration if fallback is
+  // used too often (visible as `taxSource=api_unavailable` in logs).
+  const shopifyTaxResult = await calculateShopifyTax({
+    shop: resolveShopDomain(request),
+    destination: rate.destination,
+    realItems,
+    subtotalCents: cartSubtotalCents,
+  });
+
+  let baseTaxCents = 0;
+  let taxRate = 0;
+  let taxSource = "api_unavailable";
+  if (shopifyTaxResult && shopifyTaxResult.taxCents >= 0) {
+    // Shopify tax API succeeded — use its exact figure for the
+    // subtotal portion + derive a rate for scaling to shipping tax.
+    baseTaxCents = shopifyTaxResult.taxCents;
+    taxRate = cartSubtotalCents > 0 ? baseTaxCents / cartSubtotalCents : 0;
+    taxSource = shopifyTaxResult.source; // shopify_live | shopify_cached
+  }
+  console.log(
+    `[shipping.rates] processing-fee inputs: subtotal=$${(cartSubtotalCents / 100).toFixed(2)} · taxRate=${(taxRate * 100).toFixed(2)}% · state=${rate.destination?.province || rate.destination?.province_code || "?"} · taxSource=${taxSource}`,
+  );
 
   // Carrier APIs (USPS/UPS) read items[] to compute package weight + box
   // dims. Pass `realItems` so the Processing Fee line — which should be
@@ -659,13 +1080,65 @@ export async function action({ request }) {
     }
 
     const rates = Array.from(dedup.values()).map((r) => {
-      const finalCents = r.rateCents + baseCents;
+      // Free-shipping rule zeros shipping cost + handling markup, but the
+      // 3% processing fee is INDEPENDENT — it still applies on FREE-ship
+      // NS-only carts because it's a payment-processing surcharge, not a
+      // shipping charge. Customer still sees per-service labels
+      // (Ground/Priority/Express) so delivery-speed choice is meaningful.
+      const shippingCents = isFreeShipping ? 0 : r.rateCents + baseCents;
+
+      // Fee base = subtotal + shipping + tax.
+      //   • baseTaxCents is the exact tax on the SUBTOTAL (from Shopify
+      //     API or state fallback — already computed above).
+      //   • Extra shipping-tax is added at the derived rate — many US
+      //     states tax shipping, so this component is not zero.
+      const shippingTaxCents = Math.round(shippingCents * taxRate);
+      const totalTaxCents = baseTaxCents + shippingTaxCents;
+      const feeBaseCents = cartSubtotalCents + shippingCents + totalTaxCents;
+      const processingFeeCents = Math.round(
+        feeBaseCents * CONFIG.processingFeeRate,
+      );
+
+      // Final rate = shipping (possibly $0) + processing fee.
+      const finalCents = shippingCents + processingFeeCents;
+
+      const baseName = `${r.carrier} ${r.service}`.trim();
+      const feeUsd = (processingFeeCents / 100).toFixed(2);
+      const taxUsd = (totalTaxCents / 100).toFixed(2);
+
+      // ── Detailed per-rate log ──────────────────────────────────────
+      // Prints the full calculation breakdown for THIS shipping option
+      // so operators can pinpoint exactly why the total came out to
+      // what it did. Renders as a compact single-line block in Render
+      // logs — search for `shipping.rates.breakdown` to filter.
+      // eslint-disable-next-line no-console
+      console.log(
+        `[shipping.rates.breakdown] ${baseName}
+    ├─ Raw carrier rate:     $${(r.rateCents / 100).toFixed(2)}
+    ├─ Handling markup:      $${(baseCents / 100).toFixed(2)} (tier: ${totalQty <= 2 ? "1-2 items" : totalQty === 3 ? "3 items" : "4+ items"})
+    ├─ Free-shipping active: ${isFreeShipping ? "YES → shipping zeroed" : "no"}
+    ├─ Shipping (final):     $${(shippingCents / 100).toFixed(2)} ${isFreeShipping ? "(free)" : "(raw + handling)"}
+    ├─ Raw items sum:        $${(rawItemsSumCents / 100).toFixed(2)}
+    ├─ Cart discount:        ${discountCents > 0 ? `−$${(discountCents / 100).toFixed(2)} (source: ${cartDiscount.source})` : "$0.00 (none)"}
+    ├─ Cart subtotal (net):  $${(cartSubtotalCents / 100).toFixed(2)}
+    ├─ Base tax on subtotal: $${(baseTaxCents / 100).toFixed(2)} (source: ${taxSource})
+    ├─ Shipping tax:         $${(shippingTaxCents / 100).toFixed(2)} (rate ${(taxRate * 100).toFixed(3)}% × shipping)
+    ├─ Total tax:            $${taxUsd}
+    ├─ Fee base:             $${(feeBaseCents / 100).toFixed(2)} (net subtotal + shipping + tax)
+    ├─ Processing fee (3%):  $${feeUsd}
+    └─ Final rate to Shopify: $${(finalCents / 100).toFixed(2)}`,
+      );
+
       return {
-        service_name: `${r.carrier} ${r.service}`.trim(),
+        service_name: isFreeShipping
+          ? `${baseName} (Free shipping + 3% processing fee)`
+          : `${baseName} (incl. handling + 3% processing fee)`,
         service_code: r.code,
         total_price: String(finalCents), // STRING in cents
         currency: r.currency || "USD",
-        description: `${r.carrier} ${r.service} (incl. handling)`,
+        description: isFreeShipping
+          ? `Complimentary shipping on ${CONFIG.freeShipping.vendor} orders over $${CONFIG.freeShipping.thresholdUsd} · 3% processing fee $${feeUsd} (calculated on subtotal + tax $${taxUsd})`
+          : `${r.carrier} ${r.service} (includes handling + 3% processing fee $${feeUsd}, calculated on subtotal + shipping + tax $${taxUsd})`,
         ...(r.deliveryDateMin ? { min_delivery_date: r.deliveryDateMin } : {}),
         ...(r.deliveryDateMax ? { max_delivery_date: r.deliveryDateMax } : {}),
       };
@@ -678,7 +1151,9 @@ export async function action({ request }) {
     );
 
     console.log(
-      `[shipping.rates] Direct carriers OK: ${rates.length} real rate(s), tiered markup=$${baseCents / 100} on ${totalQty} item(s)`,
+      isFreeShipping
+        ? `[shipping.rates] Direct carriers OK: ${rates.length} rate(s) FREE-ship (+3% fee) on $${cartSubtotalUsd.toFixed(2)} NS-only cart`
+        : `[shipping.rates] Direct carriers OK: ${rates.length} real rate(s), tiered markup=$${baseCents / 100} on ${totalQty} item(s) + 3% processing fee`,
     );
     return ratesResponse(rates);
   }

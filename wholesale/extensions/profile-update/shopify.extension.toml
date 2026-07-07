@@ -12,7 +12,7 @@ api_version = "2026-04"
 name = "profile-update"
 handle = "profile-update"
 type = "ui_extension"
-uid = "ccbd7b37-897f-37ef-0bbe-6f528a1fcfe16d0f2f65"
+uid = "ccbd7b37-897f-47ef-8bbe-6f528a1fcfe1"
 description = "Self-service profile update form for approved wholesale practitioners."
 
 # Full-page target — the extension renders as a dedicated page inside

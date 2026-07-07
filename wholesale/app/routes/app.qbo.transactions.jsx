@@ -8,9 +8,15 @@ import { authenticate } from "../shopify.server";
 import {
   listPayments,
   countPayments,
+  buildCustomerRefWhere,
+  getInvoiceWebUrl,
 } from "../services/qbo/qbo.service";
-import { escapeQboQuery } from "../services/qbo/qbo.utils";
-import { formatAmount, fmtDueDate } from "../utils/format.utils";
+import {
+  escapeQboQuery,
+  derivePaymentMethod,
+  linkedInvoiceIds,
+} from "../services/qbo/qbo.utils";
+import { formatAmount, fmtDueDate, initialsOf } from "../utils/format.utils";
 import { AdvancedFilters } from "../components/admin-ui";
 
 const PAGE_SIZE = 50;
@@ -28,6 +34,12 @@ const DATE_FILTERS = [
 // Config for the shared <AdvancedFilters> card.
 const FILTER_FIELDS = [
   { key: "q", label: "Reference number", type: "text", placeholder: "Cheque / ref #" },
+  {
+    key: "customer",
+    label: "Customer",
+    type: "text",
+    placeholder: "Name or company",
+  },
   {
     key: "range",
     label: "Date range",
@@ -86,84 +98,94 @@ export const loader = async ({ request }) => {
   await authenticate.admin(request);
   const url = new URL(request.url);
   const q = (url.searchParams.get("q") || "").trim();
+  const customer = (url.searchParams.get("customer") || "").trim();
   const range = url.searchParams.get("range") || "all";
   const dateFrom = (url.searchParams.get("dateFrom") || "").trim();
   const dateTo = (url.searchParams.get("dateTo") || "").trim();
   const page = Math.max(1, Number(url.searchParams.get("page") || 1));
   const startPosition = (page - 1) * PAGE_SIZE + 1;
 
-  const explicitDate = buildExplicitDateWhere(dateFrom, dateTo);
-  const where = combineWhere(
-    explicitDate || buildDateWhere(range, new Date()),
-    buildSearchWhere(q),
-  );
+  const commonState = {
+    page,
+    pageSize: PAGE_SIZE,
+    q,
+    customer,
+    range,
+    dateFrom,
+    dateTo,
+  };
 
   try {
+    const explicitDate = buildExplicitDateWhere(dateFrom, dateTo);
+    const customerWhere = await buildCustomerRefWhere(customer);
+    const where = combineWhere(
+      explicitDate || buildDateWhere(range, new Date()),
+      buildSearchWhere(q),
+      customerWhere,
+    );
+
     const [pageRes, total] = await Promise.all([
       listPayments({ pageSize: PAGE_SIZE, startPosition, where }),
       countPayments({ where }),
     ]);
 
     return {
+      ...commonState,
       rows: pageRes.entities.map(projectPayment),
       total,
-      page,
-      pageSize: PAGE_SIZE,
-      q,
-      range,
-      dateFrom,
-      dateTo,
       error: null,
     };
   } catch (e) {
     console.error("[qbo/transactions] loader failed:", e?.message || e);
     return {
+      ...commonState,
       rows: [],
       total: 0,
-      page,
-      pageSize: PAGE_SIZE,
-      q,
-      range,
-      dateFrom,
-      dateTo,
       error: e?.message || "Failed to load QBO transactions",
     };
   }
 };
 
 function projectPayment(p) {
-  // A QBO Payment's "linked transactions" are the invoices it pays.
-  // We list those Ids so admins can correlate to /app/qbo/invoices.
-  const linkedInvoiceIds = Array.isArray(p.Line)
-    ? p.Line.flatMap((l) =>
-        (l.LinkedTxn || [])
-          .filter((t) => t.TxnType === "Invoice")
-          .map((t) => t.TxnId),
-      )
-    : [];
   // Voided + zero-amount payments retain TotalAmt=0; surface that as a
   // distinct status so the row doesn't read as "successful $0 payment".
   const amount = Number(p.TotalAmt || 0);
   const status = amount === 0 ? "Voided" : "Recorded";
+  const paymentRef = p.PaymentRefNum || null;
   return {
     id: p.Id,
     customerName: p.CustomerRef?.name || null,
     customerId: p.CustomerRef?.value || null,
     totalAmount: amount,
     currency: p.CurrencyRef?.value || "USD",
-    paymentMethod: p.PaymentMethodRef?.name || null,
+    paymentMethod: derivePaymentMethod(p.PaymentMethodRef?.name, paymentRef),
     txnDate: p.TxnDate || null,
-    paymentRef: p.PaymentRefNum || null,
+    paymentRef,
     privateNote: p.PrivateNote || null,
-    linkedInvoiceIds,
+    // We list linked invoice ids so admins can correlate to
+    // /app/qbo/invoices and deep-link straight into QuickBooks.
+    linkedInvoices: linkedInvoiceIds(p).map((id) => ({
+      id,
+      url: getInvoiceWebUrl(id),
+    })),
     status,
     createdAt: p.MetaData?.CreateTime || null,
   };
 }
 
 export default function QboTransactions() {
-  const { rows, total, page, pageSize, q, range, dateFrom, dateTo, error } =
-    useLoaderData();
+  const {
+    rows,
+    total,
+    page,
+    pageSize,
+    q,
+    customer,
+    range,
+    dateFrom,
+    dateTo,
+    error,
+  } = useLoaderData();
   const navigation = useNavigation();
   const revalidator = useRevalidator();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -188,7 +210,7 @@ export default function QboTransactions() {
     <>
       <AdvancedFilters
         fields={FILTER_FIELDS}
-        values={{ q, range, dateFrom, dateTo }}
+        values={{ q, customer, range, dateFrom, dateTo }}
         defaults={FILTER_DEFAULTS}
         onRefresh={() => revalidator.revalidate()}
         refreshing={refreshing}
@@ -210,12 +232,14 @@ export default function QboTransactions() {
               alignItems="center"
               justifyContent="center"
             >
-              <s-text>{q ? "🔍" : "📭"}</s-text>
-              <s-heading>{q ? "No matches" : "No transactions"}</s-heading>
+              <s-text>{q || customer ? "🔍" : "📭"}</s-text>
+              <s-heading>{q || customer ? "No matches" : "No transactions"}</s-heading>
               <s-paragraph tone="subdued">
                 {q
                   ? `No QBO payments match "${q}".`
-                  : "QuickBooks returned no payment records for this range."}
+                  : customer
+                    ? `No QBO payments found for a customer matching "${customer}".`
+                    : "QuickBooks returned no payment records for this range."}
               </s-paragraph>
             </s-stack>
           </s-box>
@@ -230,6 +254,7 @@ export default function QboTransactions() {
               <s-table-header>Payment method</s-table-header>
               <s-table-header>Date</s-table-header>
               <s-table-header>Reference</s-table-header>
+              <s-table-header>Applied to invoice</s-table-header>
             </s-table-header-row>
             <s-table-body>
               {rows.map((p) => (
@@ -238,7 +263,16 @@ export default function QboTransactions() {
                   <s-table-cell>
                     <s-badge tone="info">Payment</s-badge>
                   </s-table-cell>
-                  <s-table-cell>{p.customerName || "—"}</s-table-cell>
+                  <s-table-cell>
+                    <s-stack direction="inline" gap="small-200" alignItems="center">
+                      <s-avatar
+                        size="small-200"
+                        initials={initialsOf(p.customerName)}
+                        alt={p.customerName || "Customer"}
+                      />
+                      <s-text>{p.customerName || "—"}</s-text>
+                    </s-stack>
+                  </s-table-cell>
                   <s-table-cell>
                     {formatAmount(p.totalAmount, p.currency)}
                   </s-table-cell>
@@ -247,23 +281,37 @@ export default function QboTransactions() {
                       {p.status}
                     </s-badge>
                   </s-table-cell>
-                  <s-table-cell>{p.paymentMethod || "—"}</s-table-cell>
+                  <s-table-cell>
+                    {p.paymentMethod ? (
+                      <s-badge tone="neutral">{p.paymentMethod}</s-badge>
+                    ) : (
+                      <s-text tone="subdued">—</s-text>
+                    )}
+                  </s-table-cell>
                   <s-table-cell>{fmtDueDate(p.txnDate) || "—"}</s-table-cell>
                   <s-table-cell>
-                    <s-stack direction="block" gap="none">
-                      {p.paymentRef ? (
-                        <s-text>{p.paymentRef}</s-text>
-                      ) : (
-                        <s-text tone="subdued">—</s-text>
-                      )}
-                      {p.linkedInvoiceIds.length > 0 && (
-                        <s-text tone="subdued">
-                          Applied to invoice
-                          {p.linkedInvoiceIds.length === 1 ? " " : "s "}
-                          {p.linkedInvoiceIds.map((id) => `#${id}`).join(", ")}
-                        </s-text>
-                      )}
-                    </s-stack>
+                    {p.paymentRef ? (
+                      <s-text>{p.paymentRef}</s-text>
+                    ) : (
+                      <s-text tone="subdued">—</s-text>
+                    )}
+                  </s-table-cell>
+                  <s-table-cell>
+                    {p.linkedInvoices.length > 0 ? (
+                      <s-stack direction="block" gap="none">
+                        {p.linkedInvoices.map((inv) =>
+                          inv.url ? (
+                            <s-link key={inv.id} href={inv.url} target="_blank">
+                              #{inv.id}
+                            </s-link>
+                          ) : (
+                            <s-text key={inv.id}>#{inv.id}</s-text>
+                          ),
+                        )}
+                      </s-stack>
+                    ) : (
+                      <s-text tone="subdued">—</s-text>
+                    )}
                   </s-table-cell>
                 </s-table-row>
               ))}

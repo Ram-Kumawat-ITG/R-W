@@ -35,7 +35,12 @@ target = "purchase.checkout.block.render"
 # `api_access = true`, Shopify proactively fetches a private storefront
 # access token at boot from `/private_access_tokens?...`, which 401s in
 # dev preview before the customer is authenticated and floods the console.
-# Variant GID + fee rate are hardcoded constants in src/Checkout.jsx, so
-# no Storefront API access is needed.
 # https://shopify.dev/docs/api/checkout-ui-extensions/latest/configuration#api-access
 api_access = false
+
+# REQUIRED so the extension can fetch() the ns-retail app backend at
+# `${SERVER_URL}/api/cdo/fee-tiers` (via extensions/services/FullPageApi.jsx
+# → getFeeTiers()) to get the LIVE tier variant list. The bundled
+# FEE_TIERS array in Checkout.jsx is the fallback if the fetch fails.
+# https://shopify.dev/docs/api/checkout-ui-extensions/latest/configuration#network-access
+network_access = true

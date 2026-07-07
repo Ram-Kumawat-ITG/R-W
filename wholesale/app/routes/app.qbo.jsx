@@ -25,10 +25,30 @@ import { authenticate } from "../shopify.server";
 // based on the trailing pathname segment.
 
 const TABS = [
-  { id: "dashboard", label: "Dashboard", path: "/app/qbo/dashboard" },
-  { id: "customers", label: "Customers", path: "/app/qbo/customers" },
-  { id: "transactions", label: "Transactions", path: "/app/qbo/transactions" },
-  { id: "invoices", label: "Invoices", path: "/app/qbo/invoices" },
+  {
+    id: "dashboard",
+    label: "Dashboard",
+    path: "/app/qbo/dashboard",
+    description: "Live snapshot of revenue, invoices, and recent activity.",
+  },
+  {
+    id: "customers",
+    label: "Customers",
+    path: "/app/qbo/customers",
+    description: "Every customer synced to QuickBooks Online.",
+  },
+  {
+    id: "transactions",
+    label: "Transactions",
+    path: "/app/qbo/transactions",
+    description: "Payments recorded against QuickBooks invoices.",
+  },
+  {
+    id: "invoices",
+    label: "Invoices",
+    path: "/app/qbo/invoices",
+    description: "Search, filter, and track every QuickBooks invoice.",
+  },
 ];
 
 export const loader = async ({ request }) => {
@@ -44,30 +64,41 @@ export default function QboLayout() {
   // like /app/qbo/customers/<id> (future) still light the right tab.
   const segments = location.pathname.split("/").filter(Boolean);
   const trailing = segments[segments.length - 1];
-  const activeId =
-    TABS.find((t) => t.id === trailing)?.id || "dashboard";
+  const activeTab = TABS.find((t) => t.id === trailing) || TABS[0];
+  const activeId = activeTab.id;
 
   return (
     <s-page inlineSize="large" heading="QuickBooks">
       <s-section padding="none">
-        <s-box padding="base">
-          {/* Tab bar — chip-based pattern reused from the Orders list's
-              filter chips. No native `s-tabs` element exists in the
-              Polaris web-component set, and chip styling is already
-              the project's idiom for grouped navigation. */}
+        <s-box padding="base" paddingBlockEnd="small-300">
+          {/* Tab bar — chip-based pattern. This is the one layout that has
+              actually rendered correctly as a single horizontal row in
+              this admin surface: `s-button-group` rendered nothing at all,
+              and hand-rolled `s-clickable`/`s-box` rows collapsed to one
+              full-width tab per line. `s-clickable-chip` inside
+              `s-stack direction="inline"` is also what the Orders list's
+              filter chips already use elsewhere in this app. The active
+              tab uses the filled "strong" chip color plus a bold label. */}
           <s-stack direction="inline" gap="small-200" wrap>
-            {TABS.map((t) => (
-              <s-clickable-chip
-                key={t.id}
-                color={activeId === t.id ? "strong" : "base"}
-                accessibilityLabel={`Open ${t.label} tab`}
-                onClick={() => navigate(t.path)}
-              >
-                {t.label}
-              </s-clickable-chip>
-            ))}
+            {TABS.map((t) => {
+              const isActive = activeId === t.id;
+              return (
+                <s-clickable-chip
+                  key={t.id}
+                  color={isActive ? "strong" : "base"}
+                  accessibilityLabel={`Open ${t.label} tab`}
+                  onClick={() => navigate(t.path)}
+                >
+                  {isActive ? <strong>{t.label}</strong> : t.label}
+                </s-clickable-chip>
+              );
+            })}
           </s-stack>
         </s-box>
+        <s-box padding="base" paddingBlockStart="small-300">
+          <s-paragraph tone="subdued">{activeTab.description}</s-paragraph>
+        </s-box>
+        <s-divider />
       </s-section>
 
       <s-box paddingBlockStart="large-200" />

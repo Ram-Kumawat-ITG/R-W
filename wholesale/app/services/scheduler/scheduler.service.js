@@ -104,14 +104,18 @@ async function ensureRecurring(agenda) {
     schedule: achSyncConfig.intervalOverride || achSyncConfig.cron,
   })
 
-  // ── Drop-ship payment job (CRON DISABLED — replaced by batch payment UI) ──
-  // The process-dropship-payments CRON has been superseded by the manual
-  // Admin Order Batch Payment flow (/app/admin-orders/batch). The admin
+  // ── Drop-ship payment job (REMOVED — replaced by batch payment UI) ──
+  // The process-dropship-payments CRON was superseded by the manual
+  // Admin Order Batch Payment flow (/app/admin-orders/batch) — the admin
   // reviews all unpaid drop-ship invoices, enters a single payment reference
   // (cheque / bank transfer), and marks the entire batch paid in one step.
-  // Cancel any previously-scheduled runs that may still be in the Agenda
-  // agenda_jobs collection from before this change.
-  await agenda.cancel({ name: JOB_NAMES.PROCESS_DROPSHIP_PAYMENTS })
+  // The job's `agenda.define(...)` was removed entirely (dead code); this
+  // cancel-by-name is a one-time defensive cleanup for any deployment whose
+  // Mongo `agenda_jobs` collection still has a scheduled run persisted from
+  // before this change — Agenda's `cancel` just deletes matching documents,
+  // it doesn't require the job to still be defined. Safe to remove once
+  // confirmed no environment has a stale entry left.
+  await agenda.cancel({ name: 'process-dropship-payments' })
   log.info('scheduler.dropship_payment_cancelled', {
     reason: 'replaced by admin-order batch payment UI',
   })

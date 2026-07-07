@@ -8,9 +8,10 @@ import { authenticate } from "../shopify.server";
 import {
   listInvoices,
   countInvoices,
+  buildCustomerRefWhere,
 } from "../services/qbo/qbo.service";
 import { escapeQboQuery } from "../services/qbo/qbo.utils";
-import { formatAmount, fmtDueDate } from "../utils/format.utils";
+import { formatAmount, fmtDueDate, initialsOf } from "../utils/format.utils";
 import { AdvancedFilters } from "../components/admin-ui";
 
 const PAGE_SIZE = 50;
@@ -49,6 +50,12 @@ const FILTER_CHIPS = [
 // FILTER_CHIPS so the loader's where-clause mapping stays the source of truth.
 const FILTER_FIELDS = [
   { key: "q", label: "Invoice number", type: "text", placeholder: "#1142" },
+  {
+    key: "customer",
+    label: "Customer",
+    type: "text",
+    placeholder: "Name or company",
+  },
   {
     key: "filter",
     label: "Payment status",
@@ -90,6 +97,7 @@ export const loader = async ({ request }) => {
   await authenticate.admin(request);
   const url = new URL(request.url);
   const q = (url.searchParams.get("q") || "").trim();
+  const customer = (url.searchParams.get("customer") || "").trim();
   const filter = url.searchParams.get("filter") || "all";
   const dateFrom = (url.searchParams.get("dateFrom") || "").trim();
   const dateTo = (url.searchParams.get("dateTo") || "").trim();
@@ -97,40 +105,42 @@ export const loader = async ({ request }) => {
   const startPosition = (page - 1) * PAGE_SIZE + 1;
   const now = new Date();
 
-  const where = combineWhere(
-    buildFilterWhere(filter, now),
-    buildDateRangeWhere(dateFrom, dateTo),
-    buildSearchWhere(q),
-  );
+  const commonState = {
+    page,
+    pageSize: PAGE_SIZE,
+    q,
+    customer,
+    filter,
+    dateFrom,
+    dateTo,
+  };
 
   try {
+    const customerWhere = await buildCustomerRefWhere(customer);
+    const where = combineWhere(
+      buildFilterWhere(filter, now),
+      buildDateRangeWhere(dateFrom, dateTo),
+      buildSearchWhere(q),
+      customerWhere,
+    );
+
     const [pageRes, total] = await Promise.all([
       listInvoices({ pageSize: PAGE_SIZE, startPosition, where }),
       countInvoices({ where }),
     ]);
 
     return {
+      ...commonState,
       rows: pageRes.entities.map((inv) => projectInvoice(inv, now)),
       total,
-      page,
-      pageSize: PAGE_SIZE,
-      q,
-      filter,
-      dateFrom,
-      dateTo,
       error: null,
     };
   } catch (e) {
     console.error("[qbo/invoices] loader failed:", e?.message || e);
     return {
+      ...commonState,
       rows: [],
       total: 0,
-      page,
-      pageSize: PAGE_SIZE,
-      q,
-      filter,
-      dateFrom,
-      dateTo,
       error: e?.message || "Failed to load QBO invoices",
     };
   }
@@ -197,8 +207,18 @@ const EMAIL_TONE = {
 };
 
 export default function QboInvoices() {
-  const { rows, total, page, pageSize, q, filter, dateFrom, dateTo, error } =
-    useLoaderData();
+  const {
+    rows,
+    total,
+    page,
+    pageSize,
+    q,
+    customer,
+    filter,
+    dateFrom,
+    dateTo,
+    error,
+  } = useLoaderData();
   const navigation = useNavigation();
   const revalidator = useRevalidator();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -223,7 +243,7 @@ export default function QboInvoices() {
     <>
       <AdvancedFilters
         fields={FILTER_FIELDS}
-        values={{ q, filter, dateFrom, dateTo }}
+        values={{ q, customer, filter, dateFrom, dateTo }}
         defaults={FILTER_DEFAULTS}
         onRefresh={() => revalidator.revalidate()}
         refreshing={refreshing}
@@ -245,12 +265,14 @@ export default function QboInvoices() {
               alignItems="center"
               justifyContent="center"
             >
-              <s-text>{q ? "🔍" : "📭"}</s-text>
-              <s-heading>{q ? "No matches" : "No invoices"}</s-heading>
+              <s-text>{q || customer ? "🔍" : "📭"}</s-text>
+              <s-heading>{q || customer ? "No matches" : "No invoices"}</s-heading>
               <s-paragraph tone="subdued">
                 {q
                   ? `No QBO invoices match "${q}".`
-                  : "QuickBooks returned no invoices for this filter."}
+                  : customer
+                    ? `No QBO invoices found for a customer matching "${customer}".`
+                    : "QuickBooks returned no invoices for this filter."}
               </s-paragraph>
             </s-stack>
           </s-box>
@@ -281,11 +303,18 @@ export default function QboInvoices() {
                     </s-stack>
                   </s-table-cell>
                   <s-table-cell>
-                    <s-stack direction="block" gap="none">
-                      <s-text>{inv.customerName || "—"}</s-text>
-                      {inv.billEmail && (
-                        <s-text tone="subdued">{inv.billEmail}</s-text>
-                      )}
+                    <s-stack direction="inline" gap="small-200" alignItems="center">
+                      <s-avatar
+                        size="small-200"
+                        initials={initialsOf(inv.customerName)}
+                        alt={inv.customerName || "Customer"}
+                      />
+                      <s-stack direction="block" gap="none">
+                        <s-text>{inv.customerName || "—"}</s-text>
+                        {inv.billEmail && (
+                          <s-text tone="subdued">{inv.billEmail}</s-text>
+                        )}
+                      </s-stack>
                     </s-stack>
                   </s-table-cell>
                   <s-table-cell>

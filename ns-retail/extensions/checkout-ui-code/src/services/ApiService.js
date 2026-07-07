@@ -1,46 +1,29 @@
 // ApiService — wraps every fetch() this checkout extension makes to our
-// ns-retail app backend. The app URL is NOT hardcoded; it's read at
-// runtime from a SHOP metafield ($app:cdo / app_url) that the admin app
-// writes on every load (see app/routes/app.jsx → syncAppUrlMetafield).
+// ns-retail app backend.
 //
-// Wiring (one-time setup):
-//   1. app.jsx loader → metafieldsSet upserts $app:cdo / app_url
-//   2. shopify.extension.toml [[extensions.metafields]] subscribes
-//   3. shopify.appMetafields.value exposes it to this file
+// URL sourcing (2026-07-02): reads through the shared FullPageApi module
+// at extensions/services/FullPageApi.jsx, which has `SHOPIFY_APP_URL`
+// baked in at BUILD time (esbuild substitutes process.env.SHOPIFY_APP_URL
+// from the app's .env before bundling). Same pattern the other ns-retail
+// UI extensions (processing-fee, practitioner-portal-account) already use.
 //
-// If the admin app has never been opened on this shop, the metafield is
-// empty → getAppBaseUrl() throws a descriptive error so the extension
-// UI can show "App not configured" rather than a generic network error.
+// Previous impl (removed) read the base URL from a shop metafield
+// ($app:cdo / app_url) that the admin app wrote on every load; that
+// required (a) the admin app to have been opened once, (b) a metafield
+// subscription in shopify.extension.toml, and (c) shape-tolerant parsing
+// of the $app:cdo namespace. All redundant now — the build-time constant
+// is set at deploy time from the same env value.
 
-const METAFIELD_KEY = 'app_url';
+import FullPageApi from '../../../services/FullPageApi.jsx';
 
 function getAppBaseUrl() {
-  const list = (typeof shopify !== 'undefined' && shopify?.appMetafields?.value) || [];
-  // Shopify resolves $app:cdo at runtime to `app--<your-app-id>--cdo`.
-  // We match on the key plus any namespace that ends with `cdo`, so both
-  // the literal and the resolved forms are accepted.
-  //
-  // Shape gotcha: the Preact-based checkout-ui-extension API exposes
-  // metafields FLAT — `{ namespace, key, value }` directly. The older
-  // React-based API wrapped them under `.metafield`. Read both shapes
-  // so this works regardless of API version.
-  const entry = list.find((m) => {
-    const inner = m?.metafield || m;
-    const ns = inner?.namespace || '';
-    const key = inner?.key || '';
-    return (
-      key === METAFIELD_KEY &&
-      (ns === '$app:cdo' || ns.endsWith('--cdo') || ns.endsWith(':cdo'))
-    );
-  });
-  const inner = entry?.metafield || entry;
-  const url = inner?.value;
+  const url = FullPageApi.getAppBaseUrl();
   if (!url) {
     throw new Error(
-      'App URL not configured. Ask the store admin to open the app once in Shopify admin.',
+      'App URL not configured. Set SHOPIFY_APP_URL in the ns-retail app .env and redeploy the extension.',
     );
   }
-  return String(url).replace(/\/$/, '');
+  return url;
 }
 
 async function jsonPost(path, body) {
