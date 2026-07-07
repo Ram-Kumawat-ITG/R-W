@@ -1,0 +1,58 @@
+{% comment %}
+  Client Portal block — self-service account dashboard for logged-in retail
+  customers (regular customers, referred patients, and customers currently
+  attributed to a practitioner via a CDO referral code).
+
+  Zero merchant-facing settings by design, matching practitioner_code.liquid
+  — all copy/behavior lives in the React source (ns-retail/client-portal/).
+
+  Loads the Vite-built client-portal-bundle.{js,css} and mounts the React
+  app into #ns-client-portal-root.
+
+  Backend URL is NOT here either — all fetches go through Shopify's app
+  proxy at /apps/retail-signup/api/client-portal/* (see
+  client-portal/src/services/ApiService.jsx). Same pattern the signup form
+  and practitioner code block already use.
+
+  Companion source: ns-retail/client-portal/
+  Build (from ns-retail/): npm run build:client-portal
+  (or just run shopify app deploy — the predeploy hook runs it automatically)
+
+  Merchant places this block on an account/page template via the theme
+  editor.
+{% endcomment %}
+
+{% assign bundle_url = 'client-portal-bundle.js' | asset_url %}
+{% assign asset_base = bundle_url | split: 'client-portal-bundle.js' | first %}
+{% assign is_logged_in = false %}
+{% if customer %}
+  {% assign is_logged_in = true %}
+{% endif %}
+
+<script>
+  window.__CLIENT_PORTAL_ASSET_BASE__ = {{ asset_base | json }};
+  window.__CLIENT_PORTAL_CONFIG__ = {
+    loggedIn: {{ is_logged_in | json }},
+    customerId: {{ customer.id | json }},
+    customerEmail: {{ customer.email | json }},
+    shopDomain: {{ shop.permanent_domain | json }},
+    accountLoginUrl: {{ routes.account_login_url | json }}
+  };
+</script>
+
+{{ 'client-portal-bundle.css' | asset_url | stylesheet_tag }}
+
+<div id="ns-client-portal-root"></div>
+
+<script src="{{ 'client-portal-bundle.js' | asset_url }}" type="module"></script>
+
+{% schema %}
+{
+  "name": "Client Portal",
+  "target": "section",
+  "enabled_on": {
+    "templates": ["page"]
+  },
+  "settings": []
+}
+{% endschema %}
