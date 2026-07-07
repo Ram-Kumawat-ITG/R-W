@@ -12,45 +12,72 @@
 
 import { sendEmail } from '../email/email.service'
 import { paymentFailureNotificationConfig } from './paymentFailureNotification.config'
+import { isEmailNotificationsPaused } from '../scheduler/cronNotificationSettings.service'
+import { formatAmount } from '../../utils/format.utils'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('paymentFailureNotification.service')
 
-function formatAmount(amount, currency) {
-  const n = Number(amount || 0)
-  return `${(currency || 'USD').toUpperCase()} ${n.toFixed(2)}`
+const PAYMENT_METHOD_LABEL = { card: 'Credit card', ach: 'ACH / bank transfer', check: 'Cheque' }
+
+function formatOrderDate(value) {
+  if (!value) return null
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return null
+  return d.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
 }
 
 // Pure content builder — no I/O, easy to reason about / reuse elsewhere
 // (e.g. a future admin preview) without touching the send path.
 export function buildPaymentFailureEmail({
   customerName,
+  orderLabel,
+  orderDate,
   invoiceLabel,
   amount,
   currency,
+  paymentMethod,
+  attemptCount,
+  maxAttempts,
   reason,
   supportEmail,
 }) {
   const greeting = customerName ? `Hi ${customerName},` : 'Hello,'
-  const invoiceLine = invoiceLabel ? ` for invoice ${invoiceLabel}` : ''
-  const amountLine = amount !== undefined && amount !== null ? ` of ${formatAmount(amount, currency)}` : ''
-  const reasonLine = reason ? `\n\nReason: ${reason}` : ''
+  const amountLine = amount !== undefined && amount !== null ? formatAmount(amount, currency) : null
   const contactLine = supportEmail
     ? `If you have any questions or need assistance, please contact our support team at ${supportEmail}.`
     : 'If you have any questions or need assistance, please contact our support team.'
 
-  const subject = 'Payment Failed — Action Required'
+  // Order/invoice/payment context — rendered as a labelled list so the
+  // customer sees exactly what was being charged and why, without having
+  // to infer it from a single sentence.
+  const details = [
+    orderLabel && ['Order', orderLabel],
+    formatOrderDate(orderDate) && ['Order date', formatOrderDate(orderDate)],
+    invoiceLabel && ['Invoice', invoiceLabel],
+    amountLine && ['Amount', amountLine],
+    paymentMethod && ['Payment method', PAYMENT_METHOD_LABEL[paymentMethod] || paymentMethod],
+    attemptCount != null && maxAttempts != null && ['Attempt', `${attemptCount} of ${maxAttempts}`],
+  ].filter(Boolean)
+
+  const subject = orderLabel
+    ? `Payment Failed for Order ${orderLabel} — Action Required`
+    : 'Payment Failed — Action Required'
 
   const text =
     `${greeting}\n\n` +
-    `We attempted to process your payment${amountLine}${invoiceLine}, but the payment was unsuccessful.` +
-    `${reasonLine}\n\n` +
+    `We attempted to process your payment, but it was unsuccessful.\n\n` +
+    (details.length ? details.map(([label, value]) => `${label}: ${value}`).join('\n') + '\n\n' : '') +
+    (reason ? `Reason: ${reason}\n\n` : '') +
     `${contactLine}\n\n` +
     `Thank you,\nNatural Solutions`
 
   const html =
     `<p>${greeting}</p>` +
-    `<p>We attempted to process your payment${amountLine}${invoiceLine}, but the payment was unsuccessful.</p>` +
+    `<p>We attempted to process your payment, but it was unsuccessful.</p>` +
+    (details.length
+      ? `<ul>${details.map(([label, value]) => `<li><strong>${label}:</strong> ${value}</li>`).join('')}</ul>`
+      : '') +
     (reason ? `<p><strong>Reason:</strong> ${reason}</p>` : '') +
     `<p>${contactLine}</p>` +
     `<p>Thank you,<br/>Natural Solutions</p>`
@@ -63,9 +90,14 @@ export function buildPaymentFailureEmail({
 // SMTP utility. Always resolves (never rejects) — callers should log the
 // returned result if they want visibility but never need a try/catch of
 // their own.
-export async function notifyPaymentFailure({ invoice, reason, customerName }) {
+export async function notifyPaymentFailure({ invoice, reason, customerName, orderLabel, orderDate }) {
   const context = { invoiceId: invoice?._id?.toString(), to: invoice?.customerEmail }
   try {
+    if (await isEmailNotificationsPaused()) {
+      log.info('notify.skipped_paused', context)
+      return { success: false, error: 'CRON email notifications are currently paused', skipped: true }
+    }
+
     if (!invoice?.customerEmail) {
       log.warn('notify.skipped_no_email', context)
       return { success: false, error: 'invoice has no customerEmail on file' }
@@ -73,19 +105,34 @@ export async function notifyPaymentFailure({ invoice, reason, customerName }) {
 
     const { subject, text, html } = buildPaymentFailureEmail({
       customerName,
-      invoiceLabel: invoice.qboDocNumber || invoice.qboInvoiceId || invoice.shopifyOrderId,
+      orderLabel: orderLabel || (invoice.shopifyOrderId ? `#${invoice.shopifyOrderId}` : null),
+      orderDate,
+      invoiceLabel: invoice.qboDocNumber || invoice.qboInvoiceId || null,
       amount: invoice.amountDue != null && invoice.amountPaid != null
         ? invoice.amountDue - invoice.amountPaid
         : invoice.amountDue,
       currency: invoice.currency,
+      paymentMethod: invoice.paymentMethod,
+      attemptCount: invoice.attemptCount,
+      maxAttempts: invoice.maxAttempts,
       reason,
       supportEmail: paymentFailureNotificationConfig.supportEmail,
     })
 
-    const result = await sendEmail({ to: invoice.customerEmail, subject, text, html })
+    const result = await sendEmail({
+      to: invoice.customerEmail,
+      cc: paymentFailureNotificationConfig.adminEmail || undefined,
+      subject,
+      text,
+      html,
+    })
 
     if (result.success) {
-      log.info('notify.sent', { ...context, messageId: result.messageId })
+      log.info('notify.sent', {
+        ...context,
+        cc: paymentFailureNotificationConfig.adminEmail,
+        messageId: result.messageId,
+      })
     } else {
       log.error('notify.send_failed', { ...context, error: result.error })
     }
