@@ -9,7 +9,45 @@ import {
   Table,
   Pagination,
 } from './ui.jsx'
+import { apiGet } from './services/ApiService.jsx'
 import { formatMoney, formatDate, formatPercent, formatNumber } from './format.js'
+
+// Opens the order's real QBO-rendered invoice PDF directly in the browser
+// (never a redirect to QBO's hosted portal). The window must be opened
+// SYNCHRONOUSLY in the click handler (user gesture) to survive popup
+// blockers — the server returns the PDF base64, which we then swap in as
+// a blob URL. Mirrors the admin "Preview invoice" pattern.
+async function openInvoicePdf(orderId) {
+  const win = window.open('about:blank', '_blank')
+  try {
+    const result = await apiGet('invoice-pdf', { id: orderId })
+    if (!result?.base64) {
+      if (win && !win.closed) win.close()
+      return { ok: false, message: 'The invoice isn’t ready yet for this order.' }
+    }
+    const binary = atob(result.base64)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+    const blob = new Blob([bytes], { type: result.contentType || 'application/pdf' })
+    const blobUrl = URL.createObjectURL(blob)
+    if (win && !win.closed) {
+      win.location.href = blobUrl
+    } else {
+      // Popup blocked — fall back to a download.
+      const a = document.createElement('a')
+      a.href = blobUrl
+      a.download = result.filename || 'invoice.pdf'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+    }
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000)
+    return { ok: true }
+  } catch (err) {
+    if (win && !win.closed) win.close()
+    return { ok: false, message: err?.message || 'Could not load the invoice right now.' }
+  }
+}
 
 function SectionShell({ heading, description, children }) {
   return (
@@ -43,8 +81,27 @@ function AddressBlock({ address }) {
 }
 
 // ── Dashboard ────────────────────────────────────────────────────────────────
+const RECENT_ORDERS_COLUMNS = [
+  { key: 'orderName', label: 'Order', width: '22%', render: (r) => <span className="cp-strong">{r.orderName}</span> },
+  { key: 'placedAt', label: 'Date', width: '22%', render: (r) => formatDate(r.placedAt) },
+  { key: 'amount', label: 'Amount', width: '18%', align: 'right', render: (r) => formatMoney(r.amount, r.currency) },
+  { key: 'financialStatus', label: 'Payment', width: '18%', render: (r) => <StatusBadge value={r.financialStatus} /> },
+  { key: 'fulfillmentStatus', label: 'Fulfillment', width: '20%', render: (r) => <StatusBadge value={r.shippingStatus || r.fulfillmentStatus} /> },
+]
+
 export function DashboardSection({ onAuthError, onViewOrders }) {
+  const [selectedOrderId, setSelectedOrderId] = useState(null)
   const { data, loading, error, reload } = useResource('dashboard', null, onAuthError)
+
+  if (selectedOrderId) {
+    return (
+      <OrderDetailSection
+        orderId={selectedOrderId}
+        onAuthError={onAuthError}
+        onBack={() => setSelectedOrderId(null)}
+      />
+    )
+  }
 
   if (loading && !data) return <Loading />
   if (error) return <ErrorBanner message={error} onRetry={reload} />
@@ -57,6 +114,9 @@ export function DashboardSection({ onAuthError, onViewOrders }) {
         cards={[
           { label: 'Total orders', value: formatNumber(d.orderCount), tone: 'blue' },
           { label: 'Lifetime spend', value: formatMoney(d.lifetimeSpend, d.currency), tone: 'green' },
+          { label: 'This month', value: formatMoney(d.thisMonthSpend, d.currency), tone: 'green' },
+          { label: 'Average order', value: formatMoney(d.averageOrderValue, d.currency), tone: 'purple' },
+          { label: 'Pending payments', value: formatNumber(d.pendingCount), tone: d.pendingCount > 0 ? 'amber' : 'neutral' },
           { label: 'Last order', value: formatDate(d.lastOrderAt), tone: 'neutral' },
         ]}
       />
@@ -71,10 +131,19 @@ export function DashboardSection({ onAuthError, onViewOrders }) {
       ) : null}
 
       {d.orderCount > 0 ? (
-        <div className="cp-inline">
-          <button type="button" className="cp-btn cp-btn--secondary" onClick={onViewOrders}>
-            View all orders
-          </button>
+        <div className="cp-stack">
+          <div className="cp-inline cp-inline--between">
+            <h3 className="cp-subheading">Recent orders</h3>
+            <button type="button" className="cp-btn cp-btn--secondary" onClick={onViewOrders}>
+              View all orders
+            </button>
+          </div>
+          <Table
+            columns={RECENT_ORDERS_COLUMNS}
+            rows={d.recentOrders || []}
+            empty="No orders yet."
+            onRowClick={(r) => setSelectedOrderId(r.id)}
+          />
         </div>
       ) : (
         <Banner tone="info">
@@ -196,7 +265,7 @@ const FULFILLMENT_STATUSES = [
   { value: 'unfulfilled', label: 'Unfulfilled' },
 ]
 
-const EMPTY_ORDER_FILTERS = { financialStatus: '', fulfillmentStatus: '' }
+const EMPTY_ORDER_FILTERS = { financialStatus: '', fulfillmentStatus: '', search: '', dateFrom: '', dateTo: '' }
 
 export function OrdersSection({ onAuthError, initialOrderId, onOrderIdConsumed }) {
   const [selectedOrderId, setSelectedOrderId] = useState(initialOrderId || null)
@@ -224,9 +293,10 @@ export function OrdersSection({ onAuthError, initialOrderId, onOrderIdConsumed }
 
   const rows = data?.rows || []
   const setField = (k) => (e) => setDraft((p) => ({ ...p, [k]: e.target.value }))
-  const draftMatchesApplied = draft.financialStatus === applied.financialStatus && draft.fulfillmentStatus === applied.fulfillmentStatus
-  const hasDraft = !!(draft.financialStatus || draft.fulfillmentStatus)
-  const hasApplied = !!(applied.financialStatus || applied.fulfillmentStatus)
+  const FILTER_KEYS = ['financialStatus', 'fulfillmentStatus', 'search', 'dateFrom', 'dateTo']
+  const draftMatchesApplied = FILTER_KEYS.every((k) => draft[k] === applied[k])
+  const hasDraft = FILTER_KEYS.some((k) => draft[k])
+  const hasApplied = FILTER_KEYS.some((k) => applied[k])
 
   const applyFilters = () => {
     setApplied({ ...draft })
@@ -251,6 +321,15 @@ export function OrdersSection({ onAuthError, initialOrderId, onOrderIdConsumed }
       <div className="cp-stack">
         <div className="cp-field-grid cp-field-grid--2">
           <label className="cp-field">
+            <span>Search order #</span>
+            <input
+              type="text"
+              placeholder="e.g. 1420"
+              value={draft.search}
+              onChange={setField('search')}
+            />
+          </label>
+          <label className="cp-field">
             <span>Payment status</span>
             <select value={draft.financialStatus} onChange={setField('financialStatus')}>
               <option value="">Any</option>
@@ -267,6 +346,14 @@ export function OrdersSection({ onAuthError, initialOrderId, onOrderIdConsumed }
                 <option key={o.value} value={o.value}>{o.label}</option>
               ))}
             </select>
+          </label>
+          <label className="cp-field">
+            <span>From date</span>
+            <input type="date" value={draft.dateFrom} onChange={setField('dateFrom')} />
+          </label>
+          <label className="cp-field">
+            <span>To date</span>
+            <input type="date" value={draft.dateTo} onChange={setField('dateTo')} />
           </label>
         </div>
         <div className="cp-inline">
@@ -299,10 +386,53 @@ export function OrdersSection({ onAuthError, initialOrderId, onOrderIdConsumed }
 }
 
 // ── Payment history ──────────────────────────────────────────────────────────
+const PAYMENT_FINANCIAL_STATUSES = [
+  { value: 'paid', label: 'Paid' },
+  { value: 'pending', label: 'Pending' },
+  { value: 'partially_paid', label: 'Partially paid' },
+  { value: 'refunded', label: 'Refunded' },
+]
+const EMPTY_PAYMENT_FILTERS = { financialStatus: '', dateFrom: '', dateTo: '' }
+
 export function PaymentsSection({ onAuthError }) {
   const [page, setPage] = useState(1)
-  const { data, loading, error, reload } = useResource('payments', { page, pageSize: 10 }, onAuthError)
+  const [draft, setDraft] = useState(EMPTY_PAYMENT_FILTERS)
+  const [applied, setApplied] = useState(EMPTY_PAYMENT_FILTERS)
+  const [pdfBusyId, setPdfBusyId] = useState(null)
+  const [pdfError, setPdfError] = useState('')
+  const { data, loading, error, reload } = useResource(
+    'payments',
+    { ...applied, page, pageSize: 10 },
+    onAuthError,
+  )
   const rows = data?.rows || []
+  const summary = data?.summary || {}
+
+  // "View invoice" opens the order's real QBO-rendered invoice PDF in a
+  // new browser tab — never a redirect to QBO's hosted portal.
+  const handleViewInvoice = async (orderId) => {
+    setPdfError('')
+    setPdfBusyId(orderId)
+    const result = await openInvoicePdf(orderId)
+    setPdfBusyId(null)
+    if (!result.ok) setPdfError(result.message)
+  }
+
+  const setField = (k) => (e) => setDraft((p) => ({ ...p, [k]: e.target.value }))
+  const PAYMENT_FILTER_KEYS = ['financialStatus', 'dateFrom', 'dateTo']
+  const draftMatchesApplied = PAYMENT_FILTER_KEYS.every((k) => draft[k] === applied[k])
+  const hasDraft = PAYMENT_FILTER_KEYS.some((k) => draft[k])
+  const hasApplied = PAYMENT_FILTER_KEYS.some((k) => applied[k])
+
+  const applyFilters = () => {
+    setApplied({ ...draft })
+    setPage(1)
+  }
+  const resetFilters = () => {
+    setDraft(EMPTY_PAYMENT_FILTERS)
+    setApplied(EMPTY_PAYMENT_FILTERS)
+    setPage(1)
+  }
 
   const columns = [
     { key: 'orderName', label: 'Order', width: '18%', render: (r) => <span className="cp-strong">{r.orderName}</span> },
@@ -316,29 +446,78 @@ export function PaymentsSection({ onAuthError }) {
       render: (r) => (r.invoiceStatus ? <StatusBadge value={r.invoiceStatus} /> : <span className="cp-muted">Processing</span>),
     },
     {
-      key: 'invoiceUrl',
+      key: 'details',
       label: 'Details',
       width: '18%',
-      render: (r) =>
-        r.invoiceUrl ? (
-          <a href={r.invoiceUrl} target="_blank" rel="noreferrer">
-            View invoice{r.docNumber ? ` #${r.docNumber}` : ''}
-          </a>
-        ) : (
-          <span className="cp-muted">—</span>
-        ),
+      render: (r) => (
+        <button
+          type="button"
+          className="cp-btn cp-btn--secondary"
+          disabled={pdfBusyId === r.id}
+          onClick={(e) => {
+            e.stopPropagation()
+            handleViewInvoice(r.id)
+          }}
+        >
+          {pdfBusyId === r.id ? 'Loading…' : `View invoice${r.docNumber ? ` #${r.docNumber}` : ''}`}
+        </button>
+      ),
     },
   ]
 
   return (
     <SectionShell heading="Payment history" description="Payment status and invoice details for each of your orders.">
+      <StatCards
+        cards={[
+          { label: 'Total paid', value: formatMoney(summary.totalPaid, summary.currency), tone: 'green' },
+          { label: 'Total pending', value: formatMoney(summary.totalPending, summary.currency), tone: summary.totalPending > 0 ? 'amber' : 'neutral' },
+          { label: 'Total invoiced', value: formatMoney(summary.totalInvoiced, summary.currency), tone: 'blue' },
+        ]}
+      />
+
+      {pdfError ? <ErrorBanner message={pdfError} /> : null}
+
+      <div className="cp-stack">
+        <div className="cp-field-grid cp-field-grid--2">
+          <label className="cp-field">
+            <span>Payment status</span>
+            <select value={draft.financialStatus} onChange={setField('financialStatus')}>
+              <option value="">Any</option>
+              {PAYMENT_FINANCIAL_STATUSES.map((o) => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+          </label>
+          <label className="cp-field">
+            <span>From date</span>
+            <input type="date" value={draft.dateFrom} onChange={setField('dateFrom')} />
+          </label>
+          <label className="cp-field">
+            <span>To date</span>
+            <input type="date" value={draft.dateTo} onChange={setField('dateTo')} />
+          </label>
+        </div>
+        <div className="cp-inline">
+          <button type="button" className="cp-btn cp-btn--primary" disabled={draftMatchesApplied || loading} onClick={applyFilters}>
+            Apply
+          </button>
+          <button type="button" className="cp-btn cp-btn--secondary" disabled={!hasDraft && !hasApplied} onClick={resetFilters}>
+            Reset
+          </button>
+        </div>
+      </div>
+
       {error ? (
         <ErrorBanner message={error} onRetry={reload} />
       ) : loading && rows.length === 0 ? (
         <Loading />
       ) : (
         <div className="cp-stack">
-          <Table columns={columns} rows={rows} empty="No payment history yet." />
+          <Table
+            columns={columns}
+            rows={rows}
+            empty={hasApplied ? 'No payments match these filters.' : 'No payment history yet.'}
+          />
           <Pagination page={data?.page || 1} totalPages={data?.pageCount || 1} total={data?.total || 0} loading={loading} onPage={setPage} />
         </div>
       )}
@@ -403,7 +582,11 @@ export function ProfileSection({ onAuthError }) {
       <div className="cp-payout-grid">
         <Field label="Name">{d.name || '—'}</Field>
         <Field label="Email">{d.email || '—'}</Field>
+        <Field label="Phone">{d.phone || '—'}</Field>
         <Field label="Enrollment">{d.attributed ? <StatusBadge value="active" /> : <span className="cp-muted">Not enrolled</span>}</Field>
+        <Field label="Member since">{formatDate(d.memberSince)}</Field>
+        <Field label="Total orders">{formatNumber(d.orderCount)}</Field>
+        <Field label="Lifetime spend">{formatMoney(d.lifetimeSpend, d.currency)}</Field>
       </div>
 
       {!d.hasOrders ? (

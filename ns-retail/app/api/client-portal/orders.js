@@ -7,6 +7,9 @@ export const loader = portalLoader(async ({ ctx, url }) => {
     ...pageParams(url),
     financialStatus: url.searchParams.get("financialStatus") || undefined,
     fulfillmentStatus: url.searchParams.get("fulfillmentStatus") || undefined,
+    search: url.searchParams.get("search") || undefined,
+    dateFrom: url.searchParams.get("dateFrom") || undefined,
+    dateTo: url.searchParams.get("dateTo") || undefined,
   });
   return ok("OK", result);
 });

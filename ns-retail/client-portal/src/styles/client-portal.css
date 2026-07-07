@@ -122,6 +122,10 @@
   gap: 8px;
 }
 
+.cp-inline--between {
+  justify-content: space-between;
+}
+
 /* ── Tabs ─────────────────────────────────────────────────────────────── */
 
 .cp-tabs {

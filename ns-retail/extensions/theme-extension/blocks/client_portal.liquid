@@ -18,8 +18,11 @@
   Build (from ns-retail/): npm run build:client-portal
   (or just run shopify app deploy — the predeploy hook runs it automatically)
 
-  Merchant places this block on an account/page template via the theme
-  editor.
+  Merchant places this block on any page/template via the theme editor —
+  a dedicated "My Account" page is the intended use, but there's no
+  enabled_on restriction (matches signup_form.liquid's convention) so it
+  shows up in the Apps picker regardless of which template is being
+  edited.
 {% endcomment %}
 
 {% assign bundle_url = 'client-portal-bundle.js' | asset_url %}
@@ -50,9 +53,6 @@
 {
   "name": "Client Portal",
   "target": "section",
-  "enabled_on": {
-    "templates": ["page"]
-  },
   "settings": []
 }
 {% endschema %}
