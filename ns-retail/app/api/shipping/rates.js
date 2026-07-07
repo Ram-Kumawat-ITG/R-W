@@ -816,28 +816,37 @@ export async function action({ request }) {
     return ratesResponse([]);
   }
 
-  // HMAC verify — carrier-service SPECIFIC behavior.
+  // HMAC verify — LOG-ONLY (never reject).
   //
-  // Shopify's Carrier Service callbacks are NOT HMAC-signed the way
-  // regular webhooks are. Per Shopify docs, security relies on the
-  // callback URL being unguessable (registered via authenticated
-  // `carrierServiceCreate` mutation — an attacker can't register their
-  // own URL). Newer Shopify versions MAY include the header, so we
-  // still verify when it's present:
+  // Per Shopify docs, Carrier Service callbacks are NOT HMAC-signed
+  // the same way regular webhooks are. Security for this endpoint
+  // relies on the callback URL being unguessable + only registerable
+  // via authenticated `carrierServiceCreate` mutation (attacker can't
+  // point Shopify at their own URL). Empirically we DO sometimes see
+  // an `X-Shopify-Hmac-Sha256` header on the request, but its value
+  // often doesn't match a webhook-secret HMAC — likely because either
+  // (a) it's set by a proxy (Cloudflare / Render), (b) Shopify's
+  // carrier signing uses a different secret than SHOPIFY_API_SECRET,
+  // or (c) the SHOPIFY_API_SECRET env var is stale.
   //
-  //   • Header ABSENT              → accept (normal carrier-service behavior)
-  //   • Header PRESENT + valid HMAC → accept (Shopify sending it)
-  //   • Header PRESENT + INVALID    → reject (tampering attempt)
+  // Hard-rejecting on a mismatch breaks production checkout (customer
+  // sees "no shipping available"). So we verify FOR AUDIT ONLY — the
+  // result is logged but the request is always accepted. If a real
+  // tampering pattern shows up in logs, tighten this then.
   //
-  // This closes the tampering vector while keeping the endpoint working
-  // for the vast majority of Shopify's carrier callbacks that don't
-  // include the header at all.
+  // History:
+  //   2026-07-06 — added hard-reject when secret is set → broke
+  //                production carrier callbacks (both no-header AND
+  //                invalid-header cases rejected legitimate Shopify
+  //                requests).
+  //   2026-07-07 — reverted to log-only. Do NOT re-add hard-reject
+  //                without confirming Shopify actually signs THIS
+  //                endpoint with SHOPIFY_API_SECRET.
   const hmacHeader = request.headers.get("x-shopify-hmac-sha256") || "";
   if (hmacHeader && !verifyHmac(rawBody, hmacHeader)) {
     console.warn(
-      "[shipping.rates] hmac header present but invalid — rejecting (possible tampering).",
+      "[shipping.rates] hmac header present but did not match SHOPIFY_API_SECRET — accepting anyway (carrier-service callbacks aren't standard-signed; see 2026-07-07 hotfix note).",
     );
-    return ratesResponse([]);
   }
 
   let payload;
