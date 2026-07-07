@@ -82,10 +82,16 @@ const CONFIG = {
   // shipping only, no state guessing).
   shopifyTax: {
     cacheTtlMs: 5 * 60 * 1000, // 5 min
-    // Bumped 3 → 5 sec (2026-07-06) — Shopify's draftOrderCalculate
-    // occasionally takes 3-4 sec under load; 5 sec still leaves
-    // 5 sec buffer under Shopify's 10-sec carrier-callback budget.
-    timeoutMs: 5000, // 5 sec
+    // Bumped 5 → 10 sec (2026-07-07) — production Render logs showed
+    // `operation was aborted` on every call at 5 sec, meaning the
+    // draftOrderCalculate GraphQL round-trip (auth session lookup +
+    // tax computation) needs more headroom under load. 10 sec is the
+    // upper bound: Shopify's own carrier-callback budget is 10 sec so
+    // we can't go higher without risking a Shopify-side timeout of
+    // the entire callback. If this still hits the abort in prod, the
+    // real problem is elsewhere (session-store latency, network) —
+    // don't bump further, investigate root cause.
+    timeoutMs: 10000, // 10 sec
     // Hard cap on the in-process cache so unique cart+address combos
     // don't grow the Map unbounded on long-running instances (memory
     // safety). Oldest entry evicted on overflow (insertion-order LRU).
@@ -957,6 +963,29 @@ export async function action({ request }) {
   console.log(
     `[shipping.rates] inbound: ${rate.items.length} line(s) (${feeLinesExcluded} processing-fee excluded), realQty=${totalQty}, dest=${rate.destination?.country}/${rate.destination?.province}/${rate.destination?.postal_code}`,
   );
+
+  // ── Temporary diagnostic dump (added 2026-07-07) ─────────────────────
+  // Empirical probe: Shopify's carrier-service payload docs list `items`,
+  // `origin`, `destination`, `currency`, `locale` — but real payloads
+  // occasionally include extra fields (total_discounts, subtotal_price,
+  // per-item discount_allocations) inconsistently. We're seeing discount
+  // codes fail to surface in `detectCartDiscountCents` on real checkouts
+  // (e.g. DSFSD -$450 order-level discount on a $1800 cart → no field
+  // populated), so we dump the entire rate object once here to confirm
+  // whether the discount info is genuinely absent (Shopify limitation for
+  // order-level discounts) or hiding in a field we're not probing yet.
+  //
+  // REMOVE this log once we've captured 2-3 real discount-applied
+  // payloads and either extended detectCartDiscountCents to cover the
+  // missing field or confirmed the info simply isn't in the payload.
+  try {
+    console.log(
+      "[shipping.rates] RAW PAYLOAD DUMP (temp, remove after confirming discount fields):\n" +
+        JSON.stringify(rate, null, 2),
+    );
+  } catch (dumpErr) {
+    console.warn("[shipping.rates] payload dump failed:", dumpErr?.message);
+  }
 
   // ── 1a. Free-shipping rule (retail store) ─────────────────────────
   //
