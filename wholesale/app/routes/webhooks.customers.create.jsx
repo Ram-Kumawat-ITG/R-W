@@ -49,29 +49,53 @@ function hasTag(tags, target) {
   return tags.some((x) => String(x).trim().toLowerCase() === t);
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// ⚠️ DISABLED — wholesale-practitioner → retail-store customer mirror
+// ─────────────────────────────────────────────────────────────────────
+//
+// Per the product decision on 2026-07-06, wholesale practitioners should
+// NOT be auto-created as customers on the ns-retail store. The mirror
+// service `syncPractitionerToRetail` (+ its update / delete twins) stays
+// in the codebase but is no longer invoked from these webhooks.
+//
+// To re-enable, restore the awaited call inside `mirrorToRetail` (and
+// the equivalent lines in webhooks.customers.update.jsx +
+// webhooks.customers.delete.jsx) — the underlying service, GraphQL
+// helpers, env vars (RETAIL_SHOP_DOMAIN / RETAIL_ADMIN_ACCESS_TOKEN),
+// and the `WholesaleApplication.retailShopifyCustomerId` state field
+// are all preserved intact.
+// ─────────────────────────────────────────────────────────────────────
+
 // Mirror this approved wholesale practitioner to the retail Shopify store
 // via services/retailSync/practitioner.service. Best-effort — failures
 // never propagate to the webhook handler.
 async function mirrorToRetail({ shop, customerId, email }) {
-  try {
-    await connectDB();
-    const customerGid = `gid://shopify/Customer/${customerId}`;
-    const application = await WholesaleApplication.findOne({
-      customerId: customerGid,
-      shop,
-    }).lean();
-    if (!application) {
-      log.warn("retail_sync.no_application", { customerId, email });
-      return;
-    }
-    await syncPractitionerToRetail({ application, action: "create" });
-  } catch (err) {
-    log.error("retail_sync.create_failed", {
-      customerId,
-      email,
-      err: err?.message || String(err),
-    });
-  }
+  // DISABLED — see banner above. The function is kept as a no-op so
+  // callers don't need to be rewired; if the retail-mirror decision is
+  // reversed later, just un-comment the block below.
+  log.info("retail_sync.create_skipped_disabled", { shop, customerId, email });
+  return;
+
+  // ── Original implementation (preserved) ────────────────────────────
+  // try {
+  //   await connectDB();
+  //   const customerGid = `gid://shopify/Customer/${customerId}`;
+  //   const application = await WholesaleApplication.findOne({
+  //     customerId: customerGid,
+  //     shop,
+  //   }).lean();
+  //   if (!application) {
+  //     log.warn("retail_sync.no_application", { customerId, email });
+  //     return;
+  //   }
+  //   await syncPractitionerToRetail({ application, action: "create" });
+  // } catch (err) {
+  //   log.error("retail_sync.create_failed", {
+  //     customerId,
+  //     email,
+  //     err: err?.message || String(err),
+  //   });
+  // }
 }
 
 export const loader = async () => {

@@ -1,3 +1,33 @@
+// ─────────────────────────────────────────────────────────────────────────
+// ⚠️ DISABLED ON GROW PLAN — practitioner-code entry moved to the cart page
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Shopify custom-app UI extensions on the core checkout steps
+// (information / shipping / payment) are Plus-only per Shopify's docs
+// (https://help.shopify.com/en/manual/checkout-settings/customize-checkout-configurations/checkout-apps).
+// Our stores run on the Grow plan, so this extension NEVER renders in
+// their checkout — even though the bundle is deployed and network
+// access is granted.
+//
+// The replacement lives at the CART page as a theme app block:
+//   Source:      ns-retail/practitioner-code-form/
+//   Block:       ns-retail/extensions/theme-extension/blocks/practitioner_code.liquid
+//   Same backend endpoints (/api/cdo/checkout-{validate,apply}-code),
+//   same customer-tag mechanism, same Shopify discount code — only the
+//   entry point moved one step earlier so it works on non-Plus plans.
+//
+// This file is INTENTIONALLY KEPT in the codebase:
+//   • Zero cost on Grow (Shopify silently doesn't render it).
+//   • If the store ever upgrades to Shopify Plus, un-disable by restoring
+//     the ORIGINAL default export at the bottom of this file
+//     (`render(<Extension />, document.body)`) — the full <Extension />
+//     implementation below is preserved intact.
+//
+// DO NOT DELETE without re-reading `/api/cdo/checkout-{validate,apply}-code`
+// callers — those endpoints are shared with the cart-page block and must
+// stay live either way.
+// ─────────────────────────────────────────────────────────────────────────
+
 import { useBuyerJourneyIntercept } from "@shopify/ui-extensions/checkout/preact";
 import { render } from "preact";
 import { useEffect } from "preact/hooks";
@@ -7,9 +37,22 @@ import ApiService from "./services/ApiService";
 const CART_ATTR_KEY = "cdo_practitioner_code";
 const CODE_PATTERN = /^[a-z]+_[a-f0-9]{8}$/i;
 
+// ── Active default export (no-op on Grow) ─────────────────────────────
+// Renders nothing. On Plus stores, replace this with the original body:
+//   export default async () => { render(<Extension />, document.body); };
 export default async () => {
-  render(<Extension />, document.body);
+  // No-op on Grow. See disable banner above.
 };
+
+// ── Original implementation (preserved — DO NOT REMOVE) ───────────────
+// The full <Extension /> component below is the code that ran on the
+// checkout UI when the store was on Shopify Plus (or a dev store with
+// Plus features). It's kept live-code (not commented out) so the linter
+// / type-checker still validate it and it stays in build-shape — but
+// nothing calls it at runtime because the default export above is a
+// no-op. To re-activate on a future Plus upgrade, change the default
+// export back to `render(<Extension />, document.body);` — no other
+// edits should be needed.
 
 function Extension() {
   const inputCode = useSignal("");
