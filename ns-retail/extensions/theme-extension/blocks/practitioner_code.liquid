@@ -31,7 +31,8 @@
     customerEmail: {{ customer.email | json }},
     shopDomain: {{ shop.permanent_domain | json }},
     initialCode: {{ cart.attributes.cdo_practitioner_code | default: '' | json }},
-    initialPractitionerName: {{ cart.attributes.cdo_practitioner_name | default: '' | json }}
+    initialPractitionerName: {{ cart.attributes.cdo_practitioner_name | default: '' | json }},
+    initialDiscountPercent: {{ cart.attributes.cdo_practitioner_discount_percent | default: '' | json }}
   };
 </script>
 
