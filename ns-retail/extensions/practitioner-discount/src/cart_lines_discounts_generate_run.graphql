@@ -1,0 +1,25 @@
+query CartInput {
+  cart {
+    lines {
+      id
+      cost {
+        subtotalAmount {
+          amount
+        }
+      }
+    }
+    buyerIdentity {
+      customer {
+        practitionerBinding: metafield(namespace: "cdo", key: "practitioner_id") {
+          value
+        }
+      }
+    }
+  }
+  discount {
+    discountClasses
+    config: metafield(namespace: "cdo", key: "config") {
+      value
+    }
+  }
+}
