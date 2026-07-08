@@ -1624,6 +1624,7 @@ export async function createPractitionerCode({
       shop: retailShop,
       code: doc.code,
       discountPercent: discount,
+      practitionerId: profile.id,
       practitionerName: profile.name,
     });
     if (disc.ok && (disc.shopifyDiscountId || disc.shopifyDiscountUrl)) {
@@ -4026,7 +4027,14 @@ export async function ingestShopifyOrder({ shop, payload, rawCode, attributionSo
   await upsertCustomerApplication({ shop, payload, referral });
 
   const customerGid = payload?.customer?.admin_graphql_api_id || null;
-  return { ok: true, attributed: true, referralCode: referral.code, customerGid };
+  return {
+    ok: true,
+    attributed: true,
+    referralCode: referral.code,
+    practitionerId: referral.practitionerId,
+    practitionerEmail: referral.practitionerEmail || null,
+    customerGid,
+  };
 }
 
 // ── Commission eligibility by payment state ──────────────────────────

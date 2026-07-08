@@ -29,6 +29,18 @@ export default [
   // Customer Account UI extension at extensions/profile-update/ calls
   // /api/portal/profile (fetch + update via `action` field in the body).
   route("/api/portal/profile", "api/portal/profile.js"),
+  // Practitioner Portal (Theme App Extension, wholesale storefront) —
+  // migrated back from ns-retail. Auth via App Proxy's logged_in_customer_id
+  // (NOT the session-token JWT profile-update above); ns-retail still OWNS
+  // and WRITES cdo_orders/cdo_commissions/cdo_payouts/cdo_referrals — these
+  // routes read them via the wholesale-side mirrors in app/models/.
+  route("/api/portal/me", "api/portal/me.js"),
+  route("/api/portal/summary", "api/portal/summary.js"),
+  route("/api/portal/revenue", "api/portal/revenue.js"),
+  route("/api/portal/customers", "api/portal/customers.js"),
+  route("/api/portal/commissions", "api/portal/commissions.js"),
+  route("/api/portal/payouts", "api/portal/payouts.js"),
+  route("/api/portal/referrals", "api/portal/referrals.js"),
   // Shopify Carrier Service callback — receives the cart origin + destination
   // + items at checkout, fetches live rates from EasyPost, applies the
   // wholesale quantity-based markup, and returns rates to Shopify.
@@ -59,6 +71,11 @@ export default [
   route("/api/admin/orders/:id/resume-auto-charge", "api/admin/resume-auto-charge.js"),
   route("/api/admin/orders/:id/pause-reminders", "api/admin/pause-reminders.js"),
   route("/api/admin/orders/:id/resume-reminders", "api/admin/resume-reminders.js"),
+  // Global (not per-invoice) — pause/resume the process-pending-payments
+  // CRON's two email notifications (customer "Payment Failed" + admin
+  // "Batch Processing Summary"). Charge processing is unaffected.
+  route("/api/admin/cron-notifications/pause", "api/admin/pause-cron-notifications.js"),
+  route("/api/admin/cron-notifications/resume", "api/admin/resume-cron-notifications.js"),
   route("/api/admin/admin-order-batch", "api/admin/admin-order-batch.js"),
   route("/api/sync/retail-order", "api/sync/retail-order.js"),
   route("/api/sync/retail-inventory-update", "api/sync/retail-inventory-update.js"),

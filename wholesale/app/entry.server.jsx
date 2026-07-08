@@ -54,9 +54,9 @@ function printBootBanner() {
   console.log("  --- Invoicing ---");
   console.log(`  INVOICE_TERMS_DAYS        : ${invoiceConfig.termsDays} (generic fallback)`);
   console.log(
-    `  Due-date terms by method  : cheque=${invoiceConfig.dueDaysByMethod.check}d ` +
-      `ach=${invoiceConfig.dueDaysByMethod.ach}d card=${invoiceConfig.dueDaysByMethod.card}d ` +
-      `(order date + N → QBO DueDate)`,
+    `  Due-date rules by method  : ach=billing-cycle(1-15→15th, 16-EOM→month end) ` +
+      `card=billing-cycle(1-15→15th, 16-EOM→month end) ` +
+      `check=${invoiceConfig.checkDueBusinessDays} business days`,
   );
   console.log("  --- Payments ---");
   console.log(`  PAYMENT_CHARGE_IMMEDIATELY: ${paymentConfig.chargeImmediately}`);

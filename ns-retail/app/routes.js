@@ -63,6 +63,17 @@ export default [
   route("/api/portal/payouts", "api/portal/payouts.js"),
   route("/api/portal/referrals", "api/portal/referrals.js"),
   route("/api/portal/discounts", "api/portal/discounts.js"),
+  // Client Portal — Theme App Extension backend (/api/client-portal/*).
+  // Any logged-in retail customer is authorized (no approval gate, unlike
+  // the practitioner portal above). Auth via App Proxy +
+  // logged_in_customer_id (see app/api/client-portal/_guard.js).
+  route("/api/client-portal/me", "api/client-portal/me.js"),
+  route("/api/client-portal/dashboard", "api/client-portal/dashboard.js"),
+  route("/api/client-portal/orders", "api/client-portal/orders.js"),
+  route("/api/client-portal/order", "api/client-portal/order.js"),
+  route("/api/client-portal/invoice-pdf", "api/client-portal/invoice-pdf.js"),
+  route("/api/client-portal/cdo", "api/client-portal/cdo.js"),
+  route("/api/client-portal/profile", "api/client-portal/profile.js"),
   // Shopify Carrier Service callback — receives the cart origin + destination
   // + items at checkout, fetches live rates from USPS + UPS (or falls back
   // to STATIC_CARRIER_RATES placeholder when credentials are unset), and
