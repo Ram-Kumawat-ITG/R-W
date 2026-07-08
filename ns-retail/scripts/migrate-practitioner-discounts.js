@@ -40,19 +40,34 @@ const APPLY = process.argv.includes("--apply");
 // necessarily the shop where the backing Shopify discount actually lives.
 // The real retail shop is wherever this app has an installed OFFLINE
 // session, since that's the only shop Admin API calls (unauthenticated.admin)
-// can actually authenticate against. Resolve it once at startup rather than
-// trusting doc.shop per-row.
+// can actually authenticate against.
+//
+// `shopify_sessions` is shared with the wholesale workspace's MongoDB (same
+// MONGODB_URI, same DB) — so if BOTH apps' dev servers have run, this
+// collection holds offline sessions for BOTH shops, and picking "the" one
+// via findOne() is a coin flip (confirmed: it silently returned the
+// wholesale shop once). Prefer the explicit CDO_RETAIL_SHOP override; only
+// auto-detect when there's unambiguously exactly one distinct shop.
 async function resolveRetailShop() {
   if (process.env.CDO_RETAIL_SHOP) return process.env.CDO_RETAIL_SHOP;
-  const session = await mongoose.connection.db
+
+  const sessions = await mongoose.connection.db
     .collection("shopify_sessions")
-    .findOne({ isOnline: false });
-  if (!session?.shop) {
+    .find({ isOnline: false })
+    .toArray();
+  const distinctShops = [...new Set(sessions.map((s) => s.shop).filter(Boolean))];
+
+  if (distinctShops.length === 0) {
     throw new Error(
       "Could not resolve the retail shop — no offline session found in shopify_sessions, and CDO_RETAIL_SHOP is not set.",
     );
   }
-  return session.shop;
+  if (distinctShops.length > 1) {
+    throw new Error(
+      `Found ${distinctShops.length} distinct shops in shopify_sessions (${distinctShops.join(", ")}) — this collection is shared across apps, so auto-detection is ambiguous. Set CDO_RETAIL_SHOP explicitly in .env.`,
+    );
+  }
+  return distinctShops[0];
 }
 
 const QUERY_DISCOUNT_TYPE = `#graphql

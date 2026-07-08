@@ -656,6 +656,13 @@ export function ReferralsSection({ onAuthError }) {
   const [percent, setPercent] = useState('20')
   const [submitting, setSubmitting] = useState(false)
   const [formError, setFormError] = useState('')
+  // Separate from `formError` — that one is scoped to the (usually-closed)
+  // create-code dialog and only ever rendered inside it. Pause/Resume are
+  // main-section row actions that fire with the dialog closed, so their
+  // errors need their own state + their own visible banner, or they're
+  // captured but never shown (confirmed bug: a failed Resume silently set
+  // `formError` with nothing on screen to render it).
+  const [listError, setListError] = useState('')
   const [notice, setNotice] = useState('')
   const [busyId, setBusyId] = useState(null)
 
@@ -663,12 +670,12 @@ export function ReferralsSection({ onAuthError }) {
   const availablePercents = DISCOUNT_PERCENTS.filter((p) => !usedActiveTiers.has(p))
   const canCreate = availablePercents.length > 0
 
-  const handleApiError = (err, fallback) => {
+  const handleApiError = (err, fallback, setter = setFormError) => {
     if (err instanceof ApiError && (err.httpStatus === 401 || err.httpStatus === 403)) {
       onAuthError?.(err)
       return
     }
-    setFormError(err?.message || fallback)
+    setter(err?.message || fallback)
   }
 
   const resetForm = () => {
@@ -679,6 +686,7 @@ export function ReferralsSection({ onAuthError }) {
 
   const openModal = () => {
     resetForm()
+    setListError('')
     dialogRef.current?.showModal?.()
   }
   const closeModal = () => dialogRef.current?.close?.()
@@ -714,7 +722,7 @@ export function ReferralsSection({ onAuthError }) {
   }
 
   const handleToggle = async (row) => {
-    setFormError('')
+    setListError('')
     setNotice('')
     const op = row.status === 'active' ? 'pause' : 'resume'
     setBusyId(row.id)
@@ -723,7 +731,7 @@ export function ReferralsSection({ onAuthError }) {
       setNotice(op === 'pause' ? `Paused "${row.code}".` : `Resumed "${row.code}".`)
       reload()
     } catch (err) {
-      handleApiError(err, 'Could not update the referral code.')
+      handleApiError(err, 'Could not update the referral code.', setListError)
     } finally {
       setBusyId(null)
     }
@@ -786,6 +794,7 @@ export function ReferralsSection({ onAuthError }) {
             <p>{notice}</p>
           </Banner>
         ) : null}
+        {listError ? <ErrorBanner message={listError} /> : null}
       </div>
 
       <dialog ref={dialogRef} className="portal-dialog">

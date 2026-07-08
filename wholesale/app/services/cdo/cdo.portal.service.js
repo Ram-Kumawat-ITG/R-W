@@ -877,6 +877,7 @@ export async function createReferralCode(
   const disc = await createRetailDiscount({
     code: raw,
     discountPercent: fraction,
+    practitionerId,
     practitionerName: fullName,
   });
 
