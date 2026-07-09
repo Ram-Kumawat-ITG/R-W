@@ -22,6 +22,7 @@ import { propagateSuccessfulPayment } from '../invoice/invoice.service'
 import { invoiceConfig } from '../invoice/invoice.config'
 import { computeProcessingFee, applyDerivedPaymentStatus } from '../invoice/invoice.utils'
 import { createLogger } from '../../utils/logger.utils'
+import { notifyNmiVaultInvalid, notifyNmiDuplicateTransaction } from '../notifications/nmiAlertNotification.service'
 
 const log = createLogger('payment.service')
 
@@ -163,6 +164,16 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
       methodLabel,
       reason: vaultCheck.reason,
     })
+    // Fires on both CRON auto-charge and admin retry — this is the only
+    // signal an admin gets that a customer's charge is silently not
+    // happening (it will keep skipping every future attempt too).
+    await notifyNmiVaultInvalid({
+      invoiceId: invoice._id.toString(),
+      shopifyOrderId: invoice.shopifyOrderId,
+      vaultId,
+      methodLabel,
+      reason: vaultCheck.reason,
+    }).catch((e) => log.error('vault_invalid_alert.failed', { err: e?.message || e }))
     return { skipped: true, reason }
   }
 
@@ -286,6 +297,21 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
     nmiCvvResponse: result.cvvResponse,
     rawResponse: result.raw,
   })
+
+  // NMI's gateway-level duplicate-transaction check rejecting a charge is
+  // a processor-config issue, not a routine decline — see the 2026-06-22
+  // incident in CLAUDE.md. Flag it distinctly so an admin checks the NMI
+  // control panel instead of assuming it's a normal card decline.
+  if (result.outcome !== 'approved' && /duplicate transaction/i.test(result.responseText || '')) {
+    await notifyNmiDuplicateTransaction({
+      invoiceId: invoice._id.toString(),
+      shopifyOrderId: invoice.shopifyOrderId,
+      vaultId: customerMap.nmiCustomerVaultId,
+      amount,
+      responseText: result.responseText,
+      transactionId: result.transactionId,
+    }).catch((e) => log.error('duplicate_txn_alert.failed', { err: e?.message || e }))
+  }
 
   invoice.attemptCount = attemptNumber
   invoice.lastAttemptAt = new Date()

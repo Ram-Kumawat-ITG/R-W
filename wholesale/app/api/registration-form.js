@@ -22,6 +22,7 @@ import {
   notifyApplicationApproved,
   notifyApplicationDeclined,
 } from "../services/notifications/applicationLifecycleNotification.service";
+import { notifyNmiVaultCreationFailed } from "../services/notifications/nmiAlertNotification.service";
 
 // Generate a stable, readable NMI billing_id. Random suffix prevents
 // collisions when re-using a customer email; prefix makes logs scannable.
@@ -382,6 +383,13 @@ export async function action({ request }) {
           cardBillingErr?.message || cardBillingErr,
         );
         await deleteNmiVaultWithRetry(nmiCustomerVaultId);
+        await notifyNmiVaultCreationFailed({
+          email: payload.email,
+          businessName: payload.businessName,
+          paymentMethod: payload.payment?.method,
+          stage: "ACH customer — secondary card billing add",
+          error: cardBillingErr,
+        }).catch((e) => console.error("[proxy/submit] NMI alert failed:", e?.message || e));
         await notifyApplicationDeclined({
           email: payload.email,
           firstName: payload.firstName,
@@ -409,6 +417,13 @@ export async function action({ request }) {
       "[proxy/submit] NMI vault create failed:",
       vaultErr?.message || vaultErr,
     );
+    await notifyNmiVaultCreationFailed({
+      email: payload.email,
+      businessName: payload.businessName,
+      paymentMethod: payload.payment?.method,
+      stage: "Primary vault creation",
+      error: vaultErr,
+    }).catch((e) => console.error("[proxy/submit] NMI alert failed:", e?.message || e));
     await notifyApplicationDeclined({
       email: payload.email,
       firstName: payload.firstName,
@@ -430,6 +445,13 @@ export async function action({ request }) {
   }
   if (!nmiCustomerVaultId) {
     console.error("[proxy/submit] NMI returned no vault id");
+    await notifyNmiVaultCreationFailed({
+      email: payload.email,
+      businessName: payload.businessName,
+      paymentMethod: payload.payment?.method,
+      stage: "Vault creation resolved with no vault id",
+      error: new Error("createCustomerVault resolved successfully but returned no vault id"),
+    }).catch((e) => console.error("[proxy/submit] NMI alert failed:", e?.message || e));
     await notifyApplicationDeclined({
       email: payload.email,
       firstName: payload.firstName,
