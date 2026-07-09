@@ -29,7 +29,7 @@ import {
   getBillPdf,
 } from "./retailQbo.service";
 import { createLogger } from "../../utils/logger.utils";
-import { notifyVendorBillCreated } from "../notifications/vendorBillNotification.service";
+import { notifyVendorBillCreated, notifyVendorBillFailed } from "../notifications/vendorBillNotification.service";
 
 const log = createLogger("retail.vendor_bill");
 
@@ -229,6 +229,16 @@ export async function ensureRetailVendorBillForOrder({ shop, shopifyOrderId, for
       },
     );
     log.error("bill.create_failed", { shopifyOrderId, err });
+    notifyVendorBillFailed({
+      stage: "creation",
+      shopifyOrderId,
+      orderName: order.orderName,
+      totalAmount: order.amount,
+      currency: order.currency,
+      reason: msg,
+      errorDetail: err?.stack,
+      failedAt: new Date(),
+    }).catch((e) => log.error("bill.create_notification_failed", { err: e?.message || e }));
     return { ok: false, reason: "error", error: msg };
   }
 }

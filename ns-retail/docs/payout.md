@@ -1095,10 +1095,15 @@ emails hook into it, via `app/services/notifications/vendorBillNotification.serv
 - **Drop-ship Vendor Bill Created** — `notifyVendorBillCreated`, fired from
   `ensureRetailVendorBillForOrder` right after the QBO Bill is created. Includes
   the order, bill doc number, vendor, total amount, and QBO link.
-- **Drop-ship Vendor Bill Reconciliation Failed** — `notifyVendorBillReconciliationFailed`,
-  fired from `reconcileRetailVendorBillForOrder`'s catch block (e.g. the bill was
-  voided/edited directly in QBO). Notes that the bill stays unpaid and will be
-  retried automatically on the next `process-bill-reconciliation` CRON tick.
+- **Drop-ship Vendor Bill (A/P) Creation or Reconciliation Failed** — one shared
+  template/event, `notifyVendorBillFailed({ stage: 'creation'|'reconciliation', ... })`,
+  fired from BOTH `ensureRetailVendorBillForOrder`'s catch block (creation) and
+  `reconcileRetailVendorBillForOrder`'s catch block (reconciliation) — the `stage`
+  field is the only thing that differs between the two call sites (subject line +
+  one explanatory paragraph); order/bill details, error message, and error detail
+  are otherwise identical. Notes that the bill stays unpaid/uncreated and will be
+  retried automatically on the next order sync / `process-bill-reconciliation`
+  CRON tick.
 
 Both are best-effort (fire-and-forget, logged on failure) — never affect the
 underlying bill creation/reconciliation outcome.
