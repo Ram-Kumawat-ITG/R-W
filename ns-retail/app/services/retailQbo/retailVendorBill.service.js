@@ -29,6 +29,7 @@ import {
   getBillPdf,
 } from "./retailQbo.service";
 import { createLogger } from "../../utils/logger.utils";
+import { notifyVendorBillCreated } from "../notifications/vendorBillNotification.service";
 
 const log = createLogger("retail.vendor_bill");
 
@@ -201,6 +202,17 @@ export async function ensureRetailVendorBillForOrder({ shop, shopifyOrderId, for
     );
 
     log.info("bill.created", { shopifyOrderId, billId: bill.Id, vendorId, total: bill.TotalAmt });
+    notifyVendorBillCreated({
+      shopifyOrderId,
+      orderName: order.orderName,
+      billId: bill.Id,
+      billDocNumber: bill.DocNumber,
+      vendorId,
+      totalAmount: bill.TotalAmt,
+      currency: order.currency,
+      billUrl: url,
+      createdAt: new Date(),
+    }).catch((e) => log.error("bill.notification_failed", { err: e?.message || e }));
     return { ok: true, billId: String(bill.Id) };
   } catch (err) {
     const msg = errMsg(err);

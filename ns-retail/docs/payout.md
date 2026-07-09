@@ -1082,6 +1082,27 @@ webhook topics; ensure `QBO_RETAIL_REFRESH_TOKEN` is freshly minted (Intuit
 rotates the refresh token on every use — see the §14 token-reset note, which
 applies per realm).
 
+### 19.1 Drop-ship Vendor Bill (A/P) email notifications
+
+The drop-ship Vendor Bill flow itself (`app/services/retailQbo/retailVendorBill.service.js`
+creates the QBO Bill; `retailBillReconcile.service.js` reconciles it once the
+wholesale dropship invoice is paid) is the ns-retail half of the cross-repo
+drop-ship pipeline documented in the wholesale workspace's `CLAUDE.md` ("Drop-ship
+orders → unpaid QBO invoice + manual batch collection" row). Two admin-only
+emails hook into it, via `app/services/notifications/vendorBillNotification.service.js`
+(same reusable SMTP utility + `CDO_ADMIN_EMAIL` as the payout notifications in §8.5):
+
+- **Drop-ship Vendor Bill Created** — `notifyVendorBillCreated`, fired from
+  `ensureRetailVendorBillForOrder` right after the QBO Bill is created. Includes
+  the order, bill doc number, vendor, total amount, and QBO link.
+- **Drop-ship Vendor Bill Reconciliation Failed** — `notifyVendorBillReconciliationFailed`,
+  fired from `reconcileRetailVendorBillForOrder`'s catch block (e.g. the bill was
+  voided/edited directly in QBO). Notes that the bill stays unpaid and will be
+  retried automatically on the next `process-bill-reconciliation` CRON tick.
+
+Both are best-effort (fire-and-forget, logged on failure) — never affect the
+underlying bill creation/reconciliation outcome.
+
 ---
 
 ## 20. Client Portal (Theme App Extension, retail storefront) — IMPLEMENTED (2026-07-07)
