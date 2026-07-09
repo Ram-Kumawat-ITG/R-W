@@ -3,6 +3,7 @@ import { authenticate } from '../../shopify.server'
 import connectDB from '../../services/APIService/mongo.service'
 import WholesaleApplication from '../../models/wholesaleApplication.server'
 import { sendResponse } from '../../services/APIService/api.service'
+import { notifyAccountBlocked } from '../../services/notifications/accountNotification.service'
 
 // POST /api/admin/customers/:id/block
 //
@@ -28,6 +29,15 @@ export async function action({ request, params }) {
   const { id } = params
   if (!id || !mongoose.isValidObjectId(id)) {
     return sendResponse(400, 'error', 'Invalid id', null)
+  }
+
+  // Optional { reason } body — surfaced on the customer's block notification.
+  let reason = null
+  try {
+    const body = await request.json()
+    reason = body?.reason ? String(body.reason).trim() : null
+  } catch {
+    // No body / not JSON — reason stays null, block still proceeds.
   }
 
   await connectDB()
@@ -82,6 +92,15 @@ export async function action({ request, params }) {
       detail: e?.message || String(e),
     })
   }
+
+  // Best-effort — never blocks the block action on an SMTP hiccup.
+  await notifyAccountBlocked({
+    email: doc.email,
+    firstName: doc.firstName,
+    lastName: doc.lastName,
+    businessName: doc.businessName,
+    reason,
+  }).catch((e) => console.error('[admin/block] notification failed:', e?.message || e))
 
   return sendResponse(200, 'success', 'Customer blocked', { id })
 }

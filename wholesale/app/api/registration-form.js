@@ -17,6 +17,11 @@ import {
 } from "../services/nmi/nmi.service";
 import { generatePractitionerCode } from "../services/cdo/cdo.service";
 import { encryptField } from "../utils/crypto.utils";
+import {
+  notifyApplicationSubmitted,
+  notifyApplicationApproved,
+  notifyApplicationDeclined,
+} from "../services/notifications/applicationLifecycleNotification.service";
 
 // Generate a stable, readable NMI billing_id. Random suffix prevents
 // collisions when re-using a customer email; prefix makes logs scannable.
@@ -377,6 +382,13 @@ export async function action({ request }) {
           cardBillingErr?.message || cardBillingErr,
         );
         await deleteNmiVaultWithRetry(nmiCustomerVaultId);
+        await notifyApplicationDeclined({
+          email: payload.email,
+          firstName: payload.firstName,
+          lastName: payload.lastName,
+          businessName: payload.businessName,
+          reason: "We could not verify the card details provided as your backup payment method.",
+        }).catch((e) => console.error("[proxy/submit] decline email failed:", e?.message || e));
         return sendResponse(
           502,
           "error",
@@ -397,6 +409,16 @@ export async function action({ request }) {
       "[proxy/submit] NMI vault create failed:",
       vaultErr?.message || vaultErr,
     );
+    await notifyApplicationDeclined({
+      email: payload.email,
+      firstName: payload.firstName,
+      lastName: payload.lastName,
+      businessName: payload.businessName,
+      reason:
+        payload.payment?.method === "ach"
+          ? "We could not verify the bank account details provided."
+          : "We could not verify the card details provided.",
+    }).catch((e) => console.error("[proxy/submit] decline email failed:", e?.message || e));
     return sendResponse(
       502,
       "error",
@@ -408,6 +430,13 @@ export async function action({ request }) {
   }
   if (!nmiCustomerVaultId) {
     console.error("[proxy/submit] NMI returned no vault id");
+    await notifyApplicationDeclined({
+      email: payload.email,
+      firstName: payload.firstName,
+      lastName: payload.lastName,
+      businessName: payload.businessName,
+      reason: "We could not verify the payment details provided.",
+    }).catch((e) => console.error("[proxy/submit] decline email failed:", e?.message || e));
     return sendResponse(
       502,
       "error",
@@ -466,6 +495,15 @@ export async function action({ request }) {
     });
   }
 
+  // Application is persisted (NMI succeeded) — confirm receipt. Best-effort;
+  // never blocks the rest of registration.
+  await notifyApplicationSubmitted({
+    email: payload.email,
+    firstName: payload.firstName,
+    lastName: payload.lastName,
+    businessName: payload.businessName,
+  }).catch((e) => console.error("[proxy/submit] submitted email failed:", e?.message || e));
+
   // Step 3 — Shopify customer + approval invite. Failure here is non-fatal:
   // the doc is flagged with shopifyCreateFailed so an admin can retry. The
   // applicant's NMI vault and application are already safely persisted.
@@ -496,6 +534,14 @@ export async function action({ request }) {
         },
       },
     );
+
+    // Best-effort — never blocks approval on an SMTP hiccup.
+    await notifyApplicationApproved({
+      email: payload.email,
+      firstName: payload.firstName,
+      lastName: payload.lastName,
+      businessName: payload.businessName,
+    }).catch((e) => console.error("[proxy/submit] approved email failed:", e?.message || e));
 
     // CDO Phase 1 — auto-generate a practitioner referral code for this
     // newly-approved practitioner. Failure here is log-only by design:
