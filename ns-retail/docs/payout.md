@@ -469,6 +469,10 @@ On settle/return, `finalizeSettledPayout` / the return branch also call `reflect
 
 > **Still to lock before real go-live** (see Commission.md §9): choose + contract a real provider, bank-account ownership verification (micro-deposit/Plaid), encrypt/tokenize stored account numbers, funding-balance pre-check + payout caps, 1099/W-9 enforcement, and the NACHA originator agreement.
 
+### 8.5 Commission Payout Processed email notification
+
+Once a payout reaches its terminal `paid` state — via ACH settlement (`finalizeSettledPayout`) or a manually-issued check (`markCheckPayoutPaid`) — `notifyCommissionPayoutProcessed` (`app/services/notifications/payoutNotification.service.js`) emails the practitioner (amount, method, reference, date), with the admin address (`CDO_ADMIN_EMAIL`) CC'd. Sent via the same reusable SMTP utility as the wholesale workspace (`app/services/email/email.service.js`, ported for consistency — same nodemailer transport, retry, and `{success, messageId}`/`{success:false, error}` return shape). Best-effort — fired after `payout.save()`, never throws into the settlement/check-issue path.
+
 ---
 
 ## 9. Database Design
@@ -1200,4 +1204,10 @@ CDO_PAYOUT_PROVIDER=sandbox|dwolla          # default "sandbox" (in-process simu
 DWOLLA_ENVIRONMENT=sandbox|production       # required when CDO_PAYOUT_PROVIDER=dwolla
 DWOLLA_KEY=                  DWOLLA_SECRET=
 DWOLLA_FUNDING_SOURCE=                      # business funding source (URL or id)
+
+# ── SMTP email notifications (§8.5) ──
+SMTP_HOST=            SMTP_PORT=587          SMTP_SECURE=false
+SMTP_USER=            SMTP_PASSWORD=
+SMTP_FROM_NAME=Natural Solutions   SMTP_FROM_EMAIL=   SMTP_REPLY_TO=
+CDO_ADMIN_EMAIL=                            # CC'd on the Commission Payout Processed email
 ```

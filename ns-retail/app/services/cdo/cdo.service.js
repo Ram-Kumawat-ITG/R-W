@@ -46,6 +46,7 @@ import {
 import { schedulerConfig } from "../scheduler/scheduler.config";
 import { payoutConfig } from "../payout/payout.config";
 import { getPayoutProvider } from "../payout/provider";
+import { notifyCommissionPayoutProcessed } from "../notifications/payoutNotification.service";
 import { createLogger } from "../../utils/logger.utils";
 import {
   deriveShippingStatus,
@@ -584,6 +585,16 @@ export async function markCheckPayoutPaid(payoutId, { checkNumber, checkDate, no
     source: "admin",
   });
   await payout.save();
+
+  notifyCommissionPayoutProcessed({
+    email: payout.practitionerEmail,
+    practitionerName: payout.practitionerName,
+    amount: payout.amount,
+    currency: payout.currency,
+    method: payout.method,
+    reference: payout.reference,
+    paidAt: payout.paidAt,
+  }).catch((e) => log.error("payout.notification_failed", { err: e?.message || e }));
 
   // Settle the linked commissions (same fields as ACH finalizeSettledPayout)
   await CdoCommission.updateMany(
@@ -3234,6 +3245,16 @@ async function finalizeSettledPayout(payout, { actor, source } = {}) {
   payout.status = "paid";
   payout.paidAt = settledAt;
   await payout.save();
+
+  notifyCommissionPayoutProcessed({
+    email: payout.practitionerEmail,
+    practitionerName: payout.practitionerName,
+    amount: payout.amount,
+    currency: payout.currency,
+    method: payout.method,
+    reference: payout.reference,
+    paidAt: payout.paidAt,
+  }).catch((e) => log.error("payout.notification_failed", { err: e?.message || e }));
 
   // Reflect the settled outcome back onto the batch snapshot(s) that processed
   // this payout (run-time items were recorded as "processing" because ACH is
