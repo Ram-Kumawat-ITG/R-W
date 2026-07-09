@@ -46,7 +46,11 @@ import {
 import { schedulerConfig } from "../scheduler/scheduler.config";
 import { payoutConfig } from "../payout/payout.config";
 import { getPayoutProvider } from "../payout/provider";
-import { notifyCommissionPayoutProcessed } from "../notifications/payoutNotification.service";
+import {
+  notifyCommissionPayoutProcessed,
+  notifyCommissionPayoutFailed,
+  notifyPayoutBatchSummary,
+} from "../notifications/payoutNotification.service";
 import { createLogger } from "../../utils/logger.utils";
 import {
   deriveShippingStatus,
@@ -4393,6 +4397,16 @@ async function alertPayoutFailure(payout, err) {
     reference: payout?.reference,
     error: message,
   });
+  notifyCommissionPayoutFailed({
+    email: payout?.practitionerEmail,
+    practitionerName: payout?.practitionerName,
+    amount: payout?.amount,
+    currency: payout?.currency,
+    reference: payout?.reference,
+    reason: message,
+    returnCode: payout?.returnCode,
+    failedAt: new Date(),
+  }).catch((e) => log.error("payout.notification_failed", { err: e?.message || e }));
   const url = schedulerConfig.alertWebhookUrl;
   if (!url) return;
   try {
@@ -4529,6 +4543,48 @@ async function buildPractitionerPayoutRollup(payoutIds) {
   }));
 }
 
+// Row set for the Commission Payout Batch Summary email — richer than
+// buildPractitionerPayoutRollup (which feeds the persisted, strict-schema
+// batch.practitionerPayouts) since the email also wants a processed
+// timestamp + the most specific reference id available per payout.
+async function buildBatchSummaryRows(payoutIds) {
+  if (!payoutIds || !payoutIds.length) return [];
+  const payouts = await CdoPayout.find({ _id: { $in: payoutIds } }).lean();
+  return payouts.map((p) => ({
+    practitionerName: p.practitionerName,
+    practitionerEmail: p.practitionerEmail,
+    totalAmount: p.amount || 0,
+    currency: p.currency,
+    commissionCount: (p.commissionIds || []).length,
+    status: p.status,
+    txnRef: p.providerTransferId || p.qboBillPaymentId || p.qboBillId || null,
+    processedAt: p.paidAt || p.transferInitiatedAt || p.updatedAt || null,
+  }));
+}
+
+async function sendPayoutBatchSummaryEmail(batch) {
+  try {
+    const rows = await buildBatchSummaryRows(batch.payoutIds);
+    await notifyPayoutBatchSummary({
+      reference: batch.reference,
+      status: batch.status,
+      startedAt: batch.startedAt,
+      completedAt: batch.completedAt,
+      totalPractitioners: rows.length,
+      totalAmount: rows.reduce((s, r) => s + (Number(r.totalAmount) || 0), 0),
+      paidCount: rows.filter((r) => r.status === "paid").length,
+      failedCount: rows.filter((r) => r.status === "failed").length,
+      skippedCount: batch.skippedCount,
+      rows,
+    });
+  } catch (err) {
+    log.error("payout.batch_summary_notification_failed", {
+      batchId: String(batch?._id),
+      err: err?.message || String(err),
+    });
+  }
+}
+
 function finalizeBatchCounts(batch, items) {
   batch.items = items;
   batch.totalCommissions = items.length;
@@ -4610,6 +4666,7 @@ export async function runAutomatedPayouts({ shop, periodEnd, mode = "cron", trig
       summary.skipped = build.skipped.length;
       summary.awaitingApproval = build.created.length;
       log.info("automated_payouts.awaiting_approval", { ...summary });
+      await sendPayoutBatchSummaryEmail(batch);
       return summary;
     }
 
@@ -4672,10 +4729,12 @@ export async function runAutomatedPayouts({ shop, periodEnd, mode = "cron", trig
     batch.completedAt = new Date();
     await batch.save().catch(() => {});
     log.error("automated_payouts.failed", { batchId: String(batch._id), err: wholeErr });
+    await sendPayoutBatchSummaryEmail(batch);
     throw wholeErr;
   }
 
   log.info("automated_payouts.run", { ...summary });
+  await sendPayoutBatchSummaryEmail(batch);
   return summary;
 }
 

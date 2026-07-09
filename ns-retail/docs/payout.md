@@ -469,9 +469,13 @@ On settle/return, `finalizeSettledPayout` / the return branch also call `reflect
 
 > **Still to lock before real go-live** (see Commission.md §9): choose + contract a real provider, bank-account ownership verification (micro-deposit/Plaid), encrypt/tokenize stored account numbers, funding-balance pre-check + payout caps, 1099/W-9 enforcement, and the NACHA originator agreement.
 
-### 8.5 Commission Payout Processed email notification
+### 8.5 Payout email notifications
 
-Once a payout reaches its terminal `paid` state — via ACH settlement (`finalizeSettledPayout`) or a manually-issued check (`markCheckPayoutPaid`) — `notifyCommissionPayoutProcessed` (`app/services/notifications/payoutNotification.service.js`) emails the practitioner (amount, method, reference, date), with the admin address (`CDO_ADMIN_EMAIL`) CC'd. Sent via the same reusable SMTP utility as the wholesale workspace (`app/services/email/email.service.js`, ported for consistency — same nodemailer transport, retry, and `{success, messageId}`/`{success:false, error}` return shape). Best-effort — fired after `payout.save()`, never throws into the settlement/check-issue path.
+All three payout emails below live in `app/services/notifications/payoutNotification.{config,service}.js` and share the reusable SMTP utility (`app/services/email/email.service.js`, ported from the wholesale workspace for consistency — same nodemailer transport, retry, and `{success, messageId}`/`{success:false, error}` return shape). All sends are best-effort (fire-and-forget with a caught+logged rejection) — a notification failure never surfaces as a payout-processing failure.
+
+- **Commission Payout Processed** — once a payout reaches its terminal `paid` state, via ACH settlement (`finalizeSettledPayout`) or a manually-issued check (`markCheckPayoutPaid`). `notifyCommissionPayoutProcessed` emails the practitioner (amount, method, reference, date), admin (`CDO_ADMIN_EMAIL`) CC'd.
+- **Commission Payout Failed** — fired from `alertPayoutFailure`, the single choke point every payout-failure path already runs through (banking validation failures in `executeApprovedPayout`, QBO/execution errors, ACH returns in `checkPayoutSettlement`). `notifyCommissionPayoutFailed` emails the practitioner with the failure reason + return code + reference, admin CC'd, plus a note that the reserved commission will auto-retry on the next batch run.
+- **Commission Payout Batch Summary** — admin-only, fired once per `runAutomatedPayouts` run (awaiting-approval, completed, completed-with-errors, or whole-run crash) via `sendPayoutBatchSummaryEmail`/`notifyPayoutBatchSummary`. Contains a per-practitioner HTML table (name, email, total commission amount, order/commission count, payout status, transaction/reference id, processed date+time), sourced fresh from `CdoPayout` via `buildBatchSummaryRows(batch.payoutIds)` rather than the batch's persisted (narrower, strict-schema) `practitionerPayouts` field.
 
 ---
 
