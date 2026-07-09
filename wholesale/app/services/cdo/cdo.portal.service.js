@@ -34,6 +34,11 @@ import CdoCommission from "../../models/cdoCommission.server";
 import CdoPayout from "../../models/cdoPayout.server";
 import CdoReferral from "../../models/cdoReferral.server";
 import { createRetailDiscount, setRetailDiscountActive } from "./cdo.service";
+import {
+  notifyReferralCodeCreated,
+  notifyReferralCodePaused,
+  notifyReferralCodeResumed,
+} from "../notifications/referralCodeNotification.service";
 
 // Revenue expression shared by aggregations: prefer pricing.total, fall
 // back to the flat `amount`, then 0. ns-retail writes both on most docs.
@@ -928,6 +933,16 @@ export async function createReferralCode(
 
   const row = shapeCodeRow(created);
   row.otherActiveCodes = otherActive.map((c) => shapeCodeRow(c));
+
+  // Best-effort — never blocks the already-created code on an SMTP hiccup.
+  await notifyReferralCodeCreated({
+    email: application?.email,
+    practitionerName: fullName,
+    code: raw,
+    discountPercent: fraction,
+    referralUrl: row.referralUrl,
+  }).catch((e) => log.error("create_referral.notification_failed", { err: e?.message || e }));
+
   return row;
 }
 
@@ -1002,5 +1017,15 @@ export async function setReferralCodeStatus(practitionerId, { codeId, status } =
   doc.updatedBy = "portal-self-service";
   await doc.save();
   log.info("set_status.ok", { practitionerId, codeId: String(doc._id), status });
+
+  // Best-effort — never blocks the already-applied status change.
+  const notify = status === "active" ? notifyReferralCodeResumed : notifyReferralCodePaused;
+  await notify({
+    email: doc.practitionerEmail,
+    practitionerName: doc.practitionerName,
+    code: doc.code,
+    discountPercent: doc.discountPercent,
+  }).catch((e) => log.error("set_status.notification_failed", { err: e?.message || e }));
+
   return shapeCodeRow(doc);
 }
