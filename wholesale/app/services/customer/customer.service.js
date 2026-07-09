@@ -13,6 +13,7 @@ import {
   normalizePaymentMethod,
 } from './customer.utils'
 import { createLogger } from '../../utils/logger.utils'
+import { notifyQboCustomerSyncFailed } from '../notifications/qboAlertNotification.service'
 
 const log = createLogger('customer.service')
 
@@ -88,7 +89,19 @@ export async function ensureCustomerForOrder({ shop, order }) {
 
   // QBO side
   if (!mapping.qboCustomerId) {
-    const { customer } = await findOrCreateQboCustomer(profile)
+    let customer
+    try {
+      ;({ customer } = await findOrCreateQboCustomer(profile))
+    } catch (err) {
+      await notifyQboCustomerSyncFailed({
+        shop,
+        email: profile.email,
+        businessName: profile.companyName,
+        shopifyOrderId: order?.id,
+        error: err,
+      }).catch((e) => log.error('qbo_sync_alert.failed', { err: e?.message || e }))
+      throw err
+    }
     mapping.qboCustomerId = customer.Id
     log.info('qbo.linked', { email: profile.email, qboCustomerId: customer.Id })
   } else {
@@ -256,7 +269,19 @@ export async function ensureDropshipCustomerMap({ shop, order }) {
   )
 
   if (!mapping.qboCustomerId) {
-    const { customer } = await findOrCreateQboCustomer(profile)
+    let customer
+    try {
+      ;({ customer } = await findOrCreateQboCustomer(profile))
+    } catch (err) {
+      await notifyQboCustomerSyncFailed({
+        shop,
+        email: profile.email,
+        businessName: profile.companyName,
+        shopifyOrderId: order?.id,
+        error: err,
+      }).catch((e) => log.error('qbo_sync_alert.failed', { err: e?.message || e }))
+      throw err
+    }
     mapping.qboCustomerId = customer.Id
     log.info('dropship.qbo.linked', { email: profile.email, qboCustomerId: customer.Id })
     console.log(`[customers] drop-ship QBO customer linked Id=${customer.Id}`)

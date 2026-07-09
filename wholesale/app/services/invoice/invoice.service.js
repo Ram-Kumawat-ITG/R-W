@@ -28,6 +28,7 @@ import {
   markShopifyOrderPaid,
   recordOrderTransaction as recordShopifyOrderTransaction,
 } from '../shopify/shopify.service'
+import { notifyQboInvoiceCreationFailed } from '../notifications/qboAlertNotification.service'
 import { paymentConfig } from '../payment/payment.config'
 import { invoiceConfig, resolveInvoiceDueDate } from './invoice.config'
 import {
@@ -194,6 +195,16 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
     invoice.qboCreationError = qboErr.message
     await invoice.save()
     log.error('create.qbo_failed', { invoiceId: invoice._id.toString(), shopifyOrderId, err: qboErr })
+    // Permanent, admin-actionable failure — no automatic retry ever
+    // revisits a 'failed' invoice, so this is the only signal an admin
+    // gets short of noticing an unbilled order.
+    await notifyQboInvoiceCreationFailed({
+      shop,
+      shopifyOrderId,
+      orderName: order?.name,
+      customerEmail: order?.email || order?.contact_email,
+      error: qboErr,
+    }).catch((e) => log.error('create.qbo_failed_alert_failed', { err: e?.message || e }))
     throw qboErr
   }
 
