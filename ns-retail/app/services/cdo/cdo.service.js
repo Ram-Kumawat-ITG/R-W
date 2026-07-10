@@ -20,6 +20,8 @@
 // mapping — see validateReferralCode() / buildReferralSnapshot() below.
 
 import mongoose from "mongoose";
+import cronParser from "cron-parser";
+import humanInterval from "human-interval";
 import connectDB from "../../db/mongo.server";
 import WholesaleApplication from "../../models/wholesaleApplication.server";
 import CdoApplication from "../../models/cdoApplication.server";
@@ -1225,49 +1227,64 @@ export async function getDashboardMetrics() {
   };
 }
 
-// Convert a wall-clock time in a named IANA timezone to a UTC Date.
-// Uses Intl.DateTimeFormat to resolve the UTC offset at the target moment
-// so the result is correct across DST transitions (Node 20+ / V8 full ICU).
-function zonedToUtc(year, month, day, hour, minute, tz) {
-  const naive = new Date(Date.UTC(year, month, day, hour, minute, 0));
-  const fmt = new Intl.DateTimeFormat('en-US', {
-    timeZone: tz, hour12: false,
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-  });
-  const get = (parts, type) =>
-    parseInt(parts.find((p) => p.type === type)?.value ?? '0', 10);
-  const parts = fmt.formatToParts(naive);
-  const h = get(parts, 'hour');
-  const tzUtcMs = Date.UTC(
-    get(parts, 'year'), get(parts, 'month') - 1, get(parts, 'day'),
-    h === 24 ? 0 : h, get(parts, 'minute'), get(parts, 'second')
-  );
-  return new Date(naive.getTime() + (naive.getTime() - tzUtcMs));
+// Job name registered by scheduler/jobs/processCommissionPayouts.job.js
+// (PROCESS_COMMISSION_PAYOUTS_JOB) into the dedicated `cdo_agenda_jobs`
+// collection (see scheduler.service.js buildAgenda). Hardcoded rather than
+// imported to avoid a circular import — that job module imports
+// runAutomatedPayouts from THIS file.
+const PAYOUT_JOB_NAME = "process-commission-payouts";
+
+// The real Agenda job document's `nextRunAt` is the only EXACT source of
+// truth for when the payout job actually fires next — whether the scheduler
+// is on the production cron or the dev CDO_PAYOUT_INTERVAL override (Agenda
+// computes it directly from the interval + the job's last run, which we
+// can't reproduce from config alone). Returns null if the job hasn't been
+// registered on this process yet (e.g. CDO_SCHEDULER_DISABLED, or before the
+// first tick) so callers can fall back to a config-computed estimate.
+async function readScheduledPayoutJobNextRunAt() {
+  try {
+    await connectDB();
+    const doc = await mongoose.connection.db
+      .collection("cdo_agenda_jobs")
+      .find({ name: PAYOUT_JOB_NAME, nextRunAt: { $ne: null } })
+      .sort({ nextRunAt: 1 })
+      .limit(1)
+      .next();
+    return doc?.nextRunAt ? new Date(doc.nextRunAt) : null;
+  } catch (err) {
+    log.warn("payout.next_run_lookup_failed", { err: err?.message || String(err) });
+    return null;
+  }
 }
 
-// Next scheduled payout as an exact UTC Date, honouring CDO_PAYOUT_CRON and
-// CDO_PAYOUT_TZ. Parses the first three cron fields (minute hour day-of-month).
-function nextPayoutRunAt(from = new Date()) {
-  const cronParts = schedulerConfig.payoutCron.split(' ');
-  const cronMin  = parseInt(cronParts[0], 10); // 30
-  const cronHour = parseInt(cronParts[1], 10); // 0
-  const cronDay  = parseInt(cronParts[2], 10); // 25
-  const tz = schedulerConfig.scheduleTimezone;
-
-  for (let mo = 0; mo <= 2; mo++) {
-    const ref = new Date(from.getFullYear(), from.getMonth() + mo, 1);
-    const candidate = zonedToUtc(ref.getFullYear(), ref.getMonth(), cronDay, cronHour, cronMin, tz);
-    if (candidate > from) return candidate;
+// Config-computed ESTIMATE of the next payout run — used only when the real
+// Agenda job doc isn't available. Honours CDO_PAYOUT_INTERVAL (dev override —
+// "20 minutes", "30 seconds", etc., parsed the same way Agenda does) over the
+// FULL CDO_PAYOUT_CRON expression (all 5 fields) + CDO_PAYOUT_TZ in
+// production, via cron-parser — correct for any valid cron shape
+// (monthly-on-a-day, weekly-on-a-weekday, …) and across DST transitions.
+function estimateNextPayoutRunAt(from = new Date()) {
+  if (schedulerConfig.payoutIntervalOverride) {
+    return new Date(from.getTime() + humanInterval(schedulerConfig.payoutIntervalOverride));
   }
-  const ref = new Date(from.getFullYear(), from.getMonth() + 3, 1);
-  return zonedToUtc(ref.getFullYear(), ref.getMonth(), cronDay, cronHour, cronMin, tz);
+  const interval = cronParser.parseExpression(schedulerConfig.payoutCron, {
+    currentDate: from,
+    tz: schedulerConfig.scheduleTimezone,
+  });
+  return interval.next().toDate();
+}
+
+// Next scheduled payout as an exact UTC Date — see the two helpers above.
+async function nextPayoutRunAt(from = new Date()) {
+  const scheduled = await readScheduledPayoutJobNextRunAt();
+  if (scheduled && scheduled > from) return scheduled;
+  return estimateNextPayoutRunAt(from);
 }
 
 // Legacy helper — calendar date only (no time). Kept for the portal summary
 // and any other callers that don't need the exact run time.
-function nextPayoutDate(from = new Date()) {
-  const run = nextPayoutRunAt(from);
+async function nextPayoutDate(from = new Date()) {
+  const run = await nextPayoutRunAt(from);
   return new Date(run.getFullYear(), run.getMonth(), run.getDate());
 }
 
@@ -1282,7 +1299,21 @@ export async function getUpcomingPayouts({ shop } = {}) {
   const minAmount = Number(settings.minimumPayoutAmount) || 0;
 
   const eligible = await getEligibleCommissions({ periodEnd: new Date() });
-  const rows = shop ? eligible.filter((c) => c.shop === shop) : eligible;
+  // Same batch-level transfer ceiling buildPayoutBatch enforces (applied
+  // across ALL shops first, matching the real CRON run, THEN filtered to
+  // `shop` for display) — so this preview never promises more than the next
+  // actual run will include. Ceiling is ACH-only in the real run; this
+  // preview applies it to the whole eligible set as an approximation rather
+  // than resolving each practitioner's live payout method (an extra query
+  // pair per practitioner) just for a read-only estimate. That's exact for
+  // the common case — getEligibleCommissions already excludes explicit
+  // check-preferred practitioners from `eligible` here (no practitionerId
+  // passed) — and only slightly conservative for the rare edge case of an
+  // ACH-preferred practitioner whose banking currently happens to be
+  // invalid (their commissions would show as ceiling-capped here but
+  // actually go out in full as a check at real batch-build time).
+  const { included } = applyBatchCeiling(eligible);
+  const rows = shop ? included.filter((c) => c.shop === shop) : included;
 
   const groups = new Map();
   for (const c of rows) {
@@ -1306,9 +1337,9 @@ export async function getUpcomingPayouts({ shop } = {}) {
     .sort((a, b) => b.amount - a.amount);
   const belowMinimum = [...groups.values()].filter((g) => g.amount < minAmount);
 
-  const payoutRun = nextPayoutRunAt();
+  const payoutRun = await nextPayoutRunAt();
   return {
-    estimatedDate: nextPayoutDate(),
+    estimatedDate: new Date(payoutRun.getFullYear(), payoutRun.getMonth(), payoutRun.getDate()),
     payoutRunAt: payoutRun.toISOString(),
     minimumPayoutAmount: minAmount,
     totalAmount: roundMoney(breakdown.reduce((s, g) => s + g.amount, 0)),
@@ -1328,7 +1359,15 @@ export async function getUpcomingPayoutBatchDetails({ shop } = {}) {
   const minAmount = Number(settings.minimumPayoutAmount) || 0;
 
   const eligible = await getEligibleCommissions({ periodEnd: new Date() });
-  const rows = shop ? eligible.filter((c) => c.shop === shop) : eligible;
+  // Same batch-level transfer ceiling buildPayoutBatch enforces (applied
+  // across ALL shops first, matching the real CRON run, THEN filtered to
+  // `shop` for display) — so this preview never promises more than the next
+  // actual run will include. Ceiling is ACH-only in the real run; see the
+  // matching comment in getUpcomingPayouts for why this preview applies it
+  // to the whole eligible set as a close approximation instead of resolving
+  // each practitioner's live payout method.
+  const { included, deferred, ceiling } = applyBatchCeiling(eligible);
+  const rows = shop ? included.filter((c) => c.shop === shop) : included;
 
   // Batch-fetch all linked orders in one query to avoid N+1
   const orderIds = rows.map((c) => c.orderId).filter(Boolean);
@@ -1382,10 +1421,10 @@ export async function getUpcomingPayoutBatchDetails({ shop } = {}) {
     .sort((a, b) => b.amount - a.amount);
   const belowMinimum = [...groups.values()].filter((g) => g.amount < minAmount);
 
-  const payoutRun = nextPayoutRunAt();
+  const payoutRun = await nextPayoutRunAt();
   return {
     payoutRunAt: payoutRun.toISOString(),
-    estimatedDate: nextPayoutDate(),
+    estimatedDate: new Date(payoutRun.getFullYear(), payoutRun.getMonth(), payoutRun.getDate()),
     minimumPayoutAmount: minAmount,
     totalAmount: roundMoney(breakdown.reduce((s, g) => s + g.amount, 0)),
     totalSalesValue: roundMoney(breakdown.reduce((s, g) => s + g.salesTotal, 0)),
@@ -1394,6 +1433,9 @@ export async function getUpcomingPayoutBatchDetails({ shop } = {}) {
     commissionCount: breakdown.reduce((s, g) => s + g.commissionCount, 0),
     breakdown,
     belowMinimumCount: belowMinimum.length,
+    maxTransferAmount: ceiling,
+    deferredByCeilingCount: deferred.length,
+    deferredByCeilingTotal: roundMoney(deferred.reduce((s, c) => s + (Number(c.amount) || 0), 0)),
   };
 }
 
@@ -2290,7 +2332,7 @@ export async function getPractitionerKpis(practitionerId, { dateFrom, dateTo } =
     // ── Payout cadence ──
     lastPayoutDate: lastPaidPayout?.paidAt || null,
     upcomingPayoutAmount,
-    nextPayoutDate: nextPayoutDate(),
+    nextPayoutDate: await nextPayoutDate(),
     minimumPayoutAmount: minAmount,
   };
 }
@@ -2788,12 +2830,77 @@ export async function getEligibleCommissions({ practitionerId, periodEnd } = {})
   return CdoCommission.find(filter).sort({ earnedAt: 1 }).lean();
 }
 
+// Resolve which rail a practitioner's payout will disburse through — ACH or
+// check — using the exact preference + banking-probe logic buildPayoutBatch
+// applies when actually creating the payout. Extracted so any caller that
+// needs to know the eventual method WITHOUT creating anything (namely the
+// ceiling ACH/check partition just below) stays in lockstep with what a real
+// run does. Does NOT decide the "check-preferred, CRON full-batch mode skips
+// entirely" rule — that depends on whether a practitionerId was passed, which
+// callers still handle themselves.
+async function resolvePayoutMethod(pid) {
+  const practitionerApp = await WholesaleApplication.findById(pid).select("commission").lean();
+  if (practitionerApp?.commission?.payoutMethod === "check") {
+    return { payoutMethod: "check", bankingError: null, prefersCheck: true };
+  }
+  const bankingProbe = await resolvePractitionerBanking(pid);
+  const payoutMethod = bankingProbe.ok ? "ach" : "check";
+  const bankingError = payoutMethod === "check" ? bankingProbe.errors.join("; ") : null;
+  return { payoutMethod, bankingError, prefersCheck: false };
+}
+
+// ── Safety guard — batch transfer ceiling (commission-level, hard stop) ──
+// Walks `commissions` (must already be oldest-first, i.e. earnedAt-ascending)
+// accumulating a running total capped at payoutConfig.maxTransferAmount. The
+// FIRST commission that would push the running total past the ceiling stops
+// inclusion outright — every commission from that point on is deferred
+// whole, not just trimmed to fit. Deferred commissions are returned
+// untouched (not reserved, not modified) so the caller can leave them fully
+// alone for the next run to pick up.
+//
+// CDO_PAYOUT_MAX_TRANSFER_AMOUNT is a wire-transfer safety guard (the "$10
+// meant to move, $10,000 actually attempted" scenario) — it applies ONLY to
+// ACH/bank-transfer payouts. A check is reviewed, signed, and mailed by a
+// human before any money moves, so there's no automated-runaway-transfer risk
+// to guard against; callers MUST pass only ACH-bound commissions here
+// (see buildPayoutBatch's Pass 2, which partitions by resolvePayoutMethod
+// before calling this).
+function applyBatchCeiling(commissions) {
+  const ceiling = payoutConfig.maxTransferAmount;
+  let includedTotal = 0;
+  let cutoffIndex = commissions.length;
+  for (let i = 0; i < commissions.length; i += 1) {
+    const amt = Number(commissions[i].amount) || 0;
+    if (roundMoney(includedTotal + amt) > ceiling) {
+      cutoffIndex = i;
+      break;
+    }
+    includedTotal = roundMoney(includedTotal + amt);
+  }
+  return {
+    included: commissions.slice(0, cutoffIndex),
+    deferred: commissions.slice(cutoffIndex),
+    includedTotal,
+    ceiling,
+  };
+}
+
 // ── Phase 3: payout batch + approval workflow ────────────────────────
 
 // Aggregate eligible commissions per practitioner into awaiting_approval
 // payouts. Reserves the commissions (sets payoutId) so a second run won't
-// double-batch them. Skips practitioners below the minimum payout amount
-// or who already have an open payout for the period.
+// double-batch them. Skips practitioners below the minimum payout amount or
+// who already have an open payout for the period.
+//
+// payoutConfig.maxTransferAmount (CDO_PAYOUT_MAX_TRANSFER_AMOUNT) applies
+// ONLY to ACH-bound commissions (see applyBatchCeiling's docs) — check
+// payouts are never limited by it. Since a group's eventual method (ACH vs
+// check) depends on the practitioner's preference + a live banking probe,
+// this runs in three passes: (1) gate + resolve method per practitioner
+// group, (2) apply the ceiling to the ACH-bound commissions only, (3) create
+// payouts. ACH commissions past the ceiling never even reach payout creation
+// — they're left completely unreserved so they're picked up whole by the
+// next buildPayoutBatch run.
 export async function buildPayoutBatch({ periodStart, periodEnd, practitionerId, actor, onlyCommissionIds } = {}) {
   await connectDB();
   const settings = await getSettings();
@@ -2813,7 +2920,8 @@ export async function buildPayoutBatch({ periodStart, periodEnd, practitionerId,
     eligible = eligible.filter((c) => selectedSet.has(String(c._id)));
   }
 
-  // Group by practitioner.
+  // Group by practitioner (still earnedAt-ascending within each group, since
+  // `eligible` preserves getEligibleCommissions' sort).
   const groups = new Map();
   for (const c of eligible) {
     const key = c.practitionerId;
@@ -2824,6 +2932,13 @@ export async function buildPayoutBatch({ periodStart, periodEnd, practitionerId,
 
   const created = [];
   const skipped = [];
+
+  // ── Pass 1 — per-practitioner gating + payout-method resolution ──
+  // Decide which groups are batchable this run at all (minimum threshold, no
+  // already-open payout, not check-preferred-skip in CRON mode) and, for the
+  // ones that are, which rail they'll disburse through. Done BEFORE the
+  // ceiling so the ceiling (Pass 2) can be scoped to ACH only.
+  const groupInfo = new Map(); // pid -> { commissions, payoutMethod, bankingError }
   for (const [pid, commissions] of groups.entries()) {
     const total = roundMoney(commissions.reduce((s, c) => s + (Number(c.amount) || 0), 0));
     // Skip minimum check when admin explicitly selected specific commissions.
@@ -2844,30 +2959,10 @@ export async function buildPayoutBatch({ periodStart, periodEnd, practitionerId,
       continue;
     }
 
-    const first = commissions[0];
-    const reference = `CDO-${periodEndDate.toISOString().slice(0, 7).replace("-", "")}-${String(pid).slice(-6)}`;
-
-    // Determine payout method.
-    //
-    // Priority 1 — check the practitioner's preferred payout method and
-    // the admin CRON-override flag from cdo_practitioner_holds.
-    //
-    //   • payoutMethod === 'check' AND no cronOverride:
-    //       FULL-BATCH (CRON) call  → skip entirely. Commissions stay in the
-    //         approved pool untouched; the admin processes them manually via
-    //         the Check Payout queue (generate-payout action).
-    //       SINGLE-PRACTITIONER (admin UI) call → create a check payout so
-    //         the admin can record the physical cheque details.
-    //
-    //   • payoutMethod === 'ach' / unset, OR cronOverride is active:
-    //       Fall through to the ACH banking probe as before. If banking is
-    //       invalid the payout still lands in the check queue (bankingError set).
-    //
     // `practitionerId` being passed distinguishes the two call sites:
     //   - CRON: buildPayoutBatch({ periodEnd, actor: 'system' })  → no pid
     //   - Admin: buildPayoutBatch({ practitionerId, actor })      → pid set
-    const practitionerApp = await WholesaleApplication.findById(pid).select("commission").lean();
-    const prefersCheck = practitionerApp?.commission?.payoutMethod === "check";
+    const { payoutMethod, bankingError, prefersCheck } = await resolvePayoutMethod(pid);
 
     if (prefersCheck && !practitionerId) {
       // CRON full-batch mode: skip check-preferred practitioners completely.
@@ -2877,22 +2972,82 @@ export async function buildPayoutBatch({ periodStart, periodEnd, practitionerId,
       continue;
     }
 
-    let payoutMethod, bankingError, batchRemark;
-    if (prefersCheck) {
-      // Admin-triggered single-practitioner path: create the check payout.
-      payoutMethod = "check";
-      bankingError = null;
-      batchRemark = `Batched ${commissions.length} commission(s) totalling ${total} — CHECK payout (practitioner prefers check)`;
-    } else {
-      // ACH path: probe banking; invalid banking falls back to check.
-      const bankingProbe = await resolvePractitionerBanking(pid);
-      payoutMethod = bankingProbe.ok ? "ach" : "check";
-      bankingError = payoutMethod === "check" ? bankingProbe.errors.join("; ") : null;
-      batchRemark =
-        payoutMethod === "check"
-          ? `Batched ${commissions.length} commission(s) totalling ${total} — CHECK payout (no valid ACH banking: ${bankingProbe.errors.join("; ")})`
-          : `Batched ${commissions.length} commission(s) totalling ${total}`;
+    groupInfo.set(pid, { commissions, payoutMethod, bankingError });
+  }
+
+  // ── Pass 2 — batch transfer ceiling (ACH only) ──
+  // Flatten every ACH-bound group's commissions, re-sort by earnedAt (group
+  // order isn't guaranteed to match the original global chronological order),
+  // and run the same hard-stop ceiling cutoff over just that subset. Check
+  // groups are entirely unaffected regardless of amount.
+  const achCommissions = [];
+  for (const info of groupInfo.values()) {
+    if (info.payoutMethod === "ach") achCommissions.push(...info.commissions);
+  }
+  achCommissions.sort((a, b) => new Date(a.earnedAt) - new Date(b.earnedAt));
+  const ceilingResult = applyBatchCeiling(achCommissions);
+  const deferredIds = new Set(ceilingResult.deferred.map((c) => String(c._id)));
+
+  if (ceilingResult.deferred.length) {
+    log.warn("payout.batch_ceiling_reached", {
+      includedTotal: ceilingResult.includedTotal,
+      ceiling: ceilingResult.ceiling,
+      deferredCount: ceilingResult.deferred.length,
+      deferredTotal: roundMoney(
+        ceilingResult.deferred.reduce((s, c) => s + (Number(c.amount) || 0), 0),
+      ),
+      periodEnd: periodEndDate,
+    });
+  }
+
+  // Surface the ceiling-deferred commissions in `skipped` too (grouped by
+  // practitioner, for the same admin-facing reporting the other skip
+  // reasons get).
+  const deferredByPractitioner = new Map();
+  for (const c of ceilingResult.deferred) {
+    const key = c.practitionerId;
+    if (!key) continue;
+    if (!deferredByPractitioner.has(key)) {
+      deferredByPractitioner.set(key, { total: 0, commissionCount: 0 });
     }
+    const g = deferredByPractitioner.get(key);
+    g.total = roundMoney(g.total + (Number(c.amount) || 0));
+    g.commissionCount += 1;
+  }
+  for (const [pid, g] of deferredByPractitioner.entries()) {
+    skipped.push({
+      practitionerId: pid,
+      total: g.total,
+      commissionCount: g.commissionCount,
+      reason: "batch_ceiling_deferred",
+      ceiling: ceilingResult.ceiling,
+    });
+  }
+
+  // ── Pass 3 — create payouts ──
+  for (const [pid, info] of groupInfo.entries()) {
+    // ACH groups: only the commissions that survived the ceiling cutoff.
+    // Check groups: always the FULL group — checks are ceiling-exempt.
+    const commissions =
+      info.payoutMethod === "ach"
+        ? info.commissions.filter((c) => !deferredIds.has(String(c._id)))
+        : info.commissions;
+    if (commissions.length === 0) continue; // fully deferred by the ceiling this run
+
+    const total = roundMoney(commissions.reduce((s, c) => s + (Number(c.amount) || 0), 0));
+    const truncatedByCeiling = commissions.length < info.commissions.length;
+    const first = commissions[0];
+    const reference = `CDO-${periodEndDate.toISOString().slice(0, 7).replace("-", "")}-${String(pid).slice(-6)}`;
+
+    const batchRemark =
+      info.payoutMethod === "check"
+        ? info.bankingError
+          ? `Batched ${commissions.length} commission(s) totalling ${total} — CHECK payout (no valid ACH banking: ${info.bankingError})`
+          : `Batched ${commissions.length} commission(s) totalling ${total} — CHECK payout (practitioner prefers check)`
+        : `Batched ${commissions.length} commission(s) totalling ${total}` +
+          (truncatedByCeiling
+            ? ` (batch transfer ceiling reached — ${info.commissions.length - commissions.length} commission(s) deferred to next run)`
+            : "");
 
     const payout = new CdoPayout({
       shop: first.shop,
@@ -2902,13 +3057,13 @@ export async function buildPayoutBatch({ periodStart, periodEnd, practitionerId,
       practitionerName: first.practitionerName,
       currency: first.currency || settings.currency,
       amount: total,
-      method: payoutMethod,
+      method: info.payoutMethod,
       status: "awaiting_approval",
       commissionIds: commissions.map((c) => c._id),
       periodStart: periodStartDate,
       periodEnd: periodEndDate,
       reference,
-      bankingError,
+      bankingError: info.bankingError,
     });
     pushPayoutRemark(payout, {
       kind: "batch_created",
@@ -2927,7 +3082,14 @@ export async function buildPayoutBatch({ periodStart, periodEnd, practitionerId,
     created.push(payout.toObject());
   }
 
-  return { created, skipped, minAmount, periodEnd: periodEndDate };
+  return {
+    created,
+    skipped,
+    minAmount,
+    periodEnd: periodEndDate,
+    batchTotal: ceilingResult.includedTotal,
+    maxTransferAmount: ceilingResult.ceiling,
+  };
 }
 
 export async function approvePayout(payoutId, actor) {
@@ -3043,6 +3205,67 @@ export async function executeApprovedPayout(payoutId, { actor } = {}) {
     source: actor ? "admin" : "cron",
   });
   await payout.save();
+
+  // ── Safety guard — transaction size ceiling ──
+  // Runs immediately before any QBO write or real-money transfer. Two
+  // independent checks:
+  //   1) Reconciliation — payout.amount must match the LIVE sum of its
+  //      linked commissions (recomputed fresh, not trusted from the stored
+  //      field), catching data corruption / a stale amount. Applies to
+  //      EVERY payout regardless of method — it's a data-integrity check,
+  //      not a transfer-size guard.
+  //   2) Ceiling — payout.amount must not exceed payoutConfig.maxTransferAmount.
+  //      ACH ONLY: a check is reviewed, signed, and mailed by a human before
+  //      any money moves, so the automated-runaway-transfer risk this guards
+  //      against doesn't apply (mirrors the ACH-only scoping in
+  //      buildPayoutBatch/applyBatchCeiling).
+  // Either violation throws before entering the try block below, so no QBO
+  // Vendor/Bill is created and no transfer is initiated; the caller's own
+  // catch (in the batch path) records the failure + fires the existing
+  // admin+practitioner alert via alertPayoutFailure.
+  {
+    const liveCommissions = await CdoCommission.find({ _id: { $in: payout.commissionIds } })
+      .select("amount")
+      .lean();
+    const expectedAmount = roundMoney(
+      liveCommissions.reduce((s, c) => s + (Number(c.amount) || 0), 0),
+    );
+    const actualAmount = roundMoney(payout.amount);
+
+    if (Math.abs(actualAmount - expectedAmount) > 0.01) {
+      const msg =
+        `Payout amount safety check failed: transfer amount ${actualAmount} does not match the ` +
+        `live sum of its ${liveCommissions.length} linked commission(s) (${expectedAmount}) — refusing ` +
+        `to disburse. This payout was NOT charged/transferred.`;
+      payout.status = "failed";
+      payout.lastError = msg;
+      pushPayoutRemark(payout, { kind: "failed", message: msg, actor, source: actor ? "admin" : "cron" });
+      await payout.save();
+      log.error("payout.amount_mismatch_blocked", {
+        payoutId: String(payout._id),
+        expectedAmount,
+        actualAmount,
+      });
+      throw new Error(msg);
+    }
+
+    if (payout.method === "ach" && actualAmount > payoutConfig.maxTransferAmount) {
+      const msg =
+        `Payout amount safety check failed: transfer amount ${actualAmount} exceeds the configured ` +
+        `ceiling of ${payoutConfig.maxTransferAmount} (CDO_PAYOUT_MAX_TRANSFER_AMOUNT) — refusing to ` +
+        `disburse. This payout was NOT charged/transferred.`;
+      payout.status = "failed";
+      payout.lastError = msg;
+      pushPayoutRemark(payout, { kind: "failed", message: msg, actor, source: actor ? "admin" : "cron" });
+      await payout.save();
+      log.error("payout.ceiling_exceeded_blocked", {
+        payoutId: String(payout._id),
+        actualAmount,
+        ceiling: payoutConfig.maxTransferAmount,
+      });
+      throw new Error(msg);
+    }
+  }
 
   try {
     // 1) Vendor (find-or-create, cached in cdo_qbo_vendors).
@@ -4681,8 +4904,18 @@ export async function runAutomatedPayouts({ shop, periodEnd, mode = "cron", trig
       for (let i = before; i < items.length; i += 1) batchedIds.add(String(items[i].commissionId));
     }
 
-    // Skipped = eligible candidates that were not reserved into a payout
-    // (below the minimum payout amount, or an open payout already exists).
+    // Skipped = eligible candidates that were not reserved into a payout —
+    // below the minimum payout amount, an open payout already exists, the
+    // practitioner prefers check payouts, or (new) the group was deferred by
+    // the batch-level transfer ceiling. Map each skip reason back to its
+    // practitioner so every commission's item carries the SPECIFIC reason
+    // rather than a generic bucket — this is what lets an admin tell "will
+    // auto-retry next run because the batch hit its ceiling" apart from
+    // "still below the minimum payout threshold."
+    const skipReasonByPractitioner = new Map();
+    for (const s of build.skipped) {
+      skipReasonByPractitioner.set(String(s.practitionerId), s.reason);
+    }
     const skippedIds = [...eligibleIds].filter((id) => !batchedIds.has(id));
     if (skippedIds.length) {
       const skipped = await CdoCommission.find({ _id: { $in: skippedIds } }).lean();
@@ -4699,7 +4932,8 @@ export async function runAutomatedPayouts({ shop, periodEnd, mode = "cron", trig
           amount: c.amount,
           status: "skipped",
           attempt: c.payoutAttemptCount || 0,
-          failureReason: "below_minimum_or_open_payout",
+          failureReason:
+            skipReasonByPractitioner.get(String(c.practitionerId)) || "below_minimum_or_open_payout",
         });
       }
     }

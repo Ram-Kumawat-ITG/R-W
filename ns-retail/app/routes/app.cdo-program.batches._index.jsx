@@ -173,7 +173,11 @@ function UpcomingPayoutSummary({ upcoming }) {
                   label="Scheduled Total"
                   value={formatCurrency(upcoming.totalAmount)}
                   tone={upcoming.totalAmount > 0 ? "success" : undefined}
-                  sublabel={`${formatNumber(upcoming.practitionerCount)} practitioner(s) · ${formatNumber(upcoming.commissionCount)} commission(s)`}
+                  sublabel={
+                    upcoming.deferredByCeilingCount > 0
+                      ? `Capped at ${formatCurrency(upcoming.maxTransferAmount)} transfer ceiling`
+                      : `${formatNumber(upcoming.practitionerCount)} practitioner(s) · ${formatNumber(upcoming.commissionCount)} commission(s)`
+                  }
                 />
                 <MetricCard
                   label="Total Sales Value"
@@ -192,6 +196,18 @@ function UpcomingPayoutSummary({ upcoming }) {
               </s-stack>
             </s-box>
           </s-stack>
+
+          {/* Batch transfer ceiling notice */}
+          {upcoming.deferredByCeilingCount > 0 && (
+            <s-box padding="base" background="bg-surface-secondary" border-radius="base">
+              <s-text tone="subdued">
+                This run is capped at the {formatCurrency(upcoming.maxTransferAmount)} transfer
+                ceiling (CDO_PAYOUT_MAX_TRANSFER_AMOUNT). {formatNumber(upcoming.deferredByCeilingCount)}{" "}
+                commission(s) totalling {formatCurrency(upcoming.deferredByCeilingTotal)} exceed the
+                ceiling and will carry forward automatically to the next payout run.
+              </s-text>
+            </s-box>
+          )}
 
           {/* Divider */}
           <div style={{ borderTop: "1px solid #e1e3e5" }} />

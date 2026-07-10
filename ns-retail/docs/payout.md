@@ -398,9 +398,41 @@ payout dimension — distinct from the accrual `status`.)
 
 Run flow inside a batch: snapshot eligible pool → `buildPayoutBatch` reserves the
 batched ones (→ **processing**, attempt++); eligible-but-unreserved (below-minimum
-/ open payout) → **skipped**; each payout `approve → execute` → its commissions
-**paid** (txnRef + payoutDate) or **failed** (failureReason). Counts + final
-status are written on completion.
+/ open payout / **batch_ceiling_deferred**) → **skipped**; each payout `approve →
+execute` → its commissions **paid** (txnRef + payoutDate) or **failed**
+(failureReason). Counts + final status are written on completion.
+
+**Batch transfer ceiling (ACH only)** — `payoutConfig.maxTransferAmount`
+(`CDO_PAYOUT_MAX_TRANSFER_AMOUNT`, default 2000) caps how much a single
+`buildPayoutBatch` run can wire-transfer, but **never applies to check
+payouts** — a human reviews, signs, and mails every check, so there's no
+automated-runaway-transfer risk to guard against. Since a group's eventual
+rail (ACH vs check) depends on the practitioner's preference plus a live
+banking probe, `buildPayoutBatch` resolves that method for every group
+FIRST, then runs a commission-level running total over ONLY the ACH-bound
+commissions (oldest-first, earnedAt ascending, re-sorted across groups). The
+first ACH commission that would push that total past the ceiling stops
+inclusion outright — it and every ACH commission after it are deferred
+(skipped with reason `batch_ceiling_deferred`, commissions left unreserved,
+no `payoutId`) — while check-bound groups are always batched in full
+regardless of amount. Deferred ACH commissions remain eligible and are
+automatically picked up by the next scheduled run, so a single automated run
+never wire-transfers more than the ceiling, and nothing is lost, only
+delayed. An ACH group whose own total already exceeds the ceiling is
+deferred every run until an admin intervenes (raise the ceiling, or have the
+practitioner switch to check). See also the per-payout ceiling check in
+`executeApprovedPayout` (§8), gated on `payout.method === "ach"`, which
+re-validates the same cap immediately before the transfer as
+defense-in-depth.
+
+The read-only upcoming-payout previews (`getUpcomingPayouts` /
+`getUpcomingPayoutBatchDetails`, driving this tab) approximate the same
+ceiling over the whole eligible set rather than resolving each
+practitioner's live payout method (an extra query pair per practitioner just
+for an estimate) — exact for the common case, since check-preferred
+practitioners are already excluded from eligibility at the query level here,
+and only slightly conservative for the rare edge case of an ACH-preferred
+practitioner whose banking currently happens to be invalid.
 
 **Reprocess** — `reprocessBatch(batchId)` spawns a fresh `manual_reprocess` batch
 that re-runs only the source batch's **failed** payouts via the resumable
@@ -423,6 +455,7 @@ QBO records the accounting; its `BillPayment` API does **not** move funds to a p
 ```
  approved ──(admin Execute)──▶ executeApprovedPayout
    │  banking gate (§6.5)
+   │  ceiling gate (§7 — reconciliation + CDO_PAYOUT_MAX_TRANSFER_AMOUNT)
    │  QBO Vendor + Bill            ← records the LIABILITY (we owe the commission)
    │  provider.initiateTransfer()  ← initiates the bank→bank ACH credit
    ▼
@@ -1218,7 +1251,7 @@ QBO_RETAIL_NOTIFY_ON_SHIP=true              # optional — re-send the invoice (
 QBO_RETAIL_RECORD_PAYMENT=true              # optional — record a QBO Payment when the Shopify order is paid (default on)
 
 # ── Payout scheduler (§7) ──
-# CDO_PAYOUT_CRON=30 0 25 * *               # optional — prod payout cron (defaults to 00:30 on the 25th)
+# CDO_PAYOUT_CRON=30 0 * * 1                # optional — prod payout cron (defaults to 00:30 every Monday)
 # CDO_PAYOUT_TZ=America/Los_Angeles         # optional — cron timezone (defaults to America/Los_Angeles)
 CDO_PAYOUT_INTERVAL=20 minutes              # DEV ONLY — overrides the payout cron; leave unset in prod
 CDO_SETTLEMENT_INTERVAL=1 minute            # DEV ONLY — overrides the 6-hourly settlement cron; leave unset in prod
@@ -1226,6 +1259,8 @@ CDO_SETTLEMENT_INTERVAL=1 minute            # DEV ONLY — overrides the 6-hourl
 # CDO_PAYOUT_ALERT_WEBHOOK_URL=             # optional — POSTed on a failed payout
 
 # ── Payout disbursement (§9) ──
+# CDO_PAYOUT_MAX_TRANSFER_AMOUNT=2000       # optional — safety-guard ceiling (default 2000); caps a single
+                                             # batch run's total AND each individual payout at execution
 CDO_PAYOUT_PROVIDER=sandbox|dwolla          # default "sandbox" (in-process simulator)
 # CDO_PAYOUT_REQUIRE_APPROVAL=false         # optional — gate real money behind manual approve+execute
 # CDO_PAYOUT_SANDBOX_SETTLE_SECONDS=60      # sandbox provider ONLY — seconds until a sim transfer settles

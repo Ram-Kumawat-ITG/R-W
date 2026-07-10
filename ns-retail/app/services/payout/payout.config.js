@@ -6,9 +6,37 @@
 // sandbox adapter's simulation knobs. All env reads go through readEnv (no
 // raw process.env outside config).
 
-import { readEnv, readBool, readInt } from "../../utils/env.utils";
+import { readEnv, readBool, readInt, readNumber } from "../../utils/env.utils";
 
 export const payoutConfig = {
+  // ── Safety guard — transaction size ceiling (ACH / bank-transfer ONLY) ──
+  // Never applies to check payouts — a human reviews, signs, and mails every
+  // check, so there's no automated-runaway-transfer risk to guard against.
+  // Used in two places against the same cap, both scoped to ACH-bound
+  // commissions/payouts:
+  //   1) Batch build (buildPayoutBatch) — resolves each practitioner group's
+  //      payout method FIRST (preference + live banking probe), then runs a
+  //      commission-level running total over ONLY the ACH-bound commissions
+  //      (oldest-first). The first commission that would push that total past
+  //      the ceiling stops inclusion outright — it and everything after it
+  //      are deferred (left unreserved, no payoutId set) and picked up
+  //      automatically by the next scheduled run. Check-bound groups are
+  //      created in full regardless of amount. An ACH group whose own total
+  //      alone exceeds the ceiling is deferred every run until an admin
+  //      intervenes (raise the ceiling, or have the practitioner switch to
+  //      check).
+  //   2) Execution (executeApprovedPayout) — a final per-payout check, gated
+  //      on `payout.method === "ach"`, right before the real bank→bank
+  //      transfer is initiated, as defense-in-depth against a payout amount
+  //      changing between batch build and execution. Blocks real-money edge
+  //      cases — e.g. a data bug or a corrupted `amount` field causing a
+  //      payout meant to be ~$10 to attempt to transfer $10,000 — by failing
+  //      the payout (no transfer attempted) and firing the existing
+  //      admin+practitioner failure alert.
+  // Tune to comfortably exceed your largest expected legitimate single ACH
+  // payout while still bounding how much money a single automated run can
+  // wire-transfer.
+  maxTransferAmount: readNumber("CDO_PAYOUT_MAX_TRANSFER_AMOUNT", 2000),
   // Disbursement provider that actually moves money bank→bank.
   //   "sandbox"          — in-process simulator (default; safe, no real money)
   //   "dwolla" | "stripe" | "modern_treasury" — real rails (adapter not yet
