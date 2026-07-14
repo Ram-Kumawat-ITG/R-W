@@ -1,6 +1,10 @@
 import IdMap from "./idMap.model";
 import { retailClient } from "./retailApi";
 import { resolveRetailLocationId } from "./sync.utils";
+import {
+  fetchRetailPricingMetafield,
+  resolveVariantPricing,
+} from "./retailPricing";
 import { createLogger } from "../../utils/logger.utils";
 
 const log = createLogger("sync.product");
@@ -8,11 +12,19 @@ const log = createLogger("sync.product");
 // Build the payload for a retail product create/update from the
 // wholesale webhook payload (Shopify REST format).
 //
-// `includePrice` defaults to FALSE — wholesale and retail have different
-// pricing tiers (retail = ~2× wholesale), so prices should NOT be synced
-// from wholesale to retail. Callers can opt-in with `{ includePrice: true }`
-// for the rare case where prices ARE intentionally mirrored.
-function buildRetailPayload(p, { includePrice = false } = {}) {
+// Pricing sources (checked in order per variant):
+//   1. `retailPricing` — the parsed `custom.retail_pricing` metafield on the
+//      wholesale product (fetched by `fetchRetailPricingMetafield`). This is
+//      the primary + intended source of retail prices, added 2026-07-14.
+//   2. `includePrice: true` — legacy escape hatch that copies wholesale
+//      prices to retail directly. Only used when explicitly requested;
+//      wholesale ≠ retail pricing tiers, so this is rarely correct.
+//   3. Neither → variant is created WITHOUT a price (Shopify defaults it to
+//      $0). Non-breaking: this matches the pre-2026-07-14 behavior.
+function buildRetailPayload(
+  p,
+  { includePrice = false, retailPricing = null } = {},
+) {
   return {
     product: {
       title: p.title,
@@ -22,20 +34,29 @@ function buildRetailPayload(p, { includePrice = false } = {}) {
       tags: p.tags,
       status: p.status,
       options: p.options?.map((o) => ({ name: o.name, values: o.values })),
-      variants: p.variants?.map((v) => ({
-        option1: v.option1,
-        option2: v.option2,
-        option3: v.option3,
-        ...(includePrice && {
-          price: v.price,
-          compare_at_price: v.compare_at_price,
-        }),
-        sku: v.sku,
-        taxable: v.taxable,
-        barcode: v.barcode,
-        inventory_management: "shopify",
-        inventory_policy: v.inventory_policy,
-      })),
+      variants: p.variants?.map((v) => {
+        const base = {
+          option1: v.option1,
+          option2: v.option2,
+          option3: v.option3,
+          sku: v.sku,
+          taxable: v.taxable,
+          barcode: v.barcode,
+          inventory_management: "shopify",
+          inventory_policy: v.inventory_policy,
+        };
+        const metafieldPricing = resolveVariantPricing(v, retailPricing);
+        if (metafieldPricing) {
+          base.price = metafieldPricing.price;
+          if (metafieldPricing.compareAtPrice) {
+            base.compare_at_price = metafieldPricing.compareAtPrice;
+          }
+        } else if (includePrice) {
+          base.price = v.price;
+          base.compare_at_price = v.compare_at_price;
+        }
+        return base;
+      }),
       images: p.images
         ?.filter((i) => i.src)
         .map((i) => ({ src: i.src, alt: i.alt || null })),
@@ -160,7 +181,7 @@ async function upsertVariantMappings(wholesaleVariants, retailVariants) {
   }
 }
 
-export async function syncProductCreate(wholesaleProduct) {
+export async function syncProductCreate(wholesaleProduct, { shop } = {}) {
   const wholesaleId = String(wholesaleProduct.id);
 
   const existing = await IdMap.findOne({ entityType: "product", wholesaleId });
@@ -169,12 +190,26 @@ export async function syncProductCreate(wholesaleProduct) {
       wholesaleId,
       retailId: existing.retailId,
     });
-    return syncProductUpdate(wholesaleProduct);
+    return syncProductUpdate(wholesaleProduct, { shop });
   }
+
+  // Fetch retail-price metafield from the wholesale product. Best-effort —
+  // missing/malformed metafield returns null and we sync without prices
+  // (pre-2026-07-14 behavior, non-breaking). `shop` is optional so any
+  // legacy/test caller that doesn't pass it still works.
+  const retailPricing = shop
+    ? await fetchRetailPricingMetafield({ shop, productId: wholesaleId })
+    : null;
+  log.info("product_create.retail_pricing", {
+    wholesaleId,
+    hasPricing: !!retailPricing,
+    topLevelPrice: retailPricing?.price ?? null,
+    perVariantCount: retailPricing?.variantsBySku?.size ?? 0,
+  });
 
   const data = await retailClient.post(
     "products.json",
-    buildRetailPayload(wholesaleProduct),
+    buildRetailPayload(wholesaleProduct, { retailPricing }),
   );
   const retailProduct = data?.product;
   if (!retailProduct?.id) {
@@ -205,7 +240,7 @@ export async function syncProductCreate(wholesaleProduct) {
   return retailProduct;
 }
 
-export async function syncProductUpdate(wholesaleProduct) {
+export async function syncProductUpdate(wholesaleProduct, { shop } = {}) {
   const wholesaleId = String(wholesaleProduct.id);
 
   const mapping = await IdMap.findOne({ entityType: "product", wholesaleId });
@@ -214,10 +249,22 @@ export async function syncProductUpdate(wholesaleProduct) {
     return;
   }
 
+  // Re-fetch the retail-price metafield on every update — the merchant may
+  // have edited it. Missing → null → sync without prices (unchanged).
+  const retailPricing = shop
+    ? await fetchRetailPricingMetafield({ shop, productId: wholesaleId })
+    : null;
+  log.info("product_update.retail_pricing", {
+    wholesaleId,
+    hasPricing: !!retailPricing,
+    topLevelPrice: retailPricing?.price ?? null,
+    perVariantCount: retailPricing?.variantsBySku?.size ?? 0,
+  });
+
   const retailId = mapping.retailId;
   await retailClient.put(
     `products/${retailId}.json`,
-    buildRetailPayload(wholesaleProduct, { includePrice: false }),
+    buildRetailPayload(wholesaleProduct, { retailPricing }),
   );
 
   // Re-fetch to get current retail variant IDs (variants may be added/removed)

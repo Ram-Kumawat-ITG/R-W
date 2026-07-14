@@ -32,7 +32,7 @@ export const action = async ({ request }) => {
 
   await connectDB()
 
-  syncProductUpdate(payload)
+  syncProductUpdate(payload, { shop })
     .then(() => log.info('done', { shop, productId: payload.id }))
     .catch((err) => log.error('failed', { shop, productId: payload.id, err }))
 

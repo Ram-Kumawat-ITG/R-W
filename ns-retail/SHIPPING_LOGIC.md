@@ -1137,3 +1137,371 @@ Watch the Render logs for the sequence: cache miss → background fetch → subs
 ---
 
 **Document maintained alongside `ns-retail/app/api/shipping/rates.js`. When you modify the file, update the relevant section here.**
+
+---
+---
+
+# Part II — Recent History, Planned Changes & Client-Facing Ruleset
+
+*Everything below this line was added on 2026-07-13/14 to capture the July client-alignment work. The Part I content above documents the CURRENT implementation. Part II documents the DECIDED CHANGES that are next to be built. Once implemented, Part I sections should be updated and the corresponding Part II section moved into the changelog.*
+
+---
+
+## 12. Recent History — July 2026 Timeline
+
+### 2026-07-06 — Grow-plan migration (processing fee to carrier callback)
+The 3% processing fee had been implemented as a Checkout UI Extension (`ns-retail/extensions/processing-fee/`). That extension only works on Shopify Plus. To keep the fee working on Grow, we migrated it into the carrier-service callback (`rates.js`) — the fee got bundled into every returned shipping rate. Documented in earlier sessions.
+
+### 2026-07-07 — Order-level discount detection added
+The fee was being over-charged when a customer applied a discount code at checkout (fee was computed on pre-discount subtotal). We added `detectCartDiscountCents()` which probes five payload fields in priority order, and empirically confirmed `rate.order_totals.discount_amount` is the reliable modern field. See §5.6 above.
+
+### 2026-07-07/08 — Tax API architecture rewritten (async fire-and-forget)
+The `draftOrderCalculate` mutation was empirically measured at ~12 s TTFB on the staging store — well beyond Shopify's 10 s carrier-callback budget. Inline await was impossible. Rewrote to a two-path architecture: fast synchronous cache-check + fire-and-forget background fetch that warms the cache for subsequent callbacks. See §5.8 above.
+
+### 2026-07-09 — MAJOR ARCHITECTURE PIVOT (two client calls)
+
+Two calls with the client (Call 1 with Stephanie the shipping manager) surfaced fundamental problems with the "algorithm picks a box, we ship in that box" model.
+
+**Problem Stephanie surfaced**: NS does not always stock every box size. They reuse boxes from manufacturers (Neutrophil) and third-party sources (BioLite, etc.). If the algorithm picks a 15×12×9 and they don't have one on hand, they pack in whatever's available — and since our quoted rate is locked at checkout based on the picked box, there is a mismatch between quoted and actual label rate. Small envelopes (9×6×4, 11×9×4) and standard UPS boxes are always in stock; the problem is the larger and less-common tiers.
+
+**Decisions made in the July 9 calls:**
+
+**Decision A — Approval gate on every order (NEW):**
+A middle-app approval step is added. For every order, the shipping team sees the proposed box dimensions + weight (what was sent to the carrier). They either APPROVE (one-click, label prints, order ships, invoice sends) or EDIT the dimensions/weight (rate recalculates on the new box, then approve, then ship). Nothing ships until approved. Trace confirmed: this applies to ALL orders, retail and wholesale. Estimated 1–2 hrs/day of team effort, acceptable. **Implication for us**: the algorithm no longer needs to be perfect — the approval gate is a human safety net. Reasonable is enough.
+
+**Decision B — Wholesale "pay immediately" removed (REVERSAL of July-2 decision):**
+Because you cannot hold a checkout payment mid-flow while waiting for approval, the pay-immediately-via-Shopify-Payments option is removed from wholesale entirely. All wholesale now flows through invoice-based methods only: card-on-file (NMI), ACH, check — billed on the 15th/EOM batch already built. Trace was explicit that the approval gate matters more than immediate payment. **Not our concern in rates.js** — wholesale checkout flow lives elsewhere.
+
+**Decision C — Manual dimension + weight fields (NEW):**
+The middle-app gives the team editable fields for box dimensions AND total package weight per order. Stephanie's team already weighs every package and will continue to; we capture the real weight rather than the algorithm's estimate. **Implication for us**: the weight we compute is a *proposal*, not the final source of truth.
+
+**Decision D — Retail no longer charges the 3% credit card surcharge (NEW):**
+Retail customers are not charged the 3% card surcharge. Reason: retail has no alternative payment method (must pay by card), so NS considers it unfair to surcharge. A retail cart of $200 + $10 tax + shipping = exactly that, no card fee. Wholesale still handles its surcharges via NMI on the back end as built. **Implication for us**: the entire fee + tax-fetch machinery documented in §5.8 and §5.11 is being **removed from retail rates.js**.
+
+**Retail shipping — other details from Call 1:**
+- Retail customers still see live UPS/USPS rates with markup at checkout and pay on the spot.
+- Customer can indicate a carrier preference (UPS vs USPS). We may respect that when returning rates.
+- Checkout disclaimer wanted: "shipping is an estimate, final price may change, shown on invoice." **Feasibility flag**: they're on Grow, not Plus — checkout-page customization is heavily limited. Placement of the disclaimer needs to be verified against Grow-plan capabilities separately.
+- Rate lock stands: even if the approval gate changes the box and the actual cost changes, the customer's checkout charge does not change. NS absorbs or benefits from the difference.
+
+### 2026-07-13 — Scope narrowed to retail rates.js
+Confirmed the scope of this workstream:
+- Only `ns-retail/app/api/shipping/rates.js` — no wholesale, no middle-app.
+- No checkout-page UI customization (Grow limitation) — everything server-side.
+- No product metafields — product classification will be derived from data already in the carrier-callback payload (`items[].name`, `items[].vendor`, `items[].grams`).
+- The approval gate, wholesale payment rerouting, and checkout disclaimer are separate workstreams handled elsewhere.
+
+---
+
+## 13. Planned Changes — Retail Shipping (rates.js)
+
+The current implementation (Part I above) charges a 3% fee on top of shipping and asynchronously fetches tax to include in the fee base. Post-July-9 decisions require:
+
+1. **Remove the 3% fee entirely from retail** (Decision D).
+2. **Remove the tax-fetch machinery** (no longer needed — nothing to base the fee on).
+3. **Add a dynamic box-selection engine** to replace the hardcoded `10×8×4` and `sum(grams)` currently sent to USPS and UPS.
+4. **Add product classification derived from payload data** (no metafields).
+
+The final rate returned to Shopify becomes simply:
+```
+finalCents = shippingCents = rawCarrierRate + handlingMarkupCents
+```
+(free-shipping and handling-markup logic remain unchanged.)
+
+### 13.1 Product Categories (payload-derived, no metafields)
+
+Every cart line item will be assigned one of eight categories at request time, using only fields present in the Shopify carrier-service payload:
+
+| Code | Category | Detection Signal |
+|------|----------|------------------|
+| S | `small_bottle` | Weight ≤ ~2 oz (excluding FA) |
+| M | `medium_bottle` | Weight 2–3 oz |
+| L | `large_bottle` | Weight 3–6 oz, no liquid keyword in name |
+| LL | `large_liquid` | Weight > ~18 oz, or name matches known-liquid list (Liquid Life, Miracle II, Zavita, Biomega, Floradix, Enersync case) |
+| G1 | `glass_1oz` | Product name contains "1 oz" |
+| G2 | `glass_2oz` | Product name contains "2 oz" |
+| G4 | `glass_4oz` | Product name contains "4 oz" |
+| FA | `frequency_app` | Vendor === "Frequency Apps" |
+
+**Classification cascade priority** (first match wins):
+1. Vendor === "Frequency Apps" → `frequency_app`
+2. Name matches known-liquid list → `large_liquid`
+3. Name contains "1 oz" → `glass_1oz`
+4. Name contains "2 oz" → `glass_2oz`
+5. Name contains "4 oz" → `glass_4oz`
+6. Weight > 500 g (~18 oz) → `large_liquid` (heuristic)
+7. Weight > 170 g (~6 oz) → `large_bottle`
+8. Weight > 85 g (~3 oz) → `medium_bottle`
+9. Weight > 0 → `small_bottle`
+10. Missing / zero weight → **fallback**: `large_bottle` + log warning
+
+**Regex for glass size detection**: `/\b(\d+(?:\.\d+)?)\s*oz\.?\b/i` — captures both "1 oz" and "1oz" and "1 oz."; case-insensitive.
+
+**Edge cases flagged** (need client confirmation, see §16):
+- Products named "EnerSync 1 oz Case (24 ct.)" — this is a *case of 24*, not a single glass. Needs manual override or a name pattern exclusion.
+- Products where the name has an ounce number but the item is not a glass bottle (e.g., "Floradix Iron 8.5 oz | 250 ml" — this is a liquid, not a glass tincture).
+
+### 13.2 Unit-Cost System (derived from Stephanie's rules)
+
+Each product category is assigned a "space score" (unit cost). Each box has a total unit capacity. A cart's total unit demand must be ≤ the box's capacity for that box to be considered a valid pick.
+
+Derivation from Stephanie's stated rules, using the 9×6×4 envelope (which fits 3 small bottles) as the baseline of 3 units:
+
+| Category | Unit Cost | Derivation |
+|----------|-----------|------------|
+| `small_bottle` (S) | 1 | 3 S fit in 9×6×4 (3 units) |
+| `medium_bottle` (M) | 2 | 1 S + 1 M = 3 units → M = 2 |
+| `large_bottle` (L) | 3 | 1 L alone fills 9×6×4 |
+| `glass_1oz` (G1) | 0.75 | 4 G1 fit in 9×6×4 → 3 / 4 |
+| `glass_2oz` (G2) | 1 | 3 G2 fit in 9×6×4 → 3 / 3 |
+| `glass_4oz` (G4) | 3 | 1 G4 alone fills 9×6×4 |
+| `frequency_app` (FA) | 0.15 | 60 FA fit in 11×9×4 (9 units) → 9 / 60 |
+| `large_liquid` (LL) | N/A | Uses a separate `liquids` capacity dimension |
+
+Cross-check with 11×9×4 envelope:
+- 3 L = 9 units → capacity ≥ 9 (matches "3 large bottles fit")
+- 4 M = 8 units, 5 M = 10 units → matches "4 to 5 medium" borderline
+- 6 S = 6 units → matches "6 small bottles fit"
+
+The math is self-consistent with Stephanie's stated rules.
+
+---
+
+## 14. Box Ruleset (Client-Facing, Approval-Ready)
+
+This is the version to send to Trace + Stephanie for sign-off. Each box lists (a) Stephanie's original rule, (b) our derived exact rule, and (c) example combinations.
+
+### 14.1 Envelopes
+
+#### 9×6×4 Envelope (SMALL ENVELOPE) — tare 2.7 oz
+
+**Stephanie**: "Up to 3 small bottles / 1 small + 1 medium / 1 large (non-liquid) / 4 × 1oz glass / 3 × 2oz glass / 1 × 4oz glass"
+
+**Exact rule**: Fits any combination totaling ≤ **3 units**.
+- 3 × S / 1 × S + 1 × M / 1 × L / 4 × G1 / 3 × G2 / 1 × G4
+- Mixed: 2 × S + 1 × G2 = 3 units ✓; 1 × M + 1 × G1 = 2.75 units ✓; 1 × M + 1 × S + 1 × G1 = 3.75 units ✗
+
+**Confirmation needed**: The "1 × 4oz glass could also include 1 small OR 1oz OR 2oz" exception is ignored in unit-math (over-sizes to next box) — acceptable?
+
+#### 11×9×4 Envelope (LARGE ENVELOPE) — tare 0.7 oz
+
+**Stephanie**: "6 small / 4-5 medium / 3 large / 60 Frequency Apps / FA + other products"
+
+**Exact rule**: Fits any combination totaling ≤ **9 units** OR up to 60 FAs.
+- 6 × S / 4 × M / 3 × L / 60 × FA
+- Mixed: 40 × FA + 3 × S = 9 units ✓; 60 × FA + 1 × S = 10 units ✗
+
+**Confirmation needed**: Should the engine cap medium at 4 (conservative) or allow 5 (matches "4 to 5" language, tighter fit)?
+
+### 14.2 Special-Purpose Small Boxes
+
+#### 8×6×3 UPS Mini Box — tare 2.7 oz — fragile-preferred
+
+**Stephanie**: "If small order with 3+ 1oz/2oz glass bottles, use UPS mini instead of envelope. Fits ~6 × 1oz, 5 × 2oz, or 4 × 4oz."
+
+**Exact rule (trigger)**: Cart has ≥ 3 of (G1 + G2) glass, AND no large liquids, AND space demand ≤ 3 units → 8×6×3 UPS Mini.
+
+**Confirmation needed**: What defines "small cart" for the trigger — space demand ≤ 3 units? Or ≤ 6 total items?
+
+### 14.3 Liquid Boxes (ordered by liquid capacity)
+
+| Box | Tare | Liquids Cap | Extras (units) | Stephanie's Language |
+|-----|------|-------------|----------------|-----------------------|
+| 8×6×6 | 3.9 oz | 1 | 3 | "1 large liquid + a few extras" |
+| 10×7×6 | 5.0 oz | 2 | 4 | "2 large liquids + a few extras" |
+| 11×4×12 | 5.7 oz | 3 | 4 | "3 large liquids + a few extras" |
+| 16×11×3 | 7.5 oz | 4 | 4 | "4 large liquids + a few extras" |
+| 12×12×5 | 9.6 oz | 4 | 4 | "4 large liquids + a few extras" |
+| **18×13×3** | 9.3 oz | 6 | **0 (strict)** | "Up to 6 large liquids" *(no extras stated)* |
+| 15×12×9 | 11.5 oz | 12 | 6 | "Up to 12 large liquids + a few extras" |
+| 18×14×8 | ~14 oz *(estimated)* | 16 | 8 | "Up to 16 large liquids + a few extras" |
+
+**Rule**: A box is a valid pick if `box.liquids ≥ largeLiquidCount AND box.units ≥ unitDemand-of-non-liquid-items`.
+
+**Confirmations needed** (see §16):
+- The "extras" numbers per box (currently our best-guess estimates).
+- Whether 18×13×3 is truly liquids-only, or extras were accidentally omitted from the source rule.
+- The estimated 14 oz tare for 18×14×8 pending Trace's actual measurement.
+
+### 14.4 Enersync (Partitioned Boxes for 12+ Glass)
+
+**Stephanie**: "If 12+ glass bottles, use an Enersync box (partitions protect glass)."
+
+| Box | Dims | Tare | Trigger |
+|-----|------|------|---------|
+| Enersync 1oz | 10×7×6 | 7.0 oz | Total glass ≥ 12 AND majority = 1oz size |
+| Enersync 2oz | 11×7×8 | 13.2 oz | Total glass ≥ 12 AND majority = 2oz size |
+
+**Rule**: `totalGlass = G1 + G2 + G4`. If `totalGlass ≥ 12`, pick Enersync 1oz if `G1 ≥ G2 + G4`, else Enersync 2oz.
+
+**Confirmation needed**: Enersync boxes are glass-only, no other product types mixed in — correct?
+
+---
+
+## 15. Selection Algorithm — Priority Order
+
+When a cart arrives, the engine evaluates in this exact order (first matching case wins):
+
+```
+STEP 1: Total glass (G1 + G2 + G4) ≥ 12
+        → Enersync (1oz or 2oz by majority)
+
+STEP 2: (G1 + G2) ≥ 3 AND largeLiquids == 0 AND unitDemand ≤ 3
+        → 8×6×3 UPS Mini (fragile-preferred)
+
+STEP 3: largeLiquids > 0
+        → Iterate liquid boxes smallest to largest;
+          return first where box.liquids ≥ largeLiquids AND box.units ≥ unitDemand
+        → Iteration order:
+             8×6×6 → 10×7×6 → 11×4×12 → 16×11×3 → 12×12×5
+                   → 18×13×3 → 15×12×9 → 18×14×8
+
+STEP 4: frequencyApps > 0
+        → If FA ≤ 60 AND unitDemand ≤ 6 → 11×9×4 envelope
+        → Otherwise, next larger box that fits
+
+STEP 5: Bottles/glass only, no liquids
+        → unitDemand ≤ 3 → 9×6×4 envelope
+        → unitDemand ≤ 9 → 11×9×4 envelope
+        → Larger → next non-liquid box tier
+
+STEP 6: Nothing fits (overflow)
+        → Return largest tier + log warning
+          (approval gate will handle it manually)
+```
+
+**Selection principle**: at each step, pick the smallest valid box (cheaper shipping). When two boxes tie on capacity, prefer the one with lighter tare weight.
+
+---
+
+## 16. Pending Client Confirmations
+
+These decisions block the build. Answers requested from Trace + Stephanie:
+
+### Q1. "A few extras" quantification per liquid box
+
+| Box | Our Estimate | Stephanie's Number |
+|-----|--------------|--------------------|
+| 8×6×6 | 3 units | ? |
+| 10×7×6 | 4 units | ? |
+| 11×4×12 | 4 units | ? |
+| 16×11×3 | 4 units | ? |
+| 12×12×5 | 4 units | ? |
+| 15×12×9 | 6 units | ? |
+| 18×14×8 | 8 units | ? |
+
+### Q2. 18×13×3 — strict liquids only?
+Is this box reserved for large liquids only, or was "a few extras" accidentally omitted from the source rule?
+
+### Q3. Frequency App unit cost
+Our estimate: 1 FA = 0.15 units (because 60 FA = 9 units = capacity of 11×9×4). Reasonable?
+
+### Q4. Medium bottle in 11×9×4 — 4 or 5?
+Cap at 4 (conservative) or allow up to 5 (matches "4 to 5" language)?
+
+### Q5. Enersync boxes — glass only?
+No other product types (small bottles, FAs, etc.) can be mixed into Enersync boxes — correct?
+
+### Q6. "Small cart" definition for UPS mini trigger
+"3+ 1oz/2oz glass with SMALL cart" — is "small cart" defined as:
+- Space demand ≤ 3 units?
+- Total items ≤ 5?
+- No large bottles present?
+
+### Q7. Unmeasured box tare weights
+- When will Trace weigh the 18×14×8 to replace our ~14 oz estimate?
+- Should we also add 16×12×10 and 13×13×10 to the algorithm's tier list? Or stick with the current 13 tiers?
+
+### Q8. Overlap / conflict resolution
+When multiple boxes could fit the same cart: prefer smallest (cheaper) or larger with room (safer packing)?
+
+Our current logic: smallest-that-fits (cheaper). Confirm?
+
+### Q9. Packing-material weight buffer (Stephanie)
+Our estimates:
+- Envelope: +2 oz (bubble mailer + paper)
+- Box: +5 oz (packing peanuts + tape + paper)
+
+Stephanie's worst-case number for each?
+
+---
+
+## 17. Implementation Phases (Scope: rates.js Only)
+
+| Phase | Purpose | Effort | Blocking |
+|-------|---------|--------|----------|
+| 1 | Cleanup: remove 3% fee + tax-fetch machinery | ~1 hour | None |
+| 2 | Product classification logic (name/vendor/weight cascade) | ~2–3 hours | Q1 answers not needed; heuristic thresholds can iterate |
+| 3 | PACKING config block (categories, boxes, buffers) | ~30 min | Q1, Q3, Q9 answers |
+| 4 | `selectBox(cartItems)` algorithm implementation | ~4–5 hours | Q2, Q4, Q5, Q6, Q8 answers |
+| 5 | `computePackageWeight()` helper | ~30 min | Q9 answer |
+| 6 | Wire real dims + weight into `fetchUSPSRates()` and `fetchUPSRates()` | ~1 hour | Phases 3–5 complete |
+| 7 | Logging updates + edge-case testing | ~1–2 hours | Above phases complete |
+
+**Total coding time**: ~1–2 days of implementation, plus 1–2 days of iteration against client feedback.
+
+**Phase 1 can start immediately** — no client input required. Phases 3+ block on Q1–Q9 answers.
+
+### Post-implementation code impact
+
+| Feature | Current | After |
+|---------|---------|-------|
+| USPS + UPS live carrier APIs | ✅ Working | ✅ Keep — same use |
+| Handling markup ($2/$3/$5 tiered) | ✅ Working | ✅ Keep — Trace confirmed "markup logic preserved" |
+| Free shipping rule (NS vendor + $500) | ✅ Working | ✅ Keep — no change |
+| Discount detection (order_totals) | ✅ Working | ❌ Remove — was only feeding into the fee base |
+| Async tax fetch (draftOrderCalculate) | ✅ Working | ❌ Remove — no fee to calculate on |
+| 3% processing fee | ✅ Working | ❌ Remove — Decision D |
+| Hardcoded 10×8×4 dims | ⚠️ Existing shortcut | 🔨 Replace with `selectBox()` |
+| Hardcoded weight = Σ grams | ⚠️ Existing shortcut | 🔨 Replace with `computePackageWeight()` |
+| Fee breakdown log | Detailed | 🔨 Simplify (no fee to break down) |
+| `service_name` includes "3% processing fee" text | Yes | 🔨 Remove that phrase |
+
+**Estimated deletions**: ~200 lines (tax cache, in-flight tracker, GraphQL mutation, cache-key builder, `calculateShopifyTax`, `fetchShopifyTaxInBackground`, discount detection code, fee-computation lines in the response assembly).
+
+**Estimated additions**: ~350 lines (`classifyProduct`, `PACKING` config, `selectBox`, `computePackageWeight`, updated logs).
+
+---
+
+## 18. Open Questions Requiring Non-Client Answers
+
+These do not need Trace or Stephanie — they need Parker (PM), a Grow-plan feasibility check, or a code investigation:
+
+1. **Cleanup approach**: delete fee code outright, or leave behind a `CONFIG.processingFeeRate = 0` toggle? *(Recommendation: delete — git history preserves.)*
+2. **Async tax fetch removal**: confirm no other code path depends on `_shopifyTaxCache` before deletion.
+3. **Wholesale**: `wholesale/app/api/shipping/rates.js` will remain UNCHANGED in this workstream. Confirmed.
+4. **Grow-plan feasibility for retail checkout**: what disclaimer text placement is actually possible on Grow? (Blocks the "shipping is an estimate" message from Call 1.)
+5. **Carrier preference**: is it worth implementing "customer picks UPS vs USPS" via a cart-page block, or defer that as v1.5?
+6. **Pirate Ship reference test**: Parker to share screenshot + cart composition so we can construct the exact reproduction test case.
+7. **Real-order validation tolerance**: sample size + acceptable variance % for post-launch validation.
+8. **New products classification**: when a merchant adds a new product later, does the automatic classifier suffice, or should we build a manual override mechanism?
+
+---
+
+## 19. Reference Files & Sources
+
+- **Current code**: `ns-retail/app/api/shipping/rates.js`
+- **Wholesale parallel (unchanged in this workstream)**: `wholesale/app/api/shipping/rates.js`
+- **Session changelog**: `PROGRAM.md` (repository root)
+- **Product weight sheet**: `Inventory_Weights__1___1_.xlsx` (provided by Trace, includes 638 products and 13 box/envelope tare weights)
+- **Client-provided rules (Stephanie)**: verbatim in the July 8 directive email and re-quoted in §14 above
+- **Approval-gate architecture**: separate workstream, not documented here
+- **Wholesale payment reroute**: separate workstream, not documented here
+
+---
+
+## 20. Change Log for Part II
+
+| Date | Change |
+|------|--------|
+| 2026-07-06 | Initial fee migration from Checkout UI Extension to carrier callback |
+| 2026-07-07 | Order-level discount detection added |
+| 2026-07-07/08 | Async fire-and-forget tax fetch implemented |
+| 2026-07-08 | Box-selection directive received from Parker |
+| 2026-07-09 | Client calls: approval gate decided, wholesale immediate-pay reversed, 3% fee removed for retail |
+| 2026-07-13 | Scope narrowed to `rates.js` only; no metafields, payload-derived classification |
+| 2026-07-14 | Client-facing ruleset drafted (§14), pending confirmations recorded (§16), implementation phases documented (§17) |
+
+---
+
+**Awaiting client confirmations (Q1–Q9 in §16) before Phase 3 onward can start. Phase 1 (fee + tax cleanup) can begin at any time as it depends on no external input.**
