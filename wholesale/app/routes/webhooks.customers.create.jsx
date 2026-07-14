@@ -12,8 +12,6 @@ import {
 } from "../services/shopify/shopify.mutations";
 import { createLogger } from "../utils/logger.utils";
 import connectDB from "../services/APIService/mongo.service";
-import WholesaleApplication from "../models/wholesaleApplication.server";
-import { syncPractitionerToRetail } from "../services/retailSync/practitioner.service";
 import { dropshipConfig } from "../services/dropship/dropship.config";
 
 const log = createLogger("webhook.customers_create");
