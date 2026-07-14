@@ -48,6 +48,7 @@ export const QUERY_CUSTOMER_TAGS = `#graphql
     customer(id: $id) {
       id
       tags
+      note
       numberOfOrders
     }
   }

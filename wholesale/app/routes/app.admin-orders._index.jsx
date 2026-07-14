@@ -632,7 +632,7 @@ export default function AdminOrdersList() {
     Boolean(dateTo);
 
   return (
-    <s-page inlineSize="large" heading="Admin Orders">
+    <s-page inlineSize="large" heading="Retail Orders">
       <s-box paddingBlockEnd="base">
         <s-stack direction="inline" gap="small-200" alignItems="center">
           <s-button variant="primary" onClick={() => navigate("/app/admin-orders/batch")}>

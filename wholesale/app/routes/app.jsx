@@ -31,10 +31,11 @@ export default function App() {
       <s-app-nav>
         <s-link href="/app" rel="home">Home</s-link>
         <s-link href="/app/customers">Wholesale applications</s-link>
-        <s-link href="/app/orders">Orders</s-link>
-        <s-link href="/app/admin-orders">Admin Orders</s-link>
+        <s-link href="/app/orders">Practitioner Orders</s-link>
+        <s-link href="/app/admin-orders">Retail Orders</s-link>
         <s-link href="/app/qbo">QBO</s-link>
         <s-link href="/app/nmi">NMI</s-link>
+        <s-link href="/app/practitioner-migration">Migration</s-link>
         {/* <s-link href="/app/additional">Additional page</s-link> */}
       </s-app-nav>
       <Outlet />
