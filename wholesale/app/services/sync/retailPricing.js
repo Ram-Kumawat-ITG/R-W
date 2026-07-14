@@ -189,41 +189,61 @@ function normalizeMoneyString(raw) {
 // Resolve the retail price for a single wholesale variant, given the
 // normalized metafield payload. Returns { price, compareAtPrice } or null.
 //
-// Rule (per confirmed decisions D2 + D4):
-//   1. If the metafield has a non-empty `variants` list, variant is matched
-//      strictly by SKU. Unmatched variants → null (no price + warn), NOT the
-//      top-level price.
-//   2. If the metafield has NO `variants` list (or an empty one), the
-//      top-level `price` is applied to all variants uniformly.
+// Rule (revised 2026-07-14 to match D2's "top-level defaults + per-variant
+// overrides" phrasing — replaces the earlier stricter interpretation):
 //
-// This is exported so the payload builder can call it per-variant.
+//   1. Look for a variant-specific match by SKU in `variantsBySku`. If found,
+//      use the variant-specific price. `compareAtPrice` falls back to the
+//      top-level compareAtPrice when the per-variant entry omits it.
+//   2. If no SKU match (missing SKU on the wholesale variant, or SKU not
+//      listed in the metafield), fall back to the top-level `price` as the
+//      product-wide default. This matches the natural merchant mental model:
+//      "top-level = default, variants[] = overrides for specific SKUs."
+//   3. If neither is available (no SKU match AND no top-level `price`), the
+//      variant syncs WITHOUT a price and a warn log is emitted.
+//
+// Consequence: as long as the metafield has a top-level `price`, EVERY
+// variant gets a price — either its own override or the product-wide
+// default. This is what merchants expect and prevents silent $0 syncs when
+// a variant SKU accidentally doesn't match the metafield entries.
+//
+// Exported so the payload builder can call it per-variant.
 export function resolveVariantPricing(variant, retailPricing) {
   if (!retailPricing) return null
   const sku = String(variant?.sku || '').trim()
-  const hasVariantsList = retailPricing.variantsBySku?.size > 0
 
-  if (hasVariantsList) {
-    if (sku && retailPricing.variantsBySku.has(sku)) {
-      const match = retailPricing.variantsBySku.get(sku)
-      return {
-        price: match.price,
-        compareAtPrice: match.compareAtPrice ?? null,
-      }
+  // (1) Variant-specific match wins if the SKU appears in the metafield list.
+  if (sku && retailPricing.variantsBySku?.has(sku)) {
+    const match = retailPricing.variantsBySku.get(sku)
+    return {
+      price: match.price,
+      compareAtPrice:
+        match.compareAtPrice ?? retailPricing.compareAtPrice ?? null,
+      source: 'variant_match',
     }
-    log.warn('variant.no_metafield_match', {
-      variantSku: sku || '(no SKU)',
-      variantId: variant?.id,
-    })
-    return null
   }
 
-  // No variants list → top-level applies to all
+  // (2) Fall back to the top-level product-wide default.
   if (retailPricing.price) {
+    log.info('variant.using_top_level_default', {
+      variantSku: sku || '(no SKU)',
+      variantId: variant?.id,
+      reason:
+        retailPricing.variantsBySku?.size > 0
+          ? 'sku_not_in_variants_list'
+          : 'no_variants_list_in_metafield',
+    })
     return {
       price: retailPricing.price,
       compareAtPrice: retailPricing.compareAtPrice ?? null,
+      source: 'top_level_default',
     }
   }
 
+  // (3) Nothing available — variant will sync without price.
+  log.warn('variant.no_pricing_available', {
+    variantSku: sku || '(no SKU)',
+    variantId: variant?.id,
+  })
   return null
 }
