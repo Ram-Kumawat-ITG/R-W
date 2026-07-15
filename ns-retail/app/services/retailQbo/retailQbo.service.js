@@ -341,14 +341,27 @@ export async function resolveSalesItemId() {
 // via QBO query — idempotent so this is safe).
 const _retailItemCache = new Map();
 
-// QBO Item Name must be unique and cannot contain ':'. We append the SKU to
-// make the name unique even when multiple variants share the same title.
-function sanitizeRetailItemName(name, sku) {
-  const base = String(name || "").replace(/:/g, "-").trim();
-  const skuPart = sku ? ` (${String(sku).replace(/:/g, "-").trim()})` : "";
-  let full = `${base}${skuPart}`.trim();
-  if (!full) full = sku ? `SKU ${sku}` : "Item";
+// QBO Item Name can't contain ':' and is capped at 100 chars. Pure sanitizer —
+// no SKU appended (SKU has its own Item.Sku field/column). QBO also requires a
+// unique Name; that's handled at create time by falling back to
+// `uniqueRetailItemName` only on a genuine collision — see createRetailItem.
+function sanitizeRetailItemName(name) {
+  let full = String(name || "").replace(/:/g, "-").trim();
+  if (!full) full = "Item";
   return full.length > 100 ? full.slice(0, 100).trim() : full;
+}
+
+// Collision fallback: append the SKU to disambiguate two different items that
+// would otherwise share a Name. Trims the base so the SKU survives the cap.
+function uniqueRetailItemName(name, sku) {
+  const cleanSku = sku ? String(sku).replace(/:/g, "-").trim() : "";
+  const suffix = cleanSku ? ` (${cleanSku})` : "";
+  let base = String(name || "").replace(/:/g, "-").trim();
+  const max = 100 - suffix.length;
+  if (base.length > max) base = base.slice(0, Math.max(0, max)).trim();
+  let full = `${base}${suffix}`.trim();
+  if (!full) full = cleanSku ? `SKU ${cleanSku}` : "Item";
+  return full.slice(0, 100);
 }
 
 async function findRetailItemBySku(sku) {
@@ -370,7 +383,7 @@ async function findRetailItemByName(name) {
 async function createRetailItem({ name, sku, description, price, qtyOnHand }) {
   const incomeRef = await resolveIncomeAccountRef();
   if (!incomeRef) throw new Error("createRetailItem: no IncomeAccountRef available");
-  const Name = sanitizeRetailItemName(name, sku);
+  const Name = sanitizeRetailItemName(name);
   const payload = { Name, Sku: sku, Type: "Service", IncomeAccountRef: incomeRef };
   if (description) payload.Description = String(description).slice(0, 4000);
   const priceNum = priceToNumber(price);
@@ -415,11 +428,19 @@ async function createRetailItem({ name, sku, description, price, qtyOnHand }) {
     if (!created?.Id) throw new Error("QBO retail item create returned no Id");
     return created;
   } catch (err) {
-    // Name collision — adopt only when the SKU matches to avoid cross-product poisoning.
     if (/duplicate name|6240/i.test(err?.message || "")) {
       const existing = await findRetailItemByName(Name);
+      // Same SKU → adopt (idempotent). Never adopt a different-SKU item.
       if (existing?.Id && String(existing.Sku || "") === String(sku || "")) {
         return existing;
+      }
+      // Different item owns this clean Name → retry once with a SKU-qualified
+      // unique Name so both items can coexist (QBO requires unique Names).
+      const retryName = uniqueRetailItemName(name, sku);
+      if (retryName !== Name) {
+        const retry = await retailQbo.post("/item", { ...payload, Name: retryName });
+        const created = retry?.Item;
+        if (created?.Id) return created;
       }
     }
     throw err;
@@ -506,7 +527,7 @@ export async function upsertRetailQboItem({ sku, name, description, price, qtyOn
   if (!clean) throw new Error("upsertRetailQboItem: sku is required");
 
   const desired = {
-    Name: sanitizeRetailItemName(name, clean),
+    Name: sanitizeRetailItemName(name),
     Sku: clean,
     Description: description ? String(description).slice(0, 4000) : undefined,
     UnitPrice: priceToNumber(price) ?? undefined,

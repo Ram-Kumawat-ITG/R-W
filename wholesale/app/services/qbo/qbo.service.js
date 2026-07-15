@@ -169,24 +169,35 @@ async function findItemByName(name) {
   return res?.QueryResponse?.Item?.[0] || null
 }
 
-// QBO Item Name must be UNIQUE and cannot contain ':'. Multiple products /
-// variants frequently share a display name but have different SKUs, so we
-// make the Name unique by appending the SKU — otherwise QBO rejects the
-// second create as a duplicate name and we'd be forced to reuse the wrong
-// item (the bug that showed every line with the first line's SKU). Clamp to
-// QBO's 100-char Name limit.
-function sanitizeItemName(name, sku) {
-  const base = String(name || '').replace(/:/g, '-').trim()
-  const skuPart = sku ? ` (${String(sku).replace(/:/g, '-').trim()})` : ''
-  let full = `${base}${skuPart}`.trim()
-  if (!full) full = sku ? `SKU ${sku}` : 'Item'
+// QBO Item Name can't contain ':' and is capped at 100 chars. Pure sanitizer
+// — no SKU is appended (the SKU has its own Item.Sku field / column). QBO also
+// requires the Name to be UNIQUE; that's handled at create time by falling
+// back to `uniqueItemName` (SKU-qualified) only when a genuine collision with
+// a DIFFERENT item occurs — see createItem.
+function sanitizeItemName(name) {
+  let full = String(name || '').replace(/:/g, '-').trim()
+  if (!full) full = 'Item'
   return full.length > 100 ? full.slice(0, 100).trim() : full
+}
+
+// Collision fallback: append the SKU to disambiguate when two different items
+// would otherwise share a Name. Trims the base so the SKU survives the 100-char
+// cap.
+function uniqueItemName(name, sku) {
+  const cleanSku = sku ? String(sku).replace(/:/g, '-').trim() : ''
+  const suffix = cleanSku ? ` (${cleanSku})` : ''
+  let base = String(name || '').replace(/:/g, '-').trim()
+  const max = 100 - suffix.length
+  if (base.length > max) base = base.slice(0, Math.max(0, max)).trim()
+  let full = `${base}${suffix}`.trim()
+  if (!full) full = cleanSku ? `SKU ${cleanSku}` : 'Item'
+  return full.slice(0, 100)
 }
 
 async function createItem({ name, sku, description, price, qtyOnHand }) {
   const incomeRef = await resolveIncomeAccountRef()
   if (!incomeRef) throw new Error('cannot create QBO Item — no IncomeAccountRef available')
-  const Name = sanitizeItemName(name, sku)
+  const Name = sanitizeItemName(name)
   const payload = { Name, Sku: sku, Type: 'Service', IncomeAccountRef: incomeRef }
   if (description) payload.Description = String(description).slice(0, 4000)
   const priceNum = price === null || price === undefined || price === '' ? null : Number(price)
@@ -222,14 +233,21 @@ async function createItem({ name, sku, description, price, qtyOnHand }) {
     if (!created?.Id) throw new Error('QBO item create returned no Id')
     return created
   } catch (err) {
-    // Name collision (pre-existing item, or a concurrent create won the
-    // race). Adopt the existing item ONLY when its SKU matches what we're
-    // resolving — never return an item with a different SKU (that's what
-    // previously caused every line to show the first line's SKU).
+    // Name collision (pre-existing item, or a concurrent create won the race).
     if (/duplicate name|6240/i.test(err?.message || '')) {
       const existing = await findItemByName(Name)
+      // Same SKU → adopt it (idempotent re-create). Never return an item with
+      // a different SKU (that's what previously showed every line the wrong SKU).
       if (existing?.Id && String(existing.Sku || '') === String(sku || '')) {
         return existing
+      }
+      // Different item owns this clean Name → retry once with a SKU-qualified
+      // unique Name so both items can coexist (QBO requires unique Names).
+      const retryName = uniqueItemName(name, sku)
+      if (retryName !== Name) {
+        const retry = await qbo.post('/item', { ...payload, Name: retryName })
+        const created = retry?.Item
+        if (created?.Id) return created
       }
     }
     throw err
@@ -397,7 +415,7 @@ export async function upsertQboItem({ sku, name, description, price, qtyOnHand }
   if (!clean) throw new Error('upsertQboItem: sku is required')
 
   const desired = {
-    Name: sanitizeItemName(name, clean),
+    Name: sanitizeItemName(name),
     Sku: clean,
     Description: description ? String(description).slice(0, 4000) : undefined,
     UnitPrice: priceToNumber(price) ?? undefined,

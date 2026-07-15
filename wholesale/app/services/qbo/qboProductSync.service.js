@@ -32,6 +32,22 @@ export function isQboProductSyncEnabled() {
   return Boolean(qboConfig.productSyncEnabled)
 }
 
+// Compose the QBO Item NAME so each variant is distinguishable (QBO has no
+// variant concept — one Item per variant). Standard shape: "Product - Variant".
+// Special-cases: a single-variant product's "Default Title" (or a variant
+// title identical to the product) → just the product name; a variant title
+// that already contains the product name (e.g. the merchant named the option
+// "AI - B12 Folate A") → use it verbatim to avoid "Product - Product A". The
+// SKU is NOT part of the name here — upsertQboItem/sanitizeItemName append it
+// for QBO's unique-name guarantee, and it also has its own Sku column.
+function buildItemName(productTitle, variantTitle) {
+  const p = String(productTitle || '').trim()
+  const v = String(variantTitle || '').trim()
+  if (!v || v.toLowerCase() === 'default title' || v === p) return p
+  if (p && v.toLowerCase().includes(p.toLowerCase())) return v
+  return p ? `${p} - ${v}` : v
+}
+
 // Compose the QBO Item Description from the product + variant titles.
 function buildDescription(product, variant) {
   const parts = [product?.title, variant?.title].map((s) => (s ? String(s).trim() : '')).filter(Boolean)
@@ -88,7 +104,7 @@ async function syncVariant({ shop, product, variant }) {
   try {
     const result = await upsertQboItem({
       sku,
-      name: productTitle,
+      name: buildItemName(productTitle, variantTitle),
       description: buildDescription(product, variant),
       price: shopifyPrice,
       // Initial QBO on-hand quantity (Inventory items only) — seeded from the
@@ -233,7 +249,7 @@ export async function retryFailedQboProductSyncs({ limit = 200 } = {}) {
     try {
       const result = await upsertQboItem({
         sku: row.sku,
-        name: row.productTitle,
+        name: buildItemName(row.productTitle, row.variantTitle),
         description: [row.productTitle, row.variantTitle]
           .filter((s) => s && s.toLowerCase() !== 'default title')
           .join(' — ') || null,

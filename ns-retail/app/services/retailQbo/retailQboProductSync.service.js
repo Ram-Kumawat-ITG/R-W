@@ -26,6 +26,20 @@ export function isRetailQboProductSyncEnabled() {
   return Boolean(retailQboConfig.productSyncEnabled) && isRetailQboConfigured();
 }
 
+// Compose the QBO Item NAME so each variant is distinguishable (QBO has no
+// variant concept — one Item per variant). Standard shape: "Product - Variant".
+// Special-cases: "Default Title" (single-variant) or a variant title equal to
+// the product → just the product name; a variant title that already contains
+// the product name → use it verbatim (avoids "Product - Product A"). The SKU
+// is appended downstream by sanitizeRetailItemName for QBO's unique-name rule.
+function buildItemName(productTitle, variantTitle) {
+  const p = String(productTitle || "").trim();
+  const v = String(variantTitle || "").trim();
+  if (!v || v.toLowerCase() === "default title" || v === p) return p;
+  if (p && v.toLowerCase().includes(p.toLowerCase())) return v;
+  return p ? `${p} - ${v}` : v;
+}
+
 function buildDescription(product, variant) {
   const parts = [product?.title, variant?.title]
     .map((s) => (s ? String(s).trim() : ""))
@@ -69,7 +83,7 @@ async function syncVariant({ shop, product, variant }) {
   try {
     const result = await upsertRetailQboItem({
       sku,
-      name: product?.title ?? null,
+      name: buildItemName(product?.title, variant?.title),
       description: buildDescription(product, variant),
       price: shopifyPrice,
       qtyOnHand: qtyOnHand ?? 0,
@@ -220,7 +234,7 @@ export async function retryFailedRetailQboProductSyncs({ limit = 200 } = {}) {
     try {
       const result = await upsertRetailQboItem({
         sku: row.sku,
-        name: row.productTitle,
+        name: buildItemName(row.productTitle, row.variantTitle),
         description: [row.productTitle, row.variantTitle]
           .filter((s) => s && s.toLowerCase() !== "default title")
           .join(" — ") || null,
