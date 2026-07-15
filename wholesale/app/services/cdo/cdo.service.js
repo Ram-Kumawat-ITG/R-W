@@ -26,45 +26,30 @@ const DEFAULT_DISCOUNT_PERCENT = 0.2;
 const RETAIL_SHOP_DOMAIN = process.env.RETAIL_SHOP_DOMAIN || "";
 // eslint-disable-next-line no-undef
 const RETAIL_ADMIN_ACCESS_TOKEN = process.env.RETAIL_ADMIN_ACCESS_TOKEN || "";
-const RETAIL_API_VERSION = "2025-07";
+// eslint-disable-next-line no-undef
+const RETAIL_API_VERSION = process.env.RETAIL_API_VERSION || "2025-10";
+// eslint-disable-next-line no-undef
+const NS_RETAIL_API_BASE = process.env.NS_RETAIL_API_BASE || "";
+// eslint-disable-next-line no-undef
+const RETAIL_SYNC_SECRET = process.env.RETAIL_SYNC_SECRET || "";
 
-const MUTATION_DISCOUNT_CREATE = /* GraphQL */ `
-  mutation CreatePractitionerDiscount($basicCodeDiscount: DiscountCodeBasicInput!) {
-    discountCodeBasicCreate(basicCodeDiscount: $basicCodeDiscount) {
-      codeDiscountNode {
-        id
-        codeDiscount {
-          ... on DiscountCodeBasic {
-            title
-            codes(first: 1) {
-              nodes {
-                code
-              }
-            }
-          }
-        }
-      }
-      userErrors {
-        field
-        message
-        code
-      }
-    }
-  }
-`;
+// Practitioner discounts are Function-backed App discounts (not plain
+// DiscountCodeBasic) — eligibility (does THIS buyer belong to THIS
+// practitioner?) is enforced by the `practitioner-discount` Shopify
+// Function deployed from ns-retail, which reads a JSON config metafield on
+// the discount (`cdo.config` → { percentage, practitionerId }) and compares
+// it against the buyer's `cdo.practitioner_id` customer metafield. See
+// ns-retail's app/services/cdo/cdo.discount.service.js for the actual
+// mutation + metafield-writing logic — creating and activating a
+// Function-backed discount can ONLY be done by the app that owns the
+// Function (ns-retail's app), so both operations are proxied there over
+// HTTP (see createRetailDiscount / activateRetailDiscountViaNsRetail
+// below) rather than called directly against the retail store the way the
+// old plain-DiscountCodeBasic approach was.
 
 export function buildShopifyDiscountUrl(shop, code) {
   return `https://${shop}/discount/${encodeURIComponent(code)}`;
 }
-
-const MUTATION_DISCOUNT_ACTIVATE = /* GraphQL */ `
-  mutation ActivatePractitionerDiscount($id: ID!) {
-    discountCodeActivate(id: $id) {
-      codeDiscountNode { id }
-      userErrors { field message code }
-    }
-  }
-`;
 
 const MUTATION_DISCOUNT_DEACTIVATE = /* GraphQL */ `
   mutation DeactivatePractitionerDiscount($id: ID!) {
@@ -84,13 +69,27 @@ function isDuplicateError(userErrors) {
 }
 
 /**
- * Create a basic percentage code discount on the retail store for a
- * practitioner code. Direct retail Admin GraphQL call via the offline
- * access token in RETAIL_ADMIN_ACCESS_TOKEN — no HTTP hop through ns-retail.
+ * Create a Function-backed percentage code discount on the retail store for
+ * a practitioner code. Eligibility (does THIS buyer belong to THIS
+ * practitioner?) is enforced by the `practitioner-discount` Shopify
+ * Function at checkout-calculation time, not by Shopify's native
+ * `customerSelection`.
+ *
+ * PROXIED THROUGH ns-retail (`POST /api/cdo-internal/create-shopify-discount`)
+ * rather than called directly against the retail store — confirmed via live
+ * testing (2026-07-08) that `discountCodeAppCreate` rejects any app OTHER
+ * than the one that owns the referenced Function (ns-retail's app, not
+ * wholesale's separate app/token): "Function ... not found. Ensure that it
+ * is released in the current app (<wholesale's app id>)". A plain
+ * `DiscountCodeBasic` (the old approach) had no such restriction, which is
+ * why this used to be a direct call.
  *
  * @param {object} args
  * @param {string} args.code
  * @param {number} args.discountPercent  fraction (0.10 = 10%)
+ * @param {string} args.practitionerId   owning practitioner's id — written to
+ *                                       the discount's config metafield so the
+ *                                       Function can gate on it
  * @param {string} [args.practitionerName]
  * @returns {Promise<
  *   | { ok: true,  duplicate: false, shopifyDiscountId: string|null, shopifyDiscountUrl: string }
@@ -104,15 +103,21 @@ function isDuplicateError(userErrors) {
 export async function createRetailDiscount({
   code,
   discountPercent,
+  practitionerId,
   practitionerName,
 }) {
-  if (!RETAIL_SHOP_DOMAIN || !RETAIL_ADMIN_ACCESS_TOKEN) {
+  if (!RETAIL_SHOP_DOMAIN) {
+    console.warn("[cdo] skipping retail discount creation — RETAIL_SHOP_DOMAIN missing");
+    return { ok: false, error: "Retail store not configured" };
+  }
+  if (!NS_RETAIL_API_BASE || !RETAIL_SYNC_SECRET) {
     console.warn(
-      "[cdo] skipping retail discount creation — RETAIL_SHOP_DOMAIN or RETAIL_ADMIN_ACCESS_TOKEN missing",
+      "[cdo] skipping retail discount creation — NS_RETAIL_API_BASE or RETAIL_SYNC_SECRET missing",
     );
-    return { ok: false, error: "Retail store credentials not configured" };
+    return { ok: false, error: "ns-retail cross-app credentials not configured" };
   }
   if (!code) return { ok: false, error: "code required" };
+  if (!practitionerId) return { ok: false, error: "practitionerId required" };
   if (
     !Number.isFinite(discountPercent) ||
     discountPercent <= 0 ||
@@ -124,59 +129,30 @@ export async function createRetailDiscount({
     };
   }
 
-  const title = practitionerName
-    ? `Practitioner code (${practitionerName}) — ${code}`
-    : `Practitioner code — ${code}`;
-
-  const input = {
-    title,
-    code,
-    startsAt: new Date().toISOString(),
-    customerSelection: { all: true },
-    customerGets: {
-      value: { percentage: discountPercent },
-      items: { all: true },
-    },
-    usageLimit: null,
-    appliesOncePerCustomer: false,
-  };
-
   try {
-    const res = await fetch(
-      `https://${RETAIL_SHOP_DOMAIN}/admin/api/${RETAIL_API_VERSION}/graphql.json`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Shopify-Access-Token": RETAIL_ADMIN_ACCESS_TOKEN,
-        },
-        body: JSON.stringify({
-          query: MUTATION_DISCOUNT_CREATE,
-          variables: { basicCodeDiscount: input },
-        }),
+    const url = `${NS_RETAIL_API_BASE.replace(/\/$/, "")}/api/cdo-internal/create-shopify-discount`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-sync-secret": RETAIL_SYNC_SECRET,
+        "ngrok-skip-browser-warning": "true",
       },
-    );
+      body: JSON.stringify({
+        code,
+        discountPercent,
+        practitionerId,
+        practitionerName,
+        shop: RETAIL_SHOP_DOMAIN,
+      }),
+    });
+
+    const data = await res.json().catch(() => null);
+
     if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      console.error(
-        `[cdo] retail discount create HTTP ${res.status} for "${code}": ${text.slice(0, 200)}`,
-      );
-      return { ok: false, error: `Retail store HTTP ${res.status}` };
-    }
-    const data = await res.json();
-    if (data?.errors?.length) {
-      console.error(
-        `[cdo] retail discount GraphQL errors for "${code}":`,
-        JSON.stringify(data.errors).slice(0, 300),
-      );
-      return { ok: false, error: "Discount creation failed" };
-    }
-    const errs = data?.data?.discountCodeBasicCreate?.userErrors || [];
-    if (errs.length) {
-      if (isDuplicateError(errs)) {
-        console.log(
-          `[cdo] retail discount "${code}" already exists — URL returned, no node id`,
-        );
+      const isDuplicate = res.status === 409 && data?.result?.userErrors && isDuplicateError(data.result.userErrors);
+      if (isDuplicate) {
+        console.log(`[cdo] retail discount "${code}" already exists — URL returned, no node id`);
         return {
           ok: true,
           duplicate: true,
@@ -185,54 +161,43 @@ export async function createRetailDiscount({
         };
       }
       console.error(
-        `[cdo] retail discountCodeBasicCreate userErrors for "${code}":`,
-        errs.map((e) => `${(e.field || []).join(".")}: ${e.message}`).join("; "),
+        `[cdo] ns-retail create-shopify-discount HTTP ${res.status} for "${code}": ${data?.message || "(no message)"}`,
       );
-      return {
-        ok: false,
-        error: errs.map((e) => e.message).join("; "),
-        userErrors: errs,
-      };
+      return { ok: false, error: data?.message || `ns-retail HTTP ${res.status}` };
     }
-    const nodeId =
-      data?.data?.discountCodeBasicCreate?.codeDiscountNode?.id || null;
+
+    const nodeId = data?.result?.shopifyDiscountId || null;
     console.log(
-      `[cdo] created retail discount code="${code}" percent=${discountPercent} id=${nodeId}`,
+      `[cdo] created retail discount (via ns-retail) code="${code}" percent=${discountPercent} id=${nodeId}`,
     );
     return {
       ok: true,
       duplicate: false,
       shopifyDiscountId: nodeId,
-      shopifyDiscountUrl: buildShopifyDiscountUrl(RETAIL_SHOP_DOMAIN, code),
+      shopifyDiscountUrl: data?.result?.shopifyDiscountUrl || buildShopifyDiscountUrl(RETAIL_SHOP_DOMAIN, code),
     };
   } catch (err) {
-    console.error(
-      `[cdo] retail discount create threw for "${code}":`,
-      err?.message || err,
-    );
+    console.error(`[cdo] retail discount create threw for "${code}":`, err?.message || err);
     return { ok: false, error: "Discount creation failed" };
   }
 }
 
 /**
- * Activate or deactivate an existing retail discount by its node id. Used by
- * the Practitioner Portal's pause/resume referral-code flow. Direct retail
- * Admin GraphQL call via RETAIL_ADMIN_ACCESS_TOKEN — no HTTP hop through
- * ns-retail.
+ * Deactivate an existing retail discount by its node id (pause). Direct
+ * retail Admin GraphQL call via RETAIL_ADMIN_ACCESS_TOKEN — no HTTP hop
+ * through ns-retail. Unlike activation (below), deactivating a Function-
+ * backed discount works fine from any app with write_discounts, confirmed
+ * via live testing.
  *
  * @param {object} args
  * @param {string} args.discountId  gid://shopify/DiscountCodeNode/...
- * @param {boolean} args.active     true → activate, false → deactivate
  * @returns {Promise<{ ok: boolean, error?: string }>}
  */
-export async function setRetailDiscountActive({ discountId, active }) {
+async function deactivateRetailDiscountDirect({ discountId }) {
   if (!RETAIL_SHOP_DOMAIN || !RETAIL_ADMIN_ACCESS_TOKEN) {
     return { ok: false, error: "Retail store credentials not configured" };
   }
   if (!discountId) return { ok: false, error: "discountId required" };
-
-  const mutation = active ? MUTATION_DISCOUNT_ACTIVATE : MUTATION_DISCOUNT_DEACTIVATE;
-  const field = active ? "discountCodeActivate" : "discountCodeDeactivate";
 
   try {
     const res = await fetch(
@@ -243,37 +208,97 @@ export async function setRetailDiscountActive({ discountId, active }) {
           "Content-Type": "application/json",
           "X-Shopify-Access-Token": RETAIL_ADMIN_ACCESS_TOKEN,
         },
-        body: JSON.stringify({ query: mutation, variables: { id: discountId } }),
+        body: JSON.stringify({ query: MUTATION_DISCOUNT_DEACTIVATE, variables: { id: discountId } }),
       },
     );
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       console.error(
-        `[cdo] retail discount toggle HTTP ${res.status} for "${discountId}": ${text.slice(0, 200)}`,
+        `[cdo] retail discount deactivate HTTP ${res.status} for "${discountId}": ${text.slice(0, 200)}`,
       );
       return { ok: false, error: `Retail store HTTP ${res.status}` };
     }
     const data = await res.json();
     if (data?.errors?.length) {
       console.error(
-        `[cdo] retail discount toggle GraphQL errors for "${discountId}":`,
+        `[cdo] retail discount deactivate GraphQL errors for "${discountId}":`,
         JSON.stringify(data.errors).slice(0, 300),
       );
       return { ok: false, error: "Discount update failed" };
     }
-    const userErrors = data?.data?.[field]?.userErrors || [];
+    const userErrors = data?.data?.discountCodeDeactivate?.userErrors || [];
     if (userErrors.length) {
       return { ok: false, error: userErrors.map((e) => e.message).join("; ") };
     }
-    console.log(`[cdo] retail discount toggle ok id=${discountId} active=${active}`);
+    console.log(`[cdo] retail discount deactivated id=${discountId}`);
     return { ok: true };
   } catch (err) {
-    console.error(
-      `[cdo] retail discount toggle threw for "${discountId}":`,
-      err?.message || err,
-    );
+    console.error(`[cdo] retail discount deactivate threw for "${discountId}":`, err?.message || err);
     return { ok: false, error: "Discount update failed" };
   }
+}
+
+/**
+ * Activate an existing retail discount by its node id (resume). PROXIED
+ * THROUGH ns-retail (`POST /api/cdo-internal/set-discount-active`) — unlike
+ * deactivate, reactivating a Function-backed discount FAILS with
+ * "Code discount activation has failed." when called from any app other
+ * than the one that owns the discount's Function (confirmed via live
+ * testing 2026-07-08 against the real durtest11/tesst12 discounts).
+ *
+ * @param {object} args
+ * @param {string} args.discountId  gid://shopify/DiscountCodeNode/...
+ * @returns {Promise<{ ok: boolean, error?: string }>}
+ */
+async function activateRetailDiscountViaNsRetail({ discountId }) {
+  if (!RETAIL_SHOP_DOMAIN) {
+    return { ok: false, error: "Retail store not configured" };
+  }
+  if (!NS_RETAIL_API_BASE || !RETAIL_SYNC_SECRET) {
+    return { ok: false, error: "ns-retail cross-app credentials not configured" };
+  }
+  if (!discountId) return { ok: false, error: "discountId required" };
+
+  try {
+    const url = `${NS_RETAIL_API_BASE.replace(/\/$/, "")}/api/cdo-internal/set-discount-active`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-sync-secret": RETAIL_SYNC_SECRET,
+        "ngrok-skip-browser-warning": "true",
+      },
+      body: JSON.stringify({ discountId, shop: RETAIL_SHOP_DOMAIN }),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) {
+      console.error(
+        `[cdo] ns-retail set-discount-active HTTP ${res.status} for "${discountId}": ${data?.message || "(no message)"}`,
+      );
+      return { ok: false, error: data?.message || `ns-retail HTTP ${res.status}` };
+    }
+    console.log(`[cdo] retail discount activated (via ns-retail) id=${discountId}`);
+    return { ok: true };
+  } catch (err) {
+    console.error(`[cdo] retail discount activate threw for "${discountId}":`, err?.message || err);
+    return { ok: false, error: "Discount update failed" };
+  }
+}
+
+/**
+ * Activate or deactivate an existing retail discount by its node id. Used by
+ * the Practitioner Portal's pause/resume referral-code flow. See the two
+ * helpers above for why activate and deactivate take different paths.
+ *
+ * @param {object} args
+ * @param {string} args.discountId  gid://shopify/DiscountCodeNode/...
+ * @param {boolean} args.active     true → activate, false → deactivate
+ * @returns {Promise<{ ok: boolean, error?: string }>}
+ */
+export async function setRetailDiscountActive({ discountId, active }) {
+  return active
+    ? activateRetailDiscountViaNsRetail({ discountId })
+    : deactivateRetailDiscountDirect({ discountId });
 }
 
 // Strip everything that's not [a-z] from the first name so the prefix
@@ -397,6 +422,7 @@ export async function generatePractitionerCode({
   const disc = await createRetailDiscount({
     code: created.code,
     discountPercent: created.discountPercent,
+    practitionerId: String(applicationId),
     practitionerName: fullName,
   });
 

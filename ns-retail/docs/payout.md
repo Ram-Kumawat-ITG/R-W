@@ -1076,6 +1076,89 @@ applies per realm).
 
 ---
 
+## 20. Client Portal (Theme App Extension, retail storefront) — IMPLEMENTED (2026-07-07)
+
+Self-service account dashboard for **retail customers** — regular customers,
+patients referred by a practitioner, and customers currently attributed to a
+practitioner via a CDO referral code. Distinct audience from §18's
+Practitioner Portal (practitioners, not their customers); no relation to that
+feature beyond sharing the CDO data model.
+
+**Architecture — follows this repo's own proven App-Proxy Theme-App-Extension
+pattern** (`signup-form/`, `practitioner-code-form/`), not the wholesale
+Practitioner Portal's pattern, since ns-retail owns its data directly (no
+cross-store mirroring needed here):
+- New Vite+React source workspace `ns-retail/client-portal/` (sibling to
+  `signup-form/`, `practitioner-code-form/`), building into
+  `extensions/theme-extension/assets/client-portal-bundle.{js,css}`
+  (`npm run build:client-portal`, folded into `predeploy`).
+- New Liquid block `extensions/theme-extension/blocks/client_portal.liquid` —
+  zero merchant-facing settings (same convention as `practitioner_code.liquid`);
+  merchant places it on an account/page template.
+- Backend reached via the existing single App Proxy
+  (`/apps/retail-signup/api/client-portal/*`) — no new app proxy config.
+- Auth guard `app/api/client-portal/_guard.js`: verifies
+  `authenticate.public.appProxy(request)`, resolves `logged_in_customer_id` →
+  a Shopify customer GID, and builds a customer-scoped context via
+  `resolveClientContext` in the new service below. **No approval gate** —
+  any logged-in retail customer is authorized (contrast with §18's
+  practitioner guard, which 403s a non-approved account). Only failure modes
+  are 401 (not signed in / bad App Proxy signature) and 500.
+- New service `app/services/cdo/cdo.clientPortal.service.js` — every query
+  scoped strictly by `customer.shopifyCustomerId` (the trusted GID from the
+  guard), never by client-supplied email or order id alone. Exports
+  `resolveClientContext`, `getDashboard`, `getOrders`, `getOrderDetail`,
+  `getPaymentHistory`, `getCdoInfo`, `getProfile`. Reuses the existing pure
+  `utils/orderStatus.js` helpers (`deriveShippingStatus`/`deriveDeliveryStatus`/
+  `extractTracking`) rather than re-deriving fulfillment state.
+- 7 new read-only API routes registered manually in `app/routes.js` (this
+  repo's convention for `/api/*`): `me`, `dashboard`, `orders`, `order`
+  (single detail, `?id=`), `payments`, `cdo`, `profile`. All GET-only —
+  **no writes in this feature** (Profile is read-only display; contrast with
+  §18's referral-code create/pause/resume mutation path).
+
+**Sections (tabs):**
+- **Dashboard** — order count, lifetime spend, last order date; a banner
+  when the customer is linked to a practitioner.
+- **Orders** — paginated list (`getOrders`, filterable by `financialStatus`/
+  `fulfillmentStatus`) with click-through to a full order detail view
+  (`getOrderDetail`) — line items, pricing breakdown, addresses, tracking.
+  "Current vs. history" is a UI filter over one endpoint, not two separate
+  endpoints/services.
+- **Payment History** — derived from `cdo_orders.retailQbo` (no new payments
+  model) — per-order payment status + a link to the QBO-emailed invoice when
+  one exists; `invoiceStatus: null` (sync pending/not started) renders as
+  "Processing" rather than a blank cell.
+- **CDO** — **hidden entirely** (not shown with an empty state) for
+  customers with no active practitioner referral. When attributed: current
+  practitioner name, discount code + percent, enrollment date, and the
+  customer's own discount-code usage history (from `cdo_orders.discountCodes`
+  matched against their bound code — never another customer's usage).
+- **Profile** — read-only: name, email, enrollment status, and the most
+  recent order's billing/shipping address snapshot. `cdo_applications.
+  billingAddress`/`shippingAddress` are always null (nothing populates
+  them), and a live Shopify Admin address lookup was deliberately avoided
+  (no extra latency/failure mode for an informational field) — so Profile
+  sources addresses from the customer's latest `cdo_orders` document
+  instead, with an explicit "no address on file yet" empty state for a
+  zero-order customer.
+
+**Security notes:**
+- `getOrderDetail`'s ownership check (`o.customer.shopifyCustomerId !==
+  ctx.customerId` → `null`) is enumeration-safe — a guessed/foreign order id
+  returns a generic "not found," never a 403 that would confirm the id
+  exists but belongs to someone else.
+- Orders/payments/dashboard queries are **GID-only** — a customer's
+  pre-account guest-checkout orders (placed under the same email before
+  creating an account) are intentionally excluded rather than joined by
+  email, since email is not an authenticated identity signal.
+
+**Nothing in the CDO data layer changed** — `cdo_orders`/`cdo_applications`
+are read-only from this feature's perspective (already owned and written by
+the existing order-ingestion pipeline, `cdo.service.ingestShopifyOrder`).
+
+---
+
 ### Appendix — Environment variables
 
 ```

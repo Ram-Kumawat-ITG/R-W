@@ -2,14 +2,21 @@
 // orders/create, orders/paid, and orders/updated webhook handlers so they
 // resolve attribution the same way. No I/O — payload parsing only.
 
-// Canonical practitioner-code shape: <firstname>_<8-char-hex>.
-const CODE_PATTERN = /^[a-z]+_[a-f0-9]{8}$/i;
-
 // Customer-tag convention, e.g. "CODE:DURGESH10" / "REFERRAL:DURGESH10".
 export const TAG_CODE_PATTERN = /^\s*(?:code|referral)\s*:\s*(.+?)\s*$/i;
 
 // Returns { code, source } where source is "note_attribute" |
 // "discount_code" | null.
+//
+// NOTE: the discount_codes fallback intentionally does NOT shape-check the
+// code (e.g. against the auto-generated "<name>_<8hex>" pattern) — a
+// practitioner code entered directly into Shopify's native discount field
+// (bypassing the custom widget's note_attribute) can be any custom name an
+// admin chose (e.g. "durtest11", "SUMMER-PRACTITIONER"). The real gate is
+// resolvePractitionerReferral()'s catalogue lookup downstream, which safely
+// returns null for any code — practitioner-shaped or not — that isn't
+// actually in cdo_practitioner_codes, so a genuine unrelated public
+// discount code never falsely attributes.
 export function extractPractitionerCode(order) {
   // 1. Preferred: the cart attribute the checkout UI extension stamps on the
   //    order before discount apply.
@@ -20,11 +27,12 @@ export function extractPractitionerCode(order) {
       if (v) return { code: v, source: "note_attribute" };
     }
   }
-  // 2. Fallback: a discount code on the order that matches the code shape.
+  // 2. Fallback: any discount code on the order — validated against the
+  //    real catalogue downstream, not by shape here.
   const dcs = order?.discount_codes || [];
   for (const dc of dcs) {
     const c = String(dc?.code || "").trim();
-    if (c && CODE_PATTERN.test(c)) return { code: c, source: "discount_code" };
+    if (c) return { code: c, source: "discount_code" };
   }
   return { code: null, source: null };
 }

@@ -6,6 +6,7 @@ import {
   extractCodeFromTags,
 } from "../utils/orderCode";
 import { syncCustomerCodeTag } from "../utils/customerTags";
+import { bindCustomerToPractitioner } from "../utils/practitionerMetafields";
 
 // In-memory dedup of webhook ids — Shopify delivers at-least-once and
 // can fire the same payload multiple times in a short window. 5 min TTL
@@ -116,7 +117,7 @@ export async function action({ request }) {
 async function forwardToWholesaleDropship({ payload, retailShop }) {
   // eslint-disable-next-line no-undef
   const apiBase =
-    "https://snap-lance-poor-sold.trycloudflare.com" ||
+    "https://natural-solutions-wholesale.onrender.com" ||
     process.env.WHOLESALE_API_BASE;
   // eslint-disable-next-line no-undef
   const wholesaleShop = process.env.WHOLESALE_SHOP;
@@ -221,12 +222,40 @@ async function processOrder({ shop, payload }) {
       shop,
       result.customerGid,
       result.referralCode,
+      result.practitionerEmail,
     ).catch((err) => {
       console.error(
         `[webhooks.orders.create] tag customer ${result.customerGid} failed:`,
         err?.message || err,
       );
     });
+
+    // Permanent enforcement-layer binding (see utils/practitionerMetafields.js).
+    // Write-once: a customer already bound to a DIFFERENT practitioner would
+    // have had this code's discount declined by the practitioner-discount
+    // Function before the order could even be placed, so reaching here with
+    // a mismatch would indicate the code was applied through a path the
+    // Function didn't gate (e.g. manually in Admin) — logged, not corrected,
+    // since the binding is permanent by design.
+    if (result.practitionerId) {
+      try {
+        const bind = await bindCustomerToPractitioner(
+          shop,
+          result.customerGid,
+          result.practitionerId,
+        );
+        if (bind.mismatch) {
+          console.warn(
+            `[webhooks.orders.create] order used practitioner ${result.practitionerId}'s code, but customer ${result.customerGid} is permanently bound to practitioner ${bind.practitionerId} — the discount Function should have declined this; check for an out-of-band application (e.g. manual Admin entry)`,
+          );
+        }
+      } catch (err) {
+        console.error(
+          `[webhooks.orders.create] bind customer ${result.customerGid} to practitioner ${result.practitionerId} failed:`,
+          err?.message || err,
+        );
+      }
+    }
   }
 }
 

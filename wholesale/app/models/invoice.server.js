@@ -329,6 +329,18 @@ const invoiceSchema = new mongoose.Schema(
     //                          new ACH rows use cron_ach_attempt.
     //   cron_failed_followup — PASS 1.5 CRON noted a failed card OR
     //                          ACH invoice that exhausted retries
+    //   cron_payment_failed_email — Legacy enum kept for back-compat with
+    //                          rows written by an earlier draft of the
+    //                          customer-facing "Payment Failed" email
+    //                          notification (services/payment/
+    //                          paymentFailureNotification.service.js).
+    //                          The current implementation doesn't write
+    //                          a remark for the email itself (the charge
+    //                          attempt's own cron_card_attempt/
+    //                          cron_ach_attempt remark already covers
+    //                          it) — kept only so pre-existing documents
+    //                          with this value don't fail full-document
+    //                          validation on save.
     //   admin_action         — admin-driven settlement event (retry,
     //                          charge-card fallback, mark cheque paid)
     //   system_note          — any other system-generated note
@@ -351,6 +363,7 @@ const invoiceSchema = new mongoose.Schema(
                 // actual QBO invoice reminder EMAIL was triggered.
                 'cron_payment_reminder',
                 'cron_failed_followup',
+                'cron_payment_failed_email',
                 'admin_action',
                 'system_note',
               ],

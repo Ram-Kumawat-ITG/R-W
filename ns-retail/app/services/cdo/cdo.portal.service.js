@@ -1106,6 +1106,7 @@ export async function createReferralCode(
     shop,
     code: raw,
     discountPercent: fraction,
+    practitionerId,
     practitionerName: fullName,
   });
 

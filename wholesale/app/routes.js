@@ -71,6 +71,11 @@ export default [
   route("/api/admin/orders/:id/resume-auto-charge", "api/admin/resume-auto-charge.js"),
   route("/api/admin/orders/:id/pause-reminders", "api/admin/pause-reminders.js"),
   route("/api/admin/orders/:id/resume-reminders", "api/admin/resume-reminders.js"),
+  // Global (not per-invoice) — pause/resume the process-pending-payments
+  // CRON's two email notifications (customer "Payment Failed" + admin
+  // "Batch Processing Summary"). Charge processing is unaffected.
+  route("/api/admin/cron-notifications/pause", "api/admin/pause-cron-notifications.js"),
+  route("/api/admin/cron-notifications/resume", "api/admin/resume-cron-notifications.js"),
   route("/api/admin/admin-order-batch", "api/admin/admin-order-batch.js"),
   route("/api/sync/retail-order", "api/sync/retail-order.js"),
   route("/api/sync/retail-inventory-update", "api/sync/retail-inventory-update.js"),
