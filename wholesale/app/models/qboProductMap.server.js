@@ -24,7 +24,14 @@ const qboProductMapSchema = new mongoose.Schema(
     // Shopify identifiers (stored as plain numeric-string legacy ids).
     shopifyProductId: { type: String, required: true, index: true },
     shopifyVariantId: { type: String, required: true },
+    // Shopify inventory_item_id for the variant — the key the
+    // inventory_levels/update webhook carries, so we can find the QBO item to
+    // adjust when stock changes.
+    inventoryItemId: { type: String, default: null },
     sku: { type: String, default: null },
+    // Last on-hand quantity pushed to QBO — lets the inventory webhook skip
+    // no-op writes / compute deltas.
+    lastSyncedQty: { type: Number, default: null },
     // Snapshots for reporting / the invoice-time fallback + admin visibility.
     productTitle: { type: String, default: null },
     variantTitle: { type: String, default: null },
@@ -59,6 +66,7 @@ const qboProductMapSchema = new mongoose.Schema(
 // Idempotency: one row per variant. Two overlapping webhook deliveries can't
 // create duplicate rows; the upsert keys on this.
 qboProductMapSchema.index({ shopifyVariantId: 1 }, { unique: true })
+qboProductMapSchema.index({ inventoryItemId: 1 })
 qboProductMapSchema.index({ sku: 1 })
 qboProductMapSchema.index({ qboItemId: 1 })
 qboProductMapSchema.index({ syncStatus: 1 })

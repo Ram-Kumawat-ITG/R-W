@@ -26,7 +26,14 @@ const retailQboProductMapSchema = new mongoose.Schema(
     shop: { type: String, default: null, index: true },
     shopifyProductId: { type: String, required: true, index: true },
     shopifyVariantId: { type: String, required: true },
+    // Shopify inventory_item_id for the variant — the key the
+    // inventory_levels/update webhook carries, so we can find the QBO item to
+    // adjust when stock changes.
+    inventoryItemId: { type: String, default: null },
     sku: { type: String, default: null },
+    // Last on-hand quantity we pushed to QBO — lets the inventory webhook
+    // compute a delta and skip no-op writes.
+    lastSyncedQty: { type: Number, default: null },
     productTitle: { type: String, default: null },
     variantTitle: { type: String, default: null },
     vendor: { type: String, default: null },

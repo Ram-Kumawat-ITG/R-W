@@ -9,13 +9,20 @@ MongoDB). Each syncs ONLY its own Shopify store → its own QBO realm. New QBO
 Items are created as `Inventory` type (TrackQtyOnHand + QtyOnHand + InvStartDate
 + Asset/COGS/Income accounts) with a graceful fallback to `Service` when the
 inventory accounts can't be resolved. Products are NEVER deleted/deactivated in
-QBO (retention). **Still deferred (not built):** ongoing quantity PUSH via
-`InventoryAdjustment` on `inventory_levels/update` (§7 — QBO can't PATCH
-QtyOnHand after create), the reconciliation CRON + admin visibility tab (§9/§11
-Phase 5; a `retryFailed*QboProductSyncs()` reconciliation function exists in
-each repo but isn't yet wired to a scheduled job or UI), and Item Categories
-for vendor analytics (§3.4). The rest of this document is the original DRAFT
-plan and remains the reference for those deferred pieces.
+QBO (retention). **Inventory QUANTITY sync (§7) is now IMPLEMENTED in ns-retail (2026-07-15):**
+`postRetailInventoryAdjustment` / `reconcileRetailItemInventory` (QBO
+`/inventoryadjustment`), reconcile-on-product-sync, an `inventory_levels/update`
+webhook, and a `backfill-retail-qbo-products.js` script — this fixed the
+observed "QBO QtyOnHand=0 while Shopify has stock" bug (QtyOnHand can only be
+set at create or via an InventoryAdjustment). The **wholesale** side has the
+Inventory-type item create but NOT yet the ongoing quantity adjustment/webhook
+(deferred there). **Still deferred (both repos):** the QBO-invoice-decrement
+double-count guard (§5.3 — QBO auto-decrements Inventory on invoices, which can
+fight Shopify-driven adjustments), the reconciliation CRON + admin visibility
+tab (§9/§11 Phase 5; a `retryFailed*QboProductSyncs()` function exists in each
+repo but isn't wired to a scheduled job or UI), and Item Categories for vendor
+analytics (§3.4). The rest of this document is the original DRAFT plan and
+remains the reference for those deferred pieces.
 
 This document covers both Shopify app workspaces in this
 monorepo — `wholesale/` (customer invoices) and `ns-retail/` (`retailQbo`,

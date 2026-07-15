@@ -70,6 +70,11 @@ export const retailQboConfig = {
   // 'Sales of Product Income' (a generic Service-fee income account is
   // rejected). Auto-resolved from the Chart of Accounts when unset.
   productIncomeAccountId: readEnv("QBO_RETAIL_PRODUCT_INCOME_ACCOUNT_ID", { fallback: null }),
+  // Offset account for InventoryAdjustment posts (used to reconcile QtyOnHand
+  // after an item is created — QBO can't PATCH QtyOnHand on a plain item
+  // update). Auto-resolved when unset (prefers an "Inventory Shrinkage" /
+  // adjustment account, else the COGS account).
+  inventoryAdjustmentAccountId: readEnv("QBO_RETAIL_INVENTORY_ADJUSTMENT_ACCOUNT_ID", { fallback: null }),
 
   // Customer-facing email behavior — QBO is the delivery channel. Both default
   // ON per the retail spec; set the env to "false"/"0" to disable.

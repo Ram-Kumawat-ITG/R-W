@@ -21,7 +21,7 @@
 //     never blocks the others; the function resolves with a summary and only
 //     throws never (callers are fire-and-forget webhooks).
 
-import { upsertQboItem } from './qbo.service'
+import { upsertQboItem, reconcileQboItemInventory } from './qbo.service'
 import { qboConfig } from './qbo.config'
 import QboProductMap from '../../models/qboProductMap.server'
 import { createLogger } from '../../utils/logger.utils'
@@ -53,12 +53,15 @@ async function syncVariant({ shop, product, variant }) {
     variant?.price === null || variant?.price === undefined || variant?.price === ''
       ? null
       : Number(variant.price)
+  const inventoryItemId = variant?.inventory_item_id != null ? String(variant.inventory_item_id) : null
+  const qtyOnHand = variant?.inventory_quantity ?? null
 
   // Base snapshot written on every path (even skip/error) so the mapping row
   // always reflects the current Shopify identifiers.
   const baseSet = {
     shopifyProductId,
     shopifyVariantId,
+    inventoryItemId,
     sku: sku || null,
     productTitle,
     variantTitle,
@@ -89,9 +92,9 @@ async function syncVariant({ shop, product, variant }) {
       description: buildDescription(product, variant),
       price: shopifyPrice,
       // Initial QBO on-hand quantity (Inventory items only) — seeded from the
-      // Shopify variant's current stock at first create. QBO owns quantity
-      // after that; ongoing Shopify→QBO qty push is a separate feature.
-      qtyOnHand: variant?.inventory_quantity ?? 0,
+      // Shopify variant's current stock at first create; on an EXISTING item
+      // upsertQboItem reconciles QtyOnHand to this via an InventoryAdjustment.
+      qtyOnHand: qtyOnHand ?? 0,
     })
     await QboProductMap.updateOne(
       { shopifyVariantId },
@@ -101,6 +104,7 @@ async function syncVariant({ shop, product, variant }) {
           qboItemId: result.qboItemId,
           qboItemName: result.qboItemName,
           qboSyncToken: result.qboSyncToken,
+          lastSyncedQty: qtyOnHand,
           syncStatus: 'synced',
           lastSyncedAt: new Date(),
           lastSyncError: null,
@@ -110,7 +114,10 @@ async function syncVariant({ shop, product, variant }) {
       },
       { upsert: true },
     )
-    log.info('variant.synced', { shopifyVariantId, sku, qboItemId: result.qboItemId, action: result.action })
+    log.info('variant.synced', {
+      shopifyVariantId, sku, qboItemId: result.qboItemId, action: result.action,
+      qtyReconciled: result.qtyReconciled || null,
+    })
     return { status: 'synced', action: result.action, sku }
   } catch (err) {
     const message = err?.message || String(err)
@@ -152,6 +159,44 @@ export async function syncProductToQbo(product, { shop = null, event = 'update' 
 
   log.info('product.done', summary)
   return summary
+}
+
+// Handle a Shopify inventory_levels/update — reconcile the matching QBO
+// Inventory item's on-hand to Shopify's new `available`. Ongoing quantity-sync
+// path (products/update doesn't fire on stock-only changes; QBO QtyOnHand can
+// only change via InventoryAdjustment). Looked up by inventory_item_id via the
+// mapping row. Never throws.
+//
+// NOTE: `available` is per-LOCATION. Reconciles QBO to that value — correct for
+// a single-inventory-location store; a multi-location store would need the
+// summed available across locations (future enhancement).
+export async function syncInventoryLevelToQbo({ inventoryItemId, available }) {
+  if (!isQboProductSyncEnabled()) return { skipped: true, reason: 'disabled' }
+  const invId = inventoryItemId != null ? String(inventoryItemId) : null
+  const qty = Number(available)
+  if (!invId || !Number.isFinite(qty)) return { skipped: true, reason: 'bad_input' }
+
+  const row = await QboProductMap.findOne({ inventoryItemId: invId }).lean()
+  if (!row?.qboItemId) {
+    log.info('inventory_level.no_mapping', { inventoryItemId: invId })
+    return { skipped: true, reason: 'no_mapping' }
+  }
+  try {
+    const res = await reconcileQboItemInventory({ itemId: row.qboItemId, targetQty: qty })
+    await QboProductMap.updateOne(
+      { shopifyVariantId: row.shopifyVariantId },
+      { $set: { lastSyncedQty: qty, lastSyncedAt: new Date(), lastSyncError: null } },
+    )
+    log.info('inventory_level.synced', { inventoryItemId: invId, qboItemId: row.qboItemId, available: qty, ...res })
+    return { ok: true, ...res }
+  } catch (err) {
+    log.error('inventory_level.failed', { inventoryItemId: invId, err: err?.message || String(err) })
+    await QboProductMap.updateOne(
+      { shopifyVariantId: row.shopifyVariantId },
+      { $set: { lastSyncError: err?.message || String(err) } },
+    ).catch(() => {})
+    return { error: err?.message || String(err) }
+  }
 }
 
 // Mark the mapping rows for a deleted Shopify product as shopify-deleted —

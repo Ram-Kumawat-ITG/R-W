@@ -52,6 +52,11 @@ export const qboConfig = {
   inventoryTrackingEnabled: readBool('QBO_INVENTORY_TRACKING_ENABLED', true),
   inventoryAssetAccountId: readEnv('QBO_INVENTORY_ASSET_ACCOUNT_ID', { fallback: null }),
   inventoryCogsAccountId: readEnv('QBO_INVENTORY_COGS_ACCOUNT_ID', { fallback: null }),
+  // Offset account for InventoryAdjustment posts (used to reconcile QtyOnHand
+  // after an item is created — QBO can't PATCH QtyOnHand on a plain item
+  // update). Auto-resolved when unset (prefers an "Inventory Shrinkage" /
+  // adjustment account, else the COGS account).
+  inventoryAdjustmentAccountId: readEnv('QBO_INVENTORY_ADJUSTMENT_ACCOUNT_ID', { fallback: null }),
 }
 
 export function assertQboConfigured() {

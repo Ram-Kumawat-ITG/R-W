@@ -205,9 +205,77 @@ async function resolveProductIncomeAccountRef() {
   return _productIncomeRef;
 }
 
+// Offset account for InventoryAdjustment posts. Env-pinned or auto-resolved,
+// preferring an "Inventory Shrinkage"/adjustment account, else the COGS account.
+let _adjustAccountRef;
+async function resolveInventoryAdjustmentAccountRef() {
+  if (_adjustAccountRef !== undefined) return _adjustAccountRef;
+  if (retailQboConfig.inventoryAdjustmentAccountId) {
+    _adjustAccountRef = { value: String(retailQboConfig.inventoryAdjustmentAccountId) };
+    return _adjustAccountRef;
+  }
+  try {
+    const res = await retailQbo.query("SELECT * FROM Account WHERE AccountType = 'Cost of Goods Sold'");
+    const accounts = res?.QueryResponse?.Account || [];
+    const chosen =
+      accounts.find((a) => /shrinkage|adjust/i.test(a.Name || "")) ||
+      accounts.find((a) => /^cost of goods sold$/i.test(a.Name || "")) ||
+      accounts[0];
+    _adjustAccountRef = chosen?.Id ? { value: String(chosen.Id) } : await resolveCogsAccountRef();
+  } catch (err) {
+    log.warn("retail.item.adjust_account.lookup_failed", { err: err?.message || String(err) });
+    _adjustAccountRef = await resolveCogsAccountRef();
+  }
+  return _adjustAccountRef;
+}
+
 // QBO wants InvStartDate as a plain date (YYYY-MM-DD).
 function todayYmd() {
   return new Date().toISOString().slice(0, 10);
+}
+
+// Post a QBO InventoryAdjustment to change an Inventory item's on-hand by a
+// signed delta. This is the ONLY supported way to change QtyOnHand after an
+// item is created — a plain item update silently ignores QtyOnHand. Throws on
+// failure (caller records state). No-op when qtyDiff is 0.
+export async function postRetailInventoryAdjustment({ itemId, qtyDiff }) {
+  const diff = Number(qtyDiff);
+  if (!itemId) throw new Error("postRetailInventoryAdjustment: itemId is required");
+  if (!Number.isFinite(diff) || diff === 0) return { adjusted: false, reason: "no_diff" };
+  const adjustRef = await resolveInventoryAdjustmentAccountRef();
+  if (!adjustRef) throw new Error("postRetailInventoryAdjustment: no adjustment account available");
+  const payload = {
+    AdjustAccountRef: adjustRef,
+    Line: [
+      {
+        DetailType: "ItemAdjustmentLineDetail",
+        ItemAdjustmentLineDetail: {
+          ItemRef: { value: String(itemId) },
+          QtyDiff: diff,
+        },
+      },
+    ],
+  };
+  const res = await retailQbo.post("/inventoryadjustment", payload);
+  return { adjusted: true, id: res?.InventoryAdjustment?.Id || null, qtyDiff: diff };
+}
+
+// Reconcile a QBO Inventory item's on-hand TO an absolute target quantity
+// (Shopify is authoritative). GETs the item, computes the delta, and posts a
+// single corrective InventoryAdjustment. No-op when already matching or when
+// the item isn't an Inventory type. Throws on a QBO failure.
+export async function reconcileRetailItemInventory({ itemId, targetQty }) {
+  const target = Number(targetQty);
+  if (!itemId || !Number.isFinite(target)) return { adjusted: false, reason: "no_target" };
+  const item = await getRetailItem(itemId);
+  if (!item) return { adjusted: false, reason: "item_not_found" };
+  if (String(item.Type) !== "Inventory") return { adjusted: false, reason: "not_inventory" };
+  const current = Number(item.QtyOnHand ?? 0);
+  const diff = target - current;
+  if (diff === 0) return { adjusted: false, reason: "already_matches", qty: current };
+  await postRetailInventoryAdjustment({ itemId, qtyDiff: diff });
+  log.info("retail.item.qty_reconciled", { itemId: String(itemId), from: current, to: target, diff });
+  return { adjusted: true, from: current, to: target, diff };
 }
 
 // Parse a Shopify price string ("9.99") to a Number, or null.
@@ -449,12 +517,27 @@ export async function upsertRetailQboItem({ sku, name, description, price, qtyOn
     const { item, updated } = await updateRetailItemSparse(existing, desired);
     // Keep the invoice-time cache warm/consistent.
     _retailItemCache.set(clean, String(item.Id));
+    // Reconcile on-hand quantity to Shopify's value. The sparse item update
+    // above CANNOT change QtyOnHand — QBO only accepts it at create time or
+    // via an InventoryAdjustment — so an item created earlier with QtyOnHand 0
+    // (e.g. by the invoice-time path, or created before stock was loaded)
+    // stays 0 until this corrective adjustment runs. Best-effort: a failure
+    // here must not fail the item upsert.
+    let qtyResult = null;
+    if (retailQboConfig.inventoryTrackingEnabled && qtyOnHand != null && String(existing.Type) === "Inventory") {
+      try {
+        qtyResult = await reconcileRetailItemInventory({ itemId: existing.Id, targetQty: qtyOnHand });
+      } catch (err) {
+        log.warn("retail.item.qty_reconcile_failed", { sku: clean, err: err?.message || String(err) });
+      }
+    }
     return {
       qboItemId: String(item.Id),
       qboSyncToken: item.SyncToken != null ? String(item.SyncToken) : String(existing.SyncToken),
       qboItemName: item.Name || existing.Name,
       sku: item.Sku != null ? String(item.Sku) : clean,
       action: updated ? "updated" : "unchanged",
+      qtyReconciled: qtyResult?.adjusted ? qtyResult : null,
     };
   }
 

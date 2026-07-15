@@ -15,7 +15,7 @@
 // retry via retryFailedRetailQboProductSyncs(); best-effort per variant (one
 // failure never blocks the others); never throws (callers are fire-and-forget).
 
-import { upsertRetailQboItem } from "./retailQbo.service";
+import { upsertRetailQboItem, reconcileRetailItemInventory } from "./retailQbo.service";
 import { retailQboConfig, isRetailQboConfigured } from "./retailQbo.config";
 import RetailQboProductMap from "../../models/retailQboProductMap.server";
 import { createLogger } from "../../utils/logger.utils";
@@ -39,10 +39,13 @@ async function syncVariant({ shop, product, variant }) {
   const shopifyVariantId = String(variant.id);
   const sku = variant?.sku ? String(variant.sku).trim() : "";
   const shopifyPrice = priceOf(variant);
+  const inventoryItemId = variant?.inventory_item_id != null ? String(variant.inventory_item_id) : null;
+  const qtyOnHand = variant?.inventory_quantity ?? null;
 
   const baseSet = {
     shopifyProductId,
     shopifyVariantId,
+    inventoryItemId,
     sku: sku || null,
     productTitle: product?.title ?? null,
     variantTitle: variant?.title ?? null,
@@ -69,7 +72,7 @@ async function syncVariant({ shop, product, variant }) {
       name: product?.title ?? null,
       description: buildDescription(product, variant),
       price: shopifyPrice,
-      qtyOnHand: variant?.inventory_quantity ?? 0,
+      qtyOnHand: qtyOnHand ?? 0,
     });
     await RetailQboProductMap.updateOne(
       { shopifyVariantId },
@@ -79,6 +82,7 @@ async function syncVariant({ shop, product, variant }) {
           qboItemId: result.qboItemId,
           qboItemName: result.qboItemName,
           qboSyncToken: result.qboSyncToken,
+          lastSyncedQty: qtyOnHand,
           syncStatus: "synced",
           lastSyncedAt: new Date(),
           lastSyncError: null,
@@ -88,7 +92,10 @@ async function syncVariant({ shop, product, variant }) {
       },
       { upsert: true },
     );
-    log.info("variant.synced", { shopifyVariantId, sku, qboItemId: result.qboItemId, action: result.action });
+    log.info("variant.synced", {
+      shopifyVariantId, sku, qboItemId: result.qboItemId, action: result.action,
+      qtyReconciled: result.qtyReconciled || null,
+    });
     return { status: "synced", action: result.action };
   } catch (err) {
     const message = err?.message || String(err);
@@ -136,6 +143,46 @@ export async function syncRetailProductToQbo(product, { shop = null, event = "up
 
   log.info("product.done", summary);
   return summary;
+}
+
+// Handle a retail Shopify inventory_levels/update webhook — reconcile the
+// matching QBO Inventory item's on-hand to Shopify's new `available`. This is
+// the ONGOING quantity-sync path (products/update doesn't fire on stock-only
+// changes). Looked up by inventory_item_id via the mapping row. Never throws.
+//
+// NOTE: `available` is per-LOCATION. This reconciles QBO to that value, which
+// is correct for a single-inventory-location store (the current setup). A
+// multi-location store would need the summed available across locations; that
+// would be a future enhancement (sum via an Admin API read before adjusting).
+export async function syncRetailInventoryLevel({ inventoryItemId, available }) {
+  if (!isRetailQboProductSyncEnabled()) return { skipped: true, reason: "disabled" };
+  const invId = inventoryItemId != null ? String(inventoryItemId) : null;
+  const qty = Number(available);
+  if (!invId || !Number.isFinite(qty)) return { skipped: true, reason: "bad_input" };
+
+  const row = await RetailQboProductMap.findOne({ inventoryItemId: invId }).lean();
+  if (!row?.qboItemId) {
+    // No mapping yet (product not synced) — nothing to adjust. The product
+    // sync / backfill will set the initial quantity when it runs.
+    log.info("inventory_level.no_mapping", { inventoryItemId: invId });
+    return { skipped: true, reason: "no_mapping" };
+  }
+  try {
+    const res = await reconcileRetailItemInventory({ itemId: row.qboItemId, targetQty: qty });
+    await RetailQboProductMap.updateOne(
+      { shopifyVariantId: row.shopifyVariantId },
+      { $set: { lastSyncedQty: qty, lastSyncedAt: new Date(), lastSyncError: null } },
+    );
+    log.info("inventory_level.synced", { inventoryItemId: invId, qboItemId: row.qboItemId, available: qty, ...res });
+    return { ok: true, ...res };
+  } catch (err) {
+    log.error("inventory_level.failed", { inventoryItemId: invId, err: err?.message || String(err) });
+    await RetailQboProductMap.updateOne(
+      { shopifyVariantId: row.shopifyVariantId },
+      { $set: { lastSyncError: err?.message || String(err) } },
+    ).catch(() => {});
+    return { error: err?.message || String(err) };
+  }
 }
 
 // Mark the mapping rows for a deleted retail Shopify product as shopify-deleted
