@@ -1,6 +1,6 @@
 import { authenticate } from '../shopify.server'
 import connectDB from '../services/APIService/mongo.service'
-import { isSyncEnabled, syncProductDelete, claimSyncWebhook } from '../services/sync/index'
+import { isSyncEnabled, syncProductDelete, claimSyncWebhook, deleteProductMap } from '../services/sync/index'
 import { createLogger } from '../utils/logger.utils'
 
 const log = createLogger('webhook.products_delete')
@@ -39,9 +39,13 @@ export const action = async ({ request }) => {
 
   await connectDB()
 
+  // Retail delete first, then remove the MongoDB product-map document —
+  // chained after the sync settles so the mirror is removed even when the
+  // retail-side delete fails (the wholesale product is gone regardless).
   syncProductDelete(payload.id)
     .then(() => log.info('done', { shop, productId: payload.id }))
     .catch((err) => log.error('failed', { shop, productId: payload.id, err }))
+    .then(() => deleteProductMap(payload.id))
 
   return new Response(null, { status: 200 })
 }

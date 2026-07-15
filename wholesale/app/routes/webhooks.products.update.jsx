@@ -1,6 +1,6 @@
 import { authenticate } from '../shopify.server'
 import connectDB from '../services/APIService/mongo.service'
-import { isSyncEnabled, syncProductUpdate, claimSyncWebhook } from '../services/sync/index'
+import { isSyncEnabled, syncProductUpdate, claimSyncWebhook, upsertProductMap } from '../services/sync/index'
 import { createLogger } from '../utils/logger.utils'
 
 const log = createLogger('webhook.products_update')
@@ -39,9 +39,13 @@ export const action = async ({ request }) => {
 
   await connectDB()
 
+  // Retail sync first, then refresh the comprehensive MongoDB product map
+  // (chained after the sync settles so retail ids from sync_id_maps are
+  // fresh, and a failed retail sync still updates the wholesale snapshot).
   syncProductUpdate(payload, { shop })
     .then(() => log.info('done', { shop, productId: payload.id }))
     .catch((err) => log.error('failed', { shop, productId: payload.id, err }))
+    .then(() => upsertProductMap(payload, { shop, event: 'update' }))
 
   return new Response(null, { status: 200 })
 }

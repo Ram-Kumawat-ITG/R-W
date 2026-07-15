@@ -3,6 +3,7 @@ import connectDB from '../../services/APIService/mongo.service'
 import { sendResponse } from '../../services/APIService/api.service'
 import { isSyncEnabled } from '../../services/sync/sync.config'
 import { syncProductCreate } from '../../services/sync/product.sync'
+import { upsertProductMap } from '../../services/sync/productMap.service'
 import IdMap from '../../services/sync/idMap.model'
 import { createLogger } from '../../utils/logger.utils'
 
@@ -183,7 +184,7 @@ export async function action({ request }) {
 
   for (const product of allProducts) {
     try {
-      await syncProductCreate(product)
+      await syncProductCreate(product, { shop })
       results.synced++
       log.info('backfill.product_synced', { wholesaleId: product.id, title: product.title })
     } catch (err) {
@@ -191,6 +192,10 @@ export async function action({ request }) {
       results.errors.push({ productId: product.id, title: product.title, error: err.message })
       log.error('backfill.product_failed', { wholesaleId: product.id, title: product.title, err })
     }
+    // Maintain the comprehensive product map regardless of retail-sync
+    // outcome (best-effort, never throws) — runs after the sync so retail
+    // ids written to sync_id_maps are picked up.
+    await upsertProductMap(product, { shop, event: 'backfill' })
   }
 
   // Phase 2 — Snapshot current inventory levels into MongoDB (separate batched queries)
