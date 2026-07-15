@@ -68,7 +68,11 @@ export async function action({ request }) {
   const retailLocationId = payload?.location_id
   const available = payload?.available
 
-  if (!retailInventoryItemId || available === undefined || !wholesaleShop) {
+  // `available == null` covers BOTH undefined and null — Shopify sends
+  // `available: null` for untracked items; Number(null) is 0, which would
+  // poison the stored baseline and make the next real value look like a
+  // giant restock.
+  if (!retailInventoryItemId || available == null || !wholesaleShop) {
     return sendResponse(400, 'error', 'Missing inventory_item_id / available / shop', null)
   }
 

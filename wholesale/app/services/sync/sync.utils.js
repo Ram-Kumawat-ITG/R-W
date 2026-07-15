@@ -5,6 +5,21 @@ import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('sync.utils')
 
+// In-memory dedup on Shopify's X-Shopify-Webhook-Id header — guards the
+// product sync webhooks against at-least-once redelivery kicking off two
+// concurrent syncs for the same event (same pattern as the orders/create
+// route's claimWebhookForSync). Entries expire after 5 minutes. Per-process
+// only; the durable cross-restart duplicate guard is the claim-first IdMap
+// insert in syncProductCreate.
+const _seenSyncWebhookIds = new Set()
+export function claimSyncWebhook(id) {
+  if (!id) return true // no header (e.g. manual replay) — let it through
+  if (_seenSyncWebhookIds.has(id)) return false
+  _seenSyncWebhookIds.add(id)
+  setTimeout(() => _seenSyncWebhookIds.delete(id), 5 * 60 * 1000)
+  return true
+}
+
 // Resolve the retail location ID for a given wholesale location ID.
 // Falls back to the env-configured default, then auto-discovers the
 // first active retail location and caches it in the id map.

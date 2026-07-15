@@ -1,6 +1,6 @@
 import { authenticate } from '../shopify.server'
 import connectDB from '../services/APIService/mongo.service'
-import { isSyncEnabled, syncProductDelete } from '../services/sync/index'
+import { isSyncEnabled, syncProductDelete, claimSyncWebhook } from '../services/sync/index'
 import { createLogger } from '../utils/logger.utils'
 
 const log = createLogger('webhook.products_delete')
@@ -27,6 +27,13 @@ export const action = async ({ request }) => {
 
   if (!isSyncEnabled()) {
     log.info('sync_disabled', { shop })
+    return new Response(null, { status: 200 })
+  }
+
+  // Dedup Shopify's at-least-once redelivery of the same event.
+  const webhookId = request.headers.get('x-shopify-webhook-id')
+  if (!claimSyncWebhook(webhookId)) {
+    log.info('duplicate_webhook.skipped', { shop, productId: payload.id, webhookId })
     return new Response(null, { status: 200 })
   }
 

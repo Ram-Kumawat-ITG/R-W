@@ -16,6 +16,7 @@ import connectDB from '../services/APIService/mongo.service'
 import { scheduleNow, JOB_NAMES } from '../services/scheduler/scheduler.service'
 import { processShopifyOrder } from '../services/order/order.service'
 import { isSyncEnabled, deductRetailInventoryForOrder } from '../services/sync/index'
+import { isRetailCustomerEmail } from '../services/dropship/dropship.config'
 import { createLogger } from '../utils/logger.utils'
 
 // Module-level dedup for retail deduction — guards against Shopify's
@@ -138,7 +139,15 @@ export const action = async ({ request }) => {
   // Fire-and-forget — sync failure must never affect the 200 response.
   // claimWebhookForSync prevents double-deduction when Shopify retries the
   // same webhook (at-least-once delivery).
-  if (isSyncEnabled() && claimWebhookForSync(webhookId)) {
+  //
+  // Drop-ship orders are EXCLUDED: a drop-ship wholesale order mirrors a
+  // retail order whose quantities were already deducted from retail stock
+  // natively at retail checkout — mirroring the deduction again here would
+  // double-deduct the retail store for every drop-ship sale.
+  const orderEmail = payload?.email || payload?.contact_email || payload?.customer?.email
+  if (isRetailCustomerEmail(orderEmail)) {
+    log.info('retail_inventory_deduct.skipped_dropship', { shop, orderId: payload.id })
+  } else if (isSyncEnabled() && claimWebhookForSync(webhookId)) {
     deductRetailInventoryForOrder(payload)
       .catch((err) => log.error('retail_inventory_deduct.failed', { shop, orderId: payload.id, err }))
   }
