@@ -41,6 +41,17 @@ export const qboConfig = {
   // (findOrCreateItemBySku), just earlier, so enabling it introduces no new
   // class of QBO write. NEVER deletes/deactivates QBO items.
   productSyncEnabled: readBool('QBO_PRODUCT_SYNC_ENABLED', true),
+  // Create QBO Items as `Inventory` type (TrackQtyOnHand + QtyOnHand +
+  // InvStartDate) instead of `Service`, so QBO tracks stock quantities.
+  // Requires QBO Plus/Advanced. Inventory Items also need an Inventory-Asset
+  // account and a COGS/expense account in addition to the income account;
+  // both are auto-resolved from the Chart of Accounts when the ids below are
+  // unset, but pinning them is recommended for determinism. If tracking is on
+  // but the accounts can't be resolved, item creation GRACEFULLY falls back
+  // to Service type so invoicing/sync never breaks.
+  inventoryTrackingEnabled: readBool('QBO_INVENTORY_TRACKING_ENABLED', true),
+  inventoryAssetAccountId: readEnv('QBO_INVENTORY_ASSET_ACCOUNT_ID', { fallback: null }),
+  inventoryCogsAccountId: readEnv('QBO_INVENTORY_COGS_ACCOUNT_ID', { fallback: null }),
 }
 
 export function assertQboConfigured() {

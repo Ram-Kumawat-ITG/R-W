@@ -88,6 +88,10 @@ async function syncVariant({ shop, product, variant }) {
       name: productTitle,
       description: buildDescription(product, variant),
       price: shopifyPrice,
+      // Initial QBO on-hand quantity (Inventory items only) — seeded from the
+      // Shopify variant's current stock at first create. QBO owns quantity
+      // after that; ongoing Shopify→QBO qty push is a separate feature.
+      qtyOnHand: variant?.inventory_quantity ?? 0,
     })
     await QboProductMap.updateOne(
       { shopifyVariantId },

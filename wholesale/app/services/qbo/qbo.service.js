@@ -79,6 +79,58 @@ async function resolveIncomeAccountRef() {
   return cachedIncomeAccountRef
 }
 
+// Inventory-Asset account for Inventory-type Items. Env-pinned
+// (QBO_INVENTORY_ASSET_ACCOUNT_ID) or auto-resolved from the Chart of
+// Accounts (Other Current Asset / Inventory), preferring the standard-named
+// "Inventory Asset". Cached: `undefined` = unresolved, `null` = none found.
+let cachedAssetAccountRef
+async function resolveInventoryAssetAccountRef() {
+  if (cachedAssetAccountRef !== undefined) return cachedAssetAccountRef
+  if (qboConfig.inventoryAssetAccountId) {
+    cachedAssetAccountRef = { value: String(qboConfig.inventoryAssetAccountId) }
+    return cachedAssetAccountRef
+  }
+  try {
+    const stmt = `SELECT * FROM Account WHERE AccountType = 'Other Current Asset' AND AccountSubType = 'Inventory'`
+    const res = await qbo.query(stmt)
+    const accounts = res?.QueryResponse?.Account || []
+    const chosen = accounts.find((a) => /^inventory asset$/i.test(a.Name || '')) || accounts[0]
+    cachedAssetAccountRef = chosen?.Id ? { value: String(chosen.Id) } : null
+  } catch (err) {
+    log.warn('item.asset_account.lookup_failed', { err: err?.message || String(err) })
+    cachedAssetAccountRef = null
+  }
+  return cachedAssetAccountRef
+}
+
+// COGS/expense account for Inventory-type Items. Env-pinned
+// (QBO_INVENTORY_COGS_ACCOUNT_ID) or auto-resolved (Cost of Goods Sold),
+// preferring the standard-named "Cost of Goods Sold".
+let cachedCogsAccountRef
+async function resolveCogsAccountRef() {
+  if (cachedCogsAccountRef !== undefined) return cachedCogsAccountRef
+  if (qboConfig.inventoryCogsAccountId) {
+    cachedCogsAccountRef = { value: String(qboConfig.inventoryCogsAccountId) }
+    return cachedCogsAccountRef
+  }
+  try {
+    const stmt = `SELECT * FROM Account WHERE AccountType = 'Cost of Goods Sold'`
+    const res = await qbo.query(stmt)
+    const accounts = res?.QueryResponse?.Account || []
+    const chosen = accounts.find((a) => /^cost of goods sold$/i.test(a.Name || '')) || accounts[0]
+    cachedCogsAccountRef = chosen?.Id ? { value: String(chosen.Id) } : null
+  } catch (err) {
+    log.warn('item.cogs_account.lookup_failed', { err: err?.message || String(err) })
+    cachedCogsAccountRef = null
+  }
+  return cachedCogsAccountRef
+}
+
+// QBO wants InvStartDate as a plain date (YYYY-MM-DD).
+function todayYmd() {
+  return new Date().toISOString().slice(0, 10)
+}
+
 async function findItemBySku(sku) {
   if (!sku) return null
   const stmt = `SELECT * FROM Item WHERE Sku = '${escapeQboQuery(sku)}' MAXRESULTS 1`
@@ -107,7 +159,7 @@ function sanitizeItemName(name, sku) {
   return full.length > 100 ? full.slice(0, 100).trim() : full
 }
 
-async function createItem({ name, sku, description, price }) {
+async function createItem({ name, sku, description, price, qtyOnHand }) {
   const incomeRef = await resolveIncomeAccountRef()
   if (!incomeRef) throw new Error('cannot create QBO Item — no IncomeAccountRef available')
   const Name = sanitizeItemName(name, sku)
@@ -115,6 +167,31 @@ async function createItem({ name, sku, description, price }) {
   if (description) payload.Description = String(description).slice(0, 4000)
   const priceNum = price === null || price === undefined || price === '' ? null : Number(price)
   if (priceNum != null && Number.isFinite(priceNum)) payload.UnitPrice = priceNum
+
+  // Inventory type (QBO Plus/Advanced) — requires an Inventory-Asset account
+  // + a COGS/expense account + TrackQtyOnHand/QtyOnHand/InvStartDate. If
+  // either account can't be resolved we GRACEFULLY stay on Service type so
+  // item creation (and therefore invoicing/sync) never breaks.
+  if (qboConfig.inventoryTrackingEnabled) {
+    const [assetRef, cogsRef] = await Promise.all([
+      resolveInventoryAssetAccountRef(),
+      resolveCogsAccountRef(),
+    ])
+    if (assetRef && cogsRef) {
+      const qty = Number.isFinite(Number(qtyOnHand)) ? Number(qtyOnHand) : 0
+      payload.Type = 'Inventory'
+      payload.TrackQtyOnHand = true
+      payload.QtyOnHand = qty
+      payload.InvStartDate = todayYmd()
+      payload.AssetAccountRef = assetRef
+      payload.ExpenseAccountRef = cogsRef
+    } else {
+      log.warn('item.inventory_fallback_service', {
+        sku,
+        reason: !assetRef ? 'no_inventory_asset_account' : 'no_cogs_account',
+      })
+    }
+  }
   try {
     const res = await qbo.post('/item', payload)
     const created = res?.Item
@@ -185,8 +262,12 @@ export async function findOrCreateItemBySku({ sku, name }) {
 //
 // Fields synced onto the Item: Name (unique, SKU-suffixed), Sku, Description,
 // UnitPrice (informational — invoice lines still price from the Shopify
-// order, never from the Item). Type stays 'Service' (inventory tracking is a
-// separate, plan-tier-gated feature — see docs/qbo-product-sync-integration-plan.md).
+// order, never from the Item). New Items are created as `Inventory` type when
+// QBO_INVENTORY_TRACKING_ENABLED is on (initial QtyOnHand seeded from the
+// Shopify variant), else `Service`. Ongoing quantity changes after creation
+// are NOT pushed here — QBO's Item entity can't PATCH QtyOnHand; that needs
+// an InventoryAdjustment (a separate, deferred inventory-sync feature — see
+// docs/qbo-product-sync-integration-plan.md §7).
 export async function getItem(itemId) {
   const res = await qbo.get(`/item/${encodeURIComponent(itemId)}`)
   return res?.Item || null
@@ -249,7 +330,7 @@ async function updateItemSparse(existing, desired) {
   }
 }
 
-export async function upsertQboItem({ sku, name, description, price }) {
+export async function upsertQboItem({ sku, name, description, price, qtyOnHand }) {
   const clean = sku ? String(sku).trim() : ''
   if (!clean) throw new Error('upsertQboItem: sku is required')
 
@@ -272,9 +353,11 @@ export async function upsertQboItem({ sku, name, description, price }) {
     }
   }
 
-  // Not found — create (Service type). createItem already handles the
-  // duplicate-Name race by adopting a same-SKU existing item.
-  const created = await createItem({ name, sku: clean, description, price })
+  // Not found — create (Inventory type when tracking is on, else Service).
+  // createItem handles the duplicate-Name race by adopting a same-SKU item
+  // and gracefully falls back to Service if the inventory accounts are
+  // unavailable. Initial QtyOnHand seeds from the Shopify variant.
+  const created = await createItem({ name, sku: clean, description, price, qtyOnHand })
   return {
     qboItemId: String(created.Id),
     qboSyncToken: created.SyncToken != null ? String(created.SyncToken) : '0',
