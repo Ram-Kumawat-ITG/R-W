@@ -54,14 +54,18 @@ async function send({ subject, html, context }) {
 export async function notifyNmiVaultInvalid({ invoiceId, shopifyOrderId, vaultId, methodLabel, reason }) {
   const subject = `NMI Vault Invalid — Charge Skipped (Invoice ${invoiceId || 'unknown'})`
   const html = wrapHtml(`
-    <p>A scheduled or manual charge attempt was <strong>skipped</strong> because the customer's stored NMI
-    ${methodLabel || 'payment'} vault could not be validated. No charge was attempted — this invoice will keep
-    being skipped on every future attempt until the vault is fixed or replaced.</p>
-    <p><strong>Invoice:</strong> ${invoiceId || 'unknown'}<br/>
-    ${shopifyOrderId ? `<strong>Shopify order:</strong> ${shopifyOrderId}<br/>` : ''}
-    <strong>NMI vault/billing id:</strong> ${vaultId || 'unknown'}<br/>
-    <strong>Method:</strong> ${methodLabel || 'unknown'}</p>
-    ${errorDetailsHtml({ message: reason })}
+    <p>A scheduled or manual charge attempt was <strong>skipped</strong> because the customer's stored NMI payment vault could not be validated. <strong>No charge was attempted.</strong> This invoice will continue to be skipped on every future attempt until the vault is fixed or replaced.</p>
+    <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:12px">
+      <tbody>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Field</th><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Value</th></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Invoice ID</td><td style="padding:8px;border:1px solid #ddd"><strong>${invoiceId || '—'}</strong></td></tr>
+        ${shopifyOrderId ? `<tr><td style="padding:8px;border:1px solid #ddd">Shopify order</td><td style="padding:8px;border:1px solid #ddd">${shopifyOrderId}</td></tr>` : ''}
+        <tr><td style="padding:8px;border:1px solid #ddd">NMI vault ID</td><td style="padding:8px;border:1px solid #ddd"><code style="background:#f4f4f4;padding:2px 4px">${vaultId || '—'}</code></td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Payment method</td><td style="padding:8px;border:1px solid #ddd">${methodLabel || '—'}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Reason</td><td style="padding:8px;border:1px solid #ddd">${reason || '—'}</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:16px;color:#d9534f"><strong>Action:</strong> Review the vault error and either fix the stored payment method or remove this customer's auto-charge configuration.</p>
   `)
 
   return send({ subject, html, context: { event: 'nmi_vault_invalid', invoiceId, vaultId, reason } })
@@ -75,13 +79,19 @@ export async function notifyNmiVaultInvalid({ invoiceId, shopifyOrderId, vaultId
 // intentionally vague for the applicant). No account was created and
 // nothing was charged on any of these paths.
 export async function notifyNmiVaultCreationFailed({ email, businessName, paymentMethod, stage, error }) {
-  const subject = `NMI Vault Creation Failed During Registration — ${businessName || email || 'unknown applicant'}`
+  const subject = `NMI Vault Creation Failed — Registration Rejected`
   const html = wrapHtml(`
-    <p>A wholesale registration attempt failed at the NMI payment-vault step. The applicant's registration was
-    rejected — no Shopify customer or MongoDB application record was created.</p>
-    <p><strong>Applicant:</strong> ${businessName || 'unknown'} (${email || 'unknown'})<br/>
-    <strong>Payment method attempted:</strong> ${paymentMethod || 'unknown'}<br/>
-    <strong>Failure stage:</strong> ${stage || 'unknown'}</p>
+    <p>A wholesale registration attempt failed at the NMI payment-vault step. <strong>The applicant's registration was rejected</strong> — no Shopify customer or MongoDB application record was created.</p>
+    <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:12px">
+      <tbody>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Field</th><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Value</th></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Applicant</td><td style="padding:8px;border:1px solid #ddd">${businessName || email || '—'}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Email</td><td style="padding:8px;border:1px solid #ddd">${email || '—'}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Payment method attempted</td><td style="padding:8px;border:1px solid #ddd">${paymentMethod || '—'}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Failure stage</td><td style="padding:8px;border:1px solid #ddd">${stage || '—'}</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:16px;color:#d9534f"><strong>Error details:</strong></p>
     ${errorDetailsHtml(error)}
   `)
 
@@ -104,17 +114,26 @@ export async function notifyNmiVaultCreationFailed({ email, businessName, paymen
 export async function notifyNmiDuplicateTransaction({ invoiceId, shopifyOrderId, vaultId, amount, responseText, transactionId }) {
   const subject = `NMI Duplicate Transaction Rejected — Invoice ${invoiceId || 'unknown'}`
   const html = wrapHtml(`
-    <p>NMI's gateway-level duplicate-transaction check rejected a charge attempt. This is a processor/gateway
-    configuration issue, not an application bug — see the "Action required" note below.</p>
-    <p><strong>Invoice:</strong> ${invoiceId || 'unknown'}<br/>
-    ${shopifyOrderId ? `<strong>Shopify order:</strong> ${shopifyOrderId}<br/>` : ''}
-    <strong>NMI vault id:</strong> ${vaultId || 'unknown'}<br/>
-    <strong>Amount:</strong> ${amount != null ? `$${Number(amount).toFixed(2)}` : 'unknown'}<br/>
-    <strong>NMI transaction id:</strong> ${transactionId || 'none'}</p>
-    <p><strong>Action required:</strong> in the NMI control panel, check Settings → Transaction/Security
-    Options → "Duplicate Transaction Checking" for this MID — disable it, shorten the window, or key it on
-    order id instead of amount+card. This app deliberately does not override NMI's <code>dup_seconds</code>
-    setting from code (a prior attempt caused every charge to fail, not just true duplicates).</p>
+    <p>NMI's gateway-level duplicate-transaction check rejected a charge attempt. This is a <strong>processor/gateway configuration issue</strong>, not an application bug.</p>
+    <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:12px">
+      <tbody>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Field</th><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Value</th></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Invoice ID</td><td style="padding:8px;border:1px solid #ddd"><strong>${invoiceId || '—'}</strong></td></tr>
+        ${shopifyOrderId ? `<tr><td style="padding:8px;border:1px solid #ddd">Shopify order</td><td style="padding:8px;border:1px solid #ddd">${shopifyOrderId}</td></tr>` : ''}
+        <tr><td style="padding:8px;border:1px solid #ddd">NMI vault ID</td><td style="padding:8px;border:1px solid #ddd"><code style="background:#f4f4f4;padding:2px 4px">${vaultId || '—'}</code></td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Amount</td><td style="padding:8px;border:1px solid #ddd">${amount != null ? `$${Number(amount).toFixed(2)}` : '—'}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">NMI transaction ID</td><td style="padding:8px;border:1px solid #ddd"><code style="background:#f4f4f4;padding:2px 4px">${transactionId || 'none'}</code></td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:16px;color:#d9534f"><strong>Admin action required:</strong></p>
+    <p>In the NMI control panel, navigate to <strong>Settings → Transaction/Security Options → "Duplicate Transaction Checking"</strong> for this MID. Either:</p>
+    <ul>
+      <li>Disable duplicate transaction checking, OR</li>
+      <li>Shorten the duplicate window, OR</li>
+      <li>Use order ID as the deduplication key instead of amount + card</li>
+    </ul>
+    <p style="font-size:12px;color:#6b6b6b">Note: This application deliberately does not override NMI's <code>dup_seconds</code> setting from code, as doing so caused cascading charge failures.</p>
+    <p style="margin-top:12px"><strong>Gateway response:</strong></p>
     ${errorDetailsHtml({ message: responseText })}
   `)
 

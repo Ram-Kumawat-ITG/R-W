@@ -86,6 +86,18 @@ const PRACTITIONER_FILTER = {
   ],
 };
 
+async function isBlockedPractitioner(practitionerId) {
+  if (!practitionerId || !mongoose.Types.ObjectId.isValid(practitionerId)) return false;
+  await connectDB();
+  return Boolean(await WholesaleApplication.exists({ _id: practitionerId, status: "blocked" }));
+}
+
+export async function getBlockedPractitionerIds() {
+  await connectDB();
+  const rows = await WholesaleApplication.find({ status: "blocked" }).select("_id").lean();
+  return rows.map((r) => String(r._id)).filter(Boolean);
+}
+
 // Codes minted for CDO Program practitioners point at wholesale_applications.
 const PRACTITIONER_SOURCE = "wholesale";
 
@@ -2682,6 +2694,14 @@ async function createCommissionForOrder(order, settings) {
   const amount = roundMoney(order.commissionAmount);
   if (amount <= 0) return { created: false, commission: null };
 
+  if (order.practitionerId && (await isBlockedPractitioner(order.practitionerId))) {
+    log.info("commission.blocked_practitioner", {
+      orderId: String(order._id),
+      practitionerId: order.practitionerId,
+    });
+    return { created: false, commission: null };
+  }
+
   const existing = await CdoCommission.findOne({ orderId: order._id }).lean();
   if (existing) return { created: false, commission: existing };
 
@@ -2778,6 +2798,9 @@ export async function approveCommission(commissionId) {
   await connectDB();
   const c = await CdoCommission.findById(commissionId);
   if (!c) throw new Error("Commission not found");
+  if (await isBlockedPractitioner(c.practitionerId)) {
+    throw new Error("Cannot approve a commission for a blocked practitioner");
+  }
   if (c.status === "paid") throw new Error("Cannot approve a paid commission");
   c.status = "approved";
   await c.save();
@@ -2809,6 +2832,7 @@ export async function getEligibleCommissions({ practitionerId, periodEnd } = {})
   // commission owned by a practitioner whose payouts are on hold.
   const filter = { status: { $in: ["pending", "approved"] }, payoutId: null, paused: { $ne: true } };
   if (practitionerId) {
+    if (await isBlockedPractitioner(practitionerId)) return [];
     // Single-practitioner lookup (e.g. admin generating a manual check payout):
     // apply only the per-practitioner hold gate; the check-preference exclusion
     // does NOT apply because the admin is explicitly targeting this practitioner.
@@ -2823,7 +2847,9 @@ export async function getEligibleCommissions({ practitionerId, periodEnd } = {})
       getHeldPractitionerIds(),
       getCheckPreferredPractitionerIds(),
     ]);
+    const blocked = await getBlockedPractitionerIds();
     const excluded = [...new Set([...held, ...checkPreferred])];
+    if (blocked.length) excluded.push(...blocked);
     if (excluded.length) filter.practitionerId = { $nin: excluded };
   }
   if (periodEnd) filter.earnedAt = { $lte: new Date(periodEnd) };
@@ -4593,7 +4619,9 @@ export async function autoApproveEligibleCommissions({ shop } = {}) {
     getHeldPractitionerIds(),
     getCheckPreferredPractitionerIds(),
   ]);
+  const blocked = await getBlockedPractitionerIds();
   const excluded = [...new Set([...held, ...checkPreferred])];
+  if (blocked.length) excluded.push(...blocked);
   const filter = { status: "pending", paused: { $ne: true } };
   if (shop) filter.shop = shop;
   if (excluded.length) filter.practitionerId = { $nin: excluded };

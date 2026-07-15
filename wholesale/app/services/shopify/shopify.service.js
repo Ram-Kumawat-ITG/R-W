@@ -487,6 +487,15 @@ export async function customerHasApprovedTag({ shop, customerId }) {
   return tags.some((t) => String(t).trim().toLowerCase() === "approved");
 }
 
+// Convenience predicate used by the order orchestrator to detect a blocked
+// wholesale customer. Blocked customers are explicitly tagged "Blocked"
+// by the admin block flow and should not be processed until unblocked.
+export async function customerHasBlockedTag({ shop, customerId }) {
+  if (!shop || !customerId) return false;
+  const tags = await getCustomerTags({ shop, customerId });
+  return tags.some((t) => String(t).trim().toLowerCase() === "blocked");
+}
+
 // Swap one tag for another on a Shopify customer. Reads current tags,
 // removes `removeTag`, adds `addTag`, writes back.
 export async function updateCustomerTags(

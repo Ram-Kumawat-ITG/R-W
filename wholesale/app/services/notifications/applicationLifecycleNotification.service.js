@@ -46,33 +46,46 @@ async function send({ to, subject, html, context }) {
 }
 
 // ── 1. New Wholesale Application Submitted ─────────────────────────────
-export async function notifyApplicationSubmitted({ email, firstName, lastName, businessName }) {
+export async function notifyApplicationSubmitted({ email, firstName, lastName, businessName, applicationDate }) {
   if (!email) return { success: false, skipped: true, reason: 'no email' }
 
   const subject = 'We received your Wholesale Application'
   const html = wrapHtml(`
     <p>Hi ${fullName({ firstName, lastName })},</p>
-    <p>Thank you for applying for a Natural Solutions Wholesale account${businessName ? ` for <strong>${businessName}</strong>` : ''}.
-    We've received your application and it is now being processed.</p>
-    <p>You'll receive a separate email as soon as your account is ready to use.</p>
-    <p>If anything looks incorrect or you didn't submit this application, please contact us right away.</p>
+    <p>Thank you for applying for a Natural Solutions Wholesale account. We've received your application and it is now being processed. You'll get a separate email as soon as your account is ready. <strong>No action is needed right now.</strong></p>
+    <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:12px">
+      <tbody>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4;width:30%">Field</th><th style="text-align:left;padding:8px;border:1px solid #ddd">Value</th></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Applicant</td><td style="padding:8px;border:1px solid #ddd">${fullName({ firstName, lastName })}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Business</td><td style="padding:8px;border:1px solid #ddd">${businessName || '—'}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Email</td><td style="padding:8px;border:1px solid #ddd">${email}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Submitted at</td><td style="padding:8px;border:1px solid #ddd">${applicationDate ? new Date(applicationDate).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }) : '—'}</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:16px">If anything looks incorrect, please contact us right away.</p>
   `)
 
   return send({ to: email, subject, html, context: { event: 'application_submitted', email } })
 }
 
 // ── 2. Wholesale Application Auto-Approved ─────────────────────────────
-export async function notifyApplicationApproved({ email, firstName, lastName, businessName }) {
+export async function notifyApplicationApproved({ email, firstName, lastName, businessName, approvedAt }) {
   if (!email) return { success: false, skipped: true, reason: 'no email' }
 
   const subject = 'Your Wholesale Account Has Been Approved'
   const html = wrapHtml(`
     <p>Hi ${fullName({ firstName, lastName })},</p>
-    <p>Great news — your Natural Solutions Wholesale application${businessName ? ` for <strong>${businessName}</strong>` : ''}
-    has been approved.</p>
-    <p>You should receive a separate account-activation email shortly with a link to set your password
-    and start shopping at wholesale pricing. If you don't see it within a few minutes, please check your
-    spam folder before contacting us.</p>
+    <p>Your wholesale application has been approved. You can now sign in with your email and request a one-time verification code (OTP).</p>
+    <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:12px">
+      <tbody>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Field</th><th style="text-align:left;padding:8px;border:1px solid #ddd">Value</th></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Account</td><td style="padding:8px;border:1px solid #ddd">${businessName || '—'}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Email</td><td style="padding:8px;border:1px solid #ddd">${email}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Approved at</td><td style="padding:8px;border:1px solid #ddd">${approvedAt ? new Date(approvedAt).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }) : '—'}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Login method</td><td style="padding:8px;border:1px solid #ddd">One-time code (OTP)</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:16px"><strong>Next step:</strong> Sign in at your wholesale portal and request a verification code to proceed.</p>
   `)
 
   return send({ to: email, subject, html, context: { event: 'application_approved', email } })
@@ -88,16 +101,21 @@ export async function notifyApplicationDeclined({ email, firstName, lastName, bu
 
   const subject = 'We Could Not Complete Your Wholesale Application'
   const supportLine = config.supportEmail
-    ? `please contact us at <a href="mailto:${config.supportEmail}">${config.supportEmail}</a>`
-    : 'please contact our support team'
+    ? `contact us at <a href="mailto:${config.supportEmail}">${config.supportEmail}</a>`
+    : 'contact our support team'
 
   const html = wrapHtml(`
     <p>Hi ${fullName({ firstName, lastName })},</p>
-    <p>We were unable to complete your Natural Solutions Wholesale application${businessName ? ` for <strong>${businessName}</strong>` : ''}
-    because we could not verify the payment method you provided.</p>
-    ${reason ? `<p><strong>Reason:</strong> ${reason}</p>` : ''}
-    <p>No account was created and nothing was charged. Please double-check your card or bank details and
-    submit the application again — if the problem continues, ${supportLine}.</p>
+    <p>We could not complete your wholesale application. Please review the details below and resubmit with corrected information.</p>
+    <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:12px">
+      <tbody>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Field</th><th style="text-align:left;padding:8px;border:1px solid #ddd">Details</th></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Applicant</td><td style="padding:8px;border:1px solid #ddd">${fullName({ firstName, lastName })}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Business</td><td style="padding:8px;border:1px solid #ddd">${businessName || '—'}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Reason</td><td style="padding:8px;border:1px solid #ddd">${reason || 'Payment method could not be verified'}</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:12px"><strong>No account was created and nothing was charged.</strong> Double-check your payment details and submit again. If the problem continues, ${supportLine}.</p>
   `)
 
   return send({ to: email, subject, html, context: { event: 'application_declined', email, reason } })

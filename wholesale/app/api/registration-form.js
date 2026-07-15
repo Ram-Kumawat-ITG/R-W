@@ -589,23 +589,13 @@ export async function action({ request }) {
       );
     }
 
-    try {
-      await sendCustomerInvite(admin, {
-        customerId,
-        subject: "Your wholesale account has been approved",
-        message:
-          "Welcome to Natural Solutions Wholesale! Your application has been approved. Click the activation link below to set your password and start shopping at wholesale pricing.",
-      });
-      await WholesaleApplication.updateOne(
-        { _id: app._id },
-        { $set: { customerInviteSentAt: new Date() } },
-      );
-    } catch (inviteErr) {
-      console.error(
-        "[proxy/submit] received email failed:",
-        inviteErr?.message || inviteErr,
-      );
-    }
+    // NOTE: We intentionally do NOT send the Shopify account-invite email
+    // that includes an account-activation / password-set link. The system
+    // uses an email OTP login flow: customers sign in by entering their
+    // email and receiving a one-time code. Sending a password-setup invite
+    // (Shopify's account activation) is therefore misleading and has been
+    // removed. If you need to re-enable invites for a specific shop, call
+    // `sendCustomerInvite` explicitly or add a config-gated path here.
 
     // (Admin email notification removed — was using a non-existent
     // `emailSend` mutation. Shopify Admin GraphQL has no generic send-email

@@ -61,18 +61,20 @@ export async function notifyFulfillmentSyncFailed({
 }) {
   const subject = `Drop-ship Fulfillment Sync to Retail Store Failed — Order ${wholesaleOrderName || wholesaleOrderId}`
   const html = wrapHtml(`
-    <p style="color:#b00020;font-weight:bold">Syncing a drop-ship order's fulfillment status to the retail store failed.</p>
-    <p>The retail customer's order will NOT reflect this ${event === 'cancelled' ? 'cancellation' : 'fulfillment/shipping'}
-    update until the sync succeeds. This is best-effort and will retry automatically on the next fulfillment event or
-    the resync CRON — no immediate action is required unless the error below persists.</p>
-    <p>
-      <strong>Wholesale order:</strong> ${wholesaleOrderName || 'unknown'} (${wholesaleOrderId || 'unknown'})<br/>
-      <strong>Linked retail order:</strong> ${retailOrderName || retailOrderId || 'unknown'}<br/>
-      <strong>Event:</strong> ${event || 'unknown'}<br/>
-      <strong>Fulfillment status:</strong> ${fulfillmentStatus || 'unknown'}<br/>
-      ${attempts != null ? `<strong>Sync attempts so far:</strong> ${attempts}<br/>` : ''}
-    </p>
-    <p><strong>Failure reason:</strong> ${reason || 'unknown'}</p>
+    <p style="color:#b00020;font-weight:bold;font-size:16px">Drop-ship order fulfillment sync to retail store failed.</p>
+    <p>The retail customer's order will NOT reflect this ${event === 'cancelled' ? 'cancellation' : 'fulfillment/shipping'} update until the sync succeeds. This is best-effort and will retry automatically on the next fulfillment event or the resync CRON.</p>
+    <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:12px">
+      <tbody>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Field</th><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Value</th></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Wholesale order</td><td style="padding:8px;border:1px solid #ddd">${wholesaleOrderName || '—'} (${wholesaleOrderId || '—'})</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Linked retail order</td><td style="padding:8px;border:1px solid #ddd">${retailOrderName || retailOrderId || '—'}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Event type</td><td style="padding:8px;border:1px solid #ddd">${event || '—'}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Fulfillment status</td><td style="padding:8px;border:1px solid #ddd">${fulfillmentStatus || '—'}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Failure reason</td><td style="padding:8px;border:1px solid #ddd"><strong style="color:#d9534f">${reason || '—'}</strong></td></tr>
+        ${attempts != null ? `<tr><td style="padding:8px;border:1px solid #ddd">Sync attempts</td><td style="padding:8px;border:1px solid #ddd">${attempts}</td></tr>` : ''}
+      </tbody>
+    </table>
+    <p style="margin-top:16px"><strong>Error detail:</strong></p>
     <pre style="background:#f4f4f4;padding:12px;border-radius:4px;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere">${error || 'no error detail captured'}</pre>
   `)
 

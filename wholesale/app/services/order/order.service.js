@@ -18,7 +18,7 @@ import { toYmd, applyDerivedPaymentStatus } from '../invoice/invoice.utils'
 import { chargeInvoice } from '../payment/payment.service'
 import { validateShopifyOrder } from './order.validator'
 import { paymentConfig } from '../payment/payment.config'
-import { customerHasApprovedTag, getOrderFulfillments } from '../shopify/shopify.service'
+import { customerHasApprovedTag, customerHasBlockedTag, getOrderFulfillments } from '../shopify/shopify.service'
 import { voidInvoice as voidQboInvoice, setInvoiceShipping } from '../qbo/qbo.service'
 import {
   normalizeCarrier,
@@ -230,7 +230,23 @@ export async function processShopifyOrder({ shop, order, webhookId }) {
   }
 
   console.log(`[orders] approval gate — fetching tags for customer ${shopifyCustomerId}`)
-  const approved = await customerHasApprovedTag({ shop, customerId: shopifyCustomerId })
+  const [approved, blocked] = await Promise.all([
+    customerHasApprovedTag({ shop, customerId: shopifyCustomerId }),
+    customerHasBlockedTag({ shop, customerId: shopifyCustomerId }),
+  ])
+
+  if (blocked) {
+    console.log(
+      `[orders] HOLD — customer ${shopifyCustomerId} is blocked; ` +
+        `skipping QBO + NMI until unblocked. Will resume when the Blocked tag is removed.`,
+    )
+    log.info('hold.blocked', { shopifyOrderId, shopifyCustomerId })
+    local.processingStatus = 'pending_approval'
+    local.processingError = 'Customer is blocked'
+    await local.save()
+    return local
+  }
+
   if (!approved) {
     console.log(
       `[orders] HOLD — customer ${shopifyCustomerId} is not approved; ` +

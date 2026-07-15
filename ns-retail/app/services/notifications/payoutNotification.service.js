@@ -52,14 +52,17 @@ export async function notifyCommissionPayoutProcessed({
   const subject = `Your Commission Payout of ${amountLabel} Has Been Processed`;
   const html = wrapHtml(`
     <p>Hi ${practitionerName || "there"},</p>
-    <p>Your commission payout has been processed:</p>
-    <ul>
-      <li><strong>Amount:</strong> ${amountLabel}</li>
-      <li><strong>Method:</strong> ${methodLabel}</li>
-      ${reference ? `<li><strong>Reference:</strong> ${reference}</li>` : ""}
-      <li><strong>Date:</strong> ${paidAtLabel}</li>
-    </ul>
-    <p>No further action is needed on your part. If you have any questions about this payout, please contact us.</p>
+    <p>Your commission payout has been processed. <strong>No action is needed.</strong></p>
+    <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:12px">
+      <tbody>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Field</th><th style="text-align:left;padding:8px;border:1px solid #ddd">Value</th></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Amount</td><td style="padding:8px;border:1px solid #ddd">${amountLabel}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Method</td><td style="padding:8px;border:1px solid #ddd">${methodLabel}</td></tr>
+        ${reference ? `<tr><td style="padding:8px;border:1px solid #ddd">Reference</td><td style="padding:8px;border:1px solid #ddd">${reference}</td></tr>` : ""}
+        <tr><td style="padding:8px;border:1px solid #ddd">Processed at</td><td style="padding:8px;border:1px solid #ddd">${paidAtLabel}</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:16px">If you have any questions about this payout, please contact us.</p>
   `);
 
   const result = await sendEmail({ to: email, cc: config.adminEmail, subject, html });
@@ -100,18 +103,18 @@ export async function notifyCommissionPayoutFailed({
   const subject = `Action Needed: Your Commission Payout of ${amountLabel} Could Not Be Processed`;
   const html = wrapHtml(`
     <p>Hi ${practitionerName || "there"},</p>
-    <p>We attempted to process your commission payout, but it did not go through.</p>
-    <ul>
-      <li><strong>Amount:</strong> ${amountLabel}</li>
-      ${reference ? `<li><strong>Reference:</strong> ${reference}</li>` : ""}
-      <li><strong>Reason:</strong> ${reason || "An unexpected error occurred"}</li>
-      ${returnCode ? `<li><strong>Return code:</strong> ${returnCode}</li>` : ""}
-      <li><strong>Date:</strong> ${failedAtLabel}</li>
-    </ul>
-    <p>Your commission amount has not been lost — it remains reserved and will be automatically
-    retried on our next payout run once the issue above is resolved. If this relates to your bank
-    account details, please review them in your practitioner profile. If you have any questions,
-    please contact us.</p>
+    <p>We attempted to process your commission payout but it failed. Please review the details below. <strong>No funds were released.</strong></p>
+    <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:12px">
+      <tbody>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Field</th><th style="text-align:left;padding:8px;border:1px solid #ddd">Value</th></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Amount</td><td style="padding:8px;border:1px solid #ddd">${amountLabel}</td></tr>
+        ${reference ? `<tr><td style="padding:8px;border:1px solid #ddd">Reference</td><td style="padding:8px;border:1px solid #ddd">${reference}</td></tr>` : ""}
+        <tr><td style="padding:8px;border:1px solid #ddd">Reason</td><td style="padding:8px;border:1px solid #ddd">${reason || "An unexpected error occurred"}</td></tr>
+        ${returnCode ? `<tr><td style="padding:8px;border:1px solid #ddd">Return code</td><td style="padding:8px;border:1px solid #ddd">${returnCode}</td></tr>` : ""}
+        <tr><td style="padding:8px;border:1px solid #ddd">Date</td><td style="padding:8px;border:1px solid #ddd">${failedAtLabel}</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:12px">We'll retry automatically on our next payout run. If this relates to your bank account details, please review them in your practitioner profile or contact us.</p>
   `);
 
   const result = await sendEmail({ to: email, cc: config.adminEmail, subject, html });
@@ -208,17 +211,21 @@ export async function notifyPayoutBatchSummary({
 
   const subject = `Commission Payout Batch Summary — ${reference || "batch"} (${STATUS_LABEL[status] || status || "—"})`;
   const html = wrapHtml(`
-    <p>The commission payout batch <strong>${escapeHtml(reference || "—")}</strong> has finished running.</p>
-    <ul>
-      <li><strong>Status:</strong> ${STATUS_LABEL[status] || status || "—"}</li>
-      <li><strong>Started:</strong> ${formatDateTime(startedAt)}</li>
-      <li><strong>Completed:</strong> ${formatDateTime(completedAt)}</li>
-      <li><strong>Practitioners:</strong> ${totalPractitioners ?? (rows || []).length}</li>
-      <li><strong>Total amount:</strong> ${formatCurrency(totalAmount)}</li>
-      ${paidCount != null ? `<li><strong>Paid:</strong> ${paidCount}</li>` : ""}
-      ${failedCount != null ? `<li><strong>Failed:</strong> ${failedCount}</li>` : ""}
-      ${skippedCount != null ? `<li><strong>Skipped commissions:</strong> ${skippedCount}</li>` : ""}
-    </ul>
+    <p><strong>Commission Payout Batch Summary</strong></p>
+    <p>The commission payout batch <strong>${escapeHtml(reference || "—")}</strong> has finished running. Review the summary and per-practitioner details below.</p>
+    <table role="presentation" style="width:100%;border-collapse:collapse;font-size:13px;margin-top:12px">
+      <tbody>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #d5d5d5;background:#f4f4f4">Status</th><td style="padding:8px;border:1px solid #d5d5d5">${STATUS_LABEL[status] || status || "—"}</td></tr>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #d5d5d5;background:#f4f4f4">Started</th><td style="padding:8px;border:1px solid #d5d5d5">${formatDateTime(startedAt)}</td></tr>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #d5d5d5;background:#f4f4f4">Completed</th><td style="padding:8px;border:1px solid #d5d5d5">${formatDateTime(completedAt)}</td></tr>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #d5d5d5;background:#f4f4f4">Practitioners</th><td style="padding:8px;border:1px solid #d5d5d5">${totalPractitioners ?? (rows || []).length}</td></tr>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #d5d5d5;background:#f4f4f4">Total amount</th><td style="padding:8px;border:1px solid #d5d5d5">${formatCurrency(totalAmount)}</td></tr>
+        ${paidCount != null ? `<tr><th style="text-align:left;padding:8px;border:1px solid #d5d5d5;background:#f4f4f4">Paid</th><td style="padding:8px;border:1px solid #d5d5d5">${paidCount}</td></tr>` : ""}
+        ${failedCount != null ? `<tr><th style="text-align:left;padding:8px;border:1px solid #d5d5d5;background:#f4f4f4">Failed</th><td style="padding:8px;border:1px solid #d5d5d5">${failedCount}</td></tr>` : ""}
+        ${skippedCount != null ? `<tr><th style="text-align:left;padding:8px;border:1px solid #d5d5d5;background:#f4f4f4">Skipped</th><td style="padding:8px;border:1px solid #d5d5d5">${skippedCount}</td></tr>` : ""}
+      </tbody>
+    </table>
+    <p style="margin-top:16px"><strong>Practitioners</strong></p>
     ${buildBatchSummaryTable(rows)}
   `);
 

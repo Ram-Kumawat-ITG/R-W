@@ -907,18 +907,13 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
           pushWarning(report.practitioners, practitioner.rowId, `Practitioner "${email}" imported, but CDO referral code generation failed (non-fatal): ${cdoErr?.message || cdoErr}`);
         }
 
-        try {
-          await sendCustomerInvite(admin, {
-            customerId,
-            subject: "Your wholesale account has been migrated",
-            message:
-              "Welcome to Natural Solutions Wholesale! Your existing account has been migrated to our new system. Click the activation link below to set your password.",
-          });
-          app.customerInviteSentAt = new Date();
-          await app.save();
-        } catch (inviteErr) {
-          pushWarning(report.practitioners, practitioner.rowId, `Practitioner "${email}" imported, but the activation invite email failed to send (non-fatal): ${inviteErr?.message || inviteErr}`);
-        }
+        // Do NOT send Shopify account-invite emails for migrated practitioners.
+        // The platform authenticates via email OTP (one-time code) rather than
+        // password-based accounts — sending an activation/password-set invite
+        // is confusing and unnecessary. If an explicit invite is required for
+        // a migration, call `sendCustomerInvite` from an admin tool instead.
+        app.customerInviteSentAt = null;
+        await app.save();
       }
     } catch (err) {
       // Deliberately non-fatal here (see file header) — the

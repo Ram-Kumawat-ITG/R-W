@@ -74,12 +74,20 @@ export function registerProcessPendingPaymentsJob(agenda) {
       // rows where the field is absent.) Their `paymentMethod: 'dropship'`
       // already falls outside the card/ach filter; the flag is the explicit,
       // method-independent guard applied across all three passes below.
+      const blockedApps = await WholesaleApplication.find({ status: 'blocked' })
+        .select('email')
+        .lean()
+      const blockedEmails = blockedApps
+        .map((app) => String(app.email || '').toLowerCase())
+        .filter(Boolean)
+
       const pendingCursor = Invoice.find({
         paymentStatus: 'pending',
         paymentMethod: { $in: ['card', 'ach'] },
         isDropship: { $ne: true },
         autoChargePaused: { $ne: true },
         $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
+        ...(blockedEmails.length ? { customerEmail: { $nin: blockedEmails } } : {}),
       }).cursor()
 
       let processed = 0

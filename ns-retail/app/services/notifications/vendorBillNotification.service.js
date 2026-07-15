@@ -54,15 +54,18 @@ export async function notifyVendorBillCreated({
   const subject = `Drop-ship Vendor Bill Created — ${orderName || shopifyOrderId} (${formatCurrency(totalAmount, currency)})`;
   const html = wrapHtml(`
     <p>A new drop-ship vendor bill (A/P) has been created in QuickBooks Online.</p>
-    <ul>
-      <li><strong>Order:</strong> ${orderName || shopifyOrderId}</li>
-      <li><strong>Vendor Bill:</strong> ${billDocNumber || billId}</li>
-      <li><strong>Vendor:</strong> ${vendorId}</li>
-      <li><strong>Total amount:</strong> ${formatCurrency(totalAmount, currency)}</li>
-      <li><strong>Status:</strong> Unpaid — awaiting reconciliation with the wholesale invoice payment</li>
-      <li><strong>Created:</strong> ${formatDateTime(createdAt || new Date())}</li>
-      ${billUrl ? `<li><strong>QuickBooks link:</strong> <a href="${billUrl}">${billUrl}</a></li>` : ""}
-    </ul>
+    <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:12px">
+      <tbody>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Field</th><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Value</th></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Order</td><td style="padding:8px;border:1px solid #ddd">${orderName || shopifyOrderId}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Vendor Bill</td><td style="padding:8px;border:1px solid #ddd"><strong>${billDocNumber || billId}</strong></td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Vendor</td><td style="padding:8px;border:1px solid #ddd">${vendorId || '—'}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Total amount</td><td style="padding:8px;border:1px solid #ddd"><strong>${formatCurrency(totalAmount, currency)}</strong></td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Status</td><td style="padding:8px;border:1px solid #ddd">Unpaid — awaiting reconciliation</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Created</td><td style="padding:8px;border:1px solid #ddd">${formatDateTime(createdAt || new Date())}</td></tr>
+        ${billUrl ? `<tr><td style="padding:8px;border:1px solid #ddd">QuickBooks link</td><td style="padding:8px;border:1px solid #ddd"><a href="${billUrl}">${billUrl}</a></td></tr>` : ""}
+      </tbody>
+    </table>
   `);
 
   return send({
@@ -109,18 +112,21 @@ export async function notifyVendorBillFailed({
   const subject = `Action Needed: Drop-ship Vendor Bill (A/P) ${stageLabel} Failed — ${orderName || shopifyOrderId}`;
   const html = wrapHtml(`
     <p>A drop-ship vendor bill (A/P) ${stageLabel.toLowerCase()} step failed and needs attention.</p>
-    <ul>
-      <li><strong>Failure stage:</strong> ${stageLabel}</li>
-      <li><strong>Order:</strong> ${orderName || shopifyOrderId}</li>
-      <li><strong>Shopify order id:</strong> ${shopifyOrderId}</li>
-      ${billId || billDocNumber ? `<li><strong>Vendor Bill:</strong> ${billDocNumber || billId}</li>` : ""}
-      ${vendorId ? `<li><strong>Vendor:</strong> ${vendorId}</li>` : ""}
-      ${totalAmount != null ? `<li><strong>Amount:</strong> ${formatCurrency(totalAmount, currency)}</li>` : ""}
-      <li><strong>Error message:</strong> ${reason || "An unexpected error occurred"}</li>
-      ${errorDetail ? `<li><strong>Error detail:</strong> <pre style="white-space:pre-wrap;margin:4px 0 0;font-family:monospace;font-size:12px">${errorDetail}</pre></li>` : ""}
-      <li><strong>Failed at:</strong> ${formatDateTime(failedAt || new Date())}</li>
-    </ul>
-    <p>${STAGE_EXPLANATION[stage] || STAGE_EXPLANATION.reconciliation}</p>
+    <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:12px">
+      <tbody>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Field</th><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Value</th></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Failure stage</td><td style="padding:8px;border:1px solid #ddd"><strong style="color:#d9534f">${stageLabel}</strong></td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Order</td><td style="padding:8px;border:1px solid #ddd">${orderName || shopifyOrderId}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Shopify order ID</td><td style="padding:8px;border:1px solid #ddd">${shopifyOrderId}</td></tr>
+        ${billId || billDocNumber ? `<tr><td style="padding:8px;border:1px solid #ddd">Vendor Bill</td><td style="padding:8px;border:1px solid #ddd">${billDocNumber || billId}</td></tr>` : ""}
+        ${vendorId ? `<tr><td style="padding:8px;border:1px solid #ddd">Vendor</td><td style="padding:8px;border:1px solid #ddd">${vendorId}</td></tr>` : ""}
+        ${totalAmount != null ? `<tr><td style="padding:8px;border:1px solid #ddd">Amount</td><td style="padding:8px;border:1px solid #ddd">${formatCurrency(totalAmount, currency)}</td></tr>` : ""}
+        <tr><td style="padding:8px;border:1px solid #ddd">Error message</td><td style="padding:8px;border:1px solid #ddd">${reason || "An unexpected error occurred"}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Failed at</td><td style="padding:8px;border:1px solid #ddd">${formatDateTime(failedAt || new Date())}</td></tr>
+      </tbody>
+    </table>
+    ${errorDetail ? `<p style="margin-top:16px"><strong>Error detail:</strong></p><pre style="background:#f4f4f4;padding:12px;border-radius:4px;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere">${errorDetail}</pre>` : ""}
+    <p style="margin-top:16px">${STAGE_EXPLANATION[stage] || STAGE_EXPLANATION.reconciliation}</p>
   `);
 
   return send({

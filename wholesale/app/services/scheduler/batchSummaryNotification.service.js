@@ -80,15 +80,19 @@ export function buildBatchSummaryEmail({
       : '\n\nNo errors this tick.')
 
   const html =
-    `<h2>CRON Batch Processing Summary</h2>` +
-    `<table cellpadding="4" cellspacing="0" border="1" style="border-collapse:collapse;">` +
-    stats.map(([label, value]) => `<tr><td><strong>${label}</strong></td><td>${value}</td></tr>`).join('') +
+    `<p><strong>CRON Batch Processing Summary</strong></p>` +
+    `<p>Automated payment batch has completed. Review the summary and any errors below.</p>` +
+    `<table role="presentation" style="width:100%;border-collapse:collapse;font-size:13px;margin-top:12px">` +
+    `<tbody>` +
+    stats.map(([label, value]) => `<tr><th style="text-align:left;padding:8px;border:1px solid #d5d5d5;background:#f4f4f4">${label}</th><td style="padding:8px;border:1px solid #d5d5d5">${value}</td></tr>`).join('') +
+    `</tbody>` +
     `</table>` +
     (errors.length
-      ? `<h3>Errors / transaction details (${errors.length})</h3><ul>` +
-        errors.map((e) => `<li><strong>${e.qboInvoiceId || e.invoiceId}:</strong> ${e.message}</li>`).join('') +
-        `</ul>`
-      : '<p>No errors this tick.</p>')
+      ? `<p style="margin-top:16px"><strong>Errors / transaction details (${errors.length})</strong></p>` +
+        `<table role="presentation" style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr><th style="text-align:left;padding:8px;border:1px solid #d5d5d5;background:#f4f4f4">Invoice</th><th style="text-align:left;padding:8px;border:1px solid #d5d5d5;background:#f4f4f4">Message</th></tr></thead><tbody>` +
+        errors.map((e) => `<tr><td style="padding:8px;border:1px solid #d5d5d5"><strong>${e.qboInvoiceId || e.invoiceId}</strong></td><td style="padding:8px;border:1px solid #d5d5d5">${e.message}</td></tr>`).join('') +
+        `</tbody></table>`
+      : '<p style="margin-top:16px">No errors this tick.</p>')
 
   return { subject, text, html }
 }

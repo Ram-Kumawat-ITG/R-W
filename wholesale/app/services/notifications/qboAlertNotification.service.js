@@ -61,12 +61,21 @@ async function send({ subject, html, context }) {
 export async function notifyQboTokenRefreshFailed({ error, realmId }) {
   const subject = '🚨 CRITICAL: QuickBooks Token Refresh Failed — Invoicing Blocked'
   const html = wrapHtml(`
-    <p style="color:#b00020;font-weight:bold">QuickBooks Online has rejected the app's OAuth refresh token.</p>
-    <p>Every QBO operation (invoice creation, customer sync, payment recording) will fail until this is fixed —
-    this is the single most disruptive failure mode in this app's accounting pipeline.</p>
-    <p><strong>Realm ID:</strong> ${realmId || 'unknown'}</p>
-    <p><strong>Action required:</strong> re-authorize the QuickBooks connection (Intuit OAuth) for this company
-    and update the stored refresh token.</p>
+    <p style="color:#b00020;font-weight:bold;font-size:16px">QuickBooks Online OAuth token refresh failed.</p>
+    <p>Every QBO operation (invoice creation, customer sync, payment recording) will fail until this is resolved. <strong>This is a critical, complete blocker for all invoicing.</strong></p>
+    <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:12px">
+      <tbody>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Field</th><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Value</th></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Realm ID</td><td style="padding:8px;border:1px solid #ddd"><code style="background:#f4f4f4;padding:2px 4px">${realmId || '—'}</code></td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:16px;color:#d9534f;font-weight:bold">Admin action required immediately:</p>
+    <ol>
+      <li>Open the Natural Solutions QBO app authorization in QuickBooks Online</li>
+      <li>Re-authorize the connection using Intuit OAuth</li>
+      <li>Update the stored refresh token with the new credentials</li>
+    </ol>
+    <p style="margin-top:12px"><strong>Error details:</strong></p>
     ${errorDetailsHtml(error)}
   `)
 
@@ -82,11 +91,17 @@ export async function notifyQboTokenRefreshFailed({ error, realmId }) {
 export async function notifyQboInvoiceCreationFailed({ shop, shopifyOrderId, orderName, customerEmail, error }) {
   const subject = `QBO Invoice Creation Failed — Order ${orderName || shopifyOrderId}`
   const html = wrapHtml(`
-    <p>QuickBooks invoice creation permanently failed for a Shopify order. No invoice exists for this order —
-    the customer has not been billed and no automatic retry will happen; it needs manual attention.</p>
-    <p><strong>Shop:</strong> ${shop || 'unknown'}<br/>
-    <strong>Shopify order:</strong> ${orderName || 'unknown'} (${shopifyOrderId || 'unknown'})<br/>
-    <strong>Customer email:</strong> ${customerEmail || 'unknown'}</p>
+    <p>QuickBooks invoice creation permanently failed for a Shopify order. <strong>No invoice was created</strong> and the customer has not been billed. No automatic retry will happen — this needs manual attention.</p>
+    <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:12px">
+      <tbody>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Field</th><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Value</th></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Shop</td><td style="padding:8px;border:1px solid #ddd">${shop || '—'}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Order</td><td style="padding:8px;border:1px solid #ddd">${orderName || '—'} (${shopifyOrderId || '—'})</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Customer</td><td style="padding:8px;border:1px solid #ddd">${customerEmail || '—'}</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:16px;color:#d9534f"><strong>Admin action:</strong> Review the error details and manually create the invoice in QuickBooks Online.</p>
+    <p style="margin-top:12px"><strong>Error details:</strong></p>
     ${errorDetailsHtml(error)}
   `)
 
@@ -107,11 +122,17 @@ export async function notifyQboInvoiceCreationFailed({ shop, shopifyOrderId, ord
 export async function notifyQboCustomerSyncFailed({ shop, email, businessName, shopifyOrderId, error }) {
   const subject = `QBO Customer Sync Failed — ${businessName || email || 'unknown customer'}`
   const html = wrapHtml(`
-    <p>Failed to find-or-create the QuickBooks Customer record needed to invoice this order. Order processing
-    was aborted — no invoice was created.</p>
-    <p><strong>Shop:</strong> ${shop || 'unknown'}<br/>
-    <strong>Customer:</strong> ${businessName || 'unknown'} (${email || 'unknown'})<br/>
-    ${shopifyOrderId ? `<strong>Shopify order:</strong> ${shopifyOrderId}<br/>` : ''}</p>
+    <p>Failed to find-or-create the QuickBooks Customer record needed to invoice this order. <strong>Order processing was aborted</strong> — no invoice was created.</p>
+    <table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:12px">
+      <tbody>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Field</th><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Value</th></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Shop</td><td style="padding:8px;border:1px solid #ddd">${shop || '—'}</td></tr>
+        <tr><td style="padding:8px;border:1px solid #ddd">Customer</td><td style="padding:8px;border:1px solid #ddd">${businessName || '—'} (${email || '—'})</td></tr>
+        ${shopifyOrderId ? `<tr><td style="padding:8px;border:1px solid #ddd">Shopify order</td><td style="padding:8px;border:1px solid #ddd">${shopifyOrderId}</td></tr>` : ''}
+      </tbody>
+    </table>
+    <p style="margin-top:16px;color:#d9534f"><strong>Admin action:</strong> Review the error details and either create the customer manually in QuickBooks or investigate the sync configuration.</p>
+    <p style="margin-top:12px"><strong>Error details:</strong></p>
     ${errorDetailsHtml(error)}
   `)
 
