@@ -134,6 +134,89 @@ async function resolveIncomeAccountRef() {
   );
 }
 
+// Inventory-Asset + COGS account resolvers for Inventory-type Items. Env-
+// pinned (QBO_RETAIL_INVENTORY_*) or auto-resolved from the retail realm's
+// Chart of Accounts, preferring the standard-named account. Cached in-module:
+// `undefined` = unresolved, `null` = none found.
+let _assetAccountRef;
+async function resolveInventoryAssetAccountRef() {
+  if (_assetAccountRef !== undefined) return _assetAccountRef;
+  if (retailQboConfig.inventoryAssetAccountId) {
+    _assetAccountRef = { value: String(retailQboConfig.inventoryAssetAccountId) };
+    return _assetAccountRef;
+  }
+  try {
+    const res = await retailQbo.query(
+      "SELECT * FROM Account WHERE AccountType = 'Other Current Asset' AND AccountSubType = 'Inventory'",
+    );
+    const accounts = res?.QueryResponse?.Account || [];
+    const chosen = accounts.find((a) => /^inventory asset$/i.test(a.Name || "")) || accounts[0];
+    _assetAccountRef = chosen?.Id ? { value: String(chosen.Id) } : null;
+  } catch (err) {
+    log.warn("retail.item.asset_account.lookup_failed", { err: err?.message || String(err) });
+    _assetAccountRef = null;
+  }
+  return _assetAccountRef;
+}
+
+let _cogsAccountRef;
+async function resolveCogsAccountRef() {
+  if (_cogsAccountRef !== undefined) return _cogsAccountRef;
+  if (retailQboConfig.inventoryCogsAccountId) {
+    _cogsAccountRef = { value: String(retailQboConfig.inventoryCogsAccountId) };
+    return _cogsAccountRef;
+  }
+  try {
+    const res = await retailQbo.query(
+      "SELECT * FROM Account WHERE AccountType = 'Cost of Goods Sold'",
+    );
+    const accounts = res?.QueryResponse?.Account || [];
+    const chosen = accounts.find((a) => /^cost of goods sold$/i.test(a.Name || "")) || accounts[0];
+    _cogsAccountRef = chosen?.Id ? { value: String(chosen.Id) } : null;
+  } catch (err) {
+    log.warn("retail.item.cogs_account.lookup_failed", { err: err?.message || String(err) });
+    _cogsAccountRef = null;
+  }
+  return _cogsAccountRef;
+}
+
+// Income account for INVENTORY items specifically — QBO requires Detail Type
+// 'Sales of Product Income' (Account Type Income). A generic service-fee
+// income account is rejected on an Inventory create. Env-pinned or
+// auto-resolved (preferring the standard-named "Sales of Product Income").
+let _productIncomeRef;
+async function resolveProductIncomeAccountRef() {
+  if (_productIncomeRef !== undefined) return _productIncomeRef;
+  if (retailQboConfig.productIncomeAccountId) {
+    _productIncomeRef = { value: String(retailQboConfig.productIncomeAccountId) };
+    return _productIncomeRef;
+  }
+  try {
+    const res = await retailQbo.query(
+      "SELECT * FROM Account WHERE AccountType = 'Income' AND AccountSubType = 'SalesOfProductIncome'",
+    );
+    const accounts = res?.QueryResponse?.Account || [];
+    const chosen = accounts.find((a) => /^sales of product income$/i.test(a.Name || "")) || accounts[0];
+    _productIncomeRef = chosen?.Id ? { value: String(chosen.Id) } : null;
+  } catch (err) {
+    log.warn("retail.item.product_income_account.lookup_failed", { err: err?.message || String(err) });
+    _productIncomeRef = null;
+  }
+  return _productIncomeRef;
+}
+
+// QBO wants InvStartDate as a plain date (YYYY-MM-DD).
+function todayYmd() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+// Parse a Shopify price string ("9.99") to a Number, or null.
+function priceToNumber(raw) {
+  if (raw === null || raw === undefined || raw === "") return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
 // Resolve the single QBO Item every retail invoice line posts to:
 //   1. QBO_RETAIL_ITEM_ID override (verbatim)
 //   2. an existing item named QBO_RETAIL_ITEM_NAME
@@ -216,11 +299,48 @@ async function findRetailItemByName(name) {
   return res?.QueryResponse?.Item?.[0] || null;
 }
 
-async function createRetailItem({ name, sku }) {
+async function createRetailItem({ name, sku, description, price, qtyOnHand }) {
   const incomeRef = await resolveIncomeAccountRef();
   if (!incomeRef) throw new Error("createRetailItem: no IncomeAccountRef available");
   const Name = sanitizeRetailItemName(name, sku);
   const payload = { Name, Sku: sku, Type: "Service", IncomeAccountRef: incomeRef };
+  if (description) payload.Description = String(description).slice(0, 4000);
+  const priceNum = priceToNumber(price);
+  if (priceNum != null) payload.UnitPrice = priceNum;
+
+  // Inventory type (QBO Plus/Advanced) — needs an Inventory-Asset account + a
+  // COGS/expense account + TrackQtyOnHand/QtyOnHand/InvStartDate. If either
+  // account can't be resolved we GRACEFULLY stay on Service type so item
+  // creation (and therefore invoicing/sync) never breaks.
+  if (retailQboConfig.inventoryTrackingEnabled) {
+    const [assetRef, cogsRef, productIncomeRef] = await Promise.all([
+      resolveInventoryAssetAccountRef(),
+      resolveCogsAccountRef(),
+      resolveProductIncomeAccountRef(),
+    ]);
+    if (assetRef && cogsRef && productIncomeRef) {
+      const qty = Number.isFinite(Number(qtyOnHand)) ? Number(qtyOnHand) : 0;
+      payload.Type = "Inventory";
+      payload.TrackQtyOnHand = true;
+      payload.QtyOnHand = qty;
+      payload.InvStartDate = todayYmd();
+      payload.AssetAccountRef = assetRef;
+      payload.ExpenseAccountRef = cogsRef;
+      // Inventory items require a 'Sales of Product Income' income account —
+      // override the generic one resolved above (QBO rejects the create
+      // otherwise; that's the whole reason for the dedicated resolver).
+      payload.IncomeAccountRef = productIncomeRef;
+    } else {
+      log.warn("retail.item.inventory_fallback_service", {
+        sku,
+        reason: !assetRef
+          ? "no_inventory_asset_account"
+          : !cogsRef
+            ? "no_cogs_account"
+            : "no_product_income_account",
+      });
+    }
+  }
   try {
     const res = await retailQbo.post("/item", payload);
     const created = res?.Item;
@@ -255,6 +375,98 @@ async function findOrCreateRetailItemBySku({ sku, name }) {
     log.warn("retail.item.resolve_failed", { sku: clean, err: err?.message || String(err) });
     return null;
   }
+}
+
+// ── Proactive product sync (Products & Services) ─────────────────────
+//
+// Used by the Shopify → Retail-QBO product sync (retailQboProductSync
+// .service.js). Creates or updates the retail QBO Item for one Shopify
+// variant and returns the resolved id + SyncToken + action. Unlike
+// `findOrCreateRetailItemBySku` (best-effort, returns null on error), this
+// THROWS so the caller can record per-variant sync state + retry. It NEVER
+// deletes or deactivates an Item — retail QBO product records are retained
+// for historical reporting even after the Shopify product is archived/deleted.
+// New Items are `Inventory` type when tracking is on (initial QtyOnHand seeded
+// from the Shopify variant), else `Service`.
+export async function getRetailItem(itemId) {
+  const res = await retailQbo.get(`/item/${encodeURIComponent(itemId)}`);
+  return res?.Item || null;
+}
+
+async function updateRetailItemSparse(existing, desired) {
+  const changed = {};
+  if (desired.Name && desired.Name !== existing.Name) changed.Name = desired.Name;
+  if (desired.Sku != null && String(desired.Sku) !== String(existing.Sku || "")) {
+    changed.Sku = desired.Sku;
+  }
+  if (desired.Description != null && desired.Description !== (existing.Description || "")) {
+    changed.Description = desired.Description;
+  }
+  if (desired.UnitPrice != null && Number(desired.UnitPrice) !== Number(existing.UnitPrice ?? NaN)) {
+    changed.UnitPrice = desired.UnitPrice;
+  }
+  if (Object.keys(changed).length === 0) return { item: existing, updated: false };
+  const payload = {
+    Id: String(existing.Id),
+    SyncToken: String(existing.SyncToken),
+    sparse: true,
+    ...changed,
+  };
+  try {
+    const res = await retailQbo.post("/item", payload);
+    return { item: res?.Item || existing, updated: true };
+  } catch (err) {
+    // Name collision — retry without the Name change (keep the other fields).
+    if (/duplicate name|6240/i.test(err?.message || "") && changed.Name) {
+      const { Name, ...rest } = changed;
+      void Name;
+      if (Object.keys(rest).length === 0) return { item: existing, updated: false };
+      const res = await retailQbo.post("/item", {
+        Id: String(existing.Id),
+        SyncToken: String(existing.SyncToken),
+        sparse: true,
+        ...rest,
+      });
+      return { item: res?.Item || existing, updated: true };
+    }
+    throw err;
+  }
+}
+
+export async function upsertRetailQboItem({ sku, name, description, price, qtyOnHand }) {
+  const clean = sku ? String(sku).trim() : "";
+  if (!clean) throw new Error("upsertRetailQboItem: sku is required");
+
+  const desired = {
+    Name: sanitizeRetailItemName(name, clean),
+    Sku: clean,
+    Description: description ? String(description).slice(0, 4000) : undefined,
+    UnitPrice: priceToNumber(price) ?? undefined,
+  };
+
+  const existing = await findRetailItemBySku(clean);
+  if (existing?.Id) {
+    const { item, updated } = await updateRetailItemSparse(existing, desired);
+    // Keep the invoice-time cache warm/consistent.
+    _retailItemCache.set(clean, String(item.Id));
+    return {
+      qboItemId: String(item.Id),
+      qboSyncToken: item.SyncToken != null ? String(item.SyncToken) : String(existing.SyncToken),
+      qboItemName: item.Name || existing.Name,
+      sku: item.Sku != null ? String(item.Sku) : clean,
+      action: updated ? "updated" : "unchanged",
+    };
+  }
+
+  const created = await createRetailItem({ name, sku: clean, description, price, qtyOnHand });
+  _retailItemCache.set(clean, String(created.Id));
+  return {
+    qboItemId: String(created.Id),
+    qboSyncToken: created.SyncToken != null ? String(created.SyncToken) : "0",
+    qboItemName: created.Name,
+    sku: created.Sku != null ? String(created.Sku) : clean,
+    action: "created",
+  };
 }
 
 // ── Invoices ─────────────────────────────────────────────────────────

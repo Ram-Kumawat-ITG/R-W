@@ -49,6 +49,28 @@ export const retailQboConfig = {
   salesItemName: readEnv("QBO_RETAIL_ITEM_NAME", { fallback: "Retail Sales" }),
   incomeAccountId: readEnv("QBO_RETAIL_INCOME_ACCOUNT_ID"),
 
+  // ── Proactive Shopify → Retail-QBO product (Products & Services) sync ──
+  // When ON, the retail store's products/create + products/update webhooks
+  // create/update a QBO Item per variant in the RETAIL realm and maintain the
+  // retail_qbo_product_maps mapping. Only ever syncs the RETAIL Shopify store.
+  // Kill-switch: QBO_RETAIL_PRODUCT_SYNC_ENABLED=false. Defaults ON. NEVER
+  // deletes/deactivates QBO items (retention).
+  productSyncEnabled: readBool("QBO_RETAIL_PRODUCT_SYNC_ENABLED", true),
+  // Create the QBO Items as `Inventory` type (TrackQtyOnHand + QtyOnHand +
+  // InvStartDate) instead of `Service`, so QBO tracks stock. Requires QBO
+  // Plus/Advanced + an Inventory-Asset account + a COGS account. Both accounts
+  // auto-resolve from the retail realm's Chart of Accounts when the ids are
+  // unset. If tracking is on but the accounts can't be resolved (or the plan
+  // tier is too low), item creation GRACEFULLY falls back to Service type so
+  // invoicing/sync never breaks.
+  inventoryTrackingEnabled: readBool("QBO_RETAIL_INVENTORY_TRACKING_ENABLED", true),
+  inventoryAssetAccountId: readEnv("QBO_RETAIL_INVENTORY_ASSET_ACCOUNT_ID", { fallback: null }),
+  inventoryCogsAccountId: readEnv("QBO_RETAIL_INVENTORY_COGS_ACCOUNT_ID", { fallback: null }),
+  // QBO requires an Inventory item's income account to be Detail Type
+  // 'Sales of Product Income' (a generic Service-fee income account is
+  // rejected). Auto-resolved from the Chart of Accounts when unset.
+  productIncomeAccountId: readEnv("QBO_RETAIL_PRODUCT_INCOME_ACCOUNT_ID", { fallback: null }),
+
   // Customer-facing email behavior — QBO is the delivery channel. Both default
   // ON per the retail spec; set the env to "false"/"0" to disable.
   //   sendInvoiceOnCreate — email the invoice to the customer right after it's

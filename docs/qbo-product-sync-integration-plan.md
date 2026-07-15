@@ -1,7 +1,23 @@
 # Shopify → QBO Products & Services + Inventory Sync — Integration Plan
 
-Status: **DRAFT — architecture/analysis phase.** No code has been written
-for this yet. This document covers both Shopify app workspaces in this
+Status: **Products & Services sync IMPLEMENTED in BOTH repos (2026-07-15).**
+The catalog-sync + Inventory-type-item portions of this plan are live in
+`wholesale/` (services/qbo/qboProductSync.service.js, `qbo_product_maps`) and
+`ns-retail/` (services/retailQbo/retailQboProductSync.service.js,
+`retail_qbo_product_maps` — a DISTINCT collection since both apps share one
+MongoDB). Each syncs ONLY its own Shopify store → its own QBO realm. New QBO
+Items are created as `Inventory` type (TrackQtyOnHand + QtyOnHand + InvStartDate
++ Asset/COGS/Income accounts) with a graceful fallback to `Service` when the
+inventory accounts can't be resolved. Products are NEVER deleted/deactivated in
+QBO (retention). **Still deferred (not built):** ongoing quantity PUSH via
+`InventoryAdjustment` on `inventory_levels/update` (§7 — QBO can't PATCH
+QtyOnHand after create), the reconciliation CRON + admin visibility tab (§9/§11
+Phase 5; a `retryFailed*QboProductSyncs()` reconciliation function exists in
+each repo but isn't yet wired to a scheduled job or UI), and Item Categories
+for vendor analytics (§3.4). The rest of this document is the original DRAFT
+plan and remains the reference for those deferred pieces.
+
+This document covers both Shopify app workspaces in this
 monorepo — `wholesale/` (customer invoices) and `ns-retail/` (`retailQbo`,
 retail A/R invoices) — since both independently create QBO invoices today
 and both need this capability.
