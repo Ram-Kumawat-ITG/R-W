@@ -42,7 +42,9 @@
 // Any carrier whose env vars aren't set is silently skipped — no errors.
 
 import crypto from "node:crypto";
-import { unauthenticated } from "../../shopify.server";
+// Tax API now uses a direct fetch() to Shopify Admin GraphQL with an
+// env-var Admin API token — no longer routes through the framework's
+// session storage. See `calculateShopifyTax` for full rationale.
 
 // ═══════════════════════════════════════════════════════════════════════
 // CONFIG — every tunable value lives here, single source of truth. Edit
@@ -82,10 +84,19 @@ const CONFIG = {
   // shipping only, no state guessing).
   shopifyTax: {
     cacheTtlMs: 5 * 60 * 1000, // 5 min
-    // Bumped 3 → 5 sec (2026-07-06) — Shopify's draftOrderCalculate
-    // occasionally takes 3-4 sec under load; 5 sec still leaves
-    // 5 sec buffer under Shopify's 10-sec carrier-callback budget.
-    timeoutMs: 5000, // 5 sec
+    // Retained for legacy compatibility only — the tax fetch now runs
+    // in the BACKGROUND (fire-and-forget), never blocking a carrier
+    // callback. See `fetchShopifyTaxInBackground` which uses its own
+    // 30-sec ceiling. This value is unused by the current code path.
+    //
+    // History (2026-07-07 to 2026-07-08):
+    //   • 5 → 10 sec attempt broke checkout: total callback took
+    //     ~10.3 sec, exceeding Shopify's 10-sec carrier-callback
+    //     budget → "Shipping not available" at checkout.
+    //   • Postman test 2026-07-08 measured Shopify's real TTFB at
+    //     ~11.8 sec on staging → NO inline timeout value could ever
+    //     work. Switched to background fire-and-forget.
+    timeoutMs: 5000, // legacy, unused
     // Hard cap on the in-process cache so unique cart+address combos
     // don't grow the Map unbounded on long-running instances (memory
     // safety). Oldest entry evicted on overflow (insertion-order LRU).
@@ -119,9 +130,43 @@ function tieredMarkupCents(qty) {
 // Returns { cents, source } so the per-rate log can show which field
 // was used, making it easy to diagnose payload shape drift over time.
 function detectCartDiscountCents(rate, realItems) {
-  // Field 1: `rate.total_discounts` — integer cents, top-level. Newer
-  //          versions of the carrier-service payload set this. Most
-  //          reliable when present.
+  // Field 0a: `rate.order_totals.discount_amount` — integer CENTS.
+  //           Confirmed present in real 2026-07-07 production payload
+  //           dumps: Shopify carrier-service now sends an `order_totals`
+  //           block { subtotal_price, total_price, discount_amount }
+  //           on every callback. When any discount (line-level OR
+  //           order-level) is active, this field carries the total
+  //           applied discount in cents. Highest-confidence source.
+  const orderTotalDiscount = Number(rate?.order_totals?.discount_amount);
+  if (Number.isFinite(orderTotalDiscount) && orderTotalDiscount > 0) {
+    return {
+      cents: Math.round(orderTotalDiscount),
+      source: "order_totals.discount_amount",
+    };
+  }
+
+  // Field 0b: derived from `order_totals.subtotal_price` vs
+  //           `order_totals.total_price` — belt-and-braces in case
+  //           Shopify sometimes populates the totals but leaves
+  //           `discount_amount` at 0. Both values are cents already
+  //           (no dollars/cents heuristic needed for this block).
+  const otSubtotal = Number(rate?.order_totals?.subtotal_price);
+  const otTotal = Number(rate?.order_totals?.total_price);
+  if (
+    Number.isFinite(otSubtotal) &&
+    Number.isFinite(otTotal) &&
+    otSubtotal > otTotal &&
+    otSubtotal > 0
+  ) {
+    return {
+      cents: Math.round(otSubtotal - otTotal),
+      source: "order_totals (subtotal − total)",
+    };
+  }
+
+  // Field 1: `rate.total_discounts` — integer cents, top-level. Older
+  //          shape of the carrier-service payload set this. Kept as a
+  //          fallback for backward compatibility.
   const topLevel = Number(rate?.total_discounts);
   if (Number.isFinite(topLevel) && topLevel > 0) {
     return { cents: Math.round(topLevel), source: "rate.total_discounts" };
@@ -323,6 +368,13 @@ function resolveShopDomain(request) {
 
 const _shopifyTaxCache = new Map(); // key → { taxCents, cachedAt }
 
+// In-flight fetch tracker — prevents kicking off duplicate background
+// fetches for the same cache key when Shopify hits the carrier callback
+// multiple times back-to-back (which it always does — 3-4 calls per
+// checkout as the customer moves through address / shipping / discount).
+// Cleared automatically once a fetch settles.
+const _shopifyTaxInFlight = new Set(); // Set<cacheKey>
+
 function buildTaxCacheKey({ destination, realItems, subtotalCents }) {
   const state = String(destination?.province_code || destination?.province || "").toUpperCase();
   const zip = String(destination?.postal_code || destination?.zip || "").slice(0, 5);
@@ -362,15 +414,42 @@ const MUTATION_DRAFT_ORDER_CALCULATE = `#graphql
   }
 `;
 
-// Calculate the exact Shopify tax for the given cart + destination.
-// Returns { taxCents, source } on success or null on failure — caller
-// falls back to the static state-lookup rate.
+// Calculate Shopify tax for the given cart + destination.
+//
+// FAST PATH: this function is CACHE-ONLY and returns synchronously.
+//   • Cache hit  → { taxCents, source: "shopify_cached" }
+//   • Cache miss → null (caller falls through with 0 tax), AND we kick
+//                  off a background fetch (fire-and-forget) that populates
+//                  the cache for the NEXT carrier callback.
+//
+// Why fire-and-forget instead of awaiting Shopify inline?
+//   Confirmed empirically 2026-07-08 via Postman: Shopify's
+//   `draftOrderCalculate` takes ~12 seconds per call (11.8s TTFB) on our
+//   staging store. Shopify's own carrier-callback budget is 10 seconds —
+//   any inline wait guarantees the whole checkout gets "Shipping not
+//   available." So we NEVER wait for tax during a carrier callback.
+//   Instead we let the first callback return without tax, kick off the
+//   fetch async, and expect the customer's SECOND+ carrier callback
+//   (Shopify makes 3-4 during a checkout as user progresses through
+//   address / shipping / discount / review) to hit a warmed cache and
+//   include tax in the fee for the final price they actually pay.
+//
+// Trade-off: the first rate quote a customer sees may under-charge the
+// processing fee by 3% × tax. For a $10 order that's ~$0.03; for a
+// $1000 order ~$3. The final PAYMENT rate they authorize will be
+// accurate (cache warm by that point).
+// Marked `async` even though the body is synchronous — keeps the caller's
+// `await calculateShopifyTax(...)` line working unchanged and lets us
+// convert back to inline-await in the future without touching the call
+// site. The function itself does no I/O; the background fetch runs
+// entirely on its own promise chain.
 async function calculateShopifyTax({ shop, destination, realItems, subtotalCents }) {
   if (!shop) return null;
   if (!realItems?.length) return null;
 
-  // Cache hit — return instantly (no Shopify call).
   const cacheKey = buildTaxCacheKey({ destination, realItems, subtotalCents });
+
+  // Cache hit — return instantly (no Shopify call).
   const cached = _shopifyTaxCache.get(cacheKey);
   if (cached && Date.now() - cached.cachedAt < CONFIG.shopifyTax.cacheTtlMs) {
     return { taxCents: cached.taxCents, source: "shopify_cached" };
@@ -403,30 +482,139 @@ async function calculateShopifyTax({ shop, destination, realItems, subtotalCents
     delete input.shippingAddress.provinceCode;
   }
 
+  // Kick off the background fetch if not already in flight for this key.
+  // The Node process's event loop will run this concurrently with the
+  // rest of the carrier-callback response; when it finishes (~12s later),
+  // the cache is warm for the next callback in this checkout session.
+  if (!_shopifyTaxInFlight.has(cacheKey)) {
+    _shopifyTaxInFlight.add(cacheKey);
+    // Fire-and-forget — no `await`, no `.then()` chain that affects the
+    // current request. Errors are logged inside the fetcher itself.
+    fetchShopifyTaxInBackground({ shop, input, cacheKey })
+      .finally(() => _shopifyTaxInFlight.delete(cacheKey));
+    console.log(
+      `[shipping.rates] shopify tax MISS — background fetch started for cache key (this request returns without tax; next callback should hit cache)`,
+    );
+  } else {
+    console.log(
+      `[shipping.rates] shopify tax MISS — fetch already in flight for this cache key, returning without tax`,
+    );
+  }
+
+  return null;
+}
+
+// Actual Shopify Admin API call — runs in the background, not awaited by
+// the carrier callback. Uses a longer timeout (30 sec) than the previous
+// inline path because there is no request-response budget to protect.
+async function fetchShopifyTaxInBackground({ shop, input, cacheKey }) {
+
+  // ── Direct-fetch to Shopify Admin GraphQL (2026-07-07) ────────────────
+  //
+  // Previously used `unauthenticated.admin(shop).graphql(...)` which
+  // requires an offline OAuth session token stored in the app's session
+  // storage (Mongo). In prod that lookup was throwing a Response(500)
+  // with empty body — confirmed via research to mean "no offline session
+  // for this shop" (see PROGRAM.md 2026-07-07 round 6).
+  //
+  // Instead of relying on the framework's session storage (which can
+  // silently fall out of sync if the app is reinstalled, sessions get
+  // cleared, or Mongo has issues), we now hit the Admin GraphQL endpoint
+  // directly using an Admin API access token from env. This is:
+  //   • bulletproof — no session-storage dependency
+  //   • fast — no Mongo round-trip on every carrier callback
+  //   • simple — plain fetch(), no framework middleware in the path
+  //
+  // Required env vars (set in Render):
+  //   SHOPIFY_ADMIN_API_TOKEN   — Admin API access token (starts with
+  //                               shpat_...). Create in Shopify admin →
+  //                               Settings → Apps → Develop apps → your
+  //                               custom app → API credentials.
+  //   SHOPIFY_ADMIN_API_VERSION — API version, e.g. "2026-07". Optional;
+  //                               defaults to "2026-07".
+  const adminToken = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+  if (!adminToken) {
+    console.warn(
+      "[shipping.rates] shopify tax [bg] skipped — SHOPIFY_ADMIN_ACCESS_TOKEN env var not set. Add it (Admin API access token from Shopify admin → Settings → Apps → Develop apps).",
+    );
+    return;
+  }
+  const apiVersion = process.env.SHOPIFY_ADMIN_API_VERSION || "2026-07";
+  // Guard against a shop value with leading/trailing whitespace or a
+  // stray `https://` prefix — invalid URL will hang on DNS resolution.
+  const shopClean = String(shop || "")
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/, "");
+  const graphqlUrl = `https://${shopClean}/admin/api/${apiVersion}/graphql.json`;
+
+  // Background timeout — 30 sec, well beyond the empirically-observed
+  // ~12 sec Shopify TTFB (Postman test 2026-07-08). Since this runs
+  // outside the carrier-callback response cycle, there is no upper
+  // budget imposed by Shopify — the only reason to have a timeout at
+  // all is to prevent orphaned promises accumulating on chronically
+  // hung requests.
+  const BG_TIMEOUT_MS = 30000;
+
+  const tokenPreview =
+    adminToken.length > 12
+      ? `${adminToken.slice(0, 8)}...${adminToken.slice(-4)}(len=${adminToken.length})`
+      : `(short:${adminToken.length}chars)`;
+  console.log(
+    `[shipping.rates] shopify tax [bg] fetch start — url=${graphqlUrl} · token=${tokenPreview} · timeoutMs=${BG_TIMEOUT_MS}`,
+  );
+  const fetchStartMs = Date.now();
+
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), CONFIG.shopifyTax.timeoutMs);
+  const timer = setTimeout(() => controller.abort(), BG_TIMEOUT_MS);
   try {
-    const { admin } = await unauthenticated.admin(shop);
-    const res = await admin.graphql(MUTATION_DRAFT_ORDER_CALCULATE, {
-      variables: { input },
+    const res = await fetch(graphqlUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": adminToken,
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        query: MUTATION_DRAFT_ORDER_CALCULATE,
+        variables: { input },
+      }),
       signal: controller.signal,
     });
-    const body = await res.json();
     clearTimeout(timer);
 
+    if (!res.ok) {
+      const bodyText = await res.text().catch(() => "");
+      console.warn(
+        "[shipping.rates] shopify tax [bg] HTTP error:",
+        `HTTP ${res.status} ${res.statusText} · body=${bodyText.slice(0, 800)}`,
+        "· url=",
+        graphqlUrl,
+      );
+      return;
+    }
+
+    const body = await res.json();
+    if (Array.isArray(body?.errors) && body.errors.length) {
+      console.warn(
+        "[shipping.rates] shopify tax [bg] GraphQL errors:",
+        JSON.stringify(body.errors).slice(0, 800),
+      );
+      return;
+    }
     const userErrors = body?.data?.draftOrderCalculate?.userErrors || [];
     if (userErrors.length) {
       console.warn(
-        "[shipping.rates] draftOrderCalculate userErrors:",
+        "[shipping.rates] shopify tax [bg] draftOrderCalculate userErrors:",
         JSON.stringify(userErrors),
       );
-      return null;
+      return;
     }
     const taxAmountUsd = Number(
       body?.data?.draftOrderCalculate?.calculatedDraftOrder?.totalTaxSet
         ?.shopMoney?.amount,
     );
-    if (!Number.isFinite(taxAmountUsd)) return null;
+    if (!Number.isFinite(taxAmountUsd)) return;
     const taxCents = Math.round(taxAmountUsd * 100);
 
     // Cache for CONFIG.shopifyTax.cacheTtlMs. Bounded to
@@ -439,14 +627,20 @@ async function calculateShopifyTax({ shop, destination, realItems, subtotalCents
     }
     _shopifyTaxCache.set(cacheKey, { taxCents, cachedAt: Date.now() });
 
-    return { taxCents, source: "shopify_live" };
+    console.log(
+      `[shipping.rates] shopify tax [bg] OK — tax=$${(taxCents / 100).toFixed(2)} · elapsed=${Date.now() - fetchStartMs}ms · cache now WARM for this cart+address (next carrier callback will use it)`,
+    );
   } catch (err) {
     clearTimeout(timer);
+    const elapsedMs = Date.now() - fetchStartMs;
+    const isAbort =
+      err?.name === "AbortError" ||
+      /aborted/i.test(err?.message || "");
     console.warn(
-      "[shipping.rates] Shopify tax API failed — falling back to state lookup:",
-      err?.message || err,
+      "[shipping.rates] shopify tax [bg] fetch failed:",
+      isAbort ? `timeout after ${BG_TIMEOUT_MS}ms` : err?.message || String(err),
+      `· elapsed=${elapsedMs}ms · shop=${shopClean}`,
     );
-    return null;
   }
 }
 
@@ -957,6 +1151,7 @@ export async function action({ request }) {
   console.log(
     `[shipping.rates] inbound: ${rate.items.length} line(s) (${feeLinesExcluded} processing-fee excluded), realQty=${totalQty}, dest=${rate.destination?.country}/${rate.destination?.province}/${rate.destination?.postal_code}`,
   );
+
 
   // ── 1a. Free-shipping rule (retail store) ─────────────────────────
   //
