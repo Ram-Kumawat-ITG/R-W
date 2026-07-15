@@ -4,6 +4,7 @@ import { sendResponse } from '../../services/APIService/api.service'
 import { isSyncEnabled } from '../../services/sync/sync.config'
 import { syncProductCreate } from '../../services/sync/product.sync'
 import { upsertProductMap } from '../../services/sync/productMap.service'
+import { isQboProductSyncEnabled, syncProductToQbo } from '../../services/qbo/qboProductSync.service'
 import IdMap from '../../services/sync/idMap.model'
 import { createLogger } from '../../utils/logger.utils'
 
@@ -180,7 +181,8 @@ export async function action({ request }) {
 
   log.info('backfill.start', { shop, totalProducts: allProducts.length })
 
-  const results = { synced: 0, skipped: 0, failed: 0, inventorySnapshotted: 0, errors: [] }
+  const qboOn = isQboProductSyncEnabled()
+  const results = { synced: 0, skipped: 0, failed: 0, inventorySnapshotted: 0, qboSynced: 0, qboErrored: 0, errors: [] }
 
   for (const product of allProducts) {
     try {
@@ -196,6 +198,12 @@ export async function action({ request }) {
     // outcome (best-effort, never throws) — runs after the sync so retail
     // ids written to sync_id_maps are picked up.
     await upsertProductMap(product, { shop, event: 'backfill' })
+    // Proactively create/update the QBO Item per variant + qbo_product_maps.
+    if (qboOn) {
+      const s = await syncProductToQbo(product, { shop, event: 'backfill' })
+      results.qboSynced += s?.synced ?? 0
+      results.qboErrored += s?.errored ?? 0
+    }
   }
 
   // Phase 2 — Snapshot current inventory levels into MongoDB (separate batched queries)
@@ -207,7 +215,7 @@ export async function action({ request }) {
   }
 
   log.info('backfill.done', { shop, ...results })
-  return sendResponse(200, 'success', `Backfill complete: ${results.synced} synced, ${results.inventorySnapshotted} inventory levels saved, ${results.failed} failed`, results)
+  return sendResponse(200, 'success', `Backfill complete: ${results.synced} synced, ${results.inventorySnapshotted} inventory levels saved, ${results.qboSynced} QBO items synced, ${results.failed} failed`, results)
 }
 
 export async function loader() {

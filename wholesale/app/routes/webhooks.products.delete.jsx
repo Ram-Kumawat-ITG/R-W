@@ -1,6 +1,7 @@
 import { authenticate } from '../shopify.server'
 import connectDB from '../services/APIService/mongo.service'
 import { isSyncEnabled, syncProductDelete, claimSyncWebhook, deleteProductMap } from '../services/sync/index'
+import { isQboProductSyncEnabled, markQboProductDeleted } from '../services/qbo/qboProductSync.service'
 import { createLogger } from '../utils/logger.utils'
 
 const log = createLogger('webhook.products_delete')
@@ -25,7 +26,9 @@ export const action = async ({ request }) => {
 
   if (!payload?.id) return new Response('Bad payload', { status: 400 })
 
-  if (!isSyncEnabled()) {
+  const retailOn = isSyncEnabled()
+  const qboOn = isQboProductSyncEnabled()
+  if (!retailOn && !qboOn) {
     log.info('sync_disabled', { shop })
     return new Response(null, { status: 200 })
   }
@@ -42,10 +45,21 @@ export const action = async ({ request }) => {
   // Retail delete first, then remove the MongoDB product-map document —
   // chained after the sync settles so the mirror is removed even when the
   // retail-side delete fails (the wholesale product is gone regardless).
-  syncProductDelete(payload.id)
-    .then(() => log.info('done', { shop, productId: payload.id }))
-    .catch((err) => log.error('failed', { shop, productId: payload.id, err }))
-    .then(() => deleteProductMap(payload.id))
+  if (retailOn) {
+    syncProductDelete(payload.id)
+      .then(() => log.info('done', { shop, productId: payload.id }))
+      .catch((err) => log.error('failed', { shop, productId: payload.id, err }))
+      .then(() => deleteProductMap(payload.id))
+  }
+
+  // QBO: NEVER delete/deactivate the QBO Item — product records are retained
+  // for historical reporting/accounting/analytics. Only flag the mapping
+  // row(s) as shopify-deleted for audit. Fire-and-forget.
+  if (qboOn) {
+    markQboProductDeleted(payload.id)
+      .then((s) => log.info('qbo_retained', { shop, productId: payload.id, ...s }))
+      .catch((err) => log.error('qbo_mark_deleted_failed', { shop, productId: payload.id, err }))
+  }
 
   return new Response(null, { status: 200 })
 }

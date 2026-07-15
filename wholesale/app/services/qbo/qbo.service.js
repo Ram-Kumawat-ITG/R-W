@@ -107,11 +107,14 @@ function sanitizeItemName(name, sku) {
   return full.length > 100 ? full.slice(0, 100).trim() : full
 }
 
-async function createItem({ name, sku }) {
+async function createItem({ name, sku, description, price }) {
   const incomeRef = await resolveIncomeAccountRef()
   if (!incomeRef) throw new Error('cannot create QBO Item — no IncomeAccountRef available')
   const Name = sanitizeItemName(name, sku)
   const payload = { Name, Sku: sku, Type: 'Service', IncomeAccountRef: incomeRef }
+  if (description) payload.Description = String(description).slice(0, 4000)
+  const priceNum = price === null || price === undefined || price === '' ? null : Number(price)
+  if (priceNum != null && Number.isFinite(priceNum)) payload.UnitPrice = priceNum
   try {
     const res = await qbo.post('/item', payload)
     const created = res?.Item
@@ -166,6 +169,118 @@ export async function findOrCreateItemBySku({ sku, name }) {
   } catch (err) {
     log.warn('item.resolve_failed', { sku: clean, err: err?.message || String(err) })
     return null
+  }
+}
+
+// ── Proactive product sync (Products & Services) ─────────────────────
+//
+// Used by the Shopify → QBO product sync (services/qbo/qboProductSync
+// .service.js). Creates or updates the QBO Item for one Shopify variant and
+// returns the resolved id + current SyncToken + the action taken. Unlike
+// `findOrCreateItemBySku` (a best-effort invoice-time resolver that swallows
+// errors and returns null), this THROWS on failure so the caller can record
+// per-variant sync state + retry. It NEVER deletes or deactivates an Item —
+// QBO product records are retained for historical reporting even after the
+// Shopify product is archived/deleted.
+//
+// Fields synced onto the Item: Name (unique, SKU-suffixed), Sku, Description,
+// UnitPrice (informational — invoice lines still price from the Shopify
+// order, never from the Item). Type stays 'Service' (inventory tracking is a
+// separate, plan-tier-gated feature — see docs/qbo-product-sync-integration-plan.md).
+export async function getItem(itemId) {
+  const res = await qbo.get(`/item/${encodeURIComponent(itemId)}`)
+  return res?.Item || null
+}
+
+// Parse a Shopify price string ("9.99") to a Number, or null.
+function priceToNumber(raw) {
+  if (raw === null || raw === undefined || raw === '') return null
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : null
+}
+
+async function updateItemSparse(existing, desired) {
+  // Only send fields that actually changed — QBO sparse update needs the
+  // current SyncToken and an unnecessary write risks racing a concurrent
+  // invoice-time resolution of the same item.
+  const changed = {}
+  if (desired.Name && desired.Name !== existing.Name) changed.Name = desired.Name
+  if (desired.Sku != null && String(desired.Sku) !== String(existing.Sku || '')) {
+    changed.Sku = desired.Sku
+  }
+  if (desired.Description != null && desired.Description !== (existing.Description || '')) {
+    changed.Description = desired.Description
+  }
+  if (
+    desired.UnitPrice != null &&
+    Number(desired.UnitPrice) !== Number(existing.UnitPrice ?? NaN)
+  ) {
+    changed.UnitPrice = desired.UnitPrice
+  }
+  if (Object.keys(changed).length === 0) {
+    return { item: existing, updated: false }
+  }
+  const payload = {
+    Id: String(existing.Id),
+    SyncToken: String(existing.SyncToken),
+    sparse: true,
+    ...changed,
+  }
+  try {
+    const res = await qbo.post('/item', payload)
+    return { item: res?.Item || existing, updated: true }
+  } catch (err) {
+    // Name collision with another item — retry without the Name change
+    // (keep the other field updates; the SKU-suffixed name rarely collides
+    // but a manual QBO rename could cause it).
+    if (/duplicate name|6240/i.test(err?.message || '') && changed.Name) {
+      const { Name, ...rest } = changed
+      void Name
+      if (Object.keys(rest).length === 0) return { item: existing, updated: false }
+      const res = await qbo.post('/item', {
+        Id: String(existing.Id),
+        SyncToken: String(existing.SyncToken),
+        sparse: true,
+        ...rest,
+      })
+      return { item: res?.Item || existing, updated: true }
+    }
+    throw err
+  }
+}
+
+export async function upsertQboItem({ sku, name, description, price }) {
+  const clean = sku ? String(sku).trim() : ''
+  if (!clean) throw new Error('upsertQboItem: sku is required')
+
+  const desired = {
+    Name: sanitizeItemName(name, clean),
+    Sku: clean,
+    Description: description ? String(description).slice(0, 4000) : undefined,
+    UnitPrice: priceToNumber(price) ?? undefined,
+  }
+
+  const existing = await findItemBySku(clean)
+  if (existing?.Id) {
+    const { item, updated } = await updateItemSparse(existing, desired)
+    return {
+      qboItemId: String(item.Id),
+      qboSyncToken: item.SyncToken != null ? String(item.SyncToken) : String(existing.SyncToken),
+      qboItemName: item.Name || existing.Name,
+      sku: item.Sku != null ? String(item.Sku) : clean,
+      action: updated ? 'updated' : 'unchanged',
+    }
+  }
+
+  // Not found — create (Service type). createItem already handles the
+  // duplicate-Name race by adopting a same-SKU existing item.
+  const created = await createItem({ name, sku: clean, description, price })
+  return {
+    qboItemId: String(created.Id),
+    qboSyncToken: created.SyncToken != null ? String(created.SyncToken) : '0',
+    qboItemName: created.Name,
+    sku: created.Sku != null ? String(created.Sku) : clean,
+    action: 'created',
   }
 }
 
