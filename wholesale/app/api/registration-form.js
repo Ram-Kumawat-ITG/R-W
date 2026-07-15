@@ -6,7 +6,6 @@ import { sendResponse } from "../services/APIService/api.service";
 import { buildShopifyNote } from "../services/shopify/shopify.utils";
 import {
   createCustomer,
-  sendCustomerInvite,
   uploadFileToShopify,
   ShopifyUserError,
 } from "../services/shopify/shopify.service";
