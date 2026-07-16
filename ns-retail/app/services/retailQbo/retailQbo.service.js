@@ -5,6 +5,7 @@
 
 import { retailQbo, qboRetailRequest, qboRetailGetBinary } from "./retailQbo.apis";
 import { retailQboConfig } from "./retailQbo.config";
+import RetailQboProductMap from "../../models/retailQboProductMap.server";
 import { createLogger } from "../../utils/logger.utils";
 
 const log = createLogger("retail.qbo.service");
@@ -466,6 +467,41 @@ async function findOrCreateRetailItemBySku({ sku, name }) {
   }
 }
 
+// Resolve the retail QBO Item id for ONE invoice line, referencing the QBO
+// Products & Services (Inventory) records maintained by the proactive retail
+// product sync. Resolution order (mirrors the wholesale side, QBO product-sync
+// plan §8):
+//
+//   1. retail_qbo_product_maps by shopifyVariantId — the DURABLE variant-keyed
+//      mapping written by retailQboProductSync.service. Points at the QBO
+//      Inventory Item created before any order existed, so each invoice line
+//      references the real stock-tracked product (accurate sales/inventory
+//      reporting). Keyed on the stable variant id (not SKU) so a SKU rename
+//      never orphans the reference.
+//   2. findOrCreateRetailItemBySku — the just-in-time SKU resolver (also warms
+//      the in-process _retailItemCache) for lines the proactive sync hasn't
+//      covered yet (delayed webhook / un-backfilled legacy product).
+//   3. null — caller falls back to the shared default Item, unchanged.
+//
+// Best-effort throughout: any lookup failure degrades to the next tier.
+async function resolveRetailInvoiceItemId({ shopifyVariantId, sku, name }) {
+  const variantId = shopifyVariantId ? String(shopifyVariantId).trim() : "";
+  if (variantId) {
+    try {
+      const row = await RetailQboProductMap.findOne({ shopifyVariantId: variantId })
+        .select("qboItemId")
+        .lean();
+      if (row?.qboItemId) return String(row.qboItemId);
+    } catch (err) {
+      log.warn("retail.item.variant_map_lookup_failed", {
+        shopifyVariantId: variantId,
+        err: err?.message || String(err),
+      });
+    }
+  }
+  return findOrCreateRetailItemBySku({ sku, name });
+}
+
 // ── Proactive product sync (Products & Services) ─────────────────────
 //
 // Used by the Shopify → Retail-QBO product sync (retailQboProductSync
@@ -581,8 +617,11 @@ export async function upsertRetailQboItem({ sku, name, description, price, qtyOn
 // order discounts, and a reconciling Adjustment line guarantees QBO TotalAmt
 // equals the Shopify order total.
 //
-// `skuToItemId` — Map<string, string> pre-resolved by createInvoiceForOrder.
-function buildInvoiceLines({ order, itemId, skuToItemId = new Map() }) {
+// `variantToItemId` / `skuToItemId` — Map<string, string> pre-resolved by
+// createInvoiceForOrder. Each product line resolves to its QBO Item by variant
+// id first (the durable retail_qbo_product_maps Inventory Item), then by SKU,
+// then the shared default item.
+function buildInvoiceLines({ order, itemId, skuToItemId = new Map(), variantToItemId = new Map() }) {
   const lines = [];
   let productSum = 0;
   for (const li of order.lineItems || []) {
@@ -593,11 +632,15 @@ function buildInvoiceLines({ order, itemId, skuToItemId = new Map() }) {
     // SKU is used as the QBO Item key (→ populates the dedicated SKU column).
     // Use the raw stored value so the column display matches what's in the data.
     const rawSku = li.sku ? String(li.sku).trim() : null;
+    const rawVariant = li.variantId ? String(li.variantId).trim() : null;
     const productPart = [li.title, li.variantTitle].filter(Boolean).join(" — ");
     // Format: "Product Name — Variant by Vendor" (mirrors wholesale formatLineDescription).
     // SKU goes to the dedicated QBO column; omit it from description.
     const desc = li.vendor ? `${productPart} by ${li.vendor}` : productPart;
-    const lineItemId = (rawSku && skuToItemId.get(rawSku)) || itemId;
+    const lineItemId =
+      (rawVariant && variantToItemId.get(rawVariant)) ||
+      (rawSku && skuToItemId.get(rawSku)) ||
+      itemId;
     lines.push({
       DetailType: "SalesItemLineDetail",
       Amount: amount,
@@ -665,17 +708,32 @@ export async function createInvoiceForOrder({ order, customerId, itemId, request
   if (!customerId) throw new Error("createInvoiceForOrder: customerId is required");
   if (!itemId) throw new Error("createInvoiceForOrder: itemId is required");
 
-  // Pre-resolve per-product QBO Items so the invoice's SKU column populates.
-  // Best-effort: a null result leaves the line on the shared default item.
+  // Pre-resolve each line to its QBO Products & Services (Inventory) Item so
+  // invoice lines reference the real stock-tracked product (accurate sales /
+  // inventory reporting in QBO) and the SKU column populates. Variant-id fast
+  // path (durable retail_qbo_product_maps) → SKU JIT → default item. Best-
+  // effort: a null result leaves the line on the shared default item.
+  const variantToItemId = new Map();
   const skuToItemId = new Map();
   for (const li of order.lineItems || []) {
+    const rawVariant = li.variantId ? String(li.variantId).trim() : null;
     const rawSku = li.sku ? String(li.sku).trim() : null;
-    if (!rawSku || skuToItemId.has(rawSku)) continue;
-    const qboItemId = await findOrCreateRetailItemBySku({ sku: rawSku, name: li.title || undefined });
-    if (qboItemId) skuToItemId.set(rawSku, qboItemId);
+    if (rawVariant) {
+      if (variantToItemId.has(rawVariant)) continue;
+      const qboItemId = await resolveRetailInvoiceItemId({
+        shopifyVariantId: rawVariant,
+        sku: rawSku,
+        name: li.title || undefined,
+      });
+      if (qboItemId) variantToItemId.set(rawVariant, qboItemId);
+    } else if (rawSku) {
+      if (skuToItemId.has(rawSku)) continue;
+      const qboItemId = await findOrCreateRetailItemBySku({ sku: rawSku, name: li.title || undefined });
+      if (qboItemId) skuToItemId.set(rawSku, qboItemId);
+    }
   }
 
-  const { lines, tax } = buildInvoiceLines({ order, itemId, skuToItemId });
+  const { lines, tax } = buildInvoiceLines({ order, itemId, skuToItemId, variantToItemId });
   if (lines.length === 0) {
     throw new Error("createInvoiceForOrder: order has no line items to invoice");
   }

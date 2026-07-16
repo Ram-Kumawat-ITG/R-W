@@ -21,7 +21,11 @@ double-count guard (§5.3 — QBO auto-decrements Inventory on invoices, which c
 fight Shopify-driven adjustments), the reconciliation CRON + admin visibility
 tab (§9/§11 Phase 5; a `retryFailed*QboProductSyncs()` function exists in each
 repo but isn't wired to a scheduled job or UI), and Item Categories for vendor
-analytics (§3.4). The rest of this document is the original DRAFT plan and
+analytics (§3.4 — **superseded for the in-app use case:** the wholesale QBO
+admin "Products" tab (2026-07-16) rolls sales up by product/vendor IN-APP by
+joining the ItemSales report to `qbo_product_maps`, so QBO Categories are only
+needed if QuickBooks' OWN native reports must subtotal by vendor — not yet
+implemented). The rest of this document is the original DRAFT plan and
 remains the reference for those deferred pieces.
 
 This document covers both Shopify app workspaces in this
@@ -254,6 +258,16 @@ Contingent on §2 open question #2 (QBO plan tier). If confirmed available:
   breakdown to mirror into anyway.
 
 ## 8. Invoice creation using QBO Products & Services
+
+> **IMPLEMENTED in BOTH repos (2026-07-16).** Wholesale:
+> `qbo.service.resolveInvoiceItemId` runs the three-tier resolution below
+> (variant-map fast path via `qbo_product_maps` → SKU JIT → default Item);
+> `createInvoice`'s per-line loop uses it and `shopifyLinesToQboLines` carries
+> `variantId` per line (covers wholesale + drop-ship invoices). ns-retail:
+> `retailQbo.service.resolveRetailInvoiceItemId` runs the same tiers against
+> `retail_qbo_product_maps`; `createInvoiceForOrder` pre-resolves each line by
+> its `cdo_orders.lineItems[].variantId` (fast path) then SKU, and
+> `buildInvoiceLines` prefers the variant-mapped item id. Both verified live.
 
 Both `createInvoice` (wholesale) and `createInvoiceForOrder` (ns-retail
 `retailQbo`) already resolve a per-line Item before building `Line[]` —

@@ -7,6 +7,7 @@ import { qboConfig } from './qbo.config'
 import { QBO_APP_URLS } from './qbo.constants'
 import { escapeQboQuery, toCustomerPayload, toInvoiceLine, toQboAddress } from './qbo.utils'
 import QboItemMap from '../../models/qboItemMap.server'
+import QboProductMap from '../../models/qboProductMap.server'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('qbo.service')
@@ -291,6 +292,50 @@ export async function findOrCreateItemBySku({ sku, name }) {
   }
 }
 
+// Resolve the QBO Item id for ONE invoice product line, referencing the QBO
+// Products & Services (Inventory) records maintained by the proactive product
+// sync. Resolution order (QBO product-sync plan §8):
+//
+//   1. qbo_product_maps by shopifyVariantId — the DURABLE variant-keyed
+//      mapping written by services/qbo/qboProductSync.service. This points at
+//      the QBO Inventory Item created before any order existed, so every
+//      invoice line references the real stock-tracked product (enabling
+//      accurate sales/inventory reporting in QBO). Keyed on the variant id
+//      (not SKU) so a SKU rename never orphans the reference.
+//   2. findOrCreateItemBySku — the just-in-time SKU resolver (also warms the
+//      SKU-keyed qbo_item_maps cache), for lines the proactive sync hasn't
+//      covered yet (delayed webhook, or a product that predates the sync and
+//      hasn't been backfilled). Keeps invoicing from ever blocking on a sync
+//      gap.
+//   3. null — the caller (toInvoiceLine) falls back to the shared default
+//      Item, unchanged. Preserves the "invoicing never breaks" guarantee.
+//
+// Best-effort throughout: any lookup failure logs + degrades to the next tier.
+// Item pricing is NOT taken from the QBO Item — invoice line Qty/UnitPrice/
+// Amount always come from the Shopify order (Shopify pricing is authoritative).
+export async function resolveInvoiceItemId({ shopifyVariantId, sku, name }) {
+  const variantId = shopifyVariantId ? String(shopifyVariantId).trim() : ''
+  if (variantId) {
+    try {
+      const row = await QboProductMap.findOne({ shopifyVariantId: variantId })
+        .select('qboItemId')
+        .lean()
+      if (row?.qboItemId) {
+        console.log(`[items] variant ${variantId} → QBO item ${row.qboItemId} (product-map fast path)`)
+        return String(row.qboItemId)
+      }
+    } catch (err) {
+      log.warn('item.variant_map_lookup_failed', {
+        shopifyVariantId: variantId,
+        err: err?.message || String(err),
+      })
+    }
+  }
+  // Missed the proactive-sync mapping — fall back to the SKU JIT resolver
+  // (returns null on its own failure, → default item).
+  return findOrCreateItemBySku({ sku, name })
+}
+
 // ── Proactive product sync (Products & Services) ─────────────────────
 //
 // Used by the Shopify → QBO product sync (services/qbo/qboProductSync
@@ -478,14 +523,22 @@ export async function createInvoice({
     throw new Error('createInvoice: at least one line is required')
   }
 
-  // Resolve per-product QBO Items so the invoice's SKU column populates.
-  // Best-effort per line: a null result leaves `qboItemId` unset and
-  // toInvoiceLine falls back to the default item (current behavior). Only
-  // product lines carry a `sku`; shipping / discount / processing-fee lines
-  // are skipped and stay on the default item.
+  // Resolve each product line to its QBO Products & Services (Inventory) Item
+  // via the durable Shopify↔QBO product mapping — variant-id fast path, then a
+  // SKU lookup, then the default item (see resolveInvoiceItemId). Referencing
+  // the real inventory Item (not a generic line) is what enables accurate
+  // product sales tracking, inventory management, and reporting in QBO, and
+  // populates the invoice's SKU column. Best-effort per line: a null result
+  // leaves `qboItemId` unset and toInvoiceLine falls back to the default item.
+  // Product lines carry a variantId and/or sku; shipping / discount /
+  // processing-fee lines have neither and stay on the default item.
   for (const l of lines) {
-    if (l.kind === 'discount' || !l.sku) continue
-    const itemId = await findOrCreateItemBySku({ sku: l.sku, name: l.name })
+    if (l.kind === 'discount' || (!l.variantId && !l.sku)) continue
+    const itemId = await resolveInvoiceItemId({
+      shopifyVariantId: l.variantId,
+      sku: l.sku,
+      name: l.name,
+    })
     if (itemId) l.qboItemId = itemId
   }
 
@@ -1136,6 +1189,210 @@ export async function getDashboardSnapshot() {
     recentInvoices: recentInvoices?.entities || [],
     errors,
   }
+}
+
+// ── Product sales analytics (ItemSales report) ───────────────────────
+//
+// Pulls QBO's built-in "Sales by Product/Service" report (report id
+// `ItemSales`) so the admin Products tab can show which products sold most
+// + revenue/quantity/margin per product. This is only meaningful because
+// invoice lines now reference per-variant QBO Items (resolveInvoiceItemId) —
+// before that every line hit the single default Item and the report had one
+// lumped row.
+//
+// The report is date-ranged (`start_date` / `end_date`, YYYY-MM-DD). QBO
+// returns a Header/Columns/Rows tree whose columns depend on the plan tier:
+// COGS Amount / Gross Margin only appear on Plus/Advanced with inventory
+// tracking. We map columns BY TITLE, so a column the tenant's plan doesn't
+// expose simply yields null for that field instead of misaligning the parse.
+//
+// Only leaf `type: 'Data'` rows are collected (group/summary rows are
+// skipped) so totals aren't double-counted. Returns:
+//   { rows: [{ itemId, itemName, quantity, amount, avgPrice, cogs,
+//              grossMargin }], hasMargin, currency }
+export async function getItemSalesReport({ startDate, endDate } = {}) {
+  const query = {}
+  if (startDate) query.start_date = startDate
+  if (endDate) query.end_date = endDate
+  // QBO's report endpoints return the report object DIRECTLY (Header /
+  // Columns / Rows at the top level), not wrapped in a `Report` key like the
+  // entity endpoints — tolerate both shapes.
+  const res = await qbo.get('/reports/ItemSales', query)
+  return parseItemSalesReport(res?.Report || res)
+}
+
+function parseNumeric(v) {
+  if (v === null || v === undefined || v === '') return null
+  const n = Number(String(v).replace(/[^0-9.-]/g, ''))
+  return Number.isFinite(n) ? n : null
+}
+
+// Flatten QBO's nested column tree into leaf columns in ColData order. The
+// ItemSales report groups the value columns (Quantity/Amount/…) under a
+// parent "Total" column, so `Columns.Column` is [itemCol, {Columns:{Column:
+// [Quantity, Amount, …]}}] while each row's flat `ColData[]` corresponds to
+// the LEAVES: [item, Quantity, Amount, % of Sales, Avg Price, COGS, Gross
+// Margin, Gross Margin %].
+function flattenReportColumns(cols, acc = []) {
+  for (const c of cols || []) {
+    const nested = c?.Columns?.Column
+    if (Array.isArray(nested) && nested.length) flattenReportColumns(nested, acc)
+    else acc.push(c)
+  }
+  return acc
+}
+
+function parseItemSalesReport(report) {
+  const empty = { rows: [], hasMargin: false, currency: 'USD' }
+  if (!report) return empty
+
+  const leaves = flattenReportColumns(report?.Columns?.Column || [])
+  // Map each leaf column to its index by the stable `ColKey` MetaData
+  // (Quantity / Amount / PercentSales / AvgPrice / Cogs / GrossMargin /
+  // GrossMarginPerc), falling back to the display title. The item column has
+  // ColType 'ProductsAndService' (or 'Item') and no ColKey.
+  const keyIndex = {}
+  let itemIdx = 0
+  leaves.forEach((c, i) => {
+    const colKey = (c?.MetaData || []).find((m) => m?.Name === 'ColKey')?.Value
+    const key = String(colKey || c?.ColTitle || '').trim().toLowerCase()
+    if (key) keyIndex[key] = i
+    const type = String(c?.ColType || '')
+    if (type === 'ProductsAndService' || type === 'Item') itemIdx = i
+  })
+  const idxOf = (...keys) => {
+    for (const k of keys) if (k in keyIndex) return keyIndex[k]
+    return -1
+  }
+  const qtyIdx = idxOf('quantity')
+  const amtIdx = idxOf('amount')
+  const avgIdx = idxOf('avgprice', 'avg price')
+  const cogsIdx = idxOf('cogs', 'cogs amount')
+  const marginIdx = idxOf('grossmargin', 'gross margin')
+  const hasMargin = cogsIdx >= 0 || marginIdx >= 0
+
+  const currency =
+    report?.Header?.Currency || report?.Header?.ReportCurrency || 'USD'
+
+  const rows = []
+  const cellVal = (cd, i) => (i >= 0 && cd[i] ? cd[i].value : undefined)
+  const walk = (list) => {
+    for (const row of list || []) {
+      // Product rows carry a `ColData[]` whose item cell has an `id` (the QBO
+      // Item id). Grand-total / group-summary rows have no item id, so keying
+      // on the id cleanly excludes them without depending on a `type` field
+      // (QBO omits `type` on the leaf data rows in this report).
+      if (Array.isArray(row?.ColData)) {
+        const cd = row.ColData
+        const itemCell = cd[itemIdx] || {}
+        if (itemCell.id) {
+          rows.push({
+            itemId: String(itemCell.id),
+            itemName: itemCell.value || '(unspecified)',
+            quantity: parseNumeric(cellVal(cd, qtyIdx)),
+            amount: parseNumeric(cellVal(cd, amtIdx)),
+            avgPrice: parseNumeric(cellVal(cd, avgIdx)),
+            cogs: parseNumeric(cellVal(cd, cogsIdx)),
+            grossMargin: parseNumeric(cellVal(cd, marginIdx)),
+          })
+        }
+      }
+      // Recurse into nested sections (present only if the report is grouped).
+      if (row?.Rows?.Row) walk(row.Rows.Row)
+    }
+  }
+  walk(report?.Rows?.Row)
+
+  return { rows, hasMargin, currency }
+}
+
+// Product sales analytics with an optional roll-up dimension. QBO's ItemSales
+// report is inherently PER-VARIANT (each Shopify variant is its own QBO Item,
+// QBO has no variant/product grouping). To answer "which PRODUCT / which
+// VENDOR sold most" we join each report row back to `qbo_product_maps` — which
+// snapshots the variant's `vendor`, `productTitle`, and `shopifyProductId` at
+// sync time — and aggregate in JS. This needs no QBO Item Categories (which
+// would only make QBO's OWN native reports subtotal) and works on any plan
+// tier. Report items with no mapping (the default Item, legacy/manual QBO
+// items, un-synced products) fall into their own row (product view) or a
+// "(No vendor)" bucket (vendor view) — surfaced honestly rather than dropped.
+//
+//   groupBy: 'variant' (default, no aggregation) | 'product' | 'vendor'
+//
+// Returns { rows, hasMargin, currency, groupBy }. Aggregated rows carry a
+// `variantCount` (how many variant-level rows rolled into them); `avgPrice`
+// on an aggregate is the blended amount/quantity.
+export async function getProductSalesAnalytics({ startDate, endDate, groupBy = 'variant' } = {}) {
+  const { rows, hasMargin, currency } = await getItemSalesReport({ startDate, endDate })
+  if ((groupBy !== 'product' && groupBy !== 'vendor') || rows.length === 0) {
+    return { rows, hasMargin, currency, groupBy: 'variant' }
+  }
+
+  const itemIds = [...new Set(rows.map((r) => r.itemId).filter(Boolean))]
+  const maps = itemIds.length
+    ? await QboProductMap.find({ qboItemId: { $in: itemIds } })
+        .select('qboItemId vendor productTitle shopifyProductId')
+        .lean()
+    : []
+  const byItemId = new Map(maps.map((m) => [String(m.qboItemId), m]))
+
+  const keyFn =
+    groupBy === 'vendor'
+      ? (r) => {
+          const m = byItemId.get(r.itemId)
+          return m?.vendor ? `v:${m.vendor}` : '__novendor__'
+        }
+      : (r) => {
+          const m = byItemId.get(r.itemId)
+          return m?.shopifyProductId ? `p:${m.shopifyProductId}` : `i:${r.itemId}`
+        }
+  const labelFn =
+    groupBy === 'vendor'
+      ? (r) => byItemId.get(r.itemId)?.vendor || '(No vendor)'
+      : (r) => byItemId.get(r.itemId)?.productTitle || r.itemName
+
+  const groups = new Map()
+  for (const r of rows) {
+    const k = keyFn(r)
+    let g = groups.get(k)
+    if (!g) {
+      g = {
+        label: labelFn(r),
+        quantity: 0,
+        amount: 0,
+        cogs: 0,
+        grossMargin: 0,
+        hasCogs: false,
+        hasMargin: false,
+        variantCount: 0,
+      }
+      groups.set(k, g)
+    }
+    g.quantity += r.quantity || 0
+    g.amount += r.amount || 0
+    if (r.cogs != null) {
+      g.cogs += r.cogs
+      g.hasCogs = true
+    }
+    if (r.grossMargin != null) {
+      g.grossMargin += r.grossMargin
+      g.hasMargin = true
+    }
+    g.variantCount += 1
+  }
+
+  const aggRows = [...groups.values()].map((g) => ({
+    itemId: null,
+    itemName: g.label,
+    quantity: Number(g.quantity.toFixed(2)),
+    amount: Number(g.amount.toFixed(2)),
+    avgPrice: g.quantity ? Number((g.amount / g.quantity).toFixed(2)) : null,
+    cogs: g.hasCogs ? Number(g.cogs.toFixed(2)) : null,
+    grossMargin: g.hasMargin ? Number(g.grossMargin.toFixed(2)) : null,
+    variantCount: g.variantCount,
+  }))
+
+  return { rows: aggRows, hasMargin, currency, groupBy }
 }
 
 // ── Payment ──────────────────────────────────────────────────────────

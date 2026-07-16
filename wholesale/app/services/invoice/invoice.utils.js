@@ -159,9 +159,13 @@ export function shopifyLinesToQboLines(order) {
       quantity: qty,
       unitPrice,
       amount,
-      // Carried for per-product QBO Item resolution (SKU column). The QBO
-      // service resolves `sku` → a QBO Item (carrying that SKU) and sets the
-      // line's qboItemId; lines without a sku stay on the default item.
+      // Carried for per-product QBO Item resolution. The QBO service resolves
+      // each line to its QBO Inventory Item via the durable Shopify↔QBO product
+      // mapping (qbo_product_maps, keyed by variant id — the proactive product
+      // sync), falling back to a SKU lookup, then the default item. `sku` also
+      // drives QBO's SKU column (Item.Sku). Lines with neither a variant id nor
+      // a sku stay on the default item.
+      variantId: item.variant_id != null ? String(item.variant_id) : undefined,
       sku: item.sku ? String(item.sku).trim() : undefined,
       name: item.name || item.title || undefined,
     })
