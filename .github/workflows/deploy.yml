@@ -1,0 +1,27 @@
+name: Deploy to Coolify
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:        # lets you trigger a deploy manually from the Actions tab
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Coolify deployment
+        run: |
+          echo "Triggering Coolify deployment..."
+
+          # --fail-with-body  -> curl exits non-zero on any HTTP 4xx/5xx, so the
+          #                      Action turns RED instead of silently passing.
+          # --show-error      -> prints the error if it fails.
+          # Bearer token      -> required, or Coolify returns 401 Unauthorized.
+          HTTP_CODE=$(curl --silent --show-error --fail-with-body \
+            --write-out "%{http_code}" \
+            --request GET "${{ secrets.COOLIFY_WEBHOOK_URL }}" \
+            --header "Authorization: Bearer ${{ secrets.COOLIFY_TOKEN }}")
+
+          echo "Coolify responded with HTTP $HTTP_CODE"
+          echo "Deployment triggered successfully."
