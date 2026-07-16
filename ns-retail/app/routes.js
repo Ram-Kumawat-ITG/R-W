@@ -87,4 +87,12 @@ export default [
   // mirror that status (carrier + tracking + delivery) onto the linked retail
   // Shopify order. Shared-secret auth (x-sync-secret = RETAIL_SYNC_SECRET).
   route("/api/sync/wholesale-fulfillment", "api/sync/wholesale-fulfillment.js"),
+  // Cross-repo: the WHOLESALE app calls these to create/activate practitioner
+  // discounts on the retail store. Both require ns-retail's own authenticated
+  // app session because the discount is Function-backed (discountCodeAppCreate/
+  // discountCodeActivate on a Function-owned discount only work from the app
+  // that owns the Function) — see cdo.discount.service.js. Shared-secret auth
+  // (x-sync-secret = RETAIL_SYNC_SECRET), same pattern as the sync route above.
+  route("/api/cdo-internal/create-shopify-discount", "api/cdo-internal/create-shopify-discount.js"),
+  route("/api/cdo-internal/set-discount-active", "api/cdo-internal/set-discount-active.js"),
 ];

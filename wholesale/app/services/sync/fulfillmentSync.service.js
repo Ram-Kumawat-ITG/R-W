@@ -23,6 +23,7 @@ import DropshipMapping from '../../models/dropshipMapping.server'
 import { syncConfig, isFulfillmentSyncEnabled } from './sync.config'
 import { carrierDisplayName } from '../../utils/shipping.constants'
 import { createLogger } from '../../utils/logger.utils'
+import { notifyFulfillmentSyncFailed } from '../notifications/fulfillmentSyncNotification.service'
 
 const log = createLogger('sync.fulfillment')
 
@@ -180,6 +181,17 @@ export async function notifyRetailOfDropshipChange({ localOrder, event = 'fulfil
       const msg = `network: ${err?.message || err}`
       await recordOutcome(mapping._id, { signature, event, status: 'error', error: msg })
       log.error('post.network_failed', { retailOrderId: payload.retailOrderId, err: msg })
+      notifyFulfillmentSyncFailed({
+        event,
+        wholesaleOrderId: localOrder.shopifyOrderId,
+        wholesaleOrderName: localOrder.shopifyOrderName,
+        retailOrderId: payload.retailOrderId,
+        retailOrderName: payload.retailOrderName,
+        fulfillmentStatus: localOrder.fulfillmentStatus,
+        reason: 'network',
+        error: msg,
+        attempts: mapping.retailFulfillmentSync?.attempts,
+      }).catch((e) => log.error('notification_failed', { err: e?.message || e }))
       return { ok: false, reason: 'network', error: msg }
     }
 
@@ -188,6 +200,17 @@ export async function notifyRetailOfDropshipChange({ localOrder, event = 'fulfil
       const msg = `${res.status}: ${text.slice(0, 300)}`
       await recordOutcome(mapping._id, { signature, event, status: 'error', error: msg })
       log.error('post.failed', { retailOrderId: payload.retailOrderId, status: res.status, body: text.slice(0, 300) })
+      notifyFulfillmentSyncFailed({
+        event,
+        wholesaleOrderId: localOrder.shopifyOrderId,
+        wholesaleOrderName: localOrder.shopifyOrderName,
+        retailOrderId: payload.retailOrderId,
+        retailOrderName: payload.retailOrderName,
+        fulfillmentStatus: localOrder.fulfillmentStatus,
+        reason: 'http',
+        error: msg,
+        attempts: mapping.retailFulfillmentSync?.attempts,
+      }).catch((e) => log.error('notification_failed', { err: e?.message || e }))
       return { ok: false, reason: 'http', status: res.status }
     }
 
@@ -196,7 +219,16 @@ export async function notifyRetailOfDropshipChange({ localOrder, event = 'fulfil
     return { ok: true }
   } catch (err) {
     // Last-ditch guard — this function must never throw into a fulfillment path.
-    log.error('unhandled', { err: err?.message || String(err) })
-    return { ok: false, reason: 'unhandled', error: err?.message || String(err) }
+    const msg = err?.message || String(err)
+    log.error('unhandled', { err: msg })
+    notifyFulfillmentSyncFailed({
+      event,
+      wholesaleOrderId: localOrder?.shopifyOrderId,
+      wholesaleOrderName: localOrder?.shopifyOrderName,
+      fulfillmentStatus: localOrder?.fulfillmentStatus,
+      reason: 'unhandled',
+      error: msg,
+    }).catch((e) => log.error('notification_failed', { err: e?.message || e }))
+    return { ok: false, reason: 'unhandled', error: msg }
   }
 }

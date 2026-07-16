@@ -924,6 +924,17 @@ with the shared `x-sync-secret` (`RETAIL_SYNC_SECRET`), gated by
 bounded by `NS_RETAIL_SYNC_TIMEOUT_MS` (default 10 s, `AbortSignal.timeout`) so
 a hung tunnel can't stall the webhook / page load / CRON tick.
 
+**Admin alert on sync failure.** Every failure mode `notifyRetailOfDropshipChange`
+already tracks — network failure reaching ns-retail, a non-2xx HTTP response, or
+an unhandled error before either of those — fires
+`services/notifications/fulfillmentSyncNotification.notifyFulfillmentSyncFailed`
+(admin-only, SMTP via the shared `services/email/email.service.sendEmail`,
+`CRON_ADMIN_EMAIL`). Includes the wholesale + linked retail order, the event
+type, fulfillment status, failure reason (`network`/`http`/`unhandled`), the
+captured error detail, and the mapping's attempt count. Best-effort — never
+throws into the fulfillment path; a successful or skipped (unchanged-signature)
+sync never sends an email.
+
 **Reliability — single backstop on the ns-retail side.** The push above fires
 the sync **once** per fulfillment change; if that single POST fails (ns-retail
 briefly down, the dev tunnel rotated, a transient 5xx) nothing re-fires it from

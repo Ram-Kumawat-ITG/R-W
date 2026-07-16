@@ -7,6 +7,7 @@ import { qboConfig } from './qbo.config'
 import { QBO_APP_URLS } from './qbo.constants'
 import { escapeQboQuery, toCustomerPayload, toInvoiceLine, toQboAddress } from './qbo.utils'
 import QboItemMap from '../../models/qboItemMap.server'
+import QboProductMap from '../../models/qboProductMap.server'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('qbo.service')
@@ -79,6 +80,82 @@ async function resolveIncomeAccountRef() {
   return cachedIncomeAccountRef
 }
 
+// Inventory-Asset account for Inventory-type Items. Env-pinned
+// (QBO_INVENTORY_ASSET_ACCOUNT_ID) or auto-resolved from the Chart of
+// Accounts (Other Current Asset / Inventory), preferring the standard-named
+// "Inventory Asset". Cached: `undefined` = unresolved, `null` = none found.
+let cachedAssetAccountRef
+async function resolveInventoryAssetAccountRef() {
+  if (cachedAssetAccountRef !== undefined) return cachedAssetAccountRef
+  if (qboConfig.inventoryAssetAccountId) {
+    cachedAssetAccountRef = { value: String(qboConfig.inventoryAssetAccountId) }
+    return cachedAssetAccountRef
+  }
+  try {
+    const stmt = `SELECT * FROM Account WHERE AccountType = 'Other Current Asset' AND AccountSubType = 'Inventory'`
+    const res = await qbo.query(stmt)
+    const accounts = res?.QueryResponse?.Account || []
+    const chosen = accounts.find((a) => /^inventory asset$/i.test(a.Name || '')) || accounts[0]
+    cachedAssetAccountRef = chosen?.Id ? { value: String(chosen.Id) } : null
+  } catch (err) {
+    log.warn('item.asset_account.lookup_failed', { err: err?.message || String(err) })
+    cachedAssetAccountRef = null
+  }
+  return cachedAssetAccountRef
+}
+
+// COGS/expense account for Inventory-type Items. Env-pinned
+// (QBO_INVENTORY_COGS_ACCOUNT_ID) or auto-resolved (Cost of Goods Sold),
+// preferring the standard-named "Cost of Goods Sold".
+let cachedCogsAccountRef
+async function resolveCogsAccountRef() {
+  if (cachedCogsAccountRef !== undefined) return cachedCogsAccountRef
+  if (qboConfig.inventoryCogsAccountId) {
+    cachedCogsAccountRef = { value: String(qboConfig.inventoryCogsAccountId) }
+    return cachedCogsAccountRef
+  }
+  try {
+    const stmt = `SELECT * FROM Account WHERE AccountType = 'Cost of Goods Sold'`
+    const res = await qbo.query(stmt)
+    const accounts = res?.QueryResponse?.Account || []
+    const chosen = accounts.find((a) => /^cost of goods sold$/i.test(a.Name || '')) || accounts[0]
+    cachedCogsAccountRef = chosen?.Id ? { value: String(chosen.Id) } : null
+  } catch (err) {
+    log.warn('item.cogs_account.lookup_failed', { err: err?.message || String(err) })
+    cachedCogsAccountRef = null
+  }
+  return cachedCogsAccountRef
+}
+
+// Offset account for InventoryAdjustment posts. Env-pinned or auto-resolved,
+// preferring an "Inventory Shrinkage"/adjustment account, else the COGS account.
+let cachedAdjustAccountRef
+async function resolveInventoryAdjustmentAccountRef() {
+  if (cachedAdjustAccountRef !== undefined) return cachedAdjustAccountRef
+  if (qboConfig.inventoryAdjustmentAccountId) {
+    cachedAdjustAccountRef = { value: String(qboConfig.inventoryAdjustmentAccountId) }
+    return cachedAdjustAccountRef
+  }
+  try {
+    const res = await qbo.query(`SELECT * FROM Account WHERE AccountType = 'Cost of Goods Sold'`)
+    const accounts = res?.QueryResponse?.Account || []
+    const chosen =
+      accounts.find((a) => /shrinkage|adjust/i.test(a.Name || '')) ||
+      accounts.find((a) => /^cost of goods sold$/i.test(a.Name || '')) ||
+      accounts[0]
+    cachedAdjustAccountRef = chosen?.Id ? { value: String(chosen.Id) } : await resolveCogsAccountRef()
+  } catch (err) {
+    log.warn('item.adjust_account.lookup_failed', { err: err?.message || String(err) })
+    cachedAdjustAccountRef = await resolveCogsAccountRef()
+  }
+  return cachedAdjustAccountRef
+}
+
+// QBO wants InvStartDate as a plain date (YYYY-MM-DD).
+function todayYmd() {
+  return new Date().toISOString().slice(0, 10)
+}
+
 async function findItemBySku(sku) {
   if (!sku) return null
   const stmt = `SELECT * FROM Item WHERE Sku = '${escapeQboQuery(sku)}' MAXRESULTS 1`
@@ -93,39 +170,85 @@ async function findItemByName(name) {
   return res?.QueryResponse?.Item?.[0] || null
 }
 
-// QBO Item Name must be UNIQUE and cannot contain ':'. Multiple products /
-// variants frequently share a display name but have different SKUs, so we
-// make the Name unique by appending the SKU — otherwise QBO rejects the
-// second create as a duplicate name and we'd be forced to reuse the wrong
-// item (the bug that showed every line with the first line's SKU). Clamp to
-// QBO's 100-char Name limit.
-function sanitizeItemName(name, sku) {
-  const base = String(name || '').replace(/:/g, '-').trim()
-  const skuPart = sku ? ` (${String(sku).replace(/:/g, '-').trim()})` : ''
-  let full = `${base}${skuPart}`.trim()
-  if (!full) full = sku ? `SKU ${sku}` : 'Item'
+// QBO Item Name can't contain ':' and is capped at 100 chars. Pure sanitizer
+// — no SKU is appended (the SKU has its own Item.Sku field / column). QBO also
+// requires the Name to be UNIQUE; that's handled at create time by falling
+// back to `uniqueItemName` (SKU-qualified) only when a genuine collision with
+// a DIFFERENT item occurs — see createItem.
+function sanitizeItemName(name) {
+  let full = String(name || '').replace(/:/g, '-').trim()
+  if (!full) full = 'Item'
   return full.length > 100 ? full.slice(0, 100).trim() : full
 }
 
-async function createItem({ name, sku }) {
+// Collision fallback: append the SKU to disambiguate when two different items
+// would otherwise share a Name. Trims the base so the SKU survives the 100-char
+// cap.
+function uniqueItemName(name, sku) {
+  const cleanSku = sku ? String(sku).replace(/:/g, '-').trim() : ''
+  const suffix = cleanSku ? ` (${cleanSku})` : ''
+  let base = String(name || '').replace(/:/g, '-').trim()
+  const max = 100 - suffix.length
+  if (base.length > max) base = base.slice(0, Math.max(0, max)).trim()
+  let full = `${base}${suffix}`.trim()
+  if (!full) full = cleanSku ? `SKU ${cleanSku}` : 'Item'
+  return full.slice(0, 100)
+}
+
+async function createItem({ name, sku, description, price, qtyOnHand }) {
   const incomeRef = await resolveIncomeAccountRef()
   if (!incomeRef) throw new Error('cannot create QBO Item — no IncomeAccountRef available')
-  const Name = sanitizeItemName(name, sku)
+  const Name = sanitizeItemName(name)
   const payload = { Name, Sku: sku, Type: 'Service', IncomeAccountRef: incomeRef }
+  if (description) payload.Description = String(description).slice(0, 4000)
+  const priceNum = price === null || price === undefined || price === '' ? null : Number(price)
+  if (priceNum != null && Number.isFinite(priceNum)) payload.UnitPrice = priceNum
+
+  // Inventory type (QBO Plus/Advanced) — requires an Inventory-Asset account
+  // + a COGS/expense account + TrackQtyOnHand/QtyOnHand/InvStartDate. If
+  // either account can't be resolved we GRACEFULLY stay on Service type so
+  // item creation (and therefore invoicing/sync) never breaks.
+  if (qboConfig.inventoryTrackingEnabled) {
+    const [assetRef, cogsRef] = await Promise.all([
+      resolveInventoryAssetAccountRef(),
+      resolveCogsAccountRef(),
+    ])
+    if (assetRef && cogsRef) {
+      const qty = Number.isFinite(Number(qtyOnHand)) ? Number(qtyOnHand) : 0
+      payload.Type = 'Inventory'
+      payload.TrackQtyOnHand = true
+      payload.QtyOnHand = qty
+      payload.InvStartDate = todayYmd()
+      payload.AssetAccountRef = assetRef
+      payload.ExpenseAccountRef = cogsRef
+    } else {
+      log.warn('item.inventory_fallback_service', {
+        sku,
+        reason: !assetRef ? 'no_inventory_asset_account' : 'no_cogs_account',
+      })
+    }
+  }
   try {
     const res = await qbo.post('/item', payload)
     const created = res?.Item
     if (!created?.Id) throw new Error('QBO item create returned no Id')
     return created
   } catch (err) {
-    // Name collision (pre-existing item, or a concurrent create won the
-    // race). Adopt the existing item ONLY when its SKU matches what we're
-    // resolving — never return an item with a different SKU (that's what
-    // previously caused every line to show the first line's SKU).
+    // Name collision (pre-existing item, or a concurrent create won the race).
     if (/duplicate name|6240/i.test(err?.message || '')) {
       const existing = await findItemByName(Name)
+      // Same SKU → adopt it (idempotent re-create). Never return an item with
+      // a different SKU (that's what previously showed every line the wrong SKU).
       if (existing?.Id && String(existing.Sku || '') === String(sku || '')) {
         return existing
+      }
+      // Different item owns this clean Name → retry once with a SKU-qualified
+      // unique Name so both items can coexist (QBO requires unique Names).
+      const retryName = uniqueItemName(name, sku)
+      if (retryName !== Name) {
+        const retry = await qbo.post('/item', { ...payload, Name: retryName })
+        const created = retry?.Item
+        if (created?.Id) return created
       }
     }
     throw err
@@ -169,6 +292,219 @@ export async function findOrCreateItemBySku({ sku, name }) {
   }
 }
 
+// Resolve the QBO Item id for ONE invoice product line, referencing the QBO
+// Products & Services (Inventory) records maintained by the proactive product
+// sync. Resolution order (QBO product-sync plan §8):
+//
+//   1. qbo_product_maps by shopifyVariantId — the DURABLE variant-keyed
+//      mapping written by services/qbo/qboProductSync.service. This points at
+//      the QBO Inventory Item created before any order existed, so every
+//      invoice line references the real stock-tracked product (enabling
+//      accurate sales/inventory reporting in QBO). Keyed on the variant id
+//      (not SKU) so a SKU rename never orphans the reference.
+//   2. findOrCreateItemBySku — the just-in-time SKU resolver (also warms the
+//      SKU-keyed qbo_item_maps cache), for lines the proactive sync hasn't
+//      covered yet (delayed webhook, or a product that predates the sync and
+//      hasn't been backfilled). Keeps invoicing from ever blocking on a sync
+//      gap.
+//   3. null — the caller (toInvoiceLine) falls back to the shared default
+//      Item, unchanged. Preserves the "invoicing never breaks" guarantee.
+//
+// Best-effort throughout: any lookup failure logs + degrades to the next tier.
+// Item pricing is NOT taken from the QBO Item — invoice line Qty/UnitPrice/
+// Amount always come from the Shopify order (Shopify pricing is authoritative).
+export async function resolveInvoiceItemId({ shopifyVariantId, sku, name }) {
+  const variantId = shopifyVariantId ? String(shopifyVariantId).trim() : ''
+  if (variantId) {
+    try {
+      const row = await QboProductMap.findOne({ shopifyVariantId: variantId })
+        .select('qboItemId')
+        .lean()
+      if (row?.qboItemId) {
+        console.log(`[items] variant ${variantId} → QBO item ${row.qboItemId} (product-map fast path)`)
+        return String(row.qboItemId)
+      }
+    } catch (err) {
+      log.warn('item.variant_map_lookup_failed', {
+        shopifyVariantId: variantId,
+        err: err?.message || String(err),
+      })
+    }
+  }
+  // Missed the proactive-sync mapping — fall back to the SKU JIT resolver
+  // (returns null on its own failure, → default item).
+  return findOrCreateItemBySku({ sku, name })
+}
+
+// ── Proactive product sync (Products & Services) ─────────────────────
+//
+// Used by the Shopify → QBO product sync (services/qbo/qboProductSync
+// .service.js). Creates or updates the QBO Item for one Shopify variant and
+// returns the resolved id + current SyncToken + the action taken. Unlike
+// `findOrCreateItemBySku` (a best-effort invoice-time resolver that swallows
+// errors and returns null), this THROWS on failure so the caller can record
+// per-variant sync state + retry. It NEVER deletes or deactivates an Item —
+// QBO product records are retained for historical reporting even after the
+// Shopify product is archived/deleted.
+//
+// Fields synced onto the Item: Name (unique, SKU-suffixed), Sku, Description,
+// UnitPrice (informational — invoice lines still price from the Shopify
+// order, never from the Item). New Items are created as `Inventory` type when
+// QBO_INVENTORY_TRACKING_ENABLED is on (initial QtyOnHand seeded from the
+// Shopify variant), else `Service`. On-hand quantity AFTER create is changed
+// via InventoryAdjustment (QBO's Item entity can't PATCH QtyOnHand) — see
+// postInventoryAdjustment / reconcileQboItemInventory below.
+export async function getItem(itemId) {
+  const res = await qbo.get(`/item/${encodeURIComponent(itemId)}`)
+  return res?.Item || null
+}
+
+// Post a QBO InventoryAdjustment to change an Inventory item's on-hand by a
+// signed delta — the only supported way to change QtyOnHand after create.
+// Throws on failure; no-op when qtyDiff is 0.
+export async function postInventoryAdjustment({ itemId, qtyDiff }) {
+  const diff = Number(qtyDiff)
+  if (!itemId) throw new Error('postInventoryAdjustment: itemId is required')
+  if (!Number.isFinite(diff) || diff === 0) return { adjusted: false, reason: 'no_diff' }
+  const adjustRef = await resolveInventoryAdjustmentAccountRef()
+  if (!adjustRef) throw new Error('postInventoryAdjustment: no adjustment account available')
+  const payload = {
+    AdjustAccountRef: adjustRef,
+    Line: [
+      {
+        DetailType: 'ItemAdjustmentLineDetail',
+        ItemAdjustmentLineDetail: { ItemRef: { value: String(itemId) }, QtyDiff: diff },
+      },
+    ],
+  }
+  const res = await qbo.post('/inventoryadjustment', payload)
+  return { adjusted: true, id: res?.InventoryAdjustment?.Id || null, qtyDiff: diff }
+}
+
+// Reconcile a QBO Inventory item's on-hand TO an absolute target quantity
+// (Shopify is authoritative). GETs the item, posts one corrective adjustment.
+// No-op when already matching or when the item isn't Inventory type.
+export async function reconcileQboItemInventory({ itemId, targetQty }) {
+  const target = Number(targetQty)
+  if (!itemId || !Number.isFinite(target)) return { adjusted: false, reason: 'no_target' }
+  const item = await getItem(itemId)
+  if (!item) return { adjusted: false, reason: 'item_not_found' }
+  if (String(item.Type) !== 'Inventory') return { adjusted: false, reason: 'not_inventory' }
+  const current = Number(item.QtyOnHand ?? 0)
+  const diff = target - current
+  if (diff === 0) return { adjusted: false, reason: 'already_matches', qty: current }
+  await postInventoryAdjustment({ itemId, qtyDiff: diff })
+  log.info('item.qty_reconciled', { itemId: String(itemId), from: current, to: target, diff })
+  return { adjusted: true, from: current, to: target, diff }
+}
+
+// Parse a Shopify price string ("9.99") to a Number, or null.
+function priceToNumber(raw) {
+  if (raw === null || raw === undefined || raw === '') return null
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : null
+}
+
+async function updateItemSparse(existing, desired) {
+  // Only send fields that actually changed — QBO sparse update needs the
+  // current SyncToken and an unnecessary write risks racing a concurrent
+  // invoice-time resolution of the same item.
+  const changed = {}
+  if (desired.Name && desired.Name !== existing.Name) changed.Name = desired.Name
+  if (desired.Sku != null && String(desired.Sku) !== String(existing.Sku || '')) {
+    changed.Sku = desired.Sku
+  }
+  if (desired.Description != null && desired.Description !== (existing.Description || '')) {
+    changed.Description = desired.Description
+  }
+  if (
+    desired.UnitPrice != null &&
+    Number(desired.UnitPrice) !== Number(existing.UnitPrice ?? NaN)
+  ) {
+    changed.UnitPrice = desired.UnitPrice
+  }
+  if (Object.keys(changed).length === 0) {
+    return { item: existing, updated: false }
+  }
+  const payload = {
+    Id: String(existing.Id),
+    SyncToken: String(existing.SyncToken),
+    sparse: true,
+    ...changed,
+  }
+  try {
+    const res = await qbo.post('/item', payload)
+    return { item: res?.Item || existing, updated: true }
+  } catch (err) {
+    // Name collision with another item — retry without the Name change
+    // (keep the other field updates; the SKU-suffixed name rarely collides
+    // but a manual QBO rename could cause it).
+    if (/duplicate name|6240/i.test(err?.message || '') && changed.Name) {
+      const { Name, ...rest } = changed
+      void Name
+      if (Object.keys(rest).length === 0) return { item: existing, updated: false }
+      const res = await qbo.post('/item', {
+        Id: String(existing.Id),
+        SyncToken: String(existing.SyncToken),
+        sparse: true,
+        ...rest,
+      })
+      return { item: res?.Item || existing, updated: true }
+    }
+    throw err
+  }
+}
+
+export async function upsertQboItem({ sku, name, description, price, qtyOnHand }) {
+  const clean = sku ? String(sku).trim() : ''
+  if (!clean) throw new Error('upsertQboItem: sku is required')
+
+  const desired = {
+    Name: sanitizeItemName(name),
+    Sku: clean,
+    Description: description ? String(description).slice(0, 4000) : undefined,
+    UnitPrice: priceToNumber(price) ?? undefined,
+  }
+
+  const existing = await findItemBySku(clean)
+  if (existing?.Id) {
+    const { item, updated } = await updateItemSparse(existing, desired)
+    // Reconcile on-hand quantity to Shopify's value. The sparse item update
+    // CANNOT change QtyOnHand — QBO only accepts it at create time or via an
+    // InventoryAdjustment — so an item created earlier with QtyOnHand 0 stays
+    // 0 until this corrective adjustment runs. Best-effort.
+    let qtyResult = null
+    if (qboConfig.inventoryTrackingEnabled && qtyOnHand != null && String(existing.Type) === 'Inventory') {
+      try {
+        qtyResult = await reconcileQboItemInventory({ itemId: existing.Id, targetQty: qtyOnHand })
+      } catch (err) {
+        log.warn('item.qty_reconcile_failed', { sku: clean, err: err?.message || String(err) })
+      }
+    }
+    return {
+      qboItemId: String(item.Id),
+      qboSyncToken: item.SyncToken != null ? String(item.SyncToken) : String(existing.SyncToken),
+      qboItemName: item.Name || existing.Name,
+      sku: item.Sku != null ? String(item.Sku) : clean,
+      action: updated ? 'updated' : 'unchanged',
+      qtyReconciled: qtyResult?.adjusted ? qtyResult : null,
+    }
+  }
+
+  // Not found — create (Inventory type when tracking is on, else Service).
+  // createItem handles the duplicate-Name race by adopting a same-SKU item
+  // and gracefully falls back to Service if the inventory accounts are
+  // unavailable. Initial QtyOnHand seeds from the Shopify variant.
+  const created = await createItem({ name, sku: clean, description, price, qtyOnHand })
+  return {
+    qboItemId: String(created.Id),
+    qboSyncToken: created.SyncToken != null ? String(created.SyncToken) : '0',
+    qboItemName: created.Name,
+    sku: created.Sku != null ? String(created.Sku) : clean,
+    action: 'created',
+  }
+}
+
 // ── Invoice ──────────────────────────────────────────────────────────
 
 export async function createInvoice({
@@ -187,14 +523,22 @@ export async function createInvoice({
     throw new Error('createInvoice: at least one line is required')
   }
 
-  // Resolve per-product QBO Items so the invoice's SKU column populates.
-  // Best-effort per line: a null result leaves `qboItemId` unset and
-  // toInvoiceLine falls back to the default item (current behavior). Only
-  // product lines carry a `sku`; shipping / discount / processing-fee lines
-  // are skipped and stay on the default item.
+  // Resolve each product line to its QBO Products & Services (Inventory) Item
+  // via the durable Shopify↔QBO product mapping — variant-id fast path, then a
+  // SKU lookup, then the default item (see resolveInvoiceItemId). Referencing
+  // the real inventory Item (not a generic line) is what enables accurate
+  // product sales tracking, inventory management, and reporting in QBO, and
+  // populates the invoice's SKU column. Best-effort per line: a null result
+  // leaves `qboItemId` unset and toInvoiceLine falls back to the default item.
+  // Product lines carry a variantId and/or sku; shipping / discount /
+  // processing-fee lines have neither and stay on the default item.
   for (const l of lines) {
-    if (l.kind === 'discount' || !l.sku) continue
-    const itemId = await findOrCreateItemBySku({ sku: l.sku, name: l.name })
+    if (l.kind === 'discount' || (!l.variantId && !l.sku)) continue
+    const itemId = await resolveInvoiceItemId({
+      shopifyVariantId: l.variantId,
+      sku: l.sku,
+      name: l.name,
+    })
     if (itemId) l.qboItemId = itemId
   }
 
@@ -845,6 +1189,210 @@ export async function getDashboardSnapshot() {
     recentInvoices: recentInvoices?.entities || [],
     errors,
   }
+}
+
+// ── Product sales analytics (ItemSales report) ───────────────────────
+//
+// Pulls QBO's built-in "Sales by Product/Service" report (report id
+// `ItemSales`) so the admin Products tab can show which products sold most
+// + revenue/quantity/margin per product. This is only meaningful because
+// invoice lines now reference per-variant QBO Items (resolveInvoiceItemId) —
+// before that every line hit the single default Item and the report had one
+// lumped row.
+//
+// The report is date-ranged (`start_date` / `end_date`, YYYY-MM-DD). QBO
+// returns a Header/Columns/Rows tree whose columns depend on the plan tier:
+// COGS Amount / Gross Margin only appear on Plus/Advanced with inventory
+// tracking. We map columns BY TITLE, so a column the tenant's plan doesn't
+// expose simply yields null for that field instead of misaligning the parse.
+//
+// Only leaf `type: 'Data'` rows are collected (group/summary rows are
+// skipped) so totals aren't double-counted. Returns:
+//   { rows: [{ itemId, itemName, quantity, amount, avgPrice, cogs,
+//              grossMargin }], hasMargin, currency }
+export async function getItemSalesReport({ startDate, endDate } = {}) {
+  const query = {}
+  if (startDate) query.start_date = startDate
+  if (endDate) query.end_date = endDate
+  // QBO's report endpoints return the report object DIRECTLY (Header /
+  // Columns / Rows at the top level), not wrapped in a `Report` key like the
+  // entity endpoints — tolerate both shapes.
+  const res = await qbo.get('/reports/ItemSales', query)
+  return parseItemSalesReport(res?.Report || res)
+}
+
+function parseNumeric(v) {
+  if (v === null || v === undefined || v === '') return null
+  const n = Number(String(v).replace(/[^0-9.-]/g, ''))
+  return Number.isFinite(n) ? n : null
+}
+
+// Flatten QBO's nested column tree into leaf columns in ColData order. The
+// ItemSales report groups the value columns (Quantity/Amount/…) under a
+// parent "Total" column, so `Columns.Column` is [itemCol, {Columns:{Column:
+// [Quantity, Amount, …]}}] while each row's flat `ColData[]` corresponds to
+// the LEAVES: [item, Quantity, Amount, % of Sales, Avg Price, COGS, Gross
+// Margin, Gross Margin %].
+function flattenReportColumns(cols, acc = []) {
+  for (const c of cols || []) {
+    const nested = c?.Columns?.Column
+    if (Array.isArray(nested) && nested.length) flattenReportColumns(nested, acc)
+    else acc.push(c)
+  }
+  return acc
+}
+
+function parseItemSalesReport(report) {
+  const empty = { rows: [], hasMargin: false, currency: 'USD' }
+  if (!report) return empty
+
+  const leaves = flattenReportColumns(report?.Columns?.Column || [])
+  // Map each leaf column to its index by the stable `ColKey` MetaData
+  // (Quantity / Amount / PercentSales / AvgPrice / Cogs / GrossMargin /
+  // GrossMarginPerc), falling back to the display title. The item column has
+  // ColType 'ProductsAndService' (or 'Item') and no ColKey.
+  const keyIndex = {}
+  let itemIdx = 0
+  leaves.forEach((c, i) => {
+    const colKey = (c?.MetaData || []).find((m) => m?.Name === 'ColKey')?.Value
+    const key = String(colKey || c?.ColTitle || '').trim().toLowerCase()
+    if (key) keyIndex[key] = i
+    const type = String(c?.ColType || '')
+    if (type === 'ProductsAndService' || type === 'Item') itemIdx = i
+  })
+  const idxOf = (...keys) => {
+    for (const k of keys) if (k in keyIndex) return keyIndex[k]
+    return -1
+  }
+  const qtyIdx = idxOf('quantity')
+  const amtIdx = idxOf('amount')
+  const avgIdx = idxOf('avgprice', 'avg price')
+  const cogsIdx = idxOf('cogs', 'cogs amount')
+  const marginIdx = idxOf('grossmargin', 'gross margin')
+  const hasMargin = cogsIdx >= 0 || marginIdx >= 0
+
+  const currency =
+    report?.Header?.Currency || report?.Header?.ReportCurrency || 'USD'
+
+  const rows = []
+  const cellVal = (cd, i) => (i >= 0 && cd[i] ? cd[i].value : undefined)
+  const walk = (list) => {
+    for (const row of list || []) {
+      // Product rows carry a `ColData[]` whose item cell has an `id` (the QBO
+      // Item id). Grand-total / group-summary rows have no item id, so keying
+      // on the id cleanly excludes them without depending on a `type` field
+      // (QBO omits `type` on the leaf data rows in this report).
+      if (Array.isArray(row?.ColData)) {
+        const cd = row.ColData
+        const itemCell = cd[itemIdx] || {}
+        if (itemCell.id) {
+          rows.push({
+            itemId: String(itemCell.id),
+            itemName: itemCell.value || '(unspecified)',
+            quantity: parseNumeric(cellVal(cd, qtyIdx)),
+            amount: parseNumeric(cellVal(cd, amtIdx)),
+            avgPrice: parseNumeric(cellVal(cd, avgIdx)),
+            cogs: parseNumeric(cellVal(cd, cogsIdx)),
+            grossMargin: parseNumeric(cellVal(cd, marginIdx)),
+          })
+        }
+      }
+      // Recurse into nested sections (present only if the report is grouped).
+      if (row?.Rows?.Row) walk(row.Rows.Row)
+    }
+  }
+  walk(report?.Rows?.Row)
+
+  return { rows, hasMargin, currency }
+}
+
+// Product sales analytics with an optional roll-up dimension. QBO's ItemSales
+// report is inherently PER-VARIANT (each Shopify variant is its own QBO Item,
+// QBO has no variant/product grouping). To answer "which PRODUCT / which
+// VENDOR sold most" we join each report row back to `qbo_product_maps` — which
+// snapshots the variant's `vendor`, `productTitle`, and `shopifyProductId` at
+// sync time — and aggregate in JS. This needs no QBO Item Categories (which
+// would only make QBO's OWN native reports subtotal) and works on any plan
+// tier. Report items with no mapping (the default Item, legacy/manual QBO
+// items, un-synced products) fall into their own row (product view) or a
+// "(No vendor)" bucket (vendor view) — surfaced honestly rather than dropped.
+//
+//   groupBy: 'variant' (default, no aggregation) | 'product' | 'vendor'
+//
+// Returns { rows, hasMargin, currency, groupBy }. Aggregated rows carry a
+// `variantCount` (how many variant-level rows rolled into them); `avgPrice`
+// on an aggregate is the blended amount/quantity.
+export async function getProductSalesAnalytics({ startDate, endDate, groupBy = 'variant' } = {}) {
+  const { rows, hasMargin, currency } = await getItemSalesReport({ startDate, endDate })
+  if ((groupBy !== 'product' && groupBy !== 'vendor') || rows.length === 0) {
+    return { rows, hasMargin, currency, groupBy: 'variant' }
+  }
+
+  const itemIds = [...new Set(rows.map((r) => r.itemId).filter(Boolean))]
+  const maps = itemIds.length
+    ? await QboProductMap.find({ qboItemId: { $in: itemIds } })
+        .select('qboItemId vendor productTitle shopifyProductId')
+        .lean()
+    : []
+  const byItemId = new Map(maps.map((m) => [String(m.qboItemId), m]))
+
+  const keyFn =
+    groupBy === 'vendor'
+      ? (r) => {
+          const m = byItemId.get(r.itemId)
+          return m?.vendor ? `v:${m.vendor}` : '__novendor__'
+        }
+      : (r) => {
+          const m = byItemId.get(r.itemId)
+          return m?.shopifyProductId ? `p:${m.shopifyProductId}` : `i:${r.itemId}`
+        }
+  const labelFn =
+    groupBy === 'vendor'
+      ? (r) => byItemId.get(r.itemId)?.vendor || '(No vendor)'
+      : (r) => byItemId.get(r.itemId)?.productTitle || r.itemName
+
+  const groups = new Map()
+  for (const r of rows) {
+    const k = keyFn(r)
+    let g = groups.get(k)
+    if (!g) {
+      g = {
+        label: labelFn(r),
+        quantity: 0,
+        amount: 0,
+        cogs: 0,
+        grossMargin: 0,
+        hasCogs: false,
+        hasMargin: false,
+        variantCount: 0,
+      }
+      groups.set(k, g)
+    }
+    g.quantity += r.quantity || 0
+    g.amount += r.amount || 0
+    if (r.cogs != null) {
+      g.cogs += r.cogs
+      g.hasCogs = true
+    }
+    if (r.grossMargin != null) {
+      g.grossMargin += r.grossMargin
+      g.hasMargin = true
+    }
+    g.variantCount += 1
+  }
+
+  const aggRows = [...groups.values()].map((g) => ({
+    itemId: null,
+    itemName: g.label,
+    quantity: Number(g.quantity.toFixed(2)),
+    amount: Number(g.amount.toFixed(2)),
+    avgPrice: g.quantity ? Number((g.amount / g.quantity).toFixed(2)) : null,
+    cogs: g.hasCogs ? Number(g.cogs.toFixed(2)) : null,
+    grossMargin: g.hasMargin ? Number(g.grossMargin.toFixed(2)) : null,
+    variantCount: g.variantCount,
+  }))
+
+  return { rows: aggRows, hasMargin, currency, groupBy }
 }
 
 // ── Payment ──────────────────────────────────────────────────────────

@@ -35,13 +35,14 @@ async function resolvePractitionerNamesByEmail(emails) {
 // Same eligibility filter PASS 1 of processPendingPayments.job.js charges
 // against — kept in sync manually since the job's cursor isn't exported
 // as a reusable query builder. If that filter changes, update this too.
-function pendingChargeFilter() {
+function pendingChargeFilter(blockedEmails = []) {
   return {
     paymentStatus: 'pending',
     paymentMethod: { $in: ['card', 'ach'] },
     isDropship: { $ne: true },
     autoChargePaused: { $ne: true },
     $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
+    ...(blockedEmails.length ? { customerEmail: { $nin: blockedEmails } } : {}),
   }
 }
 
@@ -70,7 +71,14 @@ export async function getUpcomingBatch() {
     if (a.nextRunAt && (!soonest || a.nextRunAt < soonest.nextRunAt)) soonest = a
   }
 
-  const invoices = await Invoice.find(pendingChargeFilter())
+  const blockedApps = await WholesaleApplication.find({ status: 'blocked' })
+    .select('email')
+    .lean()
+  const blockedEmails = blockedApps
+    .map((app) => String(app.email || '').toLowerCase())
+    .filter(Boolean)
+
+  const invoices = await Invoice.find(pendingChargeFilter(blockedEmails))
     .select(
       'shopifyOrderId orderRef customerEmail qboInvoiceId qboDocNumber ' +
         'currency amountDue amountPaid processingFeeAmount attemptCount ' +

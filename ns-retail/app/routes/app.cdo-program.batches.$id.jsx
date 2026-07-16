@@ -8,6 +8,19 @@ import DataTable from "../components/cdo/DataTable";
 import StatusBadge from "../components/cdo/StatusBadge";
 import { formatCurrency, formatDate } from "../utils/format";
 
+// Skip reasons are stored as stable machine keys (see buildPayoutBatch /
+// runAutomatedPayouts in cdo.service.js) — map the ones an admin can hit
+// here to a plain-language explanation; anything unmapped falls back to the
+// raw key so a new reason is still visible, just not yet prettified.
+const FAILURE_REASON_LABELS = {
+  below_minimum_or_open_payout: "Below minimum payout amount, or an open payout already exists",
+  below_minimum: "Below minimum payout amount",
+  open_payout_exists: "An open payout already exists for this practitioner",
+  check_preferred: "Practitioner prefers check payouts (processed via Check Payout queue)",
+  batch_ceiling_deferred: "Deferred — this run hit the batch transfer ceiling; will auto-include in the next payout run",
+};
+const failureReasonLabel = (reason) => FAILURE_REASON_LABELS[reason] || reason;
+
 export const loader = async ({ request, params }) => {
   await authenticate.admin(request);
   const batch = await getPayoutBatch(params.id);
@@ -97,7 +110,7 @@ export default function CdoPayoutBatchDetail() {
     { key: "attempt", header: "Attempt", render: (r) => r.attempt || 0 },
     { key: "txnRef", header: "Txn ref", render: (r) => r.txnRef || "—" },
     { key: "payoutDate", header: "Payout date", render: (r) => (r.payoutDate ? formatDate(r.payoutDate) : "—") },
-    { key: "failureReason", header: "Failure reason", render: (r) => r.failureReason || "—" },
+    { key: "failureReason", header: "Failure reason", render: (r) => (r.failureReason ? failureReasonLabel(r.failureReason) : "—") },
   ];
 
   const Row = ({ label, value }) => (

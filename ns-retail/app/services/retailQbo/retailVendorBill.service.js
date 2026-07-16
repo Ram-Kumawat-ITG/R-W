@@ -29,6 +29,7 @@ import {
   getBillPdf,
 } from "./retailQbo.service";
 import { createLogger } from "../../utils/logger.utils";
+import { notifyVendorBillCreated, notifyVendorBillFailed } from "../notifications/vendorBillNotification.service";
 
 const log = createLogger("retail.vendor_bill");
 
@@ -201,6 +202,17 @@ export async function ensureRetailVendorBillForOrder({ shop, shopifyOrderId, for
     );
 
     log.info("bill.created", { shopifyOrderId, billId: bill.Id, vendorId, total: bill.TotalAmt });
+    notifyVendorBillCreated({
+      shopifyOrderId,
+      orderName: order.orderName,
+      billId: bill.Id,
+      billDocNumber: bill.DocNumber,
+      vendorId,
+      totalAmount: bill.TotalAmt,
+      currency: order.currency,
+      billUrl: url,
+      createdAt: new Date(),
+    }).catch((e) => log.error("bill.notification_failed", { err: e?.message || e }));
     return { ok: true, billId: String(bill.Id) };
   } catch (err) {
     const msg = errMsg(err);
@@ -217,6 +229,16 @@ export async function ensureRetailVendorBillForOrder({ shop, shopifyOrderId, for
       },
     );
     log.error("bill.create_failed", { shopifyOrderId, err });
+    notifyVendorBillFailed({
+      stage: "creation",
+      shopifyOrderId,
+      orderName: order.orderName,
+      totalAmount: order.amount,
+      currency: order.currency,
+      reason: msg,
+      errorDetail: err?.stack,
+      failedAt: new Date(),
+    }).catch((e) => log.error("bill.create_notification_failed", { err: e?.message || e }));
     return { ok: false, reason: "error", error: msg };
   }
 }

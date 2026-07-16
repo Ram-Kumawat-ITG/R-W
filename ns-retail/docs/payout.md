@@ -398,9 +398,41 @@ payout dimension — distinct from the accrual `status`.)
 
 Run flow inside a batch: snapshot eligible pool → `buildPayoutBatch` reserves the
 batched ones (→ **processing**, attempt++); eligible-but-unreserved (below-minimum
-/ open payout) → **skipped**; each payout `approve → execute` → its commissions
-**paid** (txnRef + payoutDate) or **failed** (failureReason). Counts + final
-status are written on completion.
+/ open payout / **batch_ceiling_deferred**) → **skipped**; each payout `approve →
+execute` → its commissions **paid** (txnRef + payoutDate) or **failed**
+(failureReason). Counts + final status are written on completion.
+
+**Batch transfer ceiling (ACH only)** — `payoutConfig.maxTransferAmount`
+(`CDO_PAYOUT_MAX_TRANSFER_AMOUNT`, default 2000) caps how much a single
+`buildPayoutBatch` run can wire-transfer, but **never applies to check
+payouts** — a human reviews, signs, and mails every check, so there's no
+automated-runaway-transfer risk to guard against. Since a group's eventual
+rail (ACH vs check) depends on the practitioner's preference plus a live
+banking probe, `buildPayoutBatch` resolves that method for every group
+FIRST, then runs a commission-level running total over ONLY the ACH-bound
+commissions (oldest-first, earnedAt ascending, re-sorted across groups). The
+first ACH commission that would push that total past the ceiling stops
+inclusion outright — it and every ACH commission after it are deferred
+(skipped with reason `batch_ceiling_deferred`, commissions left unreserved,
+no `payoutId`) — while check-bound groups are always batched in full
+regardless of amount. Deferred ACH commissions remain eligible and are
+automatically picked up by the next scheduled run, so a single automated run
+never wire-transfers more than the ceiling, and nothing is lost, only
+delayed. An ACH group whose own total already exceeds the ceiling is
+deferred every run until an admin intervenes (raise the ceiling, or have the
+practitioner switch to check). See also the per-payout ceiling check in
+`executeApprovedPayout` (§8), gated on `payout.method === "ach"`, which
+re-validates the same cap immediately before the transfer as
+defense-in-depth.
+
+The read-only upcoming-payout previews (`getUpcomingPayouts` /
+`getUpcomingPayoutBatchDetails`, driving this tab) approximate the same
+ceiling over the whole eligible set rather than resolving each
+practitioner's live payout method (an extra query pair per practitioner just
+for an estimate) — exact for the common case, since check-preferred
+practitioners are already excluded from eligibility at the query level here,
+and only slightly conservative for the rare edge case of an ACH-preferred
+practitioner whose banking currently happens to be invalid.
 
 **Reprocess** — `reprocessBatch(batchId)` spawns a fresh `manual_reprocess` batch
 that re-runs only the source batch's **failed** payouts via the resumable
@@ -423,6 +455,7 @@ QBO records the accounting; its `BillPayment` API does **not** move funds to a p
 ```
  approved ──(admin Execute)──▶ executeApprovedPayout
    │  banking gate (§6.5)
+   │  ceiling gate (§7 — reconciliation + CDO_PAYOUT_MAX_TRANSFER_AMOUNT)
    │  QBO Vendor + Bill            ← records the LIABILITY (we owe the commission)
    │  provider.initiateTransfer()  ← initiates the bank→bank ACH credit
    ▼
@@ -468,6 +501,14 @@ Adapters MUST be idempotent on `idempotencyKey` (`cdo-payout-<payoutId>-<attempt
 On settle/return, `finalizeSettledPayout` / the return branch also call `reflectPayoutOnBatches` to update the **batch snapshot** that processed the payout — its run-time items were recorded as `processing` (ACH is async, settled later by this CRON), so without this the Payout Batches view (Paid/Failed/Skipped/**Processing**) would stay frozen on `processing` after the payout actually settled. The reflect updates the matching `items[]` + recomputes the stored counts, so the batch reflects the final outcome.
 
 > **Still to lock before real go-live** (see Commission.md §9): choose + contract a real provider, bank-account ownership verification (micro-deposit/Plaid), encrypt/tokenize stored account numbers, funding-balance pre-check + payout caps, 1099/W-9 enforcement, and the NACHA originator agreement.
+
+### 8.5 Payout email notifications
+
+All three payout emails below live in `app/services/notifications/payoutNotification.{config,service}.js` and share the reusable SMTP utility (`app/services/email/email.service.js`, ported from the wholesale workspace for consistency — same nodemailer transport, retry, and `{success, messageId}`/`{success:false, error}` return shape). All sends are best-effort (fire-and-forget with a caught+logged rejection) — a notification failure never surfaces as a payout-processing failure.
+
+- **Commission Payout Processed** — once a payout reaches its terminal `paid` state, via ACH settlement (`finalizeSettledPayout`) or a manually-issued check (`markCheckPayoutPaid`). `notifyCommissionPayoutProcessed` emails the practitioner (amount, method, reference, date), admin (`CDO_ADMIN_EMAIL`) CC'd.
+- **Commission Payout Failed** — fired from `alertPayoutFailure`, the single choke point every payout-failure path already runs through (banking validation failures in `executeApprovedPayout`, QBO/execution errors, ACH returns in `checkPayoutSettlement`). `notifyCommissionPayoutFailed` emails the practitioner with the failure reason + return code + reference, admin CC'd, plus a note that the reserved commission will auto-retry on the next batch run.
+- **Commission Payout Batch Summary** — admin-only, fired once per `runAutomatedPayouts` run (awaiting-approval, completed, completed-with-errors, or whole-run crash) via `sendPayoutBatchSummaryEmail`/`notifyPayoutBatchSummary`. Contains a per-practitioner HTML table (name, email, total commission amount, order/commission count, payout status, transaction/reference id, processed date+time), sourced fresh from `CdoPayout` via `buildBatchSummaryRows(batch.payoutIds)` rather than the batch's persisted (narrower, strict-schema) `practitionerPayouts` field.
 
 ---
 
@@ -1074,6 +1115,32 @@ webhook topics; ensure `QBO_RETAIL_REFRESH_TOKEN` is freshly minted (Intuit
 rotates the refresh token on every use — see the §14 token-reset note, which
 applies per realm).
 
+### 19.1 Drop-ship Vendor Bill (A/P) email notifications
+
+The drop-ship Vendor Bill flow itself (`app/services/retailQbo/retailVendorBill.service.js`
+creates the QBO Bill; `retailBillReconcile.service.js` reconciles it once the
+wholesale dropship invoice is paid) is the ns-retail half of the cross-repo
+drop-ship pipeline documented in the wholesale workspace's `CLAUDE.md` ("Drop-ship
+orders → unpaid QBO invoice + manual batch collection" row). Two admin-only
+emails hook into it, via `app/services/notifications/vendorBillNotification.service.js`
+(same reusable SMTP utility + `CDO_ADMIN_EMAIL` as the payout notifications in §8.5):
+
+- **Drop-ship Vendor Bill Created** — `notifyVendorBillCreated`, fired from
+  `ensureRetailVendorBillForOrder` right after the QBO Bill is created. Includes
+  the order, bill doc number, vendor, total amount, and QBO link.
+- **Drop-ship Vendor Bill (A/P) Creation or Reconciliation Failed** — one shared
+  template/event, `notifyVendorBillFailed({ stage: 'creation'|'reconciliation', ... })`,
+  fired from BOTH `ensureRetailVendorBillForOrder`'s catch block (creation) and
+  `reconcileRetailVendorBillForOrder`'s catch block (reconciliation) — the `stage`
+  field is the only thing that differs between the two call sites (subject line +
+  one explanatory paragraph); order/bill details, error message, and error detail
+  are otherwise identical. Notes that the bill stays unpaid/uncreated and will be
+  retried automatically on the next order sync / `process-bill-reconciliation`
+  CRON tick.
+
+Both are best-effort (fire-and-forget, logged on failure) — never affect the
+underlying bill creation/reconciliation outcome.
+
 ---
 
 ## 20. Client Portal (Theme App Extension, retail storefront) — IMPLEMENTED (2026-07-07)
@@ -1184,7 +1251,7 @@ QBO_RETAIL_NOTIFY_ON_SHIP=true              # optional — re-send the invoice (
 QBO_RETAIL_RECORD_PAYMENT=true              # optional — record a QBO Payment when the Shopify order is paid (default on)
 
 # ── Payout scheduler (§7) ──
-# CDO_PAYOUT_CRON=30 0 25 * *               # optional — prod payout cron (defaults to 00:30 on the 25th)
+# CDO_PAYOUT_CRON=30 0 * * 1                # optional — prod payout cron (defaults to 00:30 every Monday)
 # CDO_PAYOUT_TZ=America/Los_Angeles         # optional — cron timezone (defaults to America/Los_Angeles)
 CDO_PAYOUT_INTERVAL=20 minutes              # DEV ONLY — overrides the payout cron; leave unset in prod
 CDO_SETTLEMENT_INTERVAL=1 minute            # DEV ONLY — overrides the 6-hourly settlement cron; leave unset in prod
@@ -1192,6 +1259,8 @@ CDO_SETTLEMENT_INTERVAL=1 minute            # DEV ONLY — overrides the 6-hourl
 # CDO_PAYOUT_ALERT_WEBHOOK_URL=             # optional — POSTed on a failed payout
 
 # ── Payout disbursement (§9) ──
+# CDO_PAYOUT_MAX_TRANSFER_AMOUNT=2000       # optional — safety-guard ceiling (default 2000); caps a single
+                                             # batch run's total AND each individual payout at execution
 CDO_PAYOUT_PROVIDER=sandbox|dwolla          # default "sandbox" (in-process simulator)
 # CDO_PAYOUT_REQUIRE_APPROVAL=false         # optional — gate real money behind manual approve+execute
 # CDO_PAYOUT_SANDBOX_SETTLE_SECONDS=60      # sandbox provider ONLY — seconds until a sim transfer settles
@@ -1200,4 +1269,10 @@ CDO_PAYOUT_PROVIDER=sandbox|dwolla          # default "sandbox" (in-process simu
 DWOLLA_ENVIRONMENT=sandbox|production       # required when CDO_PAYOUT_PROVIDER=dwolla
 DWOLLA_KEY=                  DWOLLA_SECRET=
 DWOLLA_FUNDING_SOURCE=                      # business funding source (URL or id)
+
+# ── SMTP email notifications (§8.5) ──
+SMTP_HOST=            SMTP_PORT=587          SMTP_SECURE=false
+SMTP_USER=            SMTP_PASSWORD=
+SMTP_FROM_NAME=Natural Solutions   SMTP_FROM_EMAIL=   SMTP_REPLY_TO=
+CDO_ADMIN_EMAIL=                            # CC'd on the Commission Payout Processed email
 ```

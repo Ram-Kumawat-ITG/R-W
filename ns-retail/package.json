@@ -24,6 +24,8 @@
     "cdo:qbo-accounts": "node --env-file-if-exists=.env scripts/list-cdo-qbo-accounts.js",
     "migrate:practitioner-discounts": "node --experimental-loader ./scripts/extensionless-loader.mjs --env-file-if-exists=.env scripts/migrate-practitioner-discounts.js",
     "migrate:practitioner-discounts:apply": "node --experimental-loader ./scripts/extensionless-loader.mjs --env-file-if-exists=.env scripts/migrate-practitioner-discounts.js --apply",
+    "backfill:qbo-products": "node --experimental-loader ./scripts/extensionless-loader.mjs --env-file-if-exists=.env scripts/backfill-retail-qbo-products.js",
+    "backfill:qbo-products:apply": "node --experimental-loader ./scripts/extensionless-loader.mjs --env-file-if-exists=.env scripts/backfill-retail-qbo-products.js --apply",
     "env": "shopify app env",
     "start": "react-router-serve ./build/server/index.js",
     "docker-start": "npm run setup && npm run start",
@@ -50,13 +52,17 @@
     "@shopify/shopify-app-session-storage-mongodb": "^6.0.0",
     "@shopify/shopify-app-session-storage-prisma": "^9.0.0",
     "agenda": "^5.0.0",
+    "cron-parser": "^3.5.0",
+    "human-interval": "^2.0.1",
     "isbot": "^5.1.31",
     "mongoose": "^9.6.2",
+    "nodemailer": "^9.0.3",
     "prisma": "^6.16.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router": "^7.12.0",
-    "vite-tsconfig-paths": "^5.1.4"
+    "vite-tsconfig-paths": "^5.1.4",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@shopify/api-codegen-preset": "^1.2.0",

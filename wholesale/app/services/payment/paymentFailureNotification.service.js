@@ -48,37 +48,37 @@ export function buildPaymentFailureEmail({
     ? `If you have any questions or need assistance, please contact our support team at ${supportEmail}.`
     : 'If you have any questions or need assistance, please contact our support team.'
 
-  // Order/invoice/payment context — rendered as a labelled list so the
-  // customer sees exactly what was being charged and why, without having
-  // to infer it from a single sentence.
-  const details = [
-    orderLabel && ['Order', orderLabel],
-    formatOrderDate(orderDate) && ['Order date', formatOrderDate(orderDate)],
-    invoiceLabel && ['Invoice', invoiceLabel],
-    amountLine && ['Amount', amountLine],
-    paymentMethod && ['Payment method', PAYMENT_METHOD_LABEL[paymentMethod] || paymentMethod],
-    attemptCount != null && maxAttempts != null && ['Attempt', `${attemptCount} of ${maxAttempts}`],
-  ].filter(Boolean)
-
   const subject = orderLabel
     ? `Payment Failed for Order ${orderLabel} — Action Required`
     : 'Payment Failed — Action Required'
 
   const text =
     `${greeting}\n\n` +
-    `We attempted to process your payment, but it was unsuccessful.\n\n` +
-    (details.length ? details.map(([label, value]) => `${label}: ${value}`).join('\n') + '\n\n' : '') +
+    `We attempted to process your payment, but it was unsuccessful. Please review the details below and update your payment method if needed.\n\n` +
+    `Order: ${orderLabel || '—'}\n` +
+    `Invoice: ${invoiceLabel || '—'}\n` +
+    `Amount: ${amountLine || '—'}\n` +
+    `Method: ${PAYMENT_METHOD_LABEL[paymentMethod] || paymentMethod || '—'}\n` +
+    `Attempt: ${attemptCount != null && maxAttempts != null ? `${attemptCount}/${maxAttempts}` : '—'}\n\n` +
     (reason ? `Reason: ${reason}\n\n` : '') +
     `${contactLine}\n\n` +
     `Thank you,\nNatural Solutions`
 
   const html =
     `<p>${greeting}</p>` +
-    `<p>We attempted to process your payment, but it was unsuccessful.</p>` +
-    (details.length
-      ? `<ul>${details.map(([label, value]) => `<li><strong>${label}:</strong> ${value}</li>`).join('')}</ul>`
-      : '') +
-    (reason ? `<p><strong>Reason:</strong> ${reason}</p>` : '') +
+    `<p>We attempted to process your payment, but it was unsuccessful. Please review the details and update your payment method if needed.</p>` +
+    `<table role="presentation" style="width:100%;border-collapse:collapse;font-size:14px;margin-top:12px">` +
+    `<tbody>` +
+    `<tr><th style="text-align:left;padding:8px;border:1px solid #ddd;background:#f4f4f4">Field</th><th style="text-align:left;padding:8px;border:1px solid #ddd">Details</th></tr>` +
+    `<tr><td style="padding:8px;border:1px solid #ddd">Order</td><td style="padding:8px;border:1px solid #ddd">${orderLabel || '—'}</td></tr>` +
+    `<tr><td style="padding:8px;border:1px solid #ddd">Invoice</td><td style="padding:8px;border:1px solid #ddd">${invoiceLabel || '—'}</td></tr>` +
+    `<tr><td style="padding:8px;border:1px solid #ddd">Amount due</td><td style="padding:8px;border:1px solid #ddd">${amountLine || '—'}</td></tr>` +
+    `<tr><td style="padding:8px;border:1px solid #ddd">Payment method</td><td style="padding:8px;border:1px solid #ddd">${PAYMENT_METHOD_LABEL[paymentMethod] || paymentMethod || '—'}</td></tr>` +
+    `<tr><td style="padding:8px;border:1px solid #ddd">Attempt</td><td style="padding:8px;border:1px solid #ddd">${attemptCount != null && maxAttempts != null ? `${attemptCount} of ${maxAttempts}` : '—'}</td></tr>` +
+    (reason ? `<tr><td style="padding:8px;border:1px solid #ddd">Reason</td><td style="padding:8px;border:1px solid #ddd">${reason}</td></tr>` : '') +
+    `</tbody>` +
+    `</table>` +
+    `<p style="margin-top:16px"><strong>Action:</strong> Update your payment method or contact support.</p>` +
     `<p>${contactLine}</p>` +
     `<p>Thank you,<br/>Natural Solutions</p>`
 

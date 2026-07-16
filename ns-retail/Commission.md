@@ -194,8 +194,8 @@ Bank details are only **format-validated** (ABA checksum + length). A wrong-but-
 ### 8.6 🟠 No funding-balance pre-check
 Nothing verifies the source bank/clearing account has sufficient funds before initiating payouts. A batch could overdraw.
 
-### 8.7 🟠 No payout cap / anomaly detection
-A commission-accrual bug could produce an abnormally large payout; there is no max-amount guard or anomaly alert before money would move.
+### 8.7 ✅ RESOLVED (partial) — payout cap (per-payout + batch-total, ACH only)
+`payoutConfig.maxTransferAmount` (`CDO_PAYOUT_MAX_TRANSFER_AMOUNT`, default 2000) is enforced in two places, both scoped to **ACH-bound commissions/payouts only** — check payouts are never limited by it (a human reviews, signs, and mails every check, so there's no automated-runaway-transfer risk to guard against). `buildPayoutBatch` resolves each practitioner group's payout method (preference + live banking probe) first, then runs a commission-level running total over just the ACH-bound commissions (oldest-first) — the first commission that would push it over the ceiling stops inclusion outright, deferring it and everything after (left unreserved, picked up by the next run); check-bound groups are always batched in full regardless of amount. `executeApprovedPayout` re-checks the final per-payout amount immediately before the transfer, gated on `payout.method === "ach"`, as defense-in-depth. **Remaining:** no anomaly/statistical detection (e.g. vs. trailing average) — just a static ceiling; see §9.6 for the funding-balance pre-check that's still missing.
 
 ### 8.8 🟠 1099 / tax compliance not enforced
 US contractors paid ≥ $600/yr need a **1099-NEC** and a collected **W-9**. Vendors are created but **not verified as 1099-eligible**, and W-9 collection is not enforced.
@@ -246,8 +246,8 @@ Encrypt/tokenize `bankAccountNumber` in `wholesale_applications.commission` (coo
 ### 9.5 ✅ DONE (single approval) — human approval / dual control
 `CDO_PAYOUT_REQUIRE_APPROVAL=true` gates disbursement behind an admin Approve + Execute. **Remaining (optional):** a second-approver above a configurable amount threshold.
 
-### 9.6 Funding-balance pre-check + payout caps
-Check source-account balance (or provider balance) before a run; add a per-payout max + batch-total max + anomaly alert that **pauses** rather than sends when exceeded.
+### 9.6 ✅ DONE (payout caps) / ⬜ Funding-balance pre-check remains
+Per-payout max + batch-total max are implemented (§8.7, `CDO_PAYOUT_MAX_TRANSFER_AMOUNT`) — exceeding either **pauses** (defers or fails) rather than sends. **Remaining:** checking source-account/provider balance before a run, and a statistical anomaly alert (vs. trailing average) beyond the static ceiling.
 
 ### 9.7 Tax compliance
 Mark practitioner QBO Vendors **1099-eligible**, enforce W-9 collection at onboarding, and confirm year-end 1099-NEC generation (QBO can do this once vendors are flagged).
@@ -289,7 +289,7 @@ NACHA originator agreement with the banking partner/provider, authorization reco
 
 | Concern | File |
 |---|---|
-| Payout orchestration / lifecycle | `app/services/cdo/cdo.service.js` (`runAutomatedPayouts`, `executeApprovedPayout`, `checkPayoutSettlement`, `finalizeSettledPayout`, `resolvePractitionerBanking`) |
+| Payout orchestration / lifecycle | `app/services/cdo/cdo.service.js` (`runAutomatedPayouts`, `buildPayoutBatch`, `executeApprovedPayout`, `checkPayoutSettlement`, `finalizeSettledPayout`, `resolvePractitionerBanking`) |
 | Disbursement provider abstraction | `app/services/payout/provider/index.js` (factory + contract) |
 | Sandbox provider (active) | `app/services/payout/provider/sandboxProvider.js` |
 | Disbursement config | `app/services/payout/payout.config.js` |

@@ -6,7 +6,6 @@ import { sendResponse } from "../services/APIService/api.service";
 import { buildShopifyNote } from "../services/shopify/shopify.utils";
 import {
   createCustomer,
-  sendCustomerInvite,
   uploadFileToShopify,
   ShopifyUserError,
 } from "../services/shopify/shopify.service";
@@ -17,6 +16,12 @@ import {
 } from "../services/nmi/nmi.service";
 import { generatePractitionerCode } from "../services/cdo/cdo.service";
 import { encryptField } from "../utils/crypto.utils";
+import {
+  notifyApplicationSubmitted,
+  notifyApplicationApproved,
+  notifyApplicationDeclined,
+} from "../services/notifications/applicationLifecycleNotification.service";
+import { notifyNmiVaultCreationFailed } from "../services/notifications/nmiAlertNotification.service";
 
 // Generate a stable, readable NMI billing_id. Random suffix prevents
 // collisions when re-using a customer email; prefix makes logs scannable.
@@ -377,6 +382,20 @@ export async function action({ request }) {
           cardBillingErr?.message || cardBillingErr,
         );
         await deleteNmiVaultWithRetry(nmiCustomerVaultId);
+        await notifyNmiVaultCreationFailed({
+          email: payload.email,
+          businessName: payload.businessName,
+          paymentMethod: payload.payment?.method,
+          stage: "ACH customer — secondary card billing add",
+          error: cardBillingErr,
+        }).catch((e) => console.error("[proxy/submit] NMI alert failed:", e?.message || e));
+        await notifyApplicationDeclined({
+          email: payload.email,
+          firstName: payload.firstName,
+          lastName: payload.lastName,
+          businessName: payload.businessName,
+          reason: "We could not verify the card details provided as your backup payment method.",
+        }).catch((e) => console.error("[proxy/submit] decline email failed:", e?.message || e));
         return sendResponse(
           502,
           "error",
@@ -397,6 +416,23 @@ export async function action({ request }) {
       "[proxy/submit] NMI vault create failed:",
       vaultErr?.message || vaultErr,
     );
+    await notifyNmiVaultCreationFailed({
+      email: payload.email,
+      businessName: payload.businessName,
+      paymentMethod: payload.payment?.method,
+      stage: "Primary vault creation",
+      error: vaultErr,
+    }).catch((e) => console.error("[proxy/submit] NMI alert failed:", e?.message || e));
+    await notifyApplicationDeclined({
+      email: payload.email,
+      firstName: payload.firstName,
+      lastName: payload.lastName,
+      businessName: payload.businessName,
+      reason:
+        payload.payment?.method === "ach"
+          ? "We could not verify the bank account details provided."
+          : "We could not verify the card details provided.",
+    }).catch((e) => console.error("[proxy/submit] decline email failed:", e?.message || e));
     return sendResponse(
       502,
       "error",
@@ -408,6 +444,20 @@ export async function action({ request }) {
   }
   if (!nmiCustomerVaultId) {
     console.error("[proxy/submit] NMI returned no vault id");
+    await notifyNmiVaultCreationFailed({
+      email: payload.email,
+      businessName: payload.businessName,
+      paymentMethod: payload.payment?.method,
+      stage: "Vault creation resolved with no vault id",
+      error: new Error("createCustomerVault resolved successfully but returned no vault id"),
+    }).catch((e) => console.error("[proxy/submit] NMI alert failed:", e?.message || e));
+    await notifyApplicationDeclined({
+      email: payload.email,
+      firstName: payload.firstName,
+      lastName: payload.lastName,
+      businessName: payload.businessName,
+      reason: "We could not verify the payment details provided.",
+    }).catch((e) => console.error("[proxy/submit] decline email failed:", e?.message || e));
     return sendResponse(
       502,
       "error",
@@ -466,6 +516,15 @@ export async function action({ request }) {
     });
   }
 
+  // Application is persisted (NMI succeeded) — confirm receipt. Best-effort;
+  // never blocks the rest of registration.
+  await notifyApplicationSubmitted({
+    email: payload.email,
+    firstName: payload.firstName,
+    lastName: payload.lastName,
+    businessName: payload.businessName,
+  }).catch((e) => console.error("[proxy/submit] submitted email failed:", e?.message || e));
+
   // Step 3 — Shopify customer + approval invite. Failure here is non-fatal:
   // the doc is flagged with shopifyCreateFailed so an admin can retry. The
   // applicant's NMI vault and application are already safely persisted.
@@ -497,6 +556,14 @@ export async function action({ request }) {
       },
     );
 
+    // Best-effort — never blocks approval on an SMTP hiccup.
+    await notifyApplicationApproved({
+      email: payload.email,
+      firstName: payload.firstName,
+      lastName: payload.lastName,
+      businessName: payload.businessName,
+    }).catch((e) => console.error("[proxy/submit] approved email failed:", e?.message || e));
+
     // CDO Phase 1 — auto-generate a practitioner referral code for this
     // newly-approved practitioner. Failure here is log-only by design:
     // the customer + NMI vault + application are already persisted, and
@@ -521,23 +588,13 @@ export async function action({ request }) {
       );
     }
 
-    try {
-      await sendCustomerInvite(admin, {
-        customerId,
-        subject: "Your wholesale account has been approved",
-        message:
-          "Welcome to Natural Solutions Wholesale! Your application has been approved. Click the activation link below to set your password and start shopping at wholesale pricing.",
-      });
-      await WholesaleApplication.updateOne(
-        { _id: app._id },
-        { $set: { customerInviteSentAt: new Date() } },
-      );
-    } catch (inviteErr) {
-      console.error(
-        "[proxy/submit] received email failed:",
-        inviteErr?.message || inviteErr,
-      );
-    }
+    // NOTE: We intentionally do NOT send the Shopify account-invite email
+    // that includes an account-activation / password-set link. The system
+    // uses an email OTP login flow: customers sign in by entering their
+    // email and receiving a one-time code. Sending a password-setup invite
+    // (Shopify's account activation) is therefore misleading and has been
+    // removed. If you need to re-enable invites for a specific shop, call
+    // `sendCustomerInvite` explicitly or add a config-gated path here.
 
     // (Admin email notification removed — was using a non-existent
     // `emailSend` mutation. Shopify Admin GraphQL has no generic send-email

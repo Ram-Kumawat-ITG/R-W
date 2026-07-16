@@ -7,6 +7,7 @@ import { customerUpdateNote, customerUpdateDefaultAddress } from '../utils/shopi
 import { normalizePaymentMethod } from '../services/customer/customer.utils'
 import { applyPaymentPreferenceToOpenInvoices } from '../services/invoice/paymentPreference.service'
 import { encryptField } from '../utils/crypto.utils'
+import { notifyProfileUpdated } from '../services/notifications/accountNotification.service'
 
 // POST /api/update-profile  (Shopify App Proxy)
 // Content-Type: application/json
@@ -389,6 +390,22 @@ export async function action({ request }) {
   if (updatedDoc.payment) delete updatedDoc.payment.cardNumber
   // Never echo the encrypted account back to the client.
   if (updatedDoc.commission) delete updatedDoc.commission.bankAccountEncrypted
+
+  // ── Notify customer of what changed (best-effort) ─────────────────────────
+  const changeSummary = []
+  if (hasProfileUpdate) changeSummary.push('Contact / business information')
+  if (hasAddressUpdate) changeSummary.push('Billing address')
+  if (hasPaymentUpdate) changeSummary.push('Payment method')
+  if (hasTaxUpdate) changeSummary.push('Tax information')
+  if (hasCommissionUpdate) changeSummary.push('Commission payout details')
+  await notifyProfileUpdated({
+    email,
+    firstName: updatedDoc.firstName,
+    lastName: updatedDoc.lastName,
+    businessName: updatedDoc.businessName,
+    changes: changeSummary,
+    source: 'customer',
+  }).catch((e) => console.error('[proxy/update-profile] notification failed:', e?.message || e))
 
   return sendResponse(200, 'success', 'Profile updated', {
     profile: {

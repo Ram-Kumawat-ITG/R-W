@@ -3,6 +3,8 @@ import connectDB from '../../services/APIService/mongo.service'
 import { sendResponse } from '../../services/APIService/api.service'
 import { isSyncEnabled } from '../../services/sync/sync.config'
 import { syncProductCreate } from '../../services/sync/product.sync'
+import { upsertProductMap } from '../../services/sync/productMap.service'
+import { isQboProductSyncEnabled, syncProductToQbo } from '../../services/qbo/qboProductSync.service'
 import IdMap from '../../services/sync/idMap.model'
 import { createLogger } from '../../utils/logger.utils'
 
@@ -33,6 +35,7 @@ const PRODUCTS_QUERY = `
                 taxable
                 barcode
                 inventoryPolicy
+                inventoryQuantity
                 inventoryItem { legacyResourceId }
               }
             }
@@ -80,6 +83,7 @@ function gqlToRestProduct(node) {
       taxable: v.taxable ?? true,
       barcode: v.barcode ?? null,
       inventory_policy: v.inventoryPolicy?.toLowerCase() ?? 'deny',
+      inventory_quantity: v.inventoryQuantity ?? 0,
       inventory_item_id: parseInt(v.inventoryItem?.legacyResourceId),
     }
   })
@@ -179,17 +183,28 @@ export async function action({ request }) {
 
   log.info('backfill.start', { shop, totalProducts: allProducts.length })
 
-  const results = { synced: 0, skipped: 0, failed: 0, inventorySnapshotted: 0, errors: [] }
+  const qboOn = isQboProductSyncEnabled()
+  const results = { synced: 0, skipped: 0, failed: 0, inventorySnapshotted: 0, qboSynced: 0, qboErrored: 0, errors: [] }
 
   for (const product of allProducts) {
     try {
-      await syncProductCreate(product)
+      await syncProductCreate(product, { shop })
       results.synced++
       log.info('backfill.product_synced', { wholesaleId: product.id, title: product.title })
     } catch (err) {
       results.failed++
       results.errors.push({ productId: product.id, title: product.title, error: err.message })
       log.error('backfill.product_failed', { wholesaleId: product.id, title: product.title, err })
+    }
+    // Maintain the comprehensive product map regardless of retail-sync
+    // outcome (best-effort, never throws) — runs after the sync so retail
+    // ids written to sync_id_maps are picked up.
+    await upsertProductMap(product, { shop, event: 'backfill' })
+    // Proactively create/update the QBO Item per variant + qbo_product_maps.
+    if (qboOn) {
+      const s = await syncProductToQbo(product, { shop, event: 'backfill' })
+      results.qboSynced += s?.synced ?? 0
+      results.qboErrored += s?.errored ?? 0
     }
   }
 
@@ -202,7 +217,7 @@ export async function action({ request }) {
   }
 
   log.info('backfill.done', { shop, ...results })
-  return sendResponse(200, 'success', `Backfill complete: ${results.synced} synced, ${results.inventorySnapshotted} inventory levels saved, ${results.failed} failed`, results)
+  return sendResponse(200, 'success', `Backfill complete: ${results.synced} synced, ${results.inventorySnapshotted} inventory levels saved, ${results.qboSynced} QBO items synced, ${results.failed} failed`, results)
 }
 
 export async function loader() {

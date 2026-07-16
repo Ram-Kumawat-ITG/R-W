@@ -28,6 +28,7 @@ import {
   QUERY_WEBHOOK_SUBSCRIPTIONS_BY_TOPIC,
   QUERY_ALL_WEBHOOK_SUBSCRIPTIONS,
   QUERY_CUSTOMER_TAGS,
+  QUERY_CUSTOMER_BY_EMAIL,
   QUERY_FILE_BY_ID,
   QUERY_ORDER_FULFILLMENTS,
 } from "./shopify.queries";
@@ -486,6 +487,15 @@ export async function customerHasApprovedTag({ shop, customerId }) {
   return tags.some((t) => String(t).trim().toLowerCase() === "approved");
 }
 
+// Convenience predicate used by the order orchestrator to detect a blocked
+// wholesale customer. Blocked customers are explicitly tagged "Blocked"
+// by the admin block flow and should not be processed until unblocked.
+export async function customerHasBlockedTag({ shop, customerId }) {
+  if (!shop || !customerId) return false;
+  const tags = await getCustomerTags({ shop, customerId });
+  return tags.some((t) => String(t).trim().toLowerCase() === "blocked");
+}
+
 // Swap one tag for another on a Shopify customer. Reads current tags,
 // removes `removeTag`, adds `addTag`, writes back.
 export async function updateCustomerTags(
@@ -509,6 +519,58 @@ export async function updateCustomerTags(
   if (userErrors.length)
     throw new Error(userErrors.map((e) => e.message).join("; "));
   return data?.customer?.tags || next;
+}
+
+// Look up a Shopify customer by exact email — used by the practitioner
+// migration importer to detect a practitioner who already has a real
+// Shopify account (very likely for anyone migrating from a pre-existing
+// paper/PDFfiller process) BEFORE attempting `createCustomer`, so a
+// migrated practitioner is linked to their real historical account instead
+// of failing with "email already taken" and being left Shopify-orphaned.
+export async function findCustomerByEmail(admin, email) {
+  if (!email) return null;
+  const json = await executeGraphQL(admin, QUERY_CUSTOMER_BY_EMAIL, {
+    q: `email:${email}`,
+  });
+  const node = json?.data?.customers?.edges?.[0]?.node;
+  return node ? { id: node.id, email: node.email, tags: node.tags || [] } : null;
+}
+
+// General tag add/remove + note-append editor for an ALREADY-EXISTING
+// customer — never blindly overwrites their current tags or note. Used by
+// the migration importer's "link, don't recreate" path (distinct from
+// `updateCustomerTags`, which is a single swap-one-tag-for-another helper).
+// `note`, if given, is appended (separated by a rule) rather than replacing
+// whatever the customer's note already says — idempotent on re-run: if the
+// exact note text is already present, it's left alone rather than
+// duplicated.
+export async function updateCustomerTagsAndNote(
+  admin,
+  { customerId, addTags = [], removeTags = [], note },
+) {
+  const readJson = await executeGraphQL(admin, QUERY_CUSTOMER_TAGS, {
+    id: customerId,
+  });
+  const currentTags = readJson?.data?.customer?.tags || [];
+  const currentNote = readJson?.data?.customer?.note || "";
+  const nextTags = Array.from(
+    new Set([...currentTags.filter((t) => !removeTags.includes(t)), ...addTags]),
+  );
+
+  const input = { id: customerId, tags: nextTags };
+  if (note && !currentNote.includes(note)) {
+    input.note = [currentNote, note].filter(Boolean).join("\n\n---\n\n");
+  }
+
+  const { data, userErrors } = await executeMutation(
+    admin,
+    MUTATION_CUSTOMER_UPDATE,
+    { input },
+    "customerUpdate",
+  );
+  if (userErrors.length)
+    throw new Error(userErrors.map((e) => e.message).join("; "));
+  return data?.customer?.tags || nextTags;
 }
 
 export async function deleteCustomer(admin, customerId) {

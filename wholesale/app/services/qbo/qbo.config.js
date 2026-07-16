@@ -7,7 +7,7 @@
 // to fail fast with a clear error instead of letting Intuit reject the
 // request with a generic 401.
 
-import { readEnv } from '../../utils/env.utils'
+import { readEnv, readBool } from '../../utils/env.utils'
 import { QBO_BASE_URLS, QBO_OAUTH_TOKEN_URL } from './qbo.constants'
 
 const qboEnvironment = readEnv('QBO_ENVIRONMENT', { fallback: 'sandbox' })
@@ -32,6 +32,31 @@ export const qboConfig = {
   // (QBO_WHOLESALE_DEFAULT_ITEM_ID); this is only the fallback when that item
   // exposes no IncomeAccountRef. See qbo.service.findOrCreateItemBySku.
   incomeAccountId: readEnv('QBO_WHOLESALE_INCOME_ACCOUNT_ID', { fallback: null }),
+  // Proactive Shopify → QBO product (Products & Services) sync. When on,
+  // products/create + products/update webhooks (and the admin backfill)
+  // create/update a QBO Item per variant BEFORE any invoice needs it, and
+  // maintain the qbo_product_maps mapping. Kill-switch: set
+  // QBO_PRODUCT_SYNC_ENABLED=false to disable. Defaults ON — proactive item
+  // creation is the SAME write the invoice path already does on-demand
+  // (findOrCreateItemBySku), just earlier, so enabling it introduces no new
+  // class of QBO write. NEVER deletes/deactivates QBO items.
+  productSyncEnabled: readBool('QBO_PRODUCT_SYNC_ENABLED', true),
+  // Create QBO Items as `Inventory` type (TrackQtyOnHand + QtyOnHand +
+  // InvStartDate) instead of `Service`, so QBO tracks stock quantities.
+  // Requires QBO Plus/Advanced. Inventory Items also need an Inventory-Asset
+  // account and a COGS/expense account in addition to the income account;
+  // both are auto-resolved from the Chart of Accounts when the ids below are
+  // unset, but pinning them is recommended for determinism. If tracking is on
+  // but the accounts can't be resolved, item creation GRACEFULLY falls back
+  // to Service type so invoicing/sync never breaks.
+  inventoryTrackingEnabled: readBool('QBO_INVENTORY_TRACKING_ENABLED', true),
+  inventoryAssetAccountId: readEnv('QBO_INVENTORY_ASSET_ACCOUNT_ID', { fallback: null }),
+  inventoryCogsAccountId: readEnv('QBO_INVENTORY_COGS_ACCOUNT_ID', { fallback: null }),
+  // Offset account for InventoryAdjustment posts (used to reconcile QtyOnHand
+  // after an item is created — QBO can't PATCH QtyOnHand on a plain item
+  // update). Auto-resolved when unset (prefers an "Inventory Shrinkage" /
+  // adjustment account, else the COGS account).
+  inventoryAdjustmentAccountId: readEnv('QBO_INVENTORY_ADJUSTMENT_ACCOUNT_ID', { fallback: null }),
 }
 
 export function assertQboConfigured() {

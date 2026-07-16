@@ -1,6 +1,7 @@
 import { authenticate } from '../shopify.server'
 import connectDB from '../services/APIService/mongo.service'
-import { isSyncEnabled, syncProductUpdate } from '../services/sync/index'
+import { isSyncEnabled, syncProductUpdate, claimSyncWebhook, upsertProductMap } from '../services/sync/index'
+import { isQboProductSyncEnabled, syncProductToQbo } from '../services/qbo/qboProductSync.service'
 import { createLogger } from '../utils/logger.utils'
 
 const log = createLogger('webhook.products_update')
@@ -25,16 +26,40 @@ export const action = async ({ request }) => {
 
   if (!payload?.id) return new Response('Bad payload', { status: 400 })
 
-  if (!isSyncEnabled()) {
+  const retailOn = isSyncEnabled()
+  const qboOn = isQboProductSyncEnabled()
+  if (!retailOn && !qboOn) {
     log.info('sync_disabled', { shop })
+    return new Response(null, { status: 200 })
+  }
+
+  // Dedup Shopify's at-least-once redelivery of the same event.
+  const webhookId = request.headers.get('x-shopify-webhook-id')
+  if (!claimSyncWebhook(webhookId)) {
+    log.info('duplicate_webhook.skipped', { shop, productId: payload.id, webhookId })
     return new Response(null, { status: 200 })
   }
 
   await connectDB()
 
-  syncProductUpdate(payload, { shop })
-    .then(() => log.info('done', { shop, productId: payload.id }))
-    .catch((err) => log.error('failed', { shop, productId: payload.id, err }))
+  // Retail Shopify mirror first, then refresh the comprehensive MongoDB
+  // product map (chained after the sync settles so retail ids from
+  // sync_id_maps are fresh, and a failed retail sync still updates the snapshot).
+  if (retailOn) {
+    syncProductUpdate(payload, { shop })
+      .then(() => log.info('done', { shop, productId: payload.id }))
+      .catch((err) => log.error('failed', { shop, productId: payload.id, err }))
+      .then(() => upsertProductMap(payload, { shop, event: 'update' }))
+  }
+
+  // QBO Products & Services sync — independent of the retail mirror. Updates
+  // the QBO Item per variant (creates any that don't exist yet). Never
+  // deletes/deactivates. Fire-and-forget.
+  if (qboOn) {
+    syncProductToQbo(payload, { shop, event: 'update' })
+      .then((s) => log.info('qbo_done', { shop, productId: payload.id, ...s }))
+      .catch((err) => log.error('qbo_failed', { shop, productId: payload.id, err }))
+  }
 
   return new Response(null, { status: 200 })
 }

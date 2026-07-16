@@ -5,6 +5,7 @@ import WholesaleApplication from '../../models/wholesaleApplication.server'
 import { sendResponse } from '../../services/APIService/api.service'
 import { normalizePaymentMethod } from '../../services/customer/customer.utils'
 import { applyPaymentPreferenceToOpenInvoices } from '../../services/invoice/paymentPreference.service'
+import { notifyProfileUpdated } from '../../services/notifications/accountNotification.service'
 
 // POST /api/admin/customers/:id/payment-method   body: { method }
 //
@@ -90,6 +91,16 @@ export async function action({ request, params }) {
       newMethod,
     })
   }
+
+  // Best-effort — never blocks the already-saved preference change.
+  await notifyProfileUpdated({
+    email: doc.email,
+    firstName: doc.firstName,
+    lastName: doc.lastName,
+    businessName: doc.businessName,
+    changes: [`Payment method changed to ${newMethod.toUpperCase()}`],
+    source: 'admin',
+  }).catch((e) => console.error('[admin/payment-method] notification failed:', e?.message || e))
 
   return sendResponse(200, 'success', 'Payment preference updated', {
     previousMethod,

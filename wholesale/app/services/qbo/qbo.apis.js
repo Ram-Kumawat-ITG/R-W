@@ -12,6 +12,7 @@ import { truncate } from './qbo.utils'
 import { createLogger } from '../../utils/logger.utils'
 import { retry, PermanentError, TransientError } from '../../utils/retry.utils'
 import QboToken from '../../models/qboToken.server'
+import { notifyQboTokenRefreshFailed } from '../notifications/qboAlertNotification.service'
 
 const log = createLogger('qbo.apis')
 
@@ -121,17 +122,32 @@ async function refreshAccessToken(currentRefreshToken) {
 async function getAccessToken() {
   assertQboConfigured()
 
-  let doc = await readTokenDoc()
-  if (!doc) doc = await bootstrapTokenDocFromEnv()
+  try {
+    let doc = await readTokenDoc()
+    if (!doc) doc = await bootstrapTokenDocFromEnv()
 
-  const nowMs = Date.now()
-  const expiresAt = doc.accessTokenExpiresAt?.getTime?.() ?? 0
-  if (doc.accessToken && doc.accessToken !== 'pending' && expiresAt - ACCESS_TOKEN_SAFETY_MS > nowMs) {
-    return doc.accessToken
+    const nowMs = Date.now()
+    const expiresAt = doc.accessTokenExpiresAt?.getTime?.() ?? 0
+    if (doc.accessToken && doc.accessToken !== 'pending' && expiresAt - ACCESS_TOKEN_SAFETY_MS > nowMs) {
+      return doc.accessToken
+    }
+
+    const refreshed = await refreshAccessToken(doc.refreshToken)
+    return refreshed.accessToken
+  } catch (err) {
+    // Only alert on a PERMANENT failure (refresh token expired/revoked, or
+    // no token seedable at all) — every QBO call in this app routes through
+    // here, so this is a hard stop for invoicing/payment-sync/customer-sync
+    // until an admin re-authorizes the connection. Transient HTTP hiccups
+    // are absorbed by qboRequest's own retry() and never reach this catch
+    // as a final failure.
+    if (err?.permanent) {
+      await notifyQboTokenRefreshFailed({ error: err, realmId: qboConfig.realmId }).catch((e) =>
+        log.error('token_refresh_alert.failed', { err: e?.message || e }),
+      )
+    }
+    throw err
   }
-
-  const refreshed = await refreshAccessToken(doc.refreshToken)
-  return refreshed.accessToken
 }
 
 function buildUrl(path, query, { requestId, method } = {}) {

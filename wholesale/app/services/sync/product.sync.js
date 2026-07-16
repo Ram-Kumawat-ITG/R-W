@@ -237,16 +237,48 @@ async function upsertVariantMappings(wholesaleVariants, retailVariants) {
   }
 }
 
+// Sentinel retailId stored on the claim row while a retail product create
+// is in flight. Lets a concurrent duplicate webhook (Shopify at-least-once
+// delivery, or the products/update Shopify fires right after create) detect
+// the in-progress create and back off instead of POSTing a second retail
+// product or PUTing against a nonexistent id.
+export const PENDING_RETAIL_ID = "__pending__";
+
 export async function syncProductCreate(wholesaleProduct, { shop } = {}) {
   const wholesaleId = String(wholesaleProduct.id);
 
   const existing = await IdMap.findOne({ entityType: "product", wholesaleId });
   if (existing) {
+    if (existing.retailId === PENDING_RETAIL_ID) {
+      log.warn("product_create.create_in_flight", { wholesaleId });
+      return;
+    }
     log.info("product_create.already_mapped", {
       wholesaleId,
       retailId: existing.retailId,
     });
     return syncProductUpdate(wholesaleProduct, { shop });
+  }
+
+  // ── Claim-first (2026-07-15) ─────────────────────────────────────────
+  // Insert the mapping row BEFORE the retail POST so the unique
+  // (entityType, wholesaleId) index — not the findOne above — is the real
+  // duplicate guard. Two racing creates (duplicate webhook delivery, or a
+  // restart replay) both pass the findOne when neither has inserted yet;
+  // without this claim both would POST products.json and the loser's
+  // retail product would be a permanent unmapped orphan.
+  try {
+    await IdMap.create({
+      entityType: "product",
+      wholesaleId,
+      retailId: PENDING_RETAIL_ID,
+    });
+  } catch (err) {
+    if (err?.code === 11000) {
+      log.warn("product_create.lost_claim_race", { wholesaleId });
+      return;
+    }
+    throw err;
   }
 
   // Fetch retail-price metafield from the wholesale product. Best-effort —
@@ -263,22 +295,35 @@ export async function syncProductCreate(wholesaleProduct, { shop } = {}) {
     perVariantCount: retailPricing?.variantsBySku?.size ?? 0,
   });
 
-  const data = await retailClient.post(
-    "products.json",
-    buildRetailPayload(wholesaleProduct, { retailPricing }),
-  );
-  const retailProduct = data?.product;
-  if (!retailProduct?.id) {
-    throw new Error(
-      `syncProductCreate: no retail product id returned for wholesale ${wholesaleId}`,
+  let retailProduct;
+  try {
+    const data = await retailClient.post(
+      "products.json",
+      buildRetailPayload(wholesaleProduct, { retailPricing }),
     );
+    retailProduct = data?.product;
+    if (!retailProduct?.id) {
+      throw new Error(
+        `syncProductCreate: no retail product id returned for wholesale ${wholesaleId}`,
+      );
+    }
+  } catch (err) {
+    // Release the claim so a later retry (webhook redelivery, manual
+    // backfill) can attempt the create again instead of hitting the
+    // "create in flight" guard forever.
+    await IdMap.deleteOne({
+      entityType: "product",
+      wholesaleId,
+      retailId: PENDING_RETAIL_ID,
+    }).catch(() => {});
+    throw err;
   }
 
-  await IdMap.create({
-    entityType: "product",
-    wholesaleId,
-    retailId: String(retailProduct.id),
-  });
+  // Finalize the claim with the real retail id.
+  await IdMap.updateOne(
+    { entityType: "product", wholesaleId },
+    { $set: { retailId: String(retailProduct.id) } },
+  );
   await upsertVariantMappings(
     wholesaleProduct.variants || [],
     retailProduct.variants || [],
@@ -302,6 +347,13 @@ export async function syncProductUpdate(wholesaleProduct, { shop } = {}) {
   const mapping = await IdMap.findOne({ entityType: "product", wholesaleId });
   if (!mapping) {
     log.warn("product_update.no_mapping", { wholesaleId });
+    return;
+  }
+  if (mapping.retailId === PENDING_RETAIL_ID) {
+    // A create is still in flight (Shopify fires products/update almost
+    // immediately after products/create) — the create path will push the
+    // full current payload, so skipping here loses nothing.
+    log.warn("product_update.create_in_flight", { wholesaleId });
     return;
   }
 
@@ -380,6 +432,14 @@ export async function syncProductDelete(wholesaleProductId) {
   const mapping = await IdMap.findOne({ entityType: "product", wholesaleId });
   if (!mapping) {
     log.warn("product_delete.no_mapping", { wholesaleId });
+    return;
+  }
+  if (mapping.retailId === PENDING_RETAIL_ID) {
+    // Create still in flight — just drop the claim; there is no retail
+    // product to delete yet (and if the racing create does land one, the
+    // next products/delete redelivery or reconciliation pass cleans it up).
+    await IdMap.deleteOne({ entityType: "product", wholesaleId });
+    log.warn("product_delete.pending_claim_dropped", { wholesaleId });
     return;
   }
 
