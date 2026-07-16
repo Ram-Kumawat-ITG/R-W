@@ -1,5 +1,5 @@
 export { isSyncEnabled } from './sync.config'
 export { syncProductCreate, syncProductUpdate, syncProductDelete } from './product.sync'
-export { deductRetailInventoryForOrder, syncInventoryRestockToRetail } from './inventory.sync'
+export { deductRetailInventoryForOrder, syncInventoryLevelToRetail } from './inventory.sync'
 export { claimSyncWebhook } from './sync.utils'
 export { upsertProductMap, deleteProductMap } from './productMap.service'

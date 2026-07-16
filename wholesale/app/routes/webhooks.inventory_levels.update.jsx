@@ -1,6 +1,6 @@
 import { authenticate } from '../shopify.server'
 import connectDB from '../services/APIService/mongo.service'
-import { isSyncEnabled, syncInventoryRestockToRetail } from '../services/sync/index'
+import { isSyncEnabled, syncInventoryLevelToRetail } from '../services/sync/index'
 import { isQboProductSyncEnabled, syncInventoryLevelToQbo } from '../services/qbo/qboProductSync.service'
 import { createLogger } from '../utils/logger.utils'
 
@@ -39,9 +39,12 @@ export const action = async ({ request }) => {
 
   await connectDB()
 
-  // Retail Shopify restock mirror (existing behavior).
+  // Retail Shopify mirror — the SINGLE path that syncs wholesale stock to
+  // retail (both increases and decreases). Wholesale orders deduct retail
+  // through here, not via a separate order-time deduction, so retail is never
+  // double-deducted.
   if (retailOn) {
-    syncInventoryRestockToRetail(inventory_item_id, location_id, available)
+    syncInventoryLevelToRetail(inventory_item_id, location_id, available)
       .then(() => log.info('done', { shop, inventory_item_id }))
       .catch((err) => log.error('failed', { shop, inventory_item_id, err }))
   }
