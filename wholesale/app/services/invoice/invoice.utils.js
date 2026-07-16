@@ -287,8 +287,13 @@ export function computeInvoiceCalculation({ totals, fee, grandTotalOverride }) {
   const shipping = Number(totals.shipping ?? 0)
   const tax = Number(totals.tax ?? 0)
   const feeAmount = fee ? Number(fee.amount ?? 0) : 0
+  // When Shopify prices are tax-INCLUSIVE, the (adjusted) subtotal already
+  // contains the tax, so adding `tax` again would double-count it in the
+  // computed grand total. The tax row is still shown for information (the
+  // render labels it "included"); it just isn't summed a second time.
+  const taxForTotal = totals.taxesIncluded ? 0 : tax
   const computedGrand = Number(
-    (adjustedSubtotal + shipping + tax + feeAmount).toFixed(2),
+    (adjustedSubtotal + shipping + taxForTotal + feeAmount).toFixed(2),
   )
   const grandTotal = Number.isFinite(grandTotalOverride)
     ? Number(grandTotalOverride.toFixed(2))

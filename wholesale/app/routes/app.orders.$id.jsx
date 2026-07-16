@@ -1210,6 +1210,16 @@ export default function OrderDetail() {
     outstanding != null
       ? Number(((outstanding ?? 0) + (cardFeePreview?.amount ?? 0)).toFixed(2))
       : null;
+  // Retry modal previews the fee for the INVOICE's OWN method — an ACH invoice
+  // carries the 1% ACH rate, not the 3% card rate — so the quoted fee/label/
+  // total match what the ACH retry will actually apply. (The charge-card modal
+  // below keeps the card preview: it always flips the invoice to card.)
+  const retryFeeMethod = isAchInvoice ? "ach" : "card";
+  const retryFeePreview = previewFee(retryFeeMethod);
+  const retryFeeTotal =
+    outstanding != null
+      ? Number(((outstanding ?? 0) + (retryFeePreview?.amount ?? 0)).toFixed(2))
+      : null;
 
   // Full invoice-calculation breakdown for the totals box: Order Subtotal →
   // Discount → Adjusted Subtotal → Shipping → Tax → Payment Processing Fee →
@@ -2740,18 +2750,18 @@ export default function OrderDetail() {
           Invoice balance:{" "}
           <strong>{formatAmount(outstanding ?? 0, invoice?.currency)}</strong>
           <br />
-          {cardFeePreview ? (
+          {retryFeePreview ? (
             <>
-              {processingFeeLabel("card")} (
-              {+(cardFeePreview.rate * 100).toFixed(4)}
+              {processingFeeLabel(retryFeeMethod)} (
+              {+(retryFeePreview.rate * 100).toFixed(4)}
               %):{" "}
               <strong>
-                {formatAmount(cardFeePreview.amount, invoice?.currency)}
+                {formatAmount(retryFeePreview.amount, invoice?.currency)}
               </strong>
               <br />
               <strong>
                 Total to charge:{" "}
-                {formatAmount(cardFeeTotal ?? 0, invoice?.currency)}
+                {formatAmount(retryFeeTotal ?? 0, invoice?.currency)}
               </strong>
               <br />
               <s-text tone="subdued" size="small">

@@ -1306,6 +1306,33 @@ function parseItemSalesReport(report) {
   return { rows, hasMargin, currency }
 }
 
+// Fetch the current QBO on-hand quantity (QtyOnHand) for a set of Item ids.
+// The ItemSales report carries no stock level, so the Products analytics tab's
+// "Inventory in hand" column reads it from the Item entity here. Only
+// Inventory-type items track QtyOnHand — Service items return null (rendered
+// as "—"). Batched via QBO QL `Id IN (...)`, chunked to stay within QBO's
+// statement limits. Returns a Map<itemId(string), number|null>. Best-effort:
+// the caller wraps this so a failed on-hand lookup never fails the whole page.
+export async function getItemsOnHand(itemIds = []) {
+  const ids = [
+    ...new Set(itemIds.map((x) => (x == null ? '' : String(x).trim())).filter(Boolean)),
+  ]
+  const out = new Map()
+  if (!ids.length) return out
+  const CHUNK = 200
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const chunk = ids.slice(i, i + CHUNK)
+    const inList = chunk.map((id) => `'${escapeQboQuery(id)}'`).join(', ')
+    const res = await qbo.query(`SELECT Id, Type, QtyOnHand FROM Item WHERE Id IN (${inList})`)
+    const items = res?.QueryResponse?.Item || []
+    for (const it of items) {
+      const q = it?.QtyOnHand
+      out.set(String(it.Id), q == null ? null : Number(q))
+    }
+  }
+  return out
+}
+
 // Product sales analytics with an optional roll-up dimension. QBO's ItemSales
 // report is inherently PER-VARIANT (each Shopify variant is its own QBO Item,
 // QBO has no variant/product grouping). To answer "which PRODUCT / which
@@ -1323,12 +1350,26 @@ function parseItemSalesReport(report) {
 // `variantCount` (how many variant-level rows rolled into them); `avgPrice`
 // on an aggregate is the blended amount/quantity.
 export async function getProductSalesAnalytics({ startDate, endDate, groupBy = 'variant' } = {}) {
-  const { rows, hasMargin, currency } = await getItemSalesReport({ startDate, endDate })
-  if ((groupBy !== 'product' && groupBy !== 'vendor') || rows.length === 0) {
+  const { rows: reportRows, hasMargin, currency } = await getItemSalesReport({ startDate, endDate })
+  const effectiveGroup = groupBy === 'product' || groupBy === 'vendor' ? groupBy : 'variant'
+  if (reportRows.length === 0) {
+    return { rows: reportRows, hasMargin, currency, groupBy: effectiveGroup }
+  }
+
+  const itemIds = [...new Set(reportRows.map((r) => r.itemId).filter(Boolean))]
+
+  // On-hand stock per item (QBO Item.QtyOnHand). Best-effort — a failure here
+  // degrades the "Inventory in hand" column to "—" rather than 500-ing the tab.
+  const onHand = await getItemsOnHand(itemIds).catch(() => new Map())
+  const rows = reportRows.map((r) => ({
+    ...r,
+    qtyOnHand: r.itemId != null && onHand.has(r.itemId) ? onHand.get(r.itemId) : null,
+  }))
+
+  if (effectiveGroup === 'variant') {
     return { rows, hasMargin, currency, groupBy: 'variant' }
   }
 
-  const itemIds = [...new Set(rows.map((r) => r.itemId).filter(Boolean))]
   const maps = itemIds.length
     ? await QboProductMap.find({ qboItemId: { $in: itemIds } })
         .select('qboItemId vendor productTitle shopifyProductId')
@@ -1362,8 +1403,10 @@ export async function getProductSalesAnalytics({ startDate, endDate, groupBy = '
         amount: 0,
         cogs: 0,
         grossMargin: 0,
+        qtyOnHand: 0,
         hasCogs: false,
         hasMargin: false,
+        hasQtyOnHand: false,
         variantCount: 0,
       }
       groups.set(k, g)
@@ -1378,6 +1421,12 @@ export async function getProductSalesAnalytics({ startDate, endDate, groupBy = '
       g.grossMargin += r.grossMargin
       g.hasMargin = true
     }
+    // Total on-hand across the group's variants (null-aware: a group with no
+    // inventory-tracked items shows "—" rather than a misleading 0).
+    if (r.qtyOnHand != null) {
+      g.qtyOnHand += r.qtyOnHand
+      g.hasQtyOnHand = true
+    }
     g.variantCount += 1
   }
 
@@ -1389,6 +1438,7 @@ export async function getProductSalesAnalytics({ startDate, endDate, groupBy = '
     avgPrice: g.quantity ? Number((g.amount / g.quantity).toFixed(2)) : null,
     cogs: g.hasCogs ? Number(g.cogs.toFixed(2)) : null,
     grossMargin: g.hasMargin ? Number(g.grossMargin.toFixed(2)) : null,
+    qtyOnHand: g.hasQtyOnHand ? Number(g.qtyOnHand.toFixed(2)) : null,
     variantCount: g.variantCount,
   }))
 

@@ -61,6 +61,10 @@ export const loader = async ({ request }) => {
 
   const rawFrom = (url.searchParams.get("dateFrom") || "").trim();
   const rawTo = (url.searchParams.get("dateTo") || "").trim();
+  // `startDate`/`endDate` are the RESOLVED window used for the QBO query + the
+  // banner (default = trailing 90 days when unset). `dateFrom`/`dateTo` carry
+  // the RAW url values (empty when unset) — those drive the filter form so the
+  // default window is NOT shown as an "applied" filter chip and Reset works.
   const startDate = YMD_RE.test(rawFrom) ? rawFrom : defaultStart;
   const endDate = YMD_RE.test(rawTo) ? rawTo : defaultEnd;
   const sort = url.searchParams.get("sort") === "quantity" ? "quantity" : "amount";
@@ -68,7 +72,7 @@ export const loader = async ({ request }) => {
   const group =
     rawGroup === "product" || rawGroup === "vendor" ? rawGroup : "variant";
 
-  const commonState = { dateFrom: startDate, dateTo: endDate, sort, group };
+  const commonState = { dateFrom: rawFrom, dateTo: rawTo, startDate, endDate, sort, group };
 
   try {
     const { rows, hasMargin, currency, groupBy } = await getProductSalesAnalytics({
@@ -148,6 +152,8 @@ export default function QboProducts() {
     topSeller,
     dateFrom,
     dateTo,
+    startDate,
+    endDate,
     sort,
     group,
     groupBy,
@@ -187,7 +193,7 @@ export default function QboProducts() {
           <s-banner tone="info" heading="How this is measured">
             <s-paragraph>
               Product sales come from the QuickBooks Sales by Product/Service
-              report for {fmtDueDate(dateFrom)} – {fmtDueDate(dateTo)}. Only
+              report for {fmtDueDate(startDate)} – {fmtDueDate(endDate)}. Only
               invoices whose lines reference a QuickBooks product are counted —
               i.e. invoices created after product references were enabled.
               {isRolled
@@ -272,6 +278,7 @@ export default function QboProducts() {
                 <s-table-header>{nameHeader}</s-table-header>
                 {isRolled && <s-table-header>Variants</s-table-header>}
                 <s-table-header>Units sold</s-table-header>
+                <s-table-header>Inventory in hand</s-table-header>
                 <s-table-header>Revenue</s-table-header>
                 <s-table-header>% of revenue</s-table-header>
                 <s-table-header>Avg price</s-table-header>
@@ -287,6 +294,7 @@ export default function QboProducts() {
                       <s-table-cell>{r.variantCount ?? "—"}</s-table-cell>
                     )}
                     <s-table-cell>{fmtQty(r.quantity)}</s-table-cell>
+                    <s-table-cell>{fmtQty(r.qtyOnHand)}</s-table-cell>
                     <s-table-cell>
                       {r.amount != null ? formatAmount(r.amount, currency) : "—"}
                     </s-table-cell>

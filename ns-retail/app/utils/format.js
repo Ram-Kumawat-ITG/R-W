@@ -21,6 +21,10 @@ export function formatNumber(value) {
 }
 
 export function formatPercent(rate) {
+  // Distinguish "unknown" (null/undefined/empty → "—") from a genuine 0% rate.
+  // Number(null) and Number("") are both 0 (finite), so without this guard an
+  // unknown rate would render as a misleading "0%".
+  if (rate == null || rate === "") return "—";
   const n = Number(rate);
   if (!Number.isFinite(n)) return "—";
   return `${(n * 100).toFixed(n * 100 % 1 === 0 ? 0 : 1)}%`;
