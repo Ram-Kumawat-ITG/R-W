@@ -1094,10 +1094,39 @@ function firstShippingPrice(order) {
   return round2(order?.pricing?.totalShipping);
 }
 
+// Look up a QBO Item and return `{ itemId, sku }` ONLY when it can be purchased
+// on a bill — i.e. it carries an ExpenseAccountRef (Inventory items always do;
+// a plain Service item may not, and QBO rejects an item-based expense line for
+// a non-purchasable item). Returns null otherwise so the caller falls back to
+// an account-based COGS line. Best-effort — never throws.
+async function resolvePurchasableBillItem({ variantId, sku, name }, cache) {
+  const itemId = await resolveRetailInvoiceItemId({ shopifyVariantId: variantId, sku, name });
+  if (!itemId) return null;
+  if (cache.has(itemId)) return cache.get(itemId);
+  let info = null;
+  try {
+    const res = await retailQbo.get(`/item/${itemId}`);
+    const it = res?.Item;
+    if (it?.ExpenseAccountRef?.value) info = { itemId: String(itemId), sku: it.Sku || null };
+  } catch (err) {
+    log.warn("retail.bill.item_lookup_failed", { itemId, err: err?.message || String(err) });
+  }
+  cache.set(itemId, info);
+  return info;
+}
+
 // Build the QBO Bill payload from a cdo_orders snapshot, mirroring the wholesale
-// dropship invoice: one AccountBasedExpenseLine per product at the actual
-// WHOLESALE product price + an optional Shipping line at full retail cost.
-// Idempotent at the QBO layer via `requestid`. Returns the created Bill.
+// dropship invoice at the actual WHOLESALE product price + an optional Shipping
+// line at full retail cost. Idempotent at the QBO layer via `requestid`.
+// Returns the created Bill.
+//
+// Product lines post as ITEM-based expense lines (ItemBasedExpenseLineDetail)
+// referencing the QBO Product/Service item, so the bill shows a proper itemized
+// purchase — Product/Service, Qty, Rate, Amount + description all populated
+// (matching the invoice, which references the same items). A line whose item
+// can't be resolved or isn't purchasable (no ExpenseAccountRef) GRACEFULLY
+// falls back to an account-based COGS line so the bill never fails to post.
+// Shipping is always an account-based COGS line (it isn't a product).
 //
 // Per-line unit pricing precedence (keeps the bill in sync with the wholesale
 // invoice, which prices from the same source):
@@ -1124,6 +1153,7 @@ export async function createBillForOrder({
     wholesalePriceByVariantId instanceof Map ? wholesalePriceByVariantId : new Map();
   const expenseRef = { value: String(expenseAccountId) };
   const lines = [];
+  const itemCache = new Map();
 
   for (const li of order.lineItems || []) {
     const qty = Number(li.quantity) || 0;
@@ -1137,15 +1167,43 @@ export async function createBillForOrder({
     if (!(amount > 0)) continue;
     const productPart = [li.title, li.variantTitle].filter(Boolean).join(" — ");
     const titleParts = li.vendor ? `${productPart} by ${li.vendor}` : productPart;
-    const desc = [titleParts, `${qty} × ${unit.toFixed(2)} (wholesale)`]
-      .filter(Boolean)
-      .join("\n");
-    lines.push({
-      DetailType: "AccountBasedExpenseLineDetail",
-      Amount: amount,
-      ...(desc ? { Description: desc.slice(0, 4000) } : {}),
-      AccountBasedExpenseLineDetail: { AccountRef: expenseRef },
-    });
+    const rawSku = li.sku ? String(li.sku).trim() : null;
+
+    const item = await resolvePurchasableBillItem(
+      { variantId: li.variantId, sku: rawSku, name: li.title || undefined },
+      itemCache,
+    );
+
+    if (item) {
+      // Item-based line: Product/Service + Qty + Rate columns come from the
+      // fields below; the description carries the SKU (QBO's SKU column reads
+      // the ITEM's Sku, which the sync may not have populated) + wholesale note.
+      const desc = [titleParts, rawSku ? `SKU ${rawSku}` : null, "Wholesale cost"]
+        .filter(Boolean)
+        .join(" · ");
+      lines.push({
+        DetailType: "ItemBasedExpenseLineDetail",
+        Amount: amount,
+        ...(desc ? { Description: desc.slice(0, 4000) } : {}),
+        ItemBasedExpenseLineDetail: {
+          ItemRef: { value: item.itemId },
+          Qty: qty,
+          UnitPrice: unit,
+        },
+      });
+    } else {
+      // Fallback account-based COGS line (no Qty/Rate columns) — spell the
+      // qty × unit out in the description so the figures are still visible.
+      const desc = [titleParts, rawSku ? `SKU ${rawSku}` : null, `${qty} × ${unit.toFixed(2)} (wholesale)`]
+        .filter(Boolean)
+        .join("\n");
+      lines.push({
+        DetailType: "AccountBasedExpenseLineDetail",
+        Amount: amount,
+        ...(desc ? { Description: desc.slice(0, 4000) } : {}),
+        AccountBasedExpenseLineDetail: { AccountRef: expenseRef },
+      });
+    }
   }
 
   if (includeShipping) {
