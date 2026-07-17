@@ -23,6 +23,7 @@ import { invoiceConfig } from '../invoice/invoice.config'
 import { computeProcessingFee, applyDerivedPaymentStatus } from '../invoice/invoice.utils'
 import { createLogger } from '../../utils/logger.utils'
 import { notifyNmiVaultInvalid, notifyNmiDuplicateTransaction } from '../notifications/nmiAlertNotification.service'
+import { resolveCustomerCardBillingId, resolveCustomerAchBillingId } from '../customer/customer.service'
 
 const log = createLogger('payment.service')
 
@@ -106,6 +107,45 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
   }
   if (invoice.attemptCount >= invoice.maxAttempts) {
     return { skipped: true, reason: 'max attempts reached' }
+  }
+
+  // The NMI billing_id (card or ACH) is mirrored onto CustomerMap only at
+  // ORDER INTAKE, so a practitioner who updated/ADDED their card or bank
+  // details via the portal AFTER their last order leaves the cache stale/empty.
+  // Re-resolve from the source of truth on a cache MISS (only) so the
+  // scheduler/CRON auto-retry — which loads CustomerMap fresh and never
+  // re-mirrors — targets what the practitioner just set, matching what the
+  // manual retry endpoints already do. Runs BEFORE resolveInvoiceVault so the
+  // resolved ACH billing id also satisfies that helper's missing-billing gate
+  // (for ACH the billing id is required; without this a legit ACH invoice would
+  // be skipped — and eventually auto-failed — purely because the cache was
+  // stale). No extra DB read once mirrored (cache hit → skipped). Best-effort:
+  // a lookup failure leaves the id as-is and the normal gate/behaviour below
+  // applies, so it can never corrupt an otherwise-valid charge.
+  if (customerMap && customerMap.shop && customerMap.email) {
+    try {
+      if (invoice.paymentMethod === 'ach' && !customerMap.nmiAchBillingId) {
+        const resolved = await resolveCustomerAchBillingId({
+          shop: customerMap.shop,
+          email: customerMap.email,
+          customerMap,
+        })
+        if (resolved) customerMap.nmiAchBillingId = resolved
+      } else if (invoice.paymentMethod === 'card' && !customerMap.nmiCardBillingId) {
+        const resolved = await resolveCustomerCardBillingId({
+          shop: customerMap.shop,
+          email: customerMap.email,
+          customerMap,
+        })
+        if (resolved) customerMap.nmiCardBillingId = resolved
+      }
+    } catch (err) {
+      log.warn('charge.billing_resolve_failed', {
+        invoiceId: invoice._id?.toString(),
+        method: invoice.paymentMethod,
+        err: err?.message || String(err),
+      })
+    }
   }
 
   const { vaultId, billingId, methodLabel, missingReason } = resolveInvoiceVault(invoice, customerMap)
