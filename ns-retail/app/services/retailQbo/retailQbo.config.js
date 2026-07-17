@@ -49,6 +49,13 @@ export const retailQboConfig = {
   salesItemName: readEnv("QBO_RETAIL_ITEM_NAME", { fallback: "Retail Sales" }),
   incomeAccountId: readEnv("QBO_RETAIL_INCOME_ACCOUNT_ID"),
 
+  // Sales-tax code applied at the transaction level (TxnTaxDetail.TxnTaxCodeRef)
+  // so the tax the customer paid in Shopify renders as QBO's summary "Tax" row.
+  // For a manual-sales-tax QBO company this must be a taxable TaxCode id (e.g. a
+  // tax group). When unset, the service auto-resolves the company's default from
+  // Preferences.TaxPrefs.TaxGroupCodeRef. Only used when the order carries tax.
+  taxCodeId: readEnv("QBO_RETAIL_TAX_CODE_ID"),
+
   // ── Proactive Shopify → Retail-QBO product (Products & Services) sync ──
   // When ON, the retail store's products/create + products/update webhooks
   // create/update a QBO Item per variant in the RETAIL realm and maintain the

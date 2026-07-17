@@ -1363,17 +1363,35 @@ emitted as a product line. The order's `total_tax` (configured in
 `TxnTaxDetail.TotalTax`, which QBO renders in the invoice's summary
 "Tax" row (alongside Subtotal / Discount / Total) instead of in the
 Products section. It is **always sent** (even at `$0`) so the customer
-sees a tax figure on every invoice. By design **no QBO tax code
-(`TxnTaxCodeRef`) is applied** — tax authority lives in Shopify.
+sees a tax figure on every invoice.
 
-> **Rendering caveat.** Whether QBO actually shows the row in its
-> template can depend on a tax code being present on the transaction,
-> not on `TotalTax` alone: a **non-zero** Shopify tax renders fine, but a
-> **$0.00** row may be omitted by QBO. Forcing a $0 row would require a
-> company-specific tax code (AST `"NON"`, or a 0%/exempt `TaxCode` id),
-> which we deliberately do not wire in. US automated-sales-tax companies
-> may also recompute and ignore the override. The app's own Order Details
-> totals panels always show the tax line regardless of QBO's rendering.
+**Non-zero tax also carries a tax code (fixed 2026-07-17).** For an
+order that actually has tax, a bare `TotalTax` on non-taxable lines is
+**not enough** — a manual-sales-tax QBO company (`Preferences.TaxPrefs.
+UsingSalesTax: true` with a `TaxGroupCodeRef`, the default for Intuit US
+sandbox companies) **recomputes tax to `$0` and drops the amount** unless
+(a) at least one line is marked taxable and (b) the transaction carries a
+`TxnTaxCodeRef`. So `createInvoice` now marks product lines
+`TaxCodeRef: { value: "TAX" }` (shipping / discount / fee stay `"NON"`)
+and sets `TxnTaxDetail.TxnTaxCodeRef` to the company's default sales-tax
+code — resolved once from `Preferences.TaxPrefs.TaxGroupCodeRef`
+(cached; overridable via `QBO_WHOLESALE_TAX_CODE_ID`). QBO then **honors
+the passed `TotalTax` amount exactly** (verified against the sibling
+retail realm: passing `31` yields `TotalTax: 31`, not QBO's own
+rate-based figure), so the invoice total still equals Shopify's
+`total_price` and the payment fully settles. An explicit `TaxLine` is
+deliberately **not** sent — QBO ignores it and recomputes from the rate.
+A **$0-tax** order sends no line tax codes (unchanged behavior).
+
+> **Caveats.** A **$0.00** tax row may still be omitted by QBO's template
+> (a $0 order sends no tax code, so nothing forces the row) — the app's
+> own Order Details totals panels always show the tax line regardless. If
+> the company uses **Automated Sales Tax** (no `TaxGroupCodeRef`), the
+> code resolves no tax code and falls back to taxable lines + a bare
+> `TotalTax`; AST may compute its own amount from the ship-to address.
+> This was empirically confirmed on the **retail** realm (manual sales
+> tax); the wholesale realm is a sibling Intuit US sandbox and behaves the
+> same, but re-verify with a real taxed order after any QBO reconnect.
 
 > **Why only tax (and discount) reach the summary.** QBO renders the
 > customer invoice (emailed via `/invoice/{id}/send`, PDF via

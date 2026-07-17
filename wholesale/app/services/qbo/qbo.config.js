@@ -32,6 +32,12 @@ export const qboConfig = {
   // (QBO_WHOLESALE_DEFAULT_ITEM_ID); this is only the fallback when that item
   // exposes no IncomeAccountRef. See qbo.service.findOrCreateItemBySku.
   incomeAccountId: readEnv('QBO_WHOLESALE_INCOME_ACCOUNT_ID', { fallback: null }),
+  // Sales-tax code applied at the transaction level (TxnTaxDetail.TxnTaxCodeRef)
+  // so the tax the customer paid in Shopify renders as QBO's summary "Tax" row.
+  // For a manual-sales-tax QBO company this must be a taxable TaxCode id (e.g. a
+  // tax group). When unset, the service auto-resolves the company's default from
+  // Preferences.TaxPrefs.TaxGroupCodeRef. Only used when the order carries tax.
+  taxCodeId: readEnv('QBO_WHOLESALE_TAX_CODE_ID', { fallback: null }),
   // Proactive Shopify → QBO product (Products & Services) sync. When on,
   // products/create + products/update webhooks (and the admin backfill)
   // create/update a QBO Item per variant BEFORE any invoice needs it, and

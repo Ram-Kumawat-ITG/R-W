@@ -12,6 +12,32 @@ import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('qbo.service')
 
+// Sales-tax code for TxnTaxDetail.TxnTaxCodeRef. Env-pinned
+// (QBO_WHOLESALE_TAX_CODE_ID) or auto-resolved from the company's Preferences
+// (TaxPrefs.TaxGroupCodeRef — the default sales-tax code/group). Cached
+// in-module: `undefined` = unresolved, `null` = none found. Marking invoice
+// lines taxable AND setting this transaction-level code is what makes QBO honor
+// the Shopify tax amount we pass as TotalTax — without it (no taxable line, no
+// tax code) a manual-sales-tax company recomputes tax to $0 and the summary Tax
+// row never renders. Never throws (best-effort — tax must not break invoicing).
+let _salesTaxCodeId
+async function resolveSalesTaxCodeId() {
+  if (_salesTaxCodeId !== undefined) return _salesTaxCodeId
+  if (qboConfig.taxCodeId) {
+    _salesTaxCodeId = String(qboConfig.taxCodeId)
+    return _salesTaxCodeId
+  }
+  try {
+    const res = await qbo.get('/preferences')
+    const groupRef = res?.Preferences?.TaxPrefs?.TaxGroupCodeRef?.value
+    _salesTaxCodeId = groupRef ? String(groupRef) : null
+  } catch (err) {
+    log.warn('invoice.tax_code.lookup_failed', { err: err?.message || String(err) })
+    _salesTaxCodeId = null
+  }
+  return _salesTaxCodeId
+}
+
 // ── Customer ─────────────────────────────────────────────────────────
 
 export async function findCustomerByEmail(email) {
@@ -543,23 +569,33 @@ export async function createInvoice({
   }
 
   const shipAddrPayload = toQboAddress(shipAddr)
-  // Tax is SOURCED FROM SHOPIFY (order.total_tax) and passed straight through
-  // to QBO's native summary "Tax" row via TxnTaxDetail.TotalTax — NOT as a
-  // product line (see invoice.utils.shopifyLinesToQboLines). QBO adds it to
-  // the line subtotal so TotalAmt still reconciles with Shopify's total_price.
-  // Always sent (even at $0) so the customer sees a tax figure on every
-  // invoice. By design we do NOT apply a QBO tax code (TxnTaxCodeRef) — tax is
-  // configured in Shopify, not QBO. Note: whether QBO RENDERS a "$0.00 Tax"
-  // row in its summary can still depend on a tax code being present; with a
-  // non-zero Shopify tax the row shows, but a $0 row may be omitted by QBO's
-  // template. The app's own Order Details panels always show the tax line
-  // regardless. (US automated-sales-tax companies may also recompute/ignore
-  // this override.)
+  // Tax is SOURCED FROM SHOPIFY (order.total_tax) and passed through to QBO's
+  // native summary "Tax" row via TxnTaxDetail.TotalTax — NOT as a product line
+  // (see invoice.utils.shopifyLinesToQboLines). QBO adds it to the line subtotal
+  // so TotalAmt still reconciles with Shopify's total_price. TotalTax is always
+  // sent (even at $0). For a NON-ZERO tax we ALSO mark product lines taxable
+  // ("TAX") and set TxnTaxDetail.TxnTaxCodeRef — a manual-sales-tax QBO company
+  // recomputes tax to $0 (dropping the amount) when no line is taxable and no
+  // transaction-level tax code is supplied. QBO honors the passed TotalTax
+  // amount EXACTLY (verified against the retail realm) regardless of its own
+  // configured rate, so the invoice total still equals what the customer paid.
+  // A $0-tax order sends no line tax codes (QBO uses its own default).
   const tax = Number(taxAmount || 0)
-  const txnTaxDetail = { TotalTax: Number(tax.toFixed(2)) }
+  // Products carry a variantId/sku → taxable ("TAX"); shipping / discount / fee
+  // lines don't → non-taxable ("NON"). Tax-free orders send no line tax codes.
+  const taxable = tax > 0
+  const taxCodeId = taxable ? await resolveSalesTaxCodeId() : null
+  const lineTaxCode = (l) => {
+    if (!taxable || l.kind === 'discount') return undefined
+    return l.variantId || l.sku ? 'TAX' : 'NON'
+  }
+  const txnTaxDetail = {
+    ...(taxable && taxCodeId ? { TxnTaxCodeRef: { value: taxCodeId } } : {}),
+    TotalTax: Number(tax.toFixed(2)),
+  }
   const payload = {
     CustomerRef: { value: String(qboCustomerId) },
-    Line: lines.map((l) => toInvoiceLine(l, qboConfig.defaultItemId)),
+    Line: lines.map((l) => toInvoiceLine(l, qboConfig.defaultItemId, lineTaxCode(l))),
     CurrencyRef: currency ? { value: currency } : undefined,
     CustomerMemo: memo ? { value: memo } : undefined,
     DueDate: dueDate || undefined,

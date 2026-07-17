@@ -611,6 +611,32 @@ export async function upsertRetailQboItem({ sku, name, description, price, qtyOn
 
 // ── Invoices ─────────────────────────────────────────────────────────
 
+// Sales-tax code for TxnTaxDetail.TxnTaxCodeRef. Env-pinned
+// (QBO_RETAIL_TAX_CODE_ID) or auto-resolved from the company's Preferences
+// (TaxPrefs.TaxGroupCodeRef — the default sales-tax code/group). Cached
+// in-module: `undefined` = unresolved, `null` = none found. Marking invoice
+// lines taxable AND setting this transaction-level code is what makes QBO honor
+// the Shopify tax amount we pass as TotalTax — without it (lines "NON", bare
+// TotalTax) a manual-sales-tax company recomputes tax to $0 and the tax row
+// never renders. Never throws (best-effort — tax must not break invoicing).
+let _salesTaxCodeId;
+async function resolveRetailSalesTaxCodeId() {
+  if (_salesTaxCodeId !== undefined) return _salesTaxCodeId;
+  if (retailQboConfig.taxCodeId) {
+    _salesTaxCodeId = String(retailQboConfig.taxCodeId);
+    return _salesTaxCodeId;
+  }
+  try {
+    const res = await retailQbo.get("/preferences");
+    const groupRef = res?.Preferences?.TaxPrefs?.TaxGroupCodeRef?.value;
+    _salesTaxCodeId = groupRef ? String(groupRef) : null;
+  } catch (err) {
+    log.warn("retail.invoice.tax_code.lookup_failed", { err: err?.message || String(err) });
+    _salesTaxCodeId = null;
+  }
+  return _salesTaxCodeId;
+}
+
 // Build the QBO Invoice payload from a cdo_orders snapshot. Every product +
 // shipping line posts to either a per-SKU item (so the QBO SKU column
 // populates) or the shared default item as a fallback. A DiscountLine applies
@@ -624,6 +650,11 @@ export async function upsertRetailQboItem({ sku, name, description, price, qtyOn
 function buildInvoiceLines({ order, itemId, skuToItemId = new Map(), variantToItemId = new Map() }) {
   const lines = [];
   let productSum = 0;
+  // When the order carries tax, product lines must be marked taxable ("TAX")
+  // so QBO honors the TotalTax we pass in TxnTaxDetail (see
+  // resolveRetailSalesTaxCodeId). With no taxable line QBO recomputes tax to $0.
+  const orderTax = round2((order.pricing || {}).totalTax);
+  const productTaxCode = orderTax > 0 ? "TAX" : "NON";
   for (const li of order.lineItems || []) {
     const qty = Number(li.quantity) || 0;
     const unit = round2(li.price);
@@ -649,7 +680,7 @@ function buildInvoiceLines({ order, itemId, skuToItemId = new Map(), variantToIt
         ItemRef: { value: lineItemId },
         Qty: qty,
         UnitPrice: unit,
-        TaxCodeRef: { value: "NON" },
+        TaxCodeRef: { value: productTaxCode },
       },
     });
   }
@@ -738,12 +769,26 @@ export async function createInvoiceForOrder({ order, customerId, itemId, request
     throw new Error("createInvoiceForOrder: order has no line items to invoice");
   }
 
+  // Resolve the transaction-level tax code so the Shopify tax renders as QBO's
+  // summary "Tax" row. Required alongside the taxable ("TAX") line codes — a
+  // bare TotalTax with no TxnTaxCodeRef is recomputed to $0 by a manual-sales-
+  // tax company (see resolveRetailSalesTaxCodeId). Best-effort: if it can't be
+  // resolved we still pass TotalTax (better than nothing) rather than fail.
+  const taxCodeId = tax > 0 ? await resolveRetailSalesTaxCodeId() : null;
+
   const email = order.customerEmail || order.customer?.email || null;
   const invoiceDocNumber = order.orderName || String(order.shopifyOrderId || "").split("/").pop() || "";
   const payload = {
     CustomerRef: { value: String(customerId) },
     Line: lines,
-    ...(tax > 0 ? { TxnTaxDetail: { TotalTax: tax } } : {}),
+    ...(tax > 0
+      ? {
+          TxnTaxDetail: {
+            ...(taxCodeId ? { TxnTaxCodeRef: { value: taxCodeId } } : {}),
+            TotalTax: tax,
+          },
+        }
+      : {}),
     ...(order.placedAt ? { TxnDate: toQboDate(order.placedAt) } : {}),
     ...(email ? { BillEmail: { Address: email } } : {}),
     CustomerMemo: {
