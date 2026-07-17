@@ -22,30 +22,43 @@
 //     { rates: [] } so Shopify can fall back gracefully.
 //
 // What this endpoint does:
-//   1. Verifies the Shopify HMAC header (logs mismatch in dev; reject in prod).
-//   2. Reads items + origin + destination from the Shopify payload.
-//   3. Calls USPS + UPS direct-carrier APIs in parallel:
+//   1. Verifies the Shopify HMAC header (log-only; carrier-service
+//      callbacks aren't standard-signed — see history at the HMAC block).
+//   2. Reads items + origin + destination from the Shopify payload and
+//      filters out any "Processing Fee" cart lines added by the UI
+//      extension (defensive — fee is disabled today).
+//   3. Fetches the `pack:XXX` tag for every cart product via one bulk
+//      GraphQL call to Shopify Admin API (auth via unauthenticated.admin
+//      using RETAIL_SHOP_DOMAIN). If ANY product is missing a valid
+//      `pack:` tag → returns empty rates (customer sees "no shipping
+//      available"). This is the back-pressure that forces the merchant
+//      to tag every product before it can ship.
+//   4. Classifies the cart into 9 packing categories (S / S1 / M / L /
+//      LL / G1 / G2 / G4 / FA), selects the smallest box tier that fits
+//      via the 6-step selectBox() algorithm, and computes the package
+//      weight = items + tare + packing buffer.
+//   5. Calls USPS + UPS direct-carrier APIs in parallel with the picked
+//      box's real dims + weight:
 //        • USPS Web Tools v3 (USPS_CLIENT_ID / USPS_CLIENT_SECRET)
 //        • UPS Rating v2403  (UPS_CLIENT_ID / UPS_CLIENT_SECRET / UPS_SHIPPER_NUMBER)
 //      Dedups by (carrier, service), applies the tiered handling markup
-//      (see `tieredMarkupCents`), sorts cheapest-first, returns to Shopify.
-//   4. If NEITHER carrier returns rates (credentials missing / API down):
-//      returns an EMPTY rates list. Shopify will show "no shipping
-//      available" at checkout — this is intentional so we never quote
-//      placeholder prices. Static fallback was REMOVED 2026-06-22 once
-//      real USPS credentials were configured in .env.
+//      (see `tieredMarkupCents`), zeroes both when free-shipping fires
+//      ($500+ NS-only cart), sorts cheapest-first, and returns rates
+//      with the picked box surfaced in service_name + description.
+//   6. If NEITHER carrier returns rates (credentials missing / API down):
+//      returns an EMPTY rates list — never quotes placeholder prices.
 //
 // SETUP — both carriers (one-time):
 //   USPS:   registration.usps.com → APIs → OAuth credentials
 //   UPS:    developer.ups.com → My Apps → OAuth 2.0
 //
-// Any carrier whose env vars aren't set is silently skipped — no errors.
+// Env vars required in addition to carrier creds:
+//   RETAIL_SHOP_DOMAIN — the retail Shopify shop this app is installed on
+//   (used by the Admin API tag-fetch call). Any carrier whose env vars
+//   aren't set is silently skipped — no errors.
 
 import crypto from "node:crypto";
 import { unauthenticated } from "../../shopify.server";
-// Tax + processing fee logic was REMOVED 2026-07-15 (Phase 1 cleanup).
-// Client decided retail no longer charges the 3% card surcharge — see the
-// CONFIG comment block below and PROGRAM.md changelog for context.
 
 // ═══════════════════════════════════════════════════════════════════════
 // CONFIG — every tunable value lives here, single source of truth. Edit
@@ -72,14 +85,10 @@ const CONFIG = {
     thresholdUsd: 500,
   },
 
-  // NOTE (2026-07-15 — Phase 1 cleanup): the 3% processing fee and the
-  // asynchronous Shopify tax fetch (draftOrderCalculate) that fed into it
-  // are REMOVED for retail. Client decision on 2026-07-09 call: retail
-  // customers must not be charged the card surcharge (they have no
-  // alternative payment method). Tax figures on retail checkout come
-  // straight from Shopify's own tax settings — this file no longer needs
-  // to know about tax at all. Wholesale still uses its own fee/tax logic
-  // in wholesale/app/api/shipping/rates.js — not affected by this cleanup.
+  // Retail no longer charges the 3% card surcharge and no longer fetches
+  // tax here — Shopify handles retail tax natively. Wholesale still has
+  // its own fee logic in wholesale/app/api/shipping/rates.js; keep both
+  // in sync when handling markup or free-shipping rules change.
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -196,21 +205,18 @@ function tieredMarkupCents(qty) {
 
 // ── Discount detection from the carrier-service payload ──────────────
 //
-// Shopify's carrier-service callback DOES NOT reliably surface applied
-// discount codes / automatic discounts in a single canonical field —
-// different Shopify versions + themes populate different keys, and
-// sometimes NONE of them. Without accounting for the discount, the 3%
-// processing fee is calculated on the pre-discount subtotal and the
-// customer over-pays the fee (small but real — $0.45 on a $15 discount).
+// Used only for observability — the per-rate breakdown log shows the net
+// (post-discount) cart subtotal alongside the raw items sum so ops can
+// see at a glance whether a customer's discount landed in the payload.
+// Nothing in the returned rate depends on this value; free-shipping still
+// checks the pre-discount subtotal (Shopify's carrier-service payload
+// doesn't reliably expose post-discount totals across all themes).
 //
-// We probe the payload for every field we've seen actually populated,
-// in order of reliability. First non-zero win. Returns discount in
-// CENTS. Returns 0 when no discount info is available in the payload —
-// in that case the fee falls back to computing on the raw subtotal,
-// matching the previous (pre-discount-aware) behavior exactly.
-//
-// Returns { cents, source } so the per-rate log can show which field
-// was used, making it easy to diagnose payload shape drift over time.
+// Shopify populates the discount across multiple fields depending on
+// Shopify version + theme. We probe them in order of reliability and
+// return the first non-zero value in CENTS. Returns 0 on no match.
+// The { source } field records which field won so payload-shape drift
+// is diagnosable in production logs.
 function detectCartDiscountCents(rate, realItems) {
   // Field 0a: `rate.order_totals.discount_amount` — integer CENTS.
   //           Confirmed present in real 2026-07-07 production payload
@@ -408,18 +414,25 @@ function gramsToLb(grams) {
 // Shopify Admin API asking for `tags` on all product IDs in the cart, then
 // parse each product's tags to find the `pack:` prefix.
 //
-// Missing tag policy (locked 2026-07-16 with the user):
+// Missing tag policy:
 //   If ANY cart item's product has no `pack:` tag, the whole rate
 //   response is EMPTY — customer sees "no shipping available." This is
 //   intentional back-pressure: it forces the merchant to tag every
-//   product before it can ship. Safe fallback (default to L) was
-//   explicitly declined.
-//
-// The old weight/name/vendor cascade (2026-07-15) has been fully removed.
+//   product before it can ship.
 
 const PACK_TAG_PREFIX = "pack:";
 const ALLOWED_CATEGORIES = new Set([
   "FA", "LL", "G4", "G2", "G1", "L", "M", "S1", "S",
+  // Pending taxonomy lock-in (2026-07-17 — PM Q1 answer):
+  //   XL     — oversized non-liquid items (e.g. Body FX). Route to largest
+  //            tier for now; per-product mapping arrives via Trace's
+  //            worksheet.
+  //   OTHER  — products that ship in their own retail box (e.g. Three Lac,
+  //            Trimsulin). The engine shouldn't try to fit them into a
+  //            picked tier; treat as "own shipment/dimension" placeholder
+  //            (flagged overflow so merchant reviews). Full "own dims"
+  //            handling waits for per-product metafields.
+  "XL", "OTHER",
 ]);
 
 // Extract the packing category from a product's `tags` array. Returns
@@ -535,6 +548,8 @@ async function fetchProductTagsFromShopify(productIds) {
 function classifyCart(items, tagsByProductId) {
   const counts = {
     FA: 0, LL: 0, G4: 0, G2: 0, G1: 0, L: 0, M: 0, S1: 0, S: 0,
+    // Pending-taxonomy categories (structural only until Trace's worksheet):
+    XL: 0, OTHER: 0,
   };
   const perLine = [];
   const missing = [];
@@ -627,7 +642,29 @@ function selectBox(cartCounts) {
   // Non-tiny categories used to check `tinyExtrasOnly` (18x13x3).
   const hasNonTinyExtras =
     (c.S1 || 0) > 0 || (c.M || 0) > 0 || (c.L || 0) > 0 ||
-    (c.G1 || 0) > 0 || (c.G2 || 0) > 0 || (c.G4 || 0) > 0;
+    (c.G1 || 0) > 0 || (c.G2 || 0) > 0 || (c.G4 || 0) > 0 ||
+    (c.XL || 0) > 0 || (c.OTHER || 0) > 0;
+
+  // ── STEP 0 (pending taxonomy): pack:XL or pack:OTHER in cart ─────────
+  //
+  // Placeholder routing until Trace's classification worksheet lands with
+  // per-product XL vs OTHER assignments (2026-07-17 PM Q1 answer). The tag
+  // structure is live so merchants can tag their edge-case products, but
+  // the engine can't yet size an XL/OTHER package correctly:
+  //   • XL   — oversized non-liquid (e.g. Body FX). Route to largest tier
+  //            with overflow flag so merchant approval-gate reviews.
+  //   • OTHER — ships in its own retail box (e.g. Three Lac, Trimsulin).
+  //            No engine tier applies; return largest tier + overflow +
+  //            a distinct log so ops sees this needs own-dim handling.
+  // Full "own-dimension" routing waits for per-product metafields with
+  // real L/W/H on the OTHER items.
+  if ((c.XL || 0) > 0 || (c.OTHER || 0) > 0) {
+    const largest = PACKING.boxTiers[PACKING.boxTiers.length - 1];
+    console.warn(
+      `[shipping.rates] cart contains pack:XL(${c.XL || 0}) / pack:OTHER(${c.OTHER || 0}) — pending taxonomy; routing to ${largest.name} + overflow`,
+    );
+    return { box: largest, overflow: true };
+  }
 
   // ── STEP 1: 12+ glass → Enersync ────────────────────────────────────
   if (totalGlass >= 12 && llDemand === 0) {
@@ -667,11 +704,25 @@ function selectBox(cartCounts) {
   }
 
   // ── STEP 3: Any large liquid → smallest liquid box ─────────────────
+  //
+  // The `tinyExtrasOnly` flag (currently only on 18x13x3) is stricter than
+  // a simple non-tiny-extras rejection. Per Trace (2026-07-14 + 2026-07-17
+  // clarification via PM):
+  //   (a) Cart has any M/L/S1/G* items → reject outright.
+  //   (b) Box at MAX liquid capacity + cart has any S bottles → skip to
+  //       next tier. Only Frequency Apps (flat cards) may sit alongside
+  //       6 large liquids. Whether a single S bottle can squeeze in is
+  //       still under review; conservative default is S-blocked when full.
+  //   (c) Box has leftover liquid room → S + FA both fit (guarded by
+  //       normal unit-budget check below).
   if (llDemand > 0) {
     const liquidBoxes = PACKING.boxTiers.filter((b) => b.liquids > 0);
     for (const box of liquidBoxes) {
-      // tinyExtrasOnly (18x13x3): reject if cart has any M/L/S1/G* items
-      if (box.tinyExtrasOnly && hasNonTinyExtras) continue;
+      if (box.tinyExtrasOnly) {
+        if (hasNonTinyExtras) continue;
+        const liquidRoomLeft = box.liquids - llDemand;
+        if (liquidRoomLeft <= 0 && (c.S || 0) > 0) continue;
+      }
       if (box.liquids >= llDemand && box.units >= unitDemand) {
         return { box, overflow: false };
       }
@@ -842,10 +893,10 @@ async function fetchUSPSRates({ origin, destination, items, selectedBox, package
     0,
   );
 
-  // 2026-07-15 (Phase 6): dimensions + weight now come from the
-  // box-selection engine (selectedBox + packageWeight). The prior
-  // hardcoded 10×8×4 + gramsToLb(totalGrams) fallback stays in place
-  // only for defensive resilience — real requests always pass both.
+  // Dimensions + weight come from the box-selection engine
+  // (`selectedBox` + `packageWeight`). Fallback to legacy 10×8×4 +
+  // summed grams is defensive resilience only — real requests always
+  // pass both.
   const weightLbs = packageWeight?.totalLbs ?? gramsToLb(totalGrams);
   const lengthIn = selectedBox?.L ?? 10;
   const widthIn = selectedBox?.W ?? 8;
@@ -1025,10 +1076,10 @@ async function fetchUPSRates({ origin, destination, items, selectedBox, packageW
 
   // ── Step 2: Build rate request ──────────────────────────────────
   //
-  // 2026-07-15 (Phase 6): dimensions + weight come from the box-selection
-  // engine (selectedBox + packageWeight). UPS requires all numeric values
-  // as STRINGS. Fallback to legacy 10×8×4 + summed grams for defensive
-  // resilience if the box engine somehow didn't run.
+  // Dimensions + weight come from the box-selection engine
+  // (`selectedBox` + `packageWeight`). UPS requires all numeric values
+  // as STRINGS. Fallback to legacy 10×8×4 + summed grams is defensive
+  // resilience only — real requests always pass both.
   const totalGrams = (items || []).reduce(
     (s, it) => s + (Number(it?.grams) || 0) * (Number(it?.quantity) || 0),
     0,
@@ -1325,11 +1376,9 @@ export async function action({ request }) {
   // Added on top of every real carrier quote.
   const baseCents = tieredMarkupCents(totalQty);
 
-  // Cart subtotal in CENTS. First compute the raw items-sum, then
-  // subtract any applied discount so the 3% processing fee is charged
-  // on what the CUSTOMER actually owes for the merchandise — not the
-  // pre-discount list total (which would over-charge the fee by
-  // 3% × discountAmount).
+  // Cart subtotal in CENTS — raw items-sum and its discount-adjusted
+  // counterpart. Neither is used for rate math today (fee is removed);
+  // both are surfaced in the per-rate breakdown log for observability.
   const rawItemsSumCents = realItems.reduce(
     (sum, it) => sum + (Number(it?.price) || 0) * (Number(it?.quantity) || 0),
     0,
@@ -1401,14 +1450,7 @@ export async function action({ request }) {
       .join(" | "),
   );
 
-  // Tax + processing-fee removed 2026-07-15 per client decision (2026-07-09
-  // call): retail customers are NOT charged the 3% card surcharge — retail
-  // has no alternative payment method, so surcharging is unfair. Shopify
-  // handles retail tax display natively; we no longer fetch it here. The
-  // final rate returned to Shopify is now just carrier rate + handling
-  // markup (or $0 shipping when free-shipping fires).
-
-  // ── Box selection + package weight (Phase 4/5 — 2026-07-15) ─────────
+  // ── Box selection + package weight ───────────────────────────────────
   //
   // Pick the smallest box tier that fits the cart's classified contents
   // (see selectBox() docs for the exact priority order). If overflow
@@ -1459,9 +1501,9 @@ export async function action({ request }) {
       // markup. Otherwise: shipping = carrier rate + tiered markup.
       const shippingCents = isFreeShipping ? 0 : r.rateCents + baseCents;
 
-      // Final rate to Shopify = shipping only. The 3% processing fee was
-      // removed 2026-07-15 (see CONFIG comment). Tax is not touched here —
-      // Shopify's own tax settings apply it on the checkout summary line.
+      // Final rate to Shopify = shipping only (carrier rate + handling
+      // markup, or $0 when free-shipping fires). Tax is applied by
+      // Shopify's own settings on the checkout summary line.
       const finalCents = shippingCents;
 
       const baseName = `${r.carrier} ${r.service}`.trim();
