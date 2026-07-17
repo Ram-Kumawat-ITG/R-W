@@ -395,3 +395,50 @@ export async function resolveCustomerAchBillingId({ shop, email, customerMap }) 
   return sourceBillingId
 }
 
+// Resolve the NMI CARD billing id for a customer at a specific shop.
+// Sibling of `resolveCustomerAchBillingId`, consulting
+// `wholesale_applications.payment.card.nmi_billing_id`. The card billing id
+// is normally mirrored onto `customer_maps.nmiCardBillingId` at order intake
+// (ensureCustomerForOrder), but a practitioner who updates or ADDS a card via
+// the portal (profile.service) after their last order was processed leaves the
+// cache stale/null. chargeInvoice targets `customerMap.nmiCardBillingId` for
+// card charges, so a stale cache makes a retry hit the vault's default
+// (priority-1) billing instead of the card the practitioner just set — the
+// exact gap this closes on the manual-retry path.
+//
+// Cache-then-source fallback identical to the vault/ACH resolvers:
+//   1. customer_maps.nmiCardBillingId (fast path)
+//   2. wholesale_applications.payment.card.nmi_billing_id (source of truth)
+//   3. lazy sync on miss
+export async function resolveCustomerCardBillingId({ shop, email, customerMap }) {
+  if (!shop || !email) return null
+  const normalizedEmail = String(email).toLowerCase()
+
+  const cached = customerMap?.nmiCardBillingId || null
+  if (cached) return cached
+
+  const app = await WholesaleApplication.findOne({
+    shop,
+    email: normalizedEmail,
+  })
+    .select('payment.card')
+    .lean()
+  const sourceBillingId = app?.payment?.card?.nmi_billing_id || null
+  if (!sourceBillingId) return null
+
+  console.log(
+    `[customers] lazy card billing sync — copying nmi_billing_id=${sourceBillingId} ` +
+      `from wholesale_applications.payment.card → customer_maps for ${normalizedEmail}`,
+  )
+  log.info('vault.card_billing.lazy_sync', { shop, email: normalizedEmail, nmiBillingId: sourceBillingId })
+  await CustomerMap.updateOne(
+    { shop, email: normalizedEmail },
+    {
+      $setOnInsert: { shop, email: normalizedEmail },
+      $set: { nmiCardBillingId: sourceBillingId, lastSyncedAt: new Date() },
+    },
+    { upsert: true },
+  )
+  return sourceBillingId
+}
+

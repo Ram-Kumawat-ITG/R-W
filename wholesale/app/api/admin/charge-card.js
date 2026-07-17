@@ -6,7 +6,10 @@ import Invoice from '../../models/invoice.server'
 import CustomerMap from '../../models/customerMap.server'
 import { chargeInvoice } from '../../services/payment/payment.service'
 import { appendInvoiceRemark } from '../../services/invoice/invoice.service'
-import { resolveCustomerVaultId } from '../../services/customer/customer.service'
+import {
+  resolveCustomerVaultId,
+  resolveCustomerCardBillingId,
+} from '../../services/customer/customer.service'
 import { sendResponse } from '../../services/APIService/api.service'
 
 // POST /api/admin/orders/:id/charge-card
@@ -94,6 +97,25 @@ export async function action({ request, params }) {
   // own `customerMap.nmiCustomerVaultId` read sees the resolved id.
   if (customerMap && !customerMap.nmiCustomerVaultId) {
     customerMap.nmiCustomerVaultId = resolvedVaultId
+  }
+
+  // Re-resolve the CARD billing id from the source of truth too — this is the
+  // "charge the card on file" path, so a card the practitioner updated/added
+  // after their last order must be the one hit. Best-effort + non-fatal: when
+  // absent, chargeInvoice leaves billingId undefined and NMI charges the
+  // vault's default billing (pre-existing behavior). Especially relevant here
+  // since this flips an ACH/cheque invoice to card — without the card billing
+  // id an ACH customer's vault would otherwise target its priority-1 (ACH)
+  // billing instead of the card.
+  const resolvedCardBillingId = order.customerEmail
+    ? await resolveCustomerCardBillingId({
+        shop: session.shop,
+        email: order.customerEmail,
+        customerMap,
+      })
+    : null
+  if (customerMap && resolvedCardBillingId && !customerMap.nmiCardBillingId) {
+    customerMap.nmiCardBillingId = resolvedCardBillingId
   }
 
   // Per-order override: flip method to card so the scheduler will also
