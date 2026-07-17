@@ -2,7 +2,7 @@ import IdMap from "./idMap.model";
 import { retailClient } from "./retailApi";
 import { resolveRetailLocationId } from "./sync.utils";
 import {
-  fetchRetailPricingMetafield,
+  fetchVariantRetailPricingBySku,
   resolveVariantPricing,
 } from "./retailPricing";
 import { createLogger } from "../../utils/logger.utils";
@@ -13,16 +13,19 @@ const log = createLogger("sync.product");
 // wholesale webhook payload (Shopify REST format).
 //
 // Pricing sources (checked in order per variant):
-//   1. `retailPricing` — the parsed `custom.retail_pricing` metafield on the
-//      wholesale product (fetched by `fetchRetailPricingMetafield`). This is
-//      the primary + intended source of retail prices, added 2026-07-14.
+//   1. `pricingBySku` — Map<sku, {price, compareAtPrice}> from the wholesale
+//      variant-level metafields (`custom.retail_price` +
+//      `custom.retail_compare_at_price`, both `money` type). Fetched by
+//      `fetchVariantRetailPricingBySku`. This is the primary + intended
+//      source of retail prices, replaced the old product-level JSON
+//      metafield on 2026-07-17.
 //   2. `includePrice: true` — legacy escape hatch that copies wholesale
 //      prices to retail directly. Only used when explicitly requested;
 //      wholesale ≠ retail pricing tiers, so this is rarely correct.
 //   3. Neither → variant is created WITHOUT a price (Shopify defaults it to
-//      $0). Non-breaking: this matches the pre-2026-07-14 behavior.
+//      $0). Non-breaking: this matches the pre-metafield behavior.
 //
-// Variant-matching for the update path (2026-07-14):
+// Variant-matching for the update path:
 //   Pass `retailVariantsBySku` = a Map<sku, retailVariantObject> keyed by
 //   SKU. Each wholesale variant is looked up by SKU and the corresponding
 //   retail variant's `id` is injected into the payload so Shopify's PUT
@@ -35,12 +38,12 @@ function buildRetailPayload(
   p,
   {
     includePrice = false,
-    retailPricing = null,
+    pricingBySku = null,
     retailVariantsBySku = null,
   } = {},
 ) {
   const variants = (p.variants || [])
-    .map((v) => buildRetailVariant(v, { includePrice, retailPricing, retailVariantsBySku }))
+    .map((v) => buildRetailVariant(v, { includePrice, pricingBySku, retailVariantsBySku }))
     .filter(Boolean);
 
   return {
@@ -62,7 +65,7 @@ function buildRetailPayload(
 
 // Build one variant entry for the retail payload. Returns null if the
 // variant should be skipped (update path only — no retail SKU match).
-function buildRetailVariant(v, { includePrice, retailPricing, retailVariantsBySku }) {
+function buildRetailVariant(v, { includePrice, pricingBySku, retailVariantsBySku }) {
   const wholesaleSku = String(v?.sku || "").trim();
 
   // Update path — require SKU match against existing retail variants.
@@ -106,7 +109,7 @@ function buildRetailVariant(v, { includePrice, retailPricing, retailVariantsBySk
     ...(v.position != null && { position: v.position }),
   };
 
-  const metafieldPricing = resolveVariantPricing(v, retailPricing);
+  const metafieldPricing = resolveVariantPricing(v, pricingBySku);
   if (metafieldPricing) {
     base.price = metafieldPricing.price;
     if (metafieldPricing.compareAtPrice) {
@@ -281,25 +284,24 @@ export async function syncProductCreate(wholesaleProduct, { shop } = {}) {
     throw err;
   }
 
-  // Fetch retail-price metafield from the wholesale product. Best-effort —
-  // missing/malformed metafield returns null and we sync without prices
-  // (pre-2026-07-14 behavior, non-breaking). `shop` is optional so any
-  // legacy/test caller that doesn't pass it still works.
-  const retailPricing = shop
-    ? await fetchRetailPricingMetafield({ shop, productId: wholesaleId })
-    : null;
+  // Fetch variant-level retail-pricing metafields from the wholesale
+  // product. Best-effort — missing/malformed metafields yield an empty
+  // Map and we sync without prices (pre-metafield behavior, non-breaking).
+  // `shop` is optional so any legacy/test caller that doesn't pass it
+  // still works.
+  const pricingBySku = shop
+    ? await fetchVariantRetailPricingBySku({ shop, productId: wholesaleId })
+    : new Map();
   log.info("product_create.retail_pricing", {
     wholesaleId,
-    hasPricing: !!retailPricing,
-    topLevelPrice: retailPricing?.price ?? null,
-    perVariantCount: retailPricing?.variantsBySku?.size ?? 0,
+    variantsWithPricing: pricingBySku.size,
   });
 
   let retailProduct;
   try {
     const data = await retailClient.post(
       "products.json",
-      buildRetailPayload(wholesaleProduct, { retailPricing }),
+      buildRetailPayload(wholesaleProduct, { pricingBySku }),
     );
     retailProduct = data?.product;
     if (!retailProduct?.id) {
@@ -357,16 +359,14 @@ export async function syncProductUpdate(wholesaleProduct, { shop } = {}) {
     return;
   }
 
-  // Re-fetch the retail-price metafield on every update — the merchant may
-  // have edited it. Missing → null → sync without prices (unchanged).
-  const retailPricing = shop
-    ? await fetchRetailPricingMetafield({ shop, productId: wholesaleId })
-    : null;
+  // Re-fetch variant retail-pricing metafields on every update — the
+  // merchant may have edited them. Empty Map → sync without prices.
+  const pricingBySku = shop
+    ? await fetchVariantRetailPricingBySku({ shop, productId: wholesaleId })
+    : new Map();
   log.info("product_update.retail_pricing", {
     wholesaleId,
-    hasPricing: !!retailPricing,
-    topLevelPrice: retailPricing?.price ?? null,
-    perVariantCount: retailPricing?.variantsBySku?.size ?? 0,
+    variantsWithPricing: pricingBySku.size,
   });
 
   const retailId = mapping.retailId;
@@ -410,7 +410,7 @@ export async function syncProductUpdate(wholesaleProduct, { shop } = {}) {
   await retailClient.put(
     `products/${retailId}.json`,
     buildRetailPayload(wholesaleProduct, {
-      retailPricing,
+      pricingBySku,
       retailVariantsBySku:
         retailVariantsBySku.size > 0 ? retailVariantsBySku : null,
     }),

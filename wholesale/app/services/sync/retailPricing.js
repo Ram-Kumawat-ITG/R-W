@@ -1,35 +1,19 @@
-// Retail-price metafield reader for the wholesale→retail product sync.
+// Variant-level retail-pricing reader for the wholesale→retail product sync.
 //
-// Wholesale merchants set a JSON metafield `custom.retail_pricing` on each
-// product to specify the RETAIL prices (which differ from wholesale, typically
-// ~2×). When we sync a product to the retail store, we read this metafield and
-// apply the prices to the outbound retail payload — replacing the previous
-// behavior where retail products were created with $0 prices and a merchant
-// had to set them by hand on the retail side.
+// The wholesale merchant sets two `money` metafields on EACH variant of a
+// wholesale product to specify the RETAIL prices (typically ~2× wholesale):
 //
-// Expected metafield JSON shape (see SHIPPING_LOGIC.md / product-sync doubts):
+//   custom.retail_price              (money — required to apply pricing)
+//   custom.retail_compare_at_price   (money — optional strike-through)
 //
-//   {
-//     "price": "25.99",              // optional top-level default
-//     "compareAtPrice": "29.99",     // optional top-level default
-//     "variants": [                  // optional per-variant list, keyed by SKU
-//       { "sku": "SKU-A", "price": "25.99", "compareAtPrice": "29.99" },
-//       ...
-//     ]
-//   }
+// The definitions are created once via Shopify admin → Settings → Custom
+// data → Variants → Add definition (owner: PRODUCTVARIANT, type: money).
+// After that, every variant edit page shows two money input fields — the
+// merchant types prices directly, no JSON.
 //
-// Application rule (per confirmed decisions D2 + D4):
-//   - If `variants[]` is populated → variant must be explicitly listed by SKU
-//     to receive a price. Unlisted variants sync WITHOUT price (warn log).
-//     Top-level `price` is NOT used as a fallback in this mode.
-//   - If `variants[]` is empty/absent → top-level `price` applies to ALL
-//     variants uniformly (simple-product mode).
-//
-// Non-breaking guarantees:
-//   - Missing metafield → returns null → caller preserves existing behavior
-//     (retail product created without prices, as it did before this change).
-//   - Session lookup failure, GraphQL error, JSON parse error, empty JSON →
-//     all return null with a warn log.
+// Previous behaviour (deprecated 2026-07-17): product-level
+// `custom.retail_pricing` JSON metafield. Client-unfriendly (typos broke
+// sync). Superseded by these per-variant money metafields.
 //
 // This module is called from `product.sync.js` (syncProductCreate +
 // syncProductUpdate) and is otherwise self-contained.
@@ -40,25 +24,54 @@ import { createLogger } from '../../utils/logger.utils'
 const log = createLogger('sync.retail_pricing')
 
 const METAFIELD_NAMESPACE = 'custom'
-const METAFIELD_KEY = 'retail_pricing'
+const PRICE_KEY = 'retail_price'
+const COMPARE_AT_KEY = 'retail_compare_at_price'
 
-// Fetches the `custom.retail_pricing` metafield for the given wholesale
-// product and returns a normalized structure for `buildRetailPayload`.
+// GraphQL: fetch all variants of a wholesale product with both retail
+// pricing metafields in a single call. Aliased fields let us read two
+// different metafields on the same variant node in one round-trip.
+const VARIANT_PRICING_QUERY = `#graphql
+  query VariantRetailPricing($productGid: ID!, $namespace: String!, $priceKey: String!, $compareAtKey: String!) {
+    product(id: $productGid) {
+      id
+      variants(first: 100) {
+        nodes {
+          id
+          sku
+          retailPrice: metafield(namespace: $namespace, key: $priceKey) {
+            value
+            type
+          }
+          retailCompareAt: metafield(namespace: $namespace, key: $compareAtKey) {
+            value
+            type
+          }
+        }
+      }
+    }
+  }
+`
+
+// Fetches variant-level retail pricing for every variant of a wholesale
+// product. Returns Map<sku, { price, compareAtPrice }> — SKU-keyed because
+// SKU is the stable cross-store identifier used by the rest of the sync.
 //
 // Return value:
-//   {
-//     price: "25.99" | null,
-//     compareAtPrice: "29.99" | null,
-//     variantsBySku: Map<sku, { price, compareAtPrice }>,
-//   }
-// OR `null` on any failure/missing (fall back to no-price sync).
-export async function fetchRetailPricingMetafield({ shop, productId }) {
+//   Map<sku, { price: "25.99" | null, compareAtPrice: "29.99" | null }>
+// Variants missing the required `retail_price` metafield are OMITTED from
+// the map — `resolveVariantPricing` treats "no entry" as "no pricing"
+// (variant syncs without a price; matches pre-metafield behavior).
+//
+// Never throws — any failure (session lookup, GraphQL error, malformed
+// data) returns an empty Map with a warn log so the sync proceeds
+// gracefully instead of blowing up on webhook.
+export async function fetchVariantRetailPricingBySku({ shop, productId }) {
+  const empty = new Map()
+
   if (!shop || !productId) {
     log.warn('skip.missing_args', { shop, productId })
-    return null
+    return empty
   }
-
-  const productGid = `gid://shopify/Product/${productId}`
 
   let admin
   try {
@@ -70,28 +83,19 @@ export async function fetchRetailPricingMetafield({ shop, productId }) {
       productId,
       err: err?.message || String(err),
     })
-    return null
+    return empty
   }
 
-  const query = `#graphql
-    query RetailPricingForProduct($id: ID!, $namespace: String!, $key: String!) {
-      product(id: $id) {
-        id
-        metafield(namespace: $namespace, key: $key) {
-          value
-          type
-        }
-      }
-    }
-  `
+  const productGid = `gid://shopify/Product/${productId}`
 
   let body
   try {
-    const res = await admin.graphql(query, {
+    const res = await admin.graphql(VARIANT_PRICING_QUERY, {
       variables: {
-        id: productGid,
+        productGid,
         namespace: METAFIELD_NAMESPACE,
-        key: METAFIELD_KEY,
+        priceKey: PRICE_KEY,
+        compareAtKey: COMPARE_AT_KEY,
       },
     })
     body = await res.json()
@@ -101,7 +105,7 @@ export async function fetchRetailPricingMetafield({ shop, productId }) {
       productId,
       err: err?.message || String(err),
     })
-    return null
+    return empty
   }
 
   if (Array.isArray(body?.errors) && body.errors.length) {
@@ -109,70 +113,71 @@ export async function fetchRetailPricingMetafield({ shop, productId }) {
       productId,
       errors: JSON.stringify(body.errors).slice(0, 400),
     })
-    return null
+    return empty
   }
 
-  const metafield = body?.data?.product?.metafield
-  if (!metafield?.value) {
-    log.info('metafield_missing', { productId })
-    return null
-  }
-
-  let parsed
-  try {
-    parsed = JSON.parse(metafield.value)
-  } catch (err) {
-    log.warn('metafield_parse_failed', {
-      productId,
-      err: err?.message,
-      raw: String(metafield.value).slice(0, 200),
-    })
-    return null
-  }
-
-  return normalizePricing(parsed, productId)
-}
-
-// Turn a parsed metafield JSON into the normalized structure the payload
-// builder consumes. Returns null if the JSON has no usable pricing.
-function normalizePricing(parsed, productId) {
-  if (!parsed || typeof parsed !== 'object') {
-    log.warn('metafield_not_object', { productId })
-    return null
-  }
-
-  const topLevelPrice = normalizeMoneyString(parsed.price)
-  const topLevelCompareAt = normalizeMoneyString(parsed.compareAtPrice)
-
-  const variantsBySku = new Map()
-  if (Array.isArray(parsed.variants)) {
-    for (const v of parsed.variants) {
-      const sku = String(v?.sku || '').trim()
-      if (!sku) continue
-      const price = normalizeMoneyString(v?.price)
-      const compareAtPrice = normalizeMoneyString(v?.compareAtPrice)
-      // Only accept entries that have at least a price
-      if (!price) continue
-      variantsBySku.set(sku, { price, compareAtPrice })
+  const variants = body?.data?.product?.variants?.nodes || []
+  const result = new Map()
+  for (const v of variants) {
+    const sku = String(v?.sku || '').trim()
+    if (!sku) {
+      // No SKU → we can't key the map. Log and skip. The rest of the sync
+      // already warns on empty-SKU variants, so this doesn't add signal.
+      continue
     }
+
+    const price = parseMoneyMetafield(v?.retailPrice, {
+      productId,
+      sku,
+      key: PRICE_KEY,
+    })
+    if (!price) continue // no retail price → variant syncs without price
+
+    const compareAtPrice = parseMoneyMetafield(v?.retailCompareAt, {
+      productId,
+      sku,
+      key: COMPARE_AT_KEY,
+    })
+
+    result.set(sku, { price, compareAtPrice: compareAtPrice ?? null })
   }
 
-  // Nothing usable → treat as if metafield were absent
-  if (!topLevelPrice && variantsBySku.size === 0) {
-    log.warn('metafield_empty_or_invalid', { productId })
-    return null
-  }
-
-  return {
-    price: topLevelPrice,
-    compareAtPrice: topLevelCompareAt,
-    variantsBySku,
-  }
+  log.info('fetched', {
+    productId,
+    variantsWithPricing: result.size,
+    variantsTotal: variants.length,
+  })
+  return result
 }
 
-// Normalize a money value from the metafield JSON to a Shopify-friendly string
-// like "25.99". Accepts numbers (25.99) or strings ("25.99"). Returns null for
-// invalid/empty values so callers can treat null as "no price for this field".
+// Parse Shopify's money-metafield value into a plain string like "25.99".
+// Shopify stores `money` metafields as a JSON blob: {"amount":"25.99","currency_code":"USD"}
+// We keep only `amount` because the retail sync writes to Shopify REST which
+// infers currency from the destination shop settings.
+function parseMoneyMetafield(mf, ctx) {
+  if (!mf || !mf.value) return null
+  const raw = String(mf.value).trim()
+  if (!raw) return null
+
+  // The most common shape: JSON with `amount` field.
+  try {
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object' && parsed.amount != null) {
+      return normalizeMoneyString(parsed.amount)
+    }
+  } catch {
+    // Fall through — some shops may store plain decimals if the definition
+    // was created with a different type or edited outside the money UI.
+  }
+
+  // Defensive fallback: raw decimal string (e.g. "25.99").
+  const asDecimal = normalizeMoneyString(raw)
+  if (asDecimal) return asDecimal
+
+  log.warn('money_parse_failed', { ...ctx, raw: raw.slice(0, 100) })
+  return null
+}
+
 function normalizeMoneyString(raw) {
   if (raw === null || raw === undefined || raw === '') return null
   if (typeof raw === 'number' && Number.isFinite(raw)) return raw.toFixed(2)
@@ -180,70 +185,46 @@ function normalizeMoneyString(raw) {
     const trimmed = raw.trim()
     if (!trimmed) return null
     const n = Number(trimmed)
-    if (!Number.isFinite(n)) return null
+    if (!Number.isFinite(n) || n < 0) return null
     return n.toFixed(2)
   }
   return null
 }
 
 // Resolve the retail price for a single wholesale variant, given the
-// normalized metafield payload. Returns { price, compareAtPrice } or null.
+// SKU-keyed pricing map from `fetchVariantRetailPricingBySku`. Returns
+// { price, compareAtPrice } or null when no metafield is set on that
+// variant.
 //
-// Rule (revised 2026-07-14 to match D2's "top-level defaults + per-variant
-// overrides" phrasing — replaces the earlier stricter interpretation):
-//
-//   1. Look for a variant-specific match by SKU in `variantsBySku`. If found,
-//      use the variant-specific price. `compareAtPrice` falls back to the
-//      top-level compareAtPrice when the per-variant entry omits it.
-//   2. If no SKU match (missing SKU on the wholesale variant, or SKU not
-//      listed in the metafield), fall back to the top-level `price` as the
-//      product-wide default. This matches the natural merchant mental model:
-//      "top-level = default, variants[] = overrides for specific SKUs."
-//   3. If neither is available (no SKU match AND no top-level `price`), the
-//      variant syncs WITHOUT a price and a warn log is emitted.
-//
-// Consequence: as long as the metafield has a top-level `price`, EVERY
-// variant gets a price — either its own override or the product-wide
-// default. This is what merchants expect and prevents silent $0 syncs when
-// a variant SKU accidentally doesn't match the metafield entries.
-//
-// Exported so the payload builder can call it per-variant.
-export function resolveVariantPricing(variant, retailPricing) {
-  if (!retailPricing) return null
+// Rules (2026-07-17 — variant-level metafields):
+//   - Variant SKU must appear in the map. No product-wide fallback: each
+//     variant either has its own `custom.retail_price` set or syncs
+//     without a price (matches the pre-metafield legacy behavior).
+//   - `compareAtPrice` may be null even when `price` is set — a variant
+//     with retail price but no strike-through is fine.
+export function resolveVariantPricing(variant, pricingBySku) {
+  if (!pricingBySku || pricingBySku.size === 0) return null
+
   const sku = String(variant?.sku || '').trim()
-
-  // (1) Variant-specific match wins if the SKU appears in the metafield list.
-  if (sku && retailPricing.variantsBySku?.has(sku)) {
-    const match = retailPricing.variantsBySku.get(sku)
-    return {
-      price: match.price,
-      compareAtPrice:
-        match.compareAtPrice ?? retailPricing.compareAtPrice ?? null,
-      source: 'variant_match',
-    }
+  if (!sku) {
+    log.warn('variant.no_sku_cannot_price', { variantId: variant?.id })
+    return null
   }
 
-  // (2) Fall back to the top-level product-wide default.
-  if (retailPricing.price) {
-    log.info('variant.using_top_level_default', {
-      variantSku: sku || '(no SKU)',
+  const match = pricingBySku.get(sku)
+  if (!match) {
+    // Not an error — merchant may not have set retail price on this
+    // variant yet. Log at info so ops can see the "missing" list.
+    log.info('variant.no_retail_price_set', {
       variantId: variant?.id,
-      reason:
-        retailPricing.variantsBySku?.size > 0
-          ? 'sku_not_in_variants_list'
-          : 'no_variants_list_in_metafield',
+      sku,
     })
-    return {
-      price: retailPricing.price,
-      compareAtPrice: retailPricing.compareAtPrice ?? null,
-      source: 'top_level_default',
-    }
+    return null
   }
 
-  // (3) Nothing available — variant will sync without price.
-  log.warn('variant.no_pricing_available', {
-    variantSku: sku || '(no SKU)',
-    variantId: variant?.id,
-  })
-  return null
+  return {
+    price: match.price,
+    compareAtPrice: match.compareAtPrice ?? null,
+    source: 'variant_metafield',
+  }
 }
