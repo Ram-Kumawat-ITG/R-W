@@ -239,3 +239,86 @@ export async function notifyPayoutBatchSummary({
   }
   return result;
 }
+
+// ── Pending Check Payouts (admin digest) ─────────────────────────────────
+// Admin-only. Lists every OPEN (not-yet-issued) check-method payout with the
+// TOTAL amount owed plus the per-payout practitioner/payout breakdown, so the
+// admin knows exactly which physical checks still need to be cut and for how
+// much. Fired once per automated payout run (see cdo.service). `rows` is the
+// per-payout breakdown the caller assembled from the open check payouts.
+function buildPendingCheckTable(rows) {
+  const headerCells = [
+    "Practitioner Name",
+    "Practitioner Email",
+    "Amount",
+    "Commissions",
+    "Status",
+    "Reference",
+    "Period End",
+  ]
+    .map((h) => `<th style="text-align:left;padding:8px;border:1px solid #d5d5d5;background:#f4f4f4">${h}</th>`)
+    .join("");
+
+  const bodyRows = rows
+    .map((r) => {
+      const cells = [
+        escapeHtml(r.practitionerName || "—"),
+        escapeHtml(r.practitionerEmail || "—"),
+        formatCurrency(r.amount, r.currency),
+        escapeHtml(r.commissionCount ?? "—"),
+        escapeHtml(STATUS_LABEL[r.status] || r.status || "—"),
+        escapeHtml(r.reference || "—"),
+        r.periodEnd ? formatDate(r.periodEnd) : "—",
+      ]
+        .map((c) => `<td style="padding:8px;border:1px solid #d5d5d5">${c}</td>`)
+        .join("");
+      return `<tr>${cells}</tr>`;
+    })
+    .join("");
+
+  return `
+    <table style="border-collapse:collapse;width:100%;font-size:13px;margin-top:12px">
+      <thead><tr>${headerCells}</tr></thead>
+      <tbody>${bodyRows}</tbody>
+    </table>
+  `;
+}
+
+export async function notifyPendingCheckPayouts({ rows, totalAmount, currency, generatedAt } = {}) {
+  if (!config.adminEmail) {
+    log.warn("send.skipped_no_email", { event: "pending_check_payouts" });
+    return { success: false, skipped: true, reason: "no admin email configured" };
+  }
+  if (!rows || !rows.length) {
+    log.info("send.skipped_none_pending", { event: "pending_check_payouts" });
+    return { success: false, skipped: true, reason: "no pending check payouts" };
+  }
+
+  const totalLabel = formatCurrency(totalAmount, currency);
+  const generatedLabel = formatDateTime(generatedAt || new Date());
+
+  const subject = `Pending Check Payouts — ${totalLabel} across ${rows.length} payout${rows.length === 1 ? "" : "s"} awaiting issue`;
+  const html = wrapHtml(`
+    <p><strong>Pending Check Payouts</strong></p>
+    <p>The following check-method payouts are open and awaiting a physical check to be issued. Mark each one paid from the Check Payout queue once the check has been mailed.</p>
+    <table role="presentation" style="width:100%;border-collapse:collapse;font-size:13px;margin-top:12px">
+      <tbody>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #d5d5d5;background:#f4f4f4">Total pending check payout</th><td style="padding:8px;border:1px solid #d5d5d5"><strong>${totalLabel}</strong></td></tr>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #d5d5d5;background:#f4f4f4">Payouts awaiting issue</th><td style="padding:8px;border:1px solid #d5d5d5">${rows.length}</td></tr>
+        <tr><th style="text-align:left;padding:8px;border:1px solid #d5d5d5;background:#f4f4f4">Generated</th><td style="padding:8px;border:1px solid #d5d5d5">${generatedLabel}</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:16px"><strong>Payout details</strong></p>
+    ${buildPendingCheckTable(rows)}
+  `);
+
+  const result = await sendEmail({ to: config.adminEmail, subject, html });
+
+  const context = { event: "pending_check_payouts", totalAmount, rowCount: rows.length };
+  if (!result.success) {
+    log.error("send.failed", { ...context, error: result.error });
+  } else {
+    log.info("send.success", { ...context, messageId: result.messageId });
+  }
+  return result;
+}

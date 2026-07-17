@@ -52,6 +52,7 @@ import {
   notifyCommissionPayoutProcessed,
   notifyCommissionPayoutFailed,
   notifyPayoutBatchSummary,
+  notifyPendingCheckPayouts,
 } from "../notifications/payoutNotification.service";
 import { createLogger } from "../../utils/logger.utils";
 import {
@@ -4836,6 +4837,44 @@ async function sendPayoutBatchSummaryEmail(batch) {
   }
 }
 
+// Admin digest of all OPEN (pending) check-method payouts — the physical
+// checks the admin still needs to issue, plus the TOTAL amount owed. Fired at
+// the end of each automated payout run so the admin gets a recurring, actionable
+// reminder aligned with the payout cycle. Best-effort — a notification failure
+// never affects the payout run (which has already completed by the time this
+// runs). No-ops (no email) when there are no open check payouts.
+async function sendPendingCheckPayoutsDigest() {
+  try {
+    const OPEN_STATUSES = ["draft", "awaiting_approval", "approved", "processing"];
+    const payouts = await CdoPayout.find({ method: "check", status: { $in: OPEN_STATUSES } })
+      .sort({ periodEnd: 1, practitionerName: 1 })
+      .lean();
+    if (!payouts.length) {
+      log.info("payout.pending_check_digest_skipped", { reason: "none_pending" });
+      return;
+    }
+    const rows = payouts.map((p) => ({
+      practitionerName: p.practitionerName,
+      practitionerEmail: p.practitionerEmail,
+      amount: p.amount || 0,
+      currency: p.currency,
+      status: p.status,
+      reference: p.reference,
+      periodEnd: p.periodEnd,
+      commissionCount: (p.commissionIds || []).length,
+    }));
+    const totalAmount = roundMoney(rows.reduce((s, r) => s + (Number(r.amount) || 0), 0));
+    await notifyPendingCheckPayouts({
+      rows,
+      totalAmount,
+      currency: rows[0]?.currency || "USD",
+      generatedAt: new Date(),
+    });
+  } catch (err) {
+    log.error("payout.pending_check_digest_failed", { err: err?.message || String(err) });
+  }
+}
+
 function finalizeBatchCounts(batch, items) {
   batch.items = items;
   batch.totalCommissions = items.length;
@@ -4918,6 +4957,7 @@ export async function runAutomatedPayouts({ shop, periodEnd, mode = "cron", trig
       summary.awaitingApproval = build.created.length;
       log.info("automated_payouts.awaiting_approval", { ...summary });
       await sendPayoutBatchSummaryEmail(batch);
+      await sendPendingCheckPayoutsDigest();
       return summary;
     }
 
@@ -4997,6 +5037,7 @@ export async function runAutomatedPayouts({ shop, periodEnd, mode = "cron", trig
 
   log.info("automated_payouts.run", { ...summary });
   await sendPayoutBatchSummaryEmail(batch);
+  await sendPendingCheckPayoutsDigest();
   return summary;
 }
 
