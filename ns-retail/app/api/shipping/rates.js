@@ -167,7 +167,13 @@ const PACKING = {
   boxTiers: [
     // ── Envelopes + UPS mini (small, ordered by capacity) ─────────────
     { name: "9x6x4 envelope",   type: "envelope", L: 9,  W: 6,  H: 4,  tareOz: 0.7,  units: 3, liquids: 0, glassMax: 4 },
-    { name: "8x6x3 UPS mini",   type: "box",      L: 8,  W: 6,  H: 3,  tareOz: 2.7,  units: 3, liquids: 0, glassMax: 6, fragilePreferred: true },
+    // 8x6x3 UPS mini — units:6 (bumped from 3, 2026-07-20): client's stated
+    // capacity is 6×G1 (4.5u), 5×G2 (5u), or 4×G4 (6u). The units:3 budget
+    // was silently rejecting these carts and routing them to 11x9x4 envelope
+    // instead — losing the intended glass-safety protection. Non-glass items
+    // are still gated out by Step 2's small-order guard (smallGlass>=3, no L,
+    // no M, no LL, totalItems<=5).
+    { name: "8x6x3 UPS mini",   type: "box",      L: 8,  W: 6,  H: 3,  tareOz: 2.7,  units: 6, liquids: 0, glassMax: 6, fragilePreferred: true },
     { name: "11x9x4 envelope",  type: "envelope", L: 11, W: 9,  H: 4,  tareOz: 0.7,  units: 9, liquids: 0, faMax: 60 },
     // ── Liquid boxes (ordered by liquid capacity) ─────────────────────
     // "Extras" numbers per client's Q1: 3 for smallest, 4 for mid, 6-8 for big.
@@ -423,16 +429,6 @@ function gramsToLb(grams) {
 const PACK_TAG_PREFIX = "pack:";
 const ALLOWED_CATEGORIES = new Set([
   "FA", "LL", "G4", "G2", "G1", "L", "M", "S1", "S",
-  // Pending taxonomy lock-in (2026-07-17 — PM Q1 answer):
-  //   XL     — oversized non-liquid items (e.g. Body FX). Route to largest
-  //            tier for now; per-product mapping arrives via Trace's
-  //            worksheet.
-  //   OTHER  — products that ship in their own retail box (e.g. Three Lac,
-  //            Trimsulin). The engine shouldn't try to fit them into a
-  //            picked tier; treat as "own shipment/dimension" placeholder
-  //            (flagged overflow so merchant reviews). Full "own dims"
-  //            handling waits for per-product metafields.
-  "XL", "OTHER",
 ]);
 
 // Extract the packing category from a product's `tags` array. Returns
@@ -548,8 +544,6 @@ async function fetchProductTagsFromShopify(productIds) {
 function classifyCart(items, tagsByProductId) {
   const counts = {
     FA: 0, LL: 0, G4: 0, G2: 0, G1: 0, L: 0, M: 0, S1: 0, S: 0,
-    // Pending-taxonomy categories (structural only until Trace's worksheet):
-    XL: 0, OTHER: 0,
   };
   const perLine = [];
   const missing = [];
@@ -642,29 +636,7 @@ function selectBox(cartCounts) {
   // Non-tiny categories used to check `tinyExtrasOnly` (18x13x3).
   const hasNonTinyExtras =
     (c.S1 || 0) > 0 || (c.M || 0) > 0 || (c.L || 0) > 0 ||
-    (c.G1 || 0) > 0 || (c.G2 || 0) > 0 || (c.G4 || 0) > 0 ||
-    (c.XL || 0) > 0 || (c.OTHER || 0) > 0;
-
-  // ── STEP 0 (pending taxonomy): pack:XL or pack:OTHER in cart ─────────
-  //
-  // Placeholder routing until Trace's classification worksheet lands with
-  // per-product XL vs OTHER assignments (2026-07-17 PM Q1 answer). The tag
-  // structure is live so merchants can tag their edge-case products, but
-  // the engine can't yet size an XL/OTHER package correctly:
-  //   • XL   — oversized non-liquid (e.g. Body FX). Route to largest tier
-  //            with overflow flag so merchant approval-gate reviews.
-  //   • OTHER — ships in its own retail box (e.g. Three Lac, Trimsulin).
-  //            No engine tier applies; return largest tier + overflow +
-  //            a distinct log so ops sees this needs own-dim handling.
-  // Full "own-dimension" routing waits for per-product metafields with
-  // real L/W/H on the OTHER items.
-  if ((c.XL || 0) > 0 || (c.OTHER || 0) > 0) {
-    const largest = PACKING.boxTiers[PACKING.boxTiers.length - 1];
-    console.warn(
-      `[shipping.rates] cart contains pack:XL(${c.XL || 0}) / pack:OTHER(${c.OTHER || 0}) — pending taxonomy; routing to ${largest.name} + overflow`,
-    );
-    return { box: largest, overflow: true };
-  }
+    (c.G1 || 0) > 0 || (c.G2 || 0) > 0 || (c.G4 || 0) > 0;
 
   // ── STEP 1: 12+ glass → Enersync ────────────────────────────────────
   if (totalGlass >= 12 && llDemand === 0) {
@@ -689,12 +661,16 @@ function selectBox(cartCounts) {
   }
 
   // ── STEP 2: Small order with 3+ small glass → UPS mini ─────────────
-  // Client Q6: "small order" = ≤ 5 total items, no LL, no L (or larger)
+  // Client Q6 (broad interpretation, 2026-07-20): "small order" = ≤ 5 total
+  // items, no LL, no L, AND no M ("no larger bottles"). This keeps UPS mini
+  // strictly for concentrated small-glass loads + tiny S/S1/FA extras. A
+  // medium+glass cart falls through to the 11×9×4 envelope path via Step 5.
   const smallGlassCount = (c.G1 || 0) + (c.G2 || 0);
   if (
     smallGlassCount >= 3 &&
     llDemand === 0 &&
     (c.L || 0) === 0 &&
+    (c.M || 0) === 0 &&
     totalItems <= 5
   ) {
     const upsMini = PACKING.boxTiers.find((b) => b.fragilePreferred);
