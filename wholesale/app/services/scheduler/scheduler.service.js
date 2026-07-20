@@ -7,6 +7,7 @@
 import Agenda from 'agenda'
 import { schedulerConfig } from './scheduler.config'
 import { achSyncConfig } from '../payment/achStatusSync.config'
+import { paymentRetryConfig } from '../payment/paymentRetry.config'
 import { createLogger } from '../../utils/logger.utils'
 import { registerJobs, JOB_NAMES } from './jobs'
 
@@ -102,6 +103,36 @@ async function ensureRecurring(agenda) {
   log.info('scheduler.ach_sync_registered', {
     mode: achSyncConfig.intervalOverride ? 'dev-interval' : 'cron',
     schedule: achSyncConfig.intervalOverride || achSyncConfig.cron,
+  })
+
+  // ── Failed-card auto-retry job ───────────────────────────────────
+  // Independent of the twice-monthly payment-retry ticks: when a card charge
+  // fails, this re-attempts on a 2/4/7-day ladder (max 3) so recovery doesn't
+  // wait for the next regular cycle. Registered here (before the retry
+  // dev-override early-return below) so it runs in dev too.
+  // PAYMENT_RETRY_FAILED_INTERVAL gives a fast testing cadence; otherwise the
+  // cron from config (production default: hourly).
+  if (paymentRetryConfig.intervalOverride) {
+    await agenda.cancel({ name: JOB_NAMES.PROCESS_FAILED_CARD_RETRIES })
+    await agenda.every(
+      paymentRetryConfig.intervalOverride,
+      JOB_NAMES.PROCESS_FAILED_CARD_RETRIES,
+      { tick: 'dev' },
+    )
+    console.log(
+      `\n[scheduler] DEV MODE — process-failed-card-retries running every ${paymentRetryConfig.intervalOverride}\n`,
+    )
+  } else {
+    await agenda.every(
+      paymentRetryConfig.cron,
+      JOB_NAMES.PROCESS_FAILED_CARD_RETRIES,
+      { tick: 'scheduled' },
+      { timezone: paymentRetryConfig.timezone },
+    )
+  }
+  log.info('scheduler.failed_card_retry_registered', {
+    mode: paymentRetryConfig.intervalOverride ? 'dev-interval' : 'cron',
+    schedule: paymentRetryConfig.intervalOverride || paymentRetryConfig.cron,
   })
 
   // ── Drop-ship payment job (REMOVED — replaced by batch payment UI) ──

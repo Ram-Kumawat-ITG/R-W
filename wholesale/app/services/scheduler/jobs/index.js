@@ -5,12 +5,14 @@ import { registerProcessOrderJob, PROCESS_ORDER_JOB } from './processOrder.job'
 import { registerProcessPendingPaymentsJob, PROCESS_PENDING_PAYMENTS_JOB } from './processPendingPayments.job'
 import { registerProcessCheckRemindersJob, PROCESS_CHECK_REMINDERS_JOB } from './processCheckReminders.job'
 import { registerProcessAchStatusSyncJob, PROCESS_ACH_STATUS_SYNC_JOB } from './processAchStatusSync.job'
+import { registerProcessFailedCardRetriesJob, PROCESS_FAILED_CARD_RETRIES_JOB } from './processFailedCardRetries.job'
 
 export const JOB_NAMES = {
   PROCESS_ORDER: PROCESS_ORDER_JOB,
   PROCESS_PENDING_PAYMENTS: PROCESS_PENDING_PAYMENTS_JOB,
   PROCESS_CHECK_REMINDERS: PROCESS_CHECK_REMINDERS_JOB,
   PROCESS_ACH_STATUS_SYNC: PROCESS_ACH_STATUS_SYNC_JOB,
+  PROCESS_FAILED_CARD_RETRIES: PROCESS_FAILED_CARD_RETRIES_JOB,
 }
 
 export function registerJobs(agenda) {
@@ -18,4 +20,5 @@ export function registerJobs(agenda) {
   registerProcessPendingPaymentsJob(agenda)
   registerProcessCheckRemindersJob(agenda)
   registerProcessAchStatusSyncJob(agenda)
+  registerProcessFailedCardRetriesJob(agenda)
 }

@@ -2879,6 +2879,74 @@ admin click → POST /api/admin/orders/:id/charge-card
 outcome distinguishes cheque receipts from NMI-driven attempts in the
 audit history.
 
+### 11.5 Failed-card auto-retry ladder (dedicated CRON)
+
+A **separate, frequent** CRON that recovers a failed CARD payment on a fixed
+2 / 4 / 7-day ladder (max 3 retries) so the customer isn't left waiting for the
+next twice-monthly PASS 1 tick. Card-only — ACH has its own settlement flow
+(§9.5.1); cheque/dropship never in scope.
+
+**Files:** `services/payment/paymentRetry.config.js` (offsets + cron/interval +
+the pure `buildInitialCardRetry` schedule builder), `services/payment/
+paymentRetry.service.js` (`processFailedCardRetries` sweep), `services/
+scheduler/jobs/processFailedCardRetries.job.js` (`process-failed-card-retries`,
+thin Agenda wrapper, `concurrency:1`, 15-min lock; scheduled in `ensureRecurring`
+above the retry dev-override early-return so it runs in dev too).
+
+**Trigger (schedule stored immediately on first failure).** Inside
+`chargeInvoice`, the first time a card charge doesn't succeed — a declined /
+gateway error, OR a skip because the customer's NMI vault is missing/invalid
+(the vault may be re-linked within the retry window, so it's still worth
+retrying) — `maybeInitCardRetry` sets `Invoice.cardRetry` from
+`buildInitialCardRetry(firstFailedAt)`, in the same `.save()` that records the
+attempt, so all three retry dates persist atomically. (The "already
+paid/cancelled/refunded", "awaiting ACH settlement", and "max attempts reached"
+skips do NOT start a ladder — nothing to retry.) Guarded: card-only, once-only
+(`firstFailedAt` set → no-op), never paid/cancelled.
+
+**`Invoice.cardRetry` = the complete audit record:** `active` (while true PASS 1
+excludes the invoice — `cardRetry.active: { $ne: true }` — so the two paths can't
+double-charge), `firstFailedAt`/`firstFailureReason`, `schedule[]` (per retry:
+`attemptNumber`, `scheduledAt`, `status` pending/succeeded/failed/skipped,
+`executedAt`, `outcome`, `gatewayResponseText`, `failureReason`,
+`invoiceStatusAfter`, `transactionId`), `retryCount`/`maxRetries` (= offset-list
+length), `nextRetryAt` (indexed with `active`), `processingAt` (claim lock),
+`finalStatus`/`completedAt`.
+
+**Sweep.** Query: `cardRetry.active: true` AND (`nextRetryAt <= now` OR the
+invoice is already paid/cancelled), excluding dropship + blocked practitioners.
+Per invoice: (1) **atomic claim** via `findOneAndUpdate` setting `processingAt`
+only if null/absent or older than the 15-min lock (stale-reclaim) → dedup +
+crash-resume; (2) **reconcile** — if already paid/cancelled (admin/checkout/a
+crashed-but-successful charge) close the ladder without charging; (3) **charge**
+the earliest due entry via `chargeInvoice` (loads `CustomerMap` by
+`customerMapRef`; bumps `maxAttempts` for headroom so chargeInvoice's own
+6-attempt→`failed` guard doesn't fire mid-ladder — the LADDER owns the terminal
+state); one retry per tick; (4) **record** outcome/gateway-response/timestamp on
+the entry, bump `retryCount`, advance `nextRetryAt`, append a `cron_failed_retry`
+remark; (5) **finalise** — on approval (or already-paid skip) → `finalStatus:
+'paid'`; after the last retry still unpaid → `paymentStatus: 'failed'` +
+`finalStatus: 'failed'`. A retry that can't charge (e.g. no vault) is recorded
+`skipped` and still consumes the attempt, so the ladder always terminates.
+
+**Crash-resume double-charge guard:** if a charge succeeded but the process died
+before recording, the invoice is already `paid`; the reconcile step (or
+`chargeInvoice`'s own "already paid" skip) closes the ladder instead of
+re-charging.
+
+**Config** (all optional): `PAYMENT_RETRY_FAILED_CRON` (prod cadence, default
+hourly `0 * * * *`), `PAYMENT_RETRY_FAILED_INTERVAL` (dev override),
+`PAYMENT_RETRY_FAILED_DAYS` (default `2,4,7`), `PAYMENT_RETRY_FAILED_MINUTES` +
+`PAYMENT_RETRY_FAILED_USE_MINUTES` (testing ladder in minutes). The retry count
+follows the offset-list length — no separate max-retries knob to drift.
+
+**Admin visibility.** The Order Details page ("Invoice & payment" section,
+`app.orders.$id.jsx`) renders a banner from `invoice.cardRetry` whenever a
+ladder exists: next scheduled retry date (while active), attempts used / max /
+remaining, the current payment status, the first-failure time+reason, and the
+full per-attempt schedule (scheduled date · status · execution time+outcome).
+Tone = info (pending) / success (finalised paid) / warning (finalised failed).
+
 ---
 
 ## 12. Status synchronization across QBO, Shopify, and local DB

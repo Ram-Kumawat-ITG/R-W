@@ -86,6 +86,11 @@ export function registerProcessPendingPaymentsJob(agenda) {
         paymentMethod: { $in: ['card', 'ach'] },
         isDropship: { $ne: true },
         autoChargePaused: { $ne: true },
+        // While a failed-card retry ladder owns this invoice (process-failed-
+        // card-retries), skip it here so the two paths can't double-charge.
+        // Once the ladder finalises it's terminal (paid/failed) and wouldn't
+        // match `paymentStatus: 'pending'` anyway.
+        'cardRetry.active': { $ne: true },
         $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
         ...(blockedEmails.length ? { customerEmail: { $nin: blockedEmails } } : {}),
       }).cursor()

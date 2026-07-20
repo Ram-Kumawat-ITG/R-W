@@ -24,6 +24,25 @@ import { computeProcessingFee, applyDerivedPaymentStatus } from '../invoice/invo
 import { createLogger } from '../../utils/logger.utils'
 import { notifyNmiVaultInvalid, notifyNmiDuplicateTransaction } from '../notifications/nmiAlertNotification.service'
 import { resolveCustomerCardBillingId, resolveCustomerAchBillingId } from '../customer/customer.service'
+import { buildInitialCardRetry } from './paymentRetry.config'
+
+// On the FIRST failed CARD charge, initialise the retry ladder on the invoice
+// (schedule 2/4/7-days-later retries) so the dedicated process-failed-card-
+// retries CRON picks it up without waiting for the twice-monthly cycle. Pure
+// in-memory mutation — chargeInvoice persists it in its own failure save.
+// Best-effort (guarded). Card-only; once-only (guarded on firstFailedAt); never
+// for a settled invoice.
+function maybeInitCardRetry(invoice, { anchor, reason, responseText }) {
+  try {
+    if (invoice.paymentMethod !== 'card') return
+    if (invoice.cardRetry && invoice.cardRetry.firstFailedAt) return
+    if (invoice.paymentStatus === 'paid' || invoice.paymentStatus === 'cancelled') return
+    invoice.cardRetry = buildInitialCardRetry(anchor || new Date(), { reason, responseText })
+    invoice.markModified('cardRetry')
+  } catch (err) {
+    log.warn('card_retry.init_failed', { invoiceId: invoice._id?.toString(), err: err?.message || err })
+  }
+}
 
 const log = createLogger('payment.service')
 
@@ -165,6 +184,11 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
     invoice.lastAttemptError = missingReason
     if (invoice.attemptCount >= invoice.maxAttempts) invoice.paymentStatus = 'failed'
     else applyDerivedPaymentStatus(invoice)
+    // A card charge blocked by a missing/invalid vault is still a failed card
+    // payment — start the retry ladder so it re-attempts on the 2/4/7-day
+    // schedule (the vault may be fixed within that window). Card-only + once-
+    // only (guarded inside).
+    maybeInitCardRetry(invoice, { anchor: invoice.lastAttemptAt, reason: missingReason, responseText: missingReason })
     await invoice.save()
     return { skipped: true, reason: missingReason }
   }
@@ -197,6 +221,10 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
     invoice.lastAttemptError = reason
     if (invoice.attemptCount >= invoice.maxAttempts) invoice.paymentStatus = 'failed'
     else applyDerivedPaymentStatus(invoice)
+    // Vault-invalid is still a failed card payment — start the retry ladder
+    // (the vault may be re-linked within the retry window). Card-only + once-
+    // only (guarded inside maybeInitCardRetry).
+    maybeInitCardRetry(invoice, { anchor: invoice.lastAttemptAt, reason, responseText: reason })
     await invoice.save()
     log.warn('charge.skipped.vault_invalid', {
       invoiceId: invoice._id.toString(),
@@ -318,6 +346,7 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
     invoice.lastAttemptError = err.message
     if (invoice.attemptCount >= invoice.maxAttempts) invoice.paymentStatus = 'failed'
     else applyDerivedPaymentStatus(invoice)
+    maybeInitCardRetry(invoice, { anchor: invoice.lastAttemptAt, reason: err.message, responseText: err.message })
     await invoice.save()
     return { skipped: false, outcome: 'error', error: err.message }
   }
@@ -406,6 +435,11 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
   } else {
     if (invoice.attemptCount >= invoice.maxAttempts) invoice.paymentStatus = 'failed'
     else applyDerivedPaymentStatus(invoice)
+    maybeInitCardRetry(invoice, {
+      anchor: invoice.lastAttemptAt,
+      reason: result.responseText,
+      responseText: result.responseText,
+    })
   }
   await invoice.save()
 

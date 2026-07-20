@@ -257,6 +257,60 @@ const invoiceSchema = new mongoose.Schema(
 
     attemptCount: { type: Number, default: 0 },
     maxAttempts: { type: Number, default: 6 },
+
+    // ── Failed-card auto-retry ladder (services/payment/paymentRetry) ──
+    // Populated the FIRST time a CARD charge attempt fails (declined / gateway
+    // error), in chargeInvoice. Schedules up to 3 retries at fixed offsets
+    // (default 2 / 4 / 7 days) from that first failure and drives a dedicated
+    // CRON (process-failed-card-retries) that re-charges without waiting for the
+    // twice-monthly PASS 1 cycle. This ONE sub-doc is the complete audit record:
+    // initial failure time+reason, the scheduled dates, per-attempt execution
+    // time + outcome + gateway response, the running retry count, and the final
+    // invoice status. `active` gates ownership — while true PASS 1 skips the
+    // invoice so the two paths can't double-charge; `processingAt` is the
+    // per-invoice claim lock (dedup + crash-resume). Never set for ACH / cheque
+    // / dropship.
+    cardRetry: {
+      type: new mongoose.Schema(
+        {
+          active: { type: Boolean, default: false },
+          firstFailedAt: Date,
+          firstFailureReason: String,
+          retryCount: { type: Number, default: 0 },
+          maxRetries: { type: Number, default: 3 },
+          nextRetryAt: Date,
+          processingAt: Date,
+          finalStatus: String,
+          completedAt: Date,
+          schedule: {
+            type: [
+              new mongoose.Schema(
+                {
+                  attemptNumber: { type: Number, required: true },
+                  scheduledAt: { type: Date, required: true },
+                  status: {
+                    type: String,
+                    enum: ['pending', 'succeeded', 'failed', 'skipped'],
+                    default: 'pending',
+                  },
+                  executedAt: Date,
+                  outcome: String,
+                  gatewayResponseCode: String,
+                  gatewayResponseText: String,
+                  failureReason: String,
+                  invoiceStatusAfter: String,
+                  transactionId: String,
+                },
+                { _id: false },
+              ),
+            ],
+            default: [],
+          },
+        },
+        { _id: false },
+      ),
+      default: null,
+    },
     lastAttemptAt: Date,
     lastAttemptError: String,
 
@@ -363,6 +417,10 @@ const invoiceSchema = new mongoose.Schema(
                 // actual QBO invoice reminder EMAIL was triggered.
                 'cron_payment_reminder',
                 'cron_failed_followup',
+                // Failed-card auto-retry ladder (services/payment/paymentRetry)
+                // — one entry per scheduled retry attempt (2/4/7 days after the
+                // first failed card charge).
+                'cron_failed_retry',
                 'cron_payment_failed_email',
                 'admin_action',
                 'system_note',
@@ -641,6 +699,8 @@ const invoiceSchema = new mongoose.Schema(
 )
 
 invoiceSchema.index({ paymentStatus: 1, attemptCount: 1 })
+// Failed-card retry sweep: find active ladders with a due next-retry cheaply.
+invoiceSchema.index({ 'cardRetry.active': 1, 'cardRetry.nextRetryAt': 1 })
 // Hard guarantee at the DB level: at most one invoice per Shopify order
 // per shop. If application-level checks ever race, the second insert
 // throws E11000 instead of silently producing a duplicate QBO record.

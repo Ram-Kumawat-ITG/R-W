@@ -13,6 +13,7 @@ import { nmiConfig } from "./services/nmi/nmi.config";
 import { paymentConfig } from "./services/payment/payment.config";
 import { invoiceConfig } from "./services/invoice/invoice.config";
 import { schedulerConfig } from "./services/scheduler/scheduler.config";
+import { paymentRetryConfig, activeRetryOffsets } from "./services/payment/paymentRetry.config";
 import { shopifyConfig } from "./services/shopify/shopify.config";
 import { createLogger } from "./utils/logger.utils";
 
@@ -65,6 +66,12 @@ function printBootBanner() {
   console.log(`  PAYMENT_RETRY_CRON_PRIMARY: ${schedulerConfig.retryCronPrimary}`);
   console.log(`  PAYMENT_RETRY_CRON_SECONDARY: ${schedulerConfig.retryCronSecondary}`);
   console.log(`  PAYMENT_SCHEDULE_TZ       : ${schedulerConfig.scheduleTimezone}`);
+  console.log("  --- Failed-card auto-retry ---");
+  console.log(
+    `  FAILED-CARD RETRY OFFSETS : ${activeRetryOffsets().join("/")} ${paymentRetryConfig.useMinutes ? "min" : "day"} (max ${activeRetryOffsets().length} retries)`,
+  );
+  console.log(`  PAYMENT_RETRY_FAILED_INTERVAL: ${paymentRetryConfig.intervalOverride || "(unset — using cron)"}`);
+  console.log(`  PAYMENT_RETRY_FAILED_CRON : ${paymentRetryConfig.cron}`);
   console.log("  --- Logging ---");
   console.log(`  LOG_PRETTY                : ${process.env.LOG_PRETTY === "true"}`);
   console.log(`  LOG_LEVEL                 : ${process.env.LOG_LEVEL || "info"}`);

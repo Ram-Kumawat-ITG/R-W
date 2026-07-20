@@ -1832,6 +1832,82 @@ export default function OrderDetail() {
               )}
             </s-stack>
 
+            {/* Automatic payment-retry schedule (services/payment/paymentRetry)
+                — populated once a card charge fails; shows when the next retry
+                fires, how many attempts are used / remain, and the current
+                payment status. */}
+            {invoice.cardRetry && (
+              <s-banner
+                tone={
+                  invoice.cardRetry.active
+                    ? "info"
+                    : invoice.cardRetry.finalStatus === "paid"
+                      ? "success"
+                      : "warning"
+                }
+                heading={
+                  invoice.cardRetry.active
+                    ? "Automatic payment retry scheduled"
+                    : invoice.cardRetry.finalStatus === "paid"
+                      ? "Automatic retries succeeded"
+                      : "Automatic retries completed"
+                }
+              >
+                <s-stack direction="block" gap="base">
+                  {invoice.cardRetry.active && invoice.cardRetry.nextRetryAt && (
+                    <s-text>
+                      <strong>Next scheduled retry:</strong>{" "}
+                      {new Date(invoice.cardRetry.nextRetryAt).toLocaleString()}
+                    </s-text>
+                  )}
+                  <s-text>
+                    <strong>Retry attempts:</strong>{" "}
+                    {invoice.cardRetry.retryCount ?? 0} of{" "}
+                    {invoice.cardRetry.maxRetries ?? 0} used ·{" "}
+                    {Math.max(
+                      0,
+                      (invoice.cardRetry.maxRetries ?? 0) -
+                        (invoice.cardRetry.retryCount ?? 0),
+                    )}{" "}
+                    remaining
+                  </s-text>
+                  <s-text>
+                    <strong>Current payment status:</strong>{" "}
+                    {invoice.paymentStatus}
+                  </s-text>
+                  {invoice.cardRetry.firstFailedAt && (
+                    <s-text tone="subdued">
+                      First failed{" "}
+                      {new Date(invoice.cardRetry.firstFailedAt).toLocaleString()}
+                      {invoice.cardRetry.firstFailureReason
+                        ? ` — ${invoice.cardRetry.firstFailureReason}`
+                        : ""}
+                    </s-text>
+                  )}
+
+                  {invoice.cardRetry.schedule?.length > 0 && (
+                    <s-stack direction="block" gap="base">
+                      <s-text tone="subdued">
+                        <strong>Retry schedule</strong>
+                      </s-text>
+                      {invoice.cardRetry.schedule.map((e) => (
+                        <s-text key={e.attemptNumber} tone="subdued">
+                          Retry {e.attemptNumber} —{" "}
+                          {new Date(e.scheduledAt).toLocaleString()} ·{" "}
+                          {e.status}
+                          {e.executedAt
+                            ? ` (ran ${new Date(e.executedAt).toLocaleString()}${
+                                e.outcome ? `, ${e.outcome}` : ""
+                              })`
+                            : ""}
+                        </s-text>
+                      ))}
+                    </s-stack>
+                  )}
+                </s-stack>
+              </s-banner>
+            )}
+
             {/* Paused-state context banner — surfaces who paused it,
                 when, and the optional pause note so admins reviewing
                 the order know why CRON is being skipped without
