@@ -2,7 +2,7 @@
 
 client_id = "79f6038c639d31f8da67ad5d6a036fb4"
 name = "NS-Retail"
-application_url = "https://r-w.onrender.com"
+application_url = "https://ns-retail.apps.itgeeksin.com"
 embedded = true
 
 
@@ -41,10 +41,10 @@ api_version = "2026-07"
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 scopes = "customer_read_customers,customer_read_orders,customer_write_orders,read_assigned_fulfillment_orders,read_cart_transforms,read_customers,read_discounts,read_files,read_fulfillments,read_gift_cards,read_inventory,read_locations,read_markets,read_product_listings,read_products,read_publications,read_shipping,read_third_party_fulfillment_orders,unauthenticated_read_checkouts,unauthenticated_read_customers,unauthenticated_read_product_inventory,unauthenticated_read_product_listings,write_cart_transforms,write_checkouts,write_customers,write_discounts,write_draft_orders,write_files,write_gift_cards,write_merchant_managed_fulfillment_orders,write_order_edits,write_orders,write_products,write_publications,write_shipping,write_third_party_fulfillment_orders"
 [auth]
-redirect_urls = [ "https://r-w.onrender.com/api/auth" ]
+redirect_urls = [ "https://ns-retail.apps.itgeeksin.com/api/auth" ]
 
 [app_proxy]
-url = "https://r-w.onrender.com"
+url = "https://ns-retail.apps.itgeeksin.com"
 subpath = "retail-signup"
 prefix = "apps"
 
