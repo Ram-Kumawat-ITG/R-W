@@ -16,6 +16,22 @@ if (!MONGODB_URI) {
   );
 }
 
+// Resolve the database name the SAME way the Shopify session store does
+// (shopify.server.js): explicit DATABASE_NAME → the URI path → a final
+// default. This keeps Mongoose app data and Shopify sessions in the same DB.
+// Without it, a MONGODB_URI with no database in its path falls back to the
+// driver default `test`, scattering app data into a `test` database.
+function resolveDbName() {
+  try {
+    const fromPath = new URL(MONGODB_URI).pathname.substring(1);
+    return process.env.DATABASE_NAME || fromPath || "natural-solutions";
+  } catch {
+    return process.env.DATABASE_NAME || "natural-solutions";
+  }
+}
+
+const DB_NAME = resolveDbName();
+
 let cached = global.mongooseConn;
 
 if (!cached) {
@@ -27,7 +43,7 @@ export default async function connectDB() {
 
   if (!cached.promise) {
     cached.promise = mongoose
-      .connect(MONGODB_URI, { bufferCommands: false })
+      .connect(MONGODB_URI, { bufferCommands: false, dbName: DB_NAME })
       .then((m) => {
         console.log("[ns-retail] MongoDB connected (wholesale shared DB)");
         return m;
