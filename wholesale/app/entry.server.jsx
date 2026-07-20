@@ -86,7 +86,6 @@ printBootBanner();
 (async () => {
   try {
     await connectDB();
-    console.log("[boot] MongoDB connected");
     await verifyCriticalIndexes();
     // Idempotent: only writes rows missing the snapshot field. After
     // the first boot it's a no-op until a new row needs backfill.

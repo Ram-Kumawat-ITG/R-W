@@ -15,6 +15,29 @@ const log = createLogger("scheduler.service");
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
+// Agenda opens its OWN Mongo connection from a connection string and has no
+// dbName option — the database must live in the address URI. Resolve it the
+// SAME way the session store + Mongoose do (DATABASE_NAME → URI path →
+// default) and bake it into the address, so `cdo_agenda_jobs` can't land in
+// the driver-default `test` database when MONGODB_URI has no path.
+function resolveAgendaAddress() {
+  try {
+    const url = new URL(MONGODB_URI);
+    const fromPath = url.pathname.substring(1);
+    // Adding a db to the URI path changes MongoDB's default authSource (which
+    // derives from the path). A URI with no path authenticates against `admin`
+    // — pin that explicitly BEFORE we add the path, or auth breaks for a user
+    // created in `admin` (e.g. `root`).
+    if (!url.searchParams.get("authSource")) {
+      url.searchParams.set("authSource", fromPath || "admin");
+    }
+    url.pathname = "/" + (process.env.DATABASE_NAME || fromPath || "natural-solutions");
+    return url.toString();
+  } catch {
+    return MONGODB_URI;
+  }
+}
+
 let agendaInstance = null;
 let startPromise = null;
 
@@ -27,7 +50,7 @@ function buildAgenda() {
     // Dedicated collection — ns-retail shares the wholesale workspace's
     // MongoDB (see db/mongo.server.js), whose scheduler owns `agenda_jobs`.
     // Use our own collection so the two apps' job queues never collide.
-    db: { address: MONGODB_URI, collection: "cdo_agenda_jobs" },
+    db: { address: resolveAgendaAddress(), collection: "cdo_agenda_jobs" },
     processEvery,
     maxConcurrency: 5,
     defaultConcurrency: 2,
