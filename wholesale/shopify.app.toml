@@ -2,7 +2,7 @@
  
 client_id = "5aa8370722bac54a4329fdab09f5575d"
 name = "Natural Solutions App"
-application_url = "https://ns-wholesale.apps.itgeeksin.com"
+application_url = "https://natural-solutions-wholesale.onrender.com"
 embedded = true
  
 [webhooks]
@@ -50,10 +50,10 @@ scopes = "customer_read_customers,customer_read_orders,customer_write_orders,rea
 
 
 [auth]
-redirect_urls = [ "https://ns-wholesale.apps.itgeeksin.com/api/auth" ]
+redirect_urls = [ "https://natural-solutions-wholesale.onrender.com/api/auth" ]
  
 [app_proxy]
-url = "https://ns-wholesale.apps.itgeeksin.com"
+url = "https://natural-solutions-wholesale.onrender.com"
 subpath = "wholesale-application"
 prefix = "apps"
 
