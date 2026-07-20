@@ -119,7 +119,7 @@ async function forwardToWholesaleDropship({ payload, retailShop }) {
   const apiBase =
     "https://natural-solutions-wholesale.onrender.com" ||
     process.env.WHOLESALE_API_BASE;
-  // eslint-disable-next-line no-undef
+  // eslint-disable-next-line no-undef 
   const wholesaleShop = process.env.WHOLESALE_SHOP;
   // eslint-disable-next-line no-undef
   const syncSecret = process.env.RETAIL_SYNC_SECRET;
