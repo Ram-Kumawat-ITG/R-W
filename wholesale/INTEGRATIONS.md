@@ -1302,15 +1302,20 @@ we omit `DueDate` from the request and QBO falls back to its own
 SalesTerm logic — last-resort safety so a missing date can't break
 invoice creation.
 
-`ShipAddr` is derived from the Shopify order using the same
-shipping → billing → customer-default fallback chain that the
-customer sync uses (`customer.utils.buildProfileFromShopifyOrder`),
-so the invoice still ships somewhere on pickup / digital orders that
-arrive without a `shipping_address`. The normalized address is
-projected to QBO's `PhysicalAddress` shape by `qbo.utils.toQboAddress`,
-which `BillAddr` on the customer payload also uses. If no address is
-on file at all, `ShipAddr` is omitted from the payload (QBO rejects
-empty address objects).
+**`BillAddr` AND `ShipAddr` are both set on the invoice from the Shopify
+order** — `createInvoiceForOrder` destructures both `billingAddress` +
+`shippingAddress` from `customer.utils.buildProfileFromShopifyOrder(order)`
+and passes them into `createInvoice`, which projects each via
+`qbo.utils.toQboAddress` onto the `/invoice` payload. Both use the same
+order-derived fallback chain the customer sync uses (billing →
+shipping → customer-default for bill-to; shipping → billing →
+customer-default for ship-to), so an invoice still has addresses on
+pickup / digital orders that arrive without one side. Setting `BillAddr`
+on the invoice (not just on the QBO customer record) means the invoice
+shows THIS order's billing address rather than silently falling back to
+the customer's stored default, which can be stale. Either side is omitted
+when the order has no usable address there (QBO rejects empty address
+objects).
 
 `ShipDate` is **omitted at invoice creation** — `orders/create` fires
 pre-fulfillment and there is no real ship timestamp yet. QBO leaves the

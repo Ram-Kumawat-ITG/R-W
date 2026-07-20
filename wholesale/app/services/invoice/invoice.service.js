@@ -165,8 +165,17 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
   // the invoice still ships somewhere on pickup/digital orders with no
   // shipping_address. ShipDate is left blank at creation; pushShippingToInvoice
   // populates it after the order is fulfilled.
-  const shipAddr = buildProfileFromShopifyOrder(order).shippingAddress
-  console.log(`[invoice] shipAddr = ${shipAddr ? 'present' : '(none)'}`)
+  // Bill-to AND ship-to are BOTH taken from the Shopify order (via the same
+  // shipping→billing→customer-default fallback as the customer sync) and set
+  // ON THE INVOICE, so every invoice shows the order's addresses rather than
+  // relying on the QBO customer record's stored default (which can be stale /
+  // not match this order). ShipDate is left blank at creation;
+  // pushShippingToInvoice populates it after the order is fulfilled.
+  const { billingAddress: billAddr, shippingAddress: shipAddr } =
+    buildProfileFromShopifyOrder(order)
+  console.log(
+    `[invoice] billAddr = ${billAddr ? 'present' : '(none)'} shipAddr = ${shipAddr ? 'present' : '(none)'}`,
+  )
 
   const memo = `Shopify order ${order.name || order.id}`
 
@@ -181,6 +190,7 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
         ? `RS-${retailOrderName}`.slice(0, 21)
         : (order.name?.replace(/^#/, '') || shopifyOrderId),
       dueDate,
+      billAddr,
       shipAddr,
       // Tax renders in QBO's summary "Tax" row (TxnTaxDetail.TotalTax),
       // not as a product line — see shopifyLinesToQboLines.

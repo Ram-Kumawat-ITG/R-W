@@ -540,6 +540,7 @@ export async function createInvoice({
   memo,
   dueDate,
   docNumber,
+  billAddr,
   shipAddr,
   shipDate,
   taxAmount,
@@ -568,7 +569,12 @@ export async function createInvoice({
     if (itemId) l.qboItemId = itemId
   }
 
+  // BOTH addresses come from the Shopify order (see createInvoiceForOrder) and
+  // go on the invoice, so it never silently falls back to the QBO customer's
+  // stored default. Omitted (undefined) when the order has no usable address —
+  // QBO rejects an empty address object.
   const shipAddrPayload = toQboAddress(shipAddr)
+  const billAddrPayload = toQboAddress(billAddr)
   // Tax is SOURCED FROM SHOPIFY (order.total_tax) and passed through to QBO's
   // native summary "Tax" row via TxnTaxDetail.TotalTax — NOT as a product line
   // (see invoice.utils.shopifyLinesToQboLines). QBO adds it to the line subtotal
@@ -600,6 +606,7 @@ export async function createInvoice({
     CustomerMemo: memo ? { value: memo } : undefined,
     DueDate: dueDate || undefined,
     DocNumber: docNumber || undefined,
+    BillAddr: billAddrPayload,
     ShipAddr: shipAddrPayload,
     ShipDate: shipDate || undefined,
     TxnTaxDetail: txnTaxDetail,

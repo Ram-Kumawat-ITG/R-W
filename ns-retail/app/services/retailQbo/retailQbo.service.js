@@ -778,9 +778,22 @@ export async function createInvoiceForOrder({ order, customerId, itemId, request
 
   const email = order.customerEmail || order.customer?.email || null;
   const invoiceDocNumber = order.orderName || String(order.shopifyOrderId || "").split("/").pop() || "";
+
+  // Bill-to + ship-to come straight from the Shopify order (mirrored onto the
+  // cdo_orders snapshot as billingAddress / shippingAddress) and are set ON THE
+  // INVOICE, so the invoice shows THIS order's addresses rather than falling
+  // back to the QBO customer record's stored default (which is only written on
+  // first-ever customer create and can be stale for a repeat buyer). Each is
+  // omitted when the order carries no usable address (mapQboAddr → undefined;
+  // QBO rejects an empty address object).
+  const billAddr = mapQboAddr(order.billingAddress);
+  const shipAddr = mapQboAddr(order.shippingAddress);
+
   const payload = {
     CustomerRef: { value: String(customerId) },
     Line: lines,
+    ...(billAddr ? { BillAddr: billAddr } : {}),
+    ...(shipAddr ? { ShipAddr: shipAddr } : {}),
     ...(tax > 0
       ? {
           TxnTaxDetail: {
