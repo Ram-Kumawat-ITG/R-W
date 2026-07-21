@@ -593,10 +593,44 @@ export async function getReferredCustomers(
       },
     },
     {
-      // cdo_applications is not mirrored in wholesale (out of scope for the
-      // portal migration — it isn't read anywhere else here), so the current
-      // referral code falls back to the newest cdo_referrals record below.
-      $addFields: { currentCode: null },
+      // The AUTHORITATIVE current/active code lives on cdo_applications.referral
+      // (this is what the practitioner reassigns via "Assign discount code", and
+      // what order attribution + the discount Function honor). It is NOT written
+      // back to cdo_referrals, so we must read it here or the tab shows the stale
+      // first-touch code. cdo_applications isn't mirrored as a model in wholesale,
+      // but a $lookup addresses the collection by name (same as the cdo_orders
+      // lookup above) — no model needed. Matched by email (case-insensitive).
+      $lookup: {
+        from: "cdo_applications",
+        let: { email: "$referredEmail" },
+        pipeline: [
+          {
+            $match: {
+              $expr: {
+                $eq: [
+                  { $toLower: { $ifNull: ["$email", ""] } },
+                  { $toLower: { $ifNull: ["$$email", ""] } },
+                ],
+              },
+            },
+          },
+          {
+            $project: {
+              _id: 0,
+              code: "$referral.code",
+              history: { $ifNull: ["$referralHistory", []] },
+            },
+          },
+          { $limit: 1 },
+        ],
+        as: "appAgg",
+      },
+    },
+    {
+      $addFields: {
+        currentCode: { $ifNull: [{ $arrayElemAt: ["$appAgg.code", 0] }, null] },
+        appHistory: { $ifNull: [{ $arrayElemAt: ["$appAgg.history", 0] }, []] },
+      },
     },
     {
       $facet: {
@@ -613,6 +647,7 @@ export async function getReferredCustomers(
               lifetimeValue: 1,
               codes: 1,
               currentCode: 1,
+              appHistory: 1,
             },
           },
         ],
@@ -626,18 +661,23 @@ export async function getReferredCustomers(
     rows: (result?.rows || []).map((r) => {
       const seen = new Set();
       const codes = [];
-      for (const c of r.codes || []) {
-        if (!c?.code) continue;
-        const key = normalizeReferralCode(c.code) || String(c.code).toLowerCase();
-        if (seen.has(key)) continue;
+      const pushCode = (code, status, usedAt) => {
+        if (!code) return;
+        const key = normalizeReferralCode(code) || String(code).toLowerCase();
+        if (seen.has(key)) return;
         seen.add(key);
-        codes.push({
-          code: c.code,
-          status: c.status || null,
-          usedAt: c.usedAt || null,
-        });
-      }
-      const currentCode = r.currentCode || codes[0]?.code || null;
+        codes.push({ code, status: status || null, usedAt: usedAt || null });
+      };
+      // The assigned/active code (cdo_applications.referral.code) is the source
+      // of truth; fall back to the newest cdo_referrals row when a patient was
+      // attributed at checkout without an application. It ALWAYS goes first so
+      // the "Latest" row + the Code column reflect what the practitioner
+      // assigned — even when that code has no conversion row in cdo_referrals.
+      const currentCode = r.currentCode || (r.codes || [])[0]?.code || null;
+      pushCode(currentCode, "active", null);
+      // Then codes seen on actual conversions, then prior codes from history.
+      for (const c of r.codes || []) pushCode(c.code, c.status, c.usedAt);
+      for (const h of r.appHistory || []) pushCode(h.code, "replaced", h.replacedAt);
       return {
         id: String(r.refId),
         name: r.referredName || null,
