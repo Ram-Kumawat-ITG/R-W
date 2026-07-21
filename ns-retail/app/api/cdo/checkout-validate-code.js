@@ -21,6 +21,7 @@ import CdoPractitionerCode from "../../models/cdoPractitionerCode.server";
 import {
   resolvePractitionerReferral,
   checkPatientBinding,
+  resolvePatientPractitioner,
 } from "../../services/cdo/cdo.service";
 
 const CORS_HEADERS = {
@@ -153,6 +154,32 @@ export async function action({ request }) {
             message: "You are already associated with another practitioner",
           },
         });
+      }
+
+      // Same practitioner, but the patient is ALREADY attributed: they're
+      // locked to the code their practitioner assigned them. A different code
+      // (even one of the same practitioner's) is invalid here — only the
+      // practitioner can change it via the portal. Mirrors the Shopify
+      // Function's assigned-code enforcement so the widget message agrees with
+      // what actually applies at checkout. First-touch (unattributed) is
+      // unaffected — verdict.firstTime skips this.
+      if (!verdict.firstTime) {
+        const binding = await resolvePatientPractitioner({ email, customerId });
+        const assigned = binding?.code
+          ? String(binding.code).toLowerCase().trim()
+          : null;
+        if (assigned && assigned !== String(doc.code).toLowerCase().trim()) {
+          return json(200, {
+            status: "success",
+            message: "This isn't your assigned discount code",
+            result: {
+              valid: false,
+              reason: "locked_code",
+              message:
+                "You're already set up with a discount code. To use a different one, ask your practitioner to update your assigned code.",
+            },
+          });
+        }
       }
     }
 

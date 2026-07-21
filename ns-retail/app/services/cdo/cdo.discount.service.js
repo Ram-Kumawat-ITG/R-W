@@ -195,7 +195,17 @@ export async function createShopifyDiscount({
         namespace: CONFIG_METAFIELD_NAMESPACE,
         key: CONFIG_METAFIELD_KEY,
         type: "json",
-        value: JSON.stringify({ percentage: discountPercent, practitionerId: String(practitionerId) }),
+        // `code` (lowercase) lets the practitioner-discount Function enforce
+        // "only the patient's ASSIGNED code applies": it compares this against
+        // the buyer's `cdo.active_code` metafield and declines a non-matching
+        // code even from the same practitioner. Older discounts created before
+        // this field existed omit `code` → the Function fails open (falls back
+        // to the practitioner-only check). Forward-only; backfill separately.
+        value: JSON.stringify({
+          percentage: discountPercent,
+          practitionerId: String(practitionerId),
+          code: String(code).toLowerCase().trim(),
+        }),
       },
     ],
   };

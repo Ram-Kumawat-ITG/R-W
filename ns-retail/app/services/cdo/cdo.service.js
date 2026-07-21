@@ -2214,6 +2214,111 @@ export async function updateApplicationReferral({
   return customer.toObject();
 }
 
+// Practitioner-initiated reassignment of a PATIENT's active discount code
+// (the Practitioner Portal "change code" action). Distinct from the admin
+// `updateApplicationReferral` in three ways that enforce the portal's rules:
+//   1. The target code MUST belong to the requesting practitioner AND be
+//      active (a practitioner can only assign their own live codes).
+//   2. The patient MUST already be attributed to THIS practitioner — you can
+//      neither steal another practitioner's patient nor attribute a brand-new
+//      one here (first-touch attribution stays order-driven).
+//   3. It creates a minimal cdo_applications record when the patient was
+//      attributed only via cdo_referrals (checkout-only), so the canonical
+//      active-code snapshot exists for future order attribution.
+// The Shopify side (customer `cdo.active_code` metafield + `code:` tag) is
+// applied by the caller (the internal endpoint), mirroring update-customer-
+// referral.js. `practitionerId` is trusted (resolved from the portal session).
+// Existing orders/commissions stay locked at their old rate — only NEW orders
+// use the reassigned code. Throws on validation failure.
+export async function assignPatientCode({
+  practitionerId,
+  referredEmail,
+  codeId,
+  code,
+  actor = "practitioner",
+  shop,
+} = {}) {
+  await connectDB();
+  const pid = String(practitionerId || "").trim();
+  if (!pid) throw new Error("practitionerId is required");
+  const email = String(referredEmail || "").toLowerCase().trim();
+  if (!email) throw new Error("referredEmail is required");
+
+  // 1. Resolve the target code — must be one of THIS practitioner's ACTIVE codes.
+  const codeQuery = { practitionerId: pid };
+  if (codeId && isValidObjectId(codeId)) codeQuery._id = codeId;
+  else if (code) codeQuery.code = String(code).toLowerCase().trim();
+  else throw new Error("codeId or code is required");
+  const codeDoc = await CdoPractitionerCode.findOne(codeQuery).lean();
+  if (!codeDoc) throw new Error("Discount code not found for this practitioner");
+  if (codeDoc.status !== "active") {
+    throw new Error(`Discount code "${codeDoc.code}" is not active`);
+  }
+
+  // 2. The patient must ALREADY be attributed to THIS practitioner. Never
+  //    attribute a new patient or reassign someone else's patient here.
+  const binding = await resolvePatientPractitioner({ email });
+  if (!binding) {
+    throw new Error("This patient is not attributed to you yet");
+  }
+  if (String(binding.practitionerId) !== pid) {
+    throw new Error("This patient is attributed to a different practitioner");
+  }
+
+  // 3. Build the fresh referral snapshot (same validation path as signup).
+  const newReferral = await buildReferralSnapshot(codeDoc.code, { when: new Date(), shop });
+  if (!newReferral) {
+    throw new Error(`Discount code "${codeDoc.code}" could not be validated`);
+  }
+
+  // 4. Update (or create) the canonical cdo_applications.referral snapshot.
+  let customer = await CdoApplication.findOne({ email });
+  let oldCode = null;
+  if (customer) {
+    oldCode = customer.referral?.code || null;
+    if (customer.referral && oldCode && oldCode !== newReferral.code) {
+      customer.referralHistory = customer.referralHistory || [];
+      customer.referralHistory.push({
+        code: customer.referral.code,
+        practitionerId: customer.referral.practitionerId,
+        practitionerName: customer.referral.practitionerName,
+        practitionerEmail: customer.referral.practitionerEmail,
+        discountPercent: customer.referral.discountPercent,
+        commissionRate: customer.referral.commissionRate,
+        replacedAt: new Date(),
+      });
+    }
+    customer.referral = newReferral;
+    customer.updatedBy = actor;
+    if (shop && !customer.shop) customer.shop = shop;
+    await customer.save();
+  } else {
+    // Attributed via cdo_referrals only — materialize the patient application
+    // so the assigned code is the authoritative snapshot for future orders.
+    customer = await CdoApplication.create({
+      applicantType: "patient",
+      email,
+      shop: shop || null,
+      referral: newReferral,
+      updatedBy: actor,
+    });
+  }
+
+  console.log(
+    `[cdo] practitioner ${pid} reassigned patient ${email}: ${oldCode || "(none)"} → ${newReferral.code}`,
+  );
+
+  return {
+    ok: true,
+    email,
+    oldCode,
+    code: newReferral.code,
+    practitionerId: pid,
+    practitionerEmail: newReferral.practitionerEmail || null,
+    customerGid: customer.customerId || null,
+  };
+}
+
 // ── Per-practitioner aggregations (Statistics + tab loaders) ─────────
 
 // Headline KPIs for the practitioner detail Details/Statistics card.
@@ -3813,30 +3918,25 @@ async function resolveOrderReferral({ shop, payload, rawCode, codeSource }) {
     app = await CdoApplication.findOne({ customerId: customerGid }).lean();
   }
 
-  // UPGRADE LOGIC: If order has an EXPLICIT code AND it differs from the customer's
-  // existing code, treat it as an upgrade and use the new code.
+  // ATTRIBUTED PATIENTS ARE LOCKED TO THEIR ASSIGNED CODE.
+  // Once a customer has an active referral (they've been attributed to a
+  // practitioner), a DIFFERENT code entered on the order is IGNORED — there is
+  // no self-service "upgrade", not even to another code of the SAME
+  // practitioner. Only the practitioner can change a patient's active code, via
+  // the Practitioner Portal (assignPatientCode → updateApplicationReferral).
+  // We fall through to the existing-mapping branch, preserving the current
+  // practitioner→patient relationship + assigned active code. (Was: a
+  // "code_upgrade" branch that let the patient self-switch same-practitioner
+  // codes — removed per the discount-code-management requirement.)
   if (rawCode && app && app.referral && app.referral.code) {
-    const normalizedNewCode = (String(rawCode) || "").toLowerCase().trim();
-    const normalizedExistingCode = (String(app.referral.code) || "").toLowerCase().trim();
-
-    if (normalizedNewCode !== normalizedExistingCode) {
-      // Customer is applying a DIFFERENT code — this is an explicit upgrade
-      console.log(
-        `[cdo.ingest] order ${payload?.id} for ${email}: customer upgrading code from "${app.referral.code}" to "${rawCode}"`,
+    const normalizedNewCode = String(rawCode || "").toLowerCase().trim();
+    const normalizedExistingCode = String(app.referral.code || "").toLowerCase().trim();
+    if (normalizedNewCode && normalizedNewCode !== normalizedExistingCode) {
+      console.warn(
+        `[cdo.ingest] order ${payload?.id} for ${email}: ignoring self-entered code "${rawCode}" — patient is attributed and locked to assigned code "${app.referral.code}"; only a practitioner can reassign via the portal.`,
       );
-
-      // Validate the new code
-      const newReferral = await resolvePractitionerReferral(rawCode, { shop });
-      if (newReferral) {
-        // Validate binding: new code must be from same or permitted practitioner
-        const binding = await resolvePatientPractitioner({ email, customerId: customerGid });
-        if (!binding || String(binding.practitionerId) === String(newReferral.practitionerId)) {
-          // Binding allows it — use the new code
-          return { referral: newReferral, attributionSource: codeSource || "code_upgrade" };
-        }
-      }
-      // If new code validation fails, fall through to existing mapping
     }
+    // fall through to the existing-mapping branch (below) unchanged.
   }
 
   // PRIMARY: Use existing cdo_applications mapping if it exists

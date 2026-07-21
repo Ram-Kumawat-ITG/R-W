@@ -94,5 +94,6 @@ export default [
   // that owns the Function) — see cdo.discount.service.js. Shared-secret auth
   // (x-sync-secret = RETAIL_SYNC_SECRET), same pattern as the sync route above.
   route("/api/cdo-internal/create-shopify-discount", "api/cdo-internal/create-shopify-discount.js"),
+  route("/api/cdo-internal/assign-patient-code", "api/cdo-internal/assign-patient-code.js"),
   route("/api/cdo-internal/set-discount-active", "api/cdo-internal/set-discount-active.js"),
 ];

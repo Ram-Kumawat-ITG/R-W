@@ -47,10 +47,10 @@ export function cartLinesDiscountsGenerateRun(input) {
     return NO_DISCOUNT;
   }
 
-  const boundPractitionerId =
-    input.cart.buyerIdentity?.customer?.practitionerBinding?.value
-      ? String(input.cart.buyerIdentity.customer.practitionerBinding.value)
-      : null;
+  const customer = input.cart.buyerIdentity?.customer;
+  const boundPractitionerId = customer?.practitionerBinding?.value
+    ? String(customer.practitionerBinding.value)
+    : null;
 
   // Buyer is permanently bound to a DIFFERENT practitioner than the one who
   // owns this code — decline. Shopify shows the code as not applicable; no
@@ -59,9 +59,27 @@ export function cartLinesDiscountsGenerateRun(input) {
     return NO_DISCOUNT;
   }
 
-  // Allowed: unbound (first-time) buyer, or bound to the SAME practitioner.
-  // The permanent binding write happens server-side after order placement
-  // (see webhooks.orders.create.jsx) — this Function only ever reads.
+  // ASSIGNED-CODE ENFORCEMENT: once a patient is attributed they carry an
+  // `active_code` metafield = the code the practitioner assigned them. A
+  // DIFFERENT code (even one of the SAME practitioner's) must NOT apply — the
+  // patient can't self-switch; only the practitioner reassigns via the portal.
+  // Fail-open when either side is absent:
+  //   • buyer has no active_code  → unattributed / first-touch → allow (this is
+  //     how the first code attributes them).
+  //   • this discount's config has no `code` → legacy discount created before
+  //     per-code enforcement → fall back to the practitioner-only check above.
+  const activeCode = customer?.activeCode?.value
+    ? String(customer.activeCode.value).toLowerCase().trim()
+    : null;
+  const discountCode = config?.code ? String(config.code).toLowerCase().trim() : null;
+  if (activeCode && discountCode && activeCode !== discountCode) {
+    return NO_DISCOUNT;
+  }
+
+  // Allowed: unbound (first-time) buyer, bound to the SAME practitioner with a
+  // matching (or legacy-unknown) code. The permanent binding + active_code
+  // writes happen server-side after order placement (see
+  // webhooks.orders.create.jsx) — this Function only ever reads.
   const percent = Math.round(percentage * 100);
   return {
     operations: [

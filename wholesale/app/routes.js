@@ -38,6 +38,7 @@ export default [
   route("/api/portal/summary", "api/portal/summary.js"),
   route("/api/portal/revenue", "api/portal/revenue.js"),
   route("/api/portal/customers", "api/portal/customers.js"),
+  route("/api/portal/patient-code", "api/portal/patient-code.js"),
   route("/api/portal/commissions", "api/portal/commissions.js"),
   route("/api/portal/payouts", "api/portal/payouts.js"),
   route("/api/portal/referrals", "api/portal/referrals.js"),

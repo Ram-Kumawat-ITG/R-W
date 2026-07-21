@@ -13,6 +13,9 @@ query CartInput {
         practitionerBinding: metafield(namespace: "cdo", key: "practitioner_id") {
           value
         }
+        activeCode: metafield(namespace: "cdo", key: "active_code") {
+          value
+        }
       }
     }
   }

@@ -6,7 +6,10 @@ import {
   extractCodeFromTags,
 } from "../utils/orderCode";
 import { syncCustomerCodeTag } from "../utils/customerTags";
-import { bindCustomerToPractitioner } from "../utils/practitionerMetafields";
+import {
+  bindCustomerToPractitioner,
+  setCustomerActiveCode,
+} from "../utils/practitionerMetafields";
 
 // In-memory dedup of webhook ids — Shopify delivers at-least-once and
 // can fire the same payload multiple times in a short window. 5 min TTL
@@ -252,6 +255,20 @@ async function processOrder({ shop, payload }) {
       } catch (err) {
         console.error(
           `[webhooks.orders.create] bind customer ${result.customerGid} to practitioner ${result.practitionerId} failed:`,
+          err?.message || err,
+        );
+      }
+
+      // Set the patient's ACTIVE code metafield the discount Function reads to
+      // enforce "only the assigned code applies". Unlike the practitioner
+      // binding this is mutable (the practitioner can reassign it later via the
+      // portal). Best-effort — never break ingestion; on first-touch this is
+      // simply the code that just attributed them.
+      try {
+        await setCustomerActiveCode(shop, result.customerGid, result.referralCode);
+      } catch (err) {
+        console.error(
+          `[webhooks.orders.create] set active_code for customer ${result.customerGid} failed:`,
           err?.message || err,
         );
       }

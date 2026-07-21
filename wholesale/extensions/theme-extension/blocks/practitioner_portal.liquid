@@ -7,10 +7,15 @@
 
 {{ 'practitioner-portal-bundle.css' | asset_url | stylesheet_tag }}
 
+{% comment %}
+  Config is baked in (no merchant-facing settings): the app-proxy subpath must
+  match shopify.app.toml [app_proxy].subpath, and the login/support values are
+  app-owned, not per-merchant knobs. Update them here if they ever change.
+{% endcomment %}
 <div id="portal-root"
-  data-proxy-base="{{ block.settings.proxy_base }}"
-  data-login-page-url="{{ block.settings.login_page_url }}"
-  data-support-email="{{ block.settings.support_email }}"></div>
+  data-proxy-base="wholesale-application"
+  data-login-page-url="/account/login"
+  data-support-email=""></div>
 
 <script src="{{ 'practitioner-portal-bundle.js' | asset_url }}" type="module"></script>
 
@@ -18,26 +23,6 @@
 {
   "name": "Practitioner Portal",
   "target": "section",
-  "settings": [
-    {
-      "type": "text",
-      "id": "proxy_base",
-      "label": "App proxy subpath",
-      "default": "wholesale-application",
-      "info": "Must match shopify.app.toml [app_proxy].subpath"
-    },
-    {
-      "type": "url",
-      "id": "login_page_url",
-      "label": "Login page URL",
-      "info": "Where unauthenticated visitors are sent to sign in"
-    },
-    {
-      "type": "text",
-      "id": "support_email",
-      "label": "Support email",
-      "info": "Shown on the access-denied screen"
-    }
-  ]
+  "settings": []
 }
 {% endschema %}

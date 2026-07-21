@@ -192,7 +192,8 @@ export function OverviewSection({ onAuthError }) {
   )
 }
 
-// Expandable panel shown beneath a patient row: their referral-code history.
+// Expandable panel shown beneath a patient row: their referral-code history +
+// the "change assigned code" control (the practitioner-driven reassignment).
 function CodeHistory({ row }) {
   const codes = row.codes || []
   if (codes.length === 0) return null
@@ -210,6 +211,52 @@ function CodeHistory({ row }) {
   )
 }
 
+// Per-patient "change active code" control. Lets the practitioner reassign
+// which of THEIR active codes this patient uses. The patient can't change it
+// themselves — once attributed they're locked to the assigned code at checkout.
+function PatientCodeControl({ row, activeCodes, busy, onAssign }) {
+  const [selected, setSelected] = useState('')
+  const current = (row.referralCode || '').toLowerCase()
+  if (!row.email) {
+    return <span className="portal-muted">No email on file — can’t reassign a code.</span>
+  }
+  if (!activeCodes.length) {
+    return (
+      <span className="portal-muted">
+        You have no active codes to assign — create or resume one on the Referrals tab.
+      </span>
+    )
+  }
+  return (
+    <div className="portal-stack portal-stack--tight">
+      <span className="portal-strong portal-muted">Assign discount code</span>
+      <div className="portal-inline portal-inline--tight">
+        <select
+          value={selected}
+          disabled={busy}
+          onChange={(e) => setSelected(e.target.value)}
+        >
+          <option value="">Select a code…</option>
+          {activeCodes.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.code} ({formatPercent(c.discountPercent)})
+              {c.code?.toLowerCase() === current ? ' — current' : ''}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          className="portal-btn portal-btn--primary"
+          disabled={busy || !selected}
+          onClick={() => onAssign(row, selected)}
+        >
+          {busy ? 'Assigning…' : 'Assign'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
 // ── Referred customers ───────────────────────────────────────────────────────
 export function PatientsSection({ onAuthError }) {
   const [search, setSearch] = useState('')
@@ -220,6 +267,37 @@ export function PatientsSection({ onAuthError }) {
     { search: debounced, page, pageSize: 10 },
     onAuthError,
   )
+  // The practitioner's own codes — the pool the reassignment dropdown draws
+  // from. pageSize 100 to fetch them all (a practitioner has a handful).
+  const codesRes = useResource('referrals', { page: 1, pageSize: 100 }, onAuthError)
+  const activeCodes = (codesRes.data?.rows || []).filter((c) => c.status === 'active')
+
+  const [busyEmail, setBusyEmail] = useState(null)
+  const [notice, setNotice] = useState('')
+  const [listError, setListError] = useState('')
+
+  const handleApiError = (err, fallback) => {
+    if (err instanceof ApiError && (err.httpStatus === 401 || err.httpStatus === 403)) {
+      onAuthError?.(err)
+      return
+    }
+    setListError(err?.message || fallback)
+  }
+
+  const handleAssign = async (row, codeId) => {
+    setNotice('')
+    setListError('')
+    setBusyEmail(row.email)
+    try {
+      const res = await apiPost('patient-code', { referredEmail: row.email, codeId })
+      setNotice(`${row.name || row.email} is now assigned code "${res?.code || ''}".`)
+      reload()
+    } catch (err) {
+      handleApiError(err, 'Could not update the patient’s discount code.')
+    } finally {
+      setBusyEmail(null)
+    }
+  }
 
   const rows = data?.rows || []
   const columns = [
@@ -232,7 +310,7 @@ export function PatientsSection({ onAuthError }) {
   ]
 
   return (
-    <SectionShell heading="Referred customers" description="Patients you have referred.">
+    <SectionShell heading="Referred customers" description="Patients you have referred. Expand a row to change the discount code assigned to that patient.">
       <label className="portal-field">
         <span>Search</span>
         <input
@@ -245,6 +323,12 @@ export function PatientsSection({ onAuthError }) {
           }}
         />
       </label>
+      {notice ? (
+        <Banner tone="info">
+          <p>{notice}</p>
+        </Banner>
+      ) : null}
+      {listError ? <ErrorBanner message={listError} /> : null}
       {error ? (
         <ErrorBanner message={error} onRetry={reload} />
       ) : loading && rows.length === 0 ? (
@@ -255,7 +339,17 @@ export function PatientsSection({ onAuthError }) {
             columns={columns}
             rows={rows}
             empty="No referred customers yet."
-            renderExpanded={(r) => (r.codes && r.codes.length > 0 ? <CodeHistory row={r} /> : null)}
+            renderExpanded={(r) => (
+              <div className="portal-stack portal-stack--tight">
+                {r.codes && r.codes.length > 0 ? <CodeHistory row={r} /> : null}
+                <PatientCodeControl
+                  row={r}
+                  activeCodes={activeCodes}
+                  busy={busyEmail === r.email}
+                  onAssign={handleAssign}
+                />
+              </div>
+            )}
           />
           <Pagination
             page={data?.page || 1}

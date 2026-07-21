@@ -34,6 +34,7 @@ import CdoCommission from "../../models/cdoCommission.server";
 import CdoPayout from "../../models/cdoPayout.server";
 import CdoReferral from "../../models/cdoReferral.server";
 import { createRetailDiscount, setRetailDiscountActive } from "./cdo.service";
+import { syncConfig, isFulfillmentSyncEnabled } from "../sync/sync.config";
 import {
   notifyReferralCodeCreated,
   notifyReferralCodePaused,
@@ -1028,4 +1029,87 @@ export async function setReferralCodeStatus(practitionerId, { codeId, status } =
   }).catch((e) => log.error("set_status.notification_failed", { err: e?.message || e }));
 
   return shapeCodeRow(doc);
+}
+
+/**
+ * Assign/reassign the ACTIVE discount code for one of the practitioner's
+ * patients (Patients tab → "Change code"). The authoritative write lives in
+ * ns-retail (it owns cdo_applications + the retail Shopify customer), so this
+ * only validates + orchestrates: it re-checks the code is one of THIS
+ * practitioner's active codes (defense in depth), then POSTs to the ns-retail
+ * internal endpoint, which reassigns cdo_applications.referral, sets the
+ * customer `cdo.active_code` metafield the discount Function enforces, and
+ * syncs the `code:` tag. The patient must already be attributed to this
+ * practitioner (ns-retail rejects otherwise) — this never attributes a new
+ * patient or steals another practitioner's.
+ *
+ * @param {string} practitionerId  trusted tenant key (from the guard)
+ * @param {{ referredEmail: string, codeId: string }} input
+ * @param {{ application: object }} ctx
+ * @returns {Promise<{ email: string, code: string, previousCode: string|null }>}
+ * @throws {Error & { code: 'INVALID'|'CONFLICT'|'DISCOUNT_FAILED' }}
+ */
+export async function assignPatientCode(
+  practitionerId,
+  { referredEmail, codeId } = {},
+  { application } = {},
+) {
+  const email = String(referredEmail || "").trim().toLowerCase();
+  if (!email) throw portalError("INVALID", "Patient email is required.");
+  if (!codeId) throw portalError("INVALID", "Select a discount code to assign.");
+
+  // Defense in depth: the code must be one of THIS practitioner's ACTIVE codes.
+  // (ns-retail re-validates authoritatively, but fail fast with a clear message.)
+  const codeDoc = await CdoPractitionerCode.findOne({ _id: codeId, practitionerId })
+    .lean()
+    .catch(() => null);
+  if (!codeDoc) throw portalError("INVALID", "That discount code isn't one of yours.");
+  if (codeDoc.status !== "active") {
+    throw portalError("CONFLICT", `"${codeDoc.code}" isn't active — resume it or pick another code.`);
+  }
+
+  if (!isFulfillmentSyncEnabled()) {
+    throw portalError(
+      "DISCOUNT_FAILED",
+      "Code assignment is temporarily unavailable — the retail link is not configured.",
+    );
+  }
+
+  const url = `${syncConfig.nsRetailApiBase.replace(/\/+$/, "")}/api/cdo-internal/assign-patient-code`;
+  let res;
+  let data;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-sync-secret": syncConfig.syncSecret,
+      },
+      body: JSON.stringify({
+        practitionerId: String(practitionerId),
+        referredEmail: email,
+        codeId: String(codeId),
+        shop: syncConfig.retailShop,
+        actor: application?.email || "practitioner",
+      }),
+      signal: AbortSignal.timeout(syncConfig.fulfillmentSyncTimeoutMs),
+    });
+    data = await res.json().catch(() => ({}));
+  } catch (e) {
+    log.error("assign_patient_code.network", { practitionerId, email, err: e?.message || e });
+    throw portalError("DISCOUNT_FAILED", "Could not reach the assignment service. Please try again.");
+  }
+
+  if (!res.ok || data?.status !== "success") {
+    const msg = data?.message || "Could not assign the discount code.";
+    if (res.status === 409) throw portalError("CONFLICT", msg);
+    if (res.status === 400) throw portalError("INVALID", msg);
+    throw portalError("DISCOUNT_FAILED", msg);
+  }
+
+  return {
+    email,
+    code: data?.result?.code || codeDoc.code,
+    previousCode: data?.result?.oldCode || null,
+  };
 }
