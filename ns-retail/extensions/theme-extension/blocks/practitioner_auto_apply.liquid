@@ -1,0 +1,90 @@
+{% comment %}
+  Practitioner Auto-Apply — HEADLESS (renders no visible UI).
+
+  For a logged-in patient already attributed to a practitioner, this auto-applies
+  their currently-assigned practitioner code to the cart session, so the discount
+  is live on the cart + carries into checkout without the buyer typing anything.
+  Replaces the removed "Do you have a practitioner code?" input widget — same
+  auto-apply behavior, no input field.
+
+  Source of the code: the customer's `code:<code>` Shopify tag, which
+  syncCustomerCodeTag keeps to exactly ONE entry = the LATEST code the
+  practitioner assigned (portal "Assign discount code"). Read here in Liquid —
+  no backend round-trip.
+
+  Loop-safe: applies at most ONCE per code per tab session (sessionStorage
+  guard) and skips when the code is already applied — so it can never
+  infinite-reload the way the old widget's reconcile could. Clears any existing
+  (possibly stale / different, non-combinable) code first so the assigned code
+  actually takes effect, then hits Shopify's native /discount/<code> endpoint.
+
+  Placement: drop this block on the Cart template (it's invisible). For broader
+  coverage you could instead make it an app embed (target "body").
+{% endcomment %}
+
+{%- assign cdo_code = '' -%}
+{%- if customer -%}
+  {%- for tag in customer.tags -%}
+    {%- assign tag_down = tag | downcase -%}
+    {%- if tag_down contains 'code:' -%}
+      {%- assign cdo_code = tag | split: ':' | last | strip -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+
+{%- if cdo_code != '' -%}
+<script>
+(function () {
+  var code = {{ cdo_code | json }};
+  if (!code) return;
+  var lower = String(code).toLowerCase();
+  var key = 'cdo_auto_apply:' + lower;
+  // Only attempt once per code per tab session — the redirect reloads /cart,
+  // so without this guard a code that never reports "applied" (e.g. declined by
+  // the practitioner-discount Function, or a Function discount not surfaced in
+  // /cart.json) would reload forever.
+  try { if (sessionStorage.getItem(key) === '1') return; } catch (e) {}
+
+  fetch('/cart.json', { headers: { Accept: 'application/json' }, credentials: 'include' })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (cart) {
+      var applied = false;
+      if (cart) {
+        var flat = Array.isArray(cart.discount_codes) ? cart.discount_codes : [];
+        var lvl = Array.isArray(cart.cart_level_discount_applications)
+          ? cart.cart_level_discount_applications : [];
+        applied = flat.concat(lvl).some(function (dc) {
+          var c = String((dc && (dc.code || dc.title)) || '').toLowerCase();
+          return c === lower && (dc && dc.applicable) !== false;
+        });
+      }
+      if (applied) return; // already active — nothing to do.
+
+      try { sessionStorage.setItem(key, '1'); } catch (e) {}
+      var back = window.location.pathname + window.location.search;
+      var go = function () {
+        window.location.href =
+          '/discount/' + encodeURIComponent(code) +
+          '?redirect=' + encodeURIComponent(back);
+      };
+      // Clear any existing (possibly different, non-combinable) code first so
+      // the assigned code takes effect, then apply. Best-effort — go regardless.
+      fetch('/cart/update.js', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ discount: '' }),
+      }).then(go, go);
+    })
+    .catch(function () {});
+})();
+</script>
+{%- endif -%}
+
+{% schema %}
+{
+  "name": "Practitioner Auto-Apply",
+  "target": "section",
+  "enabled_on": { "templates": ["cart"] },
+  "settings": []
+}
+{% endschema %}
