@@ -2266,7 +2266,16 @@ export async function assignPatientCode({
   }
 
   // 3. Build the fresh referral snapshot (same validation path as signup).
-  const newReferral = await buildReferralSnapshot(codeDoc.code, { when: new Date(), shop });
+  //    Validate against the CODE's OWN shop (where it lives in
+  //    cdo_practitioner_codes — the wholesale store), NOT the retail `shop`
+  //    passed in for the Shopify-side metafield/tag writes. validateReferralCode
+  //    scopes its catalogue lookup by shop, so passing the retail shop here
+  //    would never find a wholesale-created code and fail with "could not be
+  //    validated". codeDoc was already fetched above, so its shop is authoritative.
+  const newReferral = await buildReferralSnapshot(codeDoc.code, {
+    when: new Date(),
+    shop: codeDoc.shop,
+  });
   if (!newReferral) {
     throw new Error(`Discount code "${codeDoc.code}" could not be validated`);
   }
