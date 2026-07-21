@@ -92,8 +92,10 @@ export async function action({ request, params }) {
     })
   }
 
-  // Best-effort — never blocks the already-saved preference change.
-  await notifyProfileUpdated({
+  // Best-effort + FIRE-AND-FORGET — never blocks the response. Awaiting this
+  // meant a slow/unreachable SMTP (e.g. staging → Ethereal) hung the admin
+  // request ~32s (10s connection timeout × retries) before responding.
+  notifyProfileUpdated({
     email: doc.email,
     firstName: doc.firstName,
     lastName: doc.lastName,

@@ -382,14 +382,14 @@ export async function action({ request }) {
           cardBillingErr?.message || cardBillingErr,
         );
         await deleteNmiVaultWithRetry(nmiCustomerVaultId);
-        await notifyNmiVaultCreationFailed({
+        notifyNmiVaultCreationFailed({
           email: payload.email,
           businessName: payload.businessName,
           paymentMethod: payload.payment?.method,
           stage: "ACH customer — secondary card billing add",
           error: cardBillingErr,
         }).catch((e) => console.error("[proxy/submit] NMI alert failed:", e?.message || e));
-        await notifyApplicationDeclined({
+        notifyApplicationDeclined({
           email: payload.email,
           firstName: payload.firstName,
           lastName: payload.lastName,
@@ -416,14 +416,14 @@ export async function action({ request }) {
       "[proxy/submit] NMI vault create failed:",
       vaultErr?.message || vaultErr,
     );
-    await notifyNmiVaultCreationFailed({
+    notifyNmiVaultCreationFailed({
       email: payload.email,
       businessName: payload.businessName,
       paymentMethod: payload.payment?.method,
       stage: "Primary vault creation",
       error: vaultErr,
     }).catch((e) => console.error("[proxy/submit] NMI alert failed:", e?.message || e));
-    await notifyApplicationDeclined({
+    notifyApplicationDeclined({
       email: payload.email,
       firstName: payload.firstName,
       lastName: payload.lastName,
@@ -444,14 +444,14 @@ export async function action({ request }) {
   }
   if (!nmiCustomerVaultId) {
     console.error("[proxy/submit] NMI returned no vault id");
-    await notifyNmiVaultCreationFailed({
+    notifyNmiVaultCreationFailed({
       email: payload.email,
       businessName: payload.businessName,
       paymentMethod: payload.payment?.method,
       stage: "Vault creation resolved with no vault id",
       error: new Error("createCustomerVault resolved successfully but returned no vault id"),
     }).catch((e) => console.error("[proxy/submit] NMI alert failed:", e?.message || e));
-    await notifyApplicationDeclined({
+    notifyApplicationDeclined({
       email: payload.email,
       firstName: payload.firstName,
       lastName: payload.lastName,

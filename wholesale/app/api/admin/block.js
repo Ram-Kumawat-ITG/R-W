@@ -93,8 +93,9 @@ export async function action({ request, params }) {
     })
   }
 
-  // Best-effort — never blocks the block action on an SMTP hiccup.
-  await notifyAccountBlocked({
+  // Best-effort + FIRE-AND-FORGET — never block the block response on a
+  // slow/unreachable SMTP server (the block itself is already persisted).
+  notifyAccountBlocked({
     email: doc.email,
     firstName: doc.firstName,
     lastName: doc.lastName,

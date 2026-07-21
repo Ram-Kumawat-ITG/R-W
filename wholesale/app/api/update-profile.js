@@ -398,7 +398,9 @@ export async function action({ request }) {
   if (hasPaymentUpdate) changeSummary.push('Payment method')
   if (hasTaxUpdate) changeSummary.push('Tax information')
   if (hasCommissionUpdate) changeSummary.push('Commission payout details')
-  await notifyProfileUpdated({
+  // Best-effort + FIRE-AND-FORGET — never block the profile-update response on
+  // a slow/unreachable SMTP server.
+  notifyProfileUpdated({
     email,
     firstName: updatedDoc.firstName,
     lastName: updatedDoc.lastName,
