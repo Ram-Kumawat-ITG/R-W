@@ -1182,9 +1182,28 @@ export async function syncFulfillmentsFromShopify({ shop, shopifyOrderId, admin 
   }
   // Mirror the order-level fulfillment status (FULFILLED / PARTIALLY_FULFILLED
   // / UNFULFILLED → lower-case) so the page can show "Fulfillment status".
+  //
+  // MONOTONIC GUARD: never let a live re-read regress a fulfilled/delivered
+  // order back to unfulfilled/partially_fulfilled. Shopify can transiently
+  // report a lower displayFulfillmentStatus (order edit in flight, a drop-ship
+  // order whose real shipment is tracked on the linked retail order, a stale
+  // read), which previously wiped the delivered state the customer already saw
+  // — the reported "reverts to Unfulfilled after Delivered" bug. `deliveredAt`
+  // is stamped first-detection-wins and the fulfillments[] rows persist, so
+  // together they are the durable "this order shipped/was delivered" signal.
+  // Genuine reversals (restocked / returned) are still honored.
   if (data.displayFulfillmentStatus) {
     const fs = String(data.displayFulfillmentStatus).toLowerCase()
-    if (localOrder.fulfillmentStatus !== fs) {
+    const RANK = { unfulfilled: 0, partial: 1, partially_fulfilled: 1, fulfilled: 2 }
+    const activeFf = (localOrder.fulfillments || []).filter(
+      (f) => String(f.status || '').toLowerCase() !== 'cancelled',
+    )
+    const hasShipped = Boolean(localOrder.deliveredAt) || activeFf.length > 0
+    const curRank = RANK[String(localOrder.fulfillmentStatus || '').toLowerCase()] ?? -1
+    const nextRank = RANK[fs] ?? -1
+    const isReversal = fs === 'restocked' || fs === 'returned'
+    const wouldRegress = hasShipped && nextRank >= 0 && nextRank < curRank
+    if (localOrder.fulfillmentStatus !== fs && (isReversal || !wouldRegress)) {
       localOrder.fulfillmentStatus = fs
       anyChanged = true
     }
