@@ -161,7 +161,38 @@ async function clearCartDiscount() {
 // between two non-combinable practitioner codes otherwise leaves the OLD
 // one as the applicable discount, since Shopify keeps both codes on the
 // cart and only one non-combinable code can be applicable at a time.
+// sessionStorage key marking that we've ALREADY attempted the /discount/<code>
+// redirect for this code in this tab. The redirect reloads /cart, so without a
+// once-per-session guard the auto-apply effect can loop forever whenever the
+// code never comes back "applicable" — e.g. the practitioner-discount Function
+// declines it (buyer locked to a different assigned code, or a stale
+// tag↔metafield mismatch), or the theme's /cart.json just doesn't surface a
+// Function-based discount. Keyed per code so a genuine reassignment to a
+// NEW code still gets its one attempt.
+function applyGuardKey(code) {
+  return `cdo_apply_attempted:${String(code || '').toLowerCase()}`
+}
+function hasAttemptedApply(code) {
+  try {
+    return sessionStorage.getItem(applyGuardKey(code)) === '1'
+  } catch {
+    return false
+  }
+}
+function markApplyAttempted(code) {
+  try {
+    sessionStorage.setItem(applyGuardKey(code), '1')
+  } catch {
+    // sessionStorage unavailable (private mode / blocked) — the redirect still
+    // runs; worst case the guard can't persist, but the manual paths are
+    // user-initiated so this only affects the auto-apply loop protection.
+  }
+}
+
 async function applyDiscountToSession(code) {
+  // Mark BEFORE navigating so the post-redirect reload sees the guard even if
+  // the discount ends up non-applicable — this is what breaks the loop.
+  markApplyAttempted(code)
   await clearCartDiscount()
   const encoded = encodeURIComponent(code)
   // ?redirect=/cart keeps the buyer on the cart page (Shopify's default
@@ -295,8 +326,22 @@ export default function App() {
           return
         }
 
-        // Not on session yet — activate via /discount/<code> and reload.
-        // Ye tab hoga:
+        // Already tried the /discount/<code> redirect once this session but the
+        // code still isn't reporting as applied — do NOT redirect again (that
+        // is the infinite-reload loop). The discount may still be honored at
+        // checkout (Function-based ORDER discounts aren't always reflected in
+        // /cart.json), or it was declined because the buyer is locked to a
+        // different assigned code. Either way, stop looping and leave the code
+        // saved on the cart attributes for checkout.
+        if (hasAttemptedApply(authCode)) {
+          setStatus({
+            tone: 'success',
+            message: `✓ ${nameLabel}'s ${suffix} — applied at checkout.`,
+          })
+          return
+        }
+
+        // Not on session yet — activate via /discount/<code> ONCE.
         //   • Logged-in returning patient's first visit this session
         //   • Session cookie expired but cart attribute persisted
         //   • Buyer manually cleared discount from cart summary
