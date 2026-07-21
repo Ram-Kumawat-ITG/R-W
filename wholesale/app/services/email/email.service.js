@@ -22,6 +22,15 @@ function getTransporter() {
     port: emailConfig.port,
     secure: emailConfig.secure,
     auth: { user: emailConfig.user, pass: emailConfig.password },
+    // Hard SMTP timeouts so a slow/unreachable mail server can never hang the
+    // caller for the OS-default TCP timeout (minutes). Without these, an
+    // awaited send in a request path (e.g. registration) could block long
+    // enough to trip the Shopify App Proxy / platform gateway timeout. A send
+    // that exceeds these fails fast as a TransientError (retried, then the
+    // caller gets { success:false }).
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 15_000,
   })
   return transporter
 }

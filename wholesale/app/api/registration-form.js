@@ -516,9 +516,13 @@ export async function action({ request }) {
     });
   }
 
-  // Application is persisted (NMI succeeded) — confirm receipt. Best-effort;
-  // never blocks the rest of registration.
-  await notifyApplicationSubmitted({
+  // Application is persisted (NMI succeeded) — confirm receipt. Best-effort and
+  // FIRE-AND-FORGET: this must NEVER sit in the critical path between the Mongo
+  // write and the Shopify customer create. A slow/hung SMTP send here would
+  // block the request long enough to trip the Shopify App Proxy gateway
+  // timeout, leaving the reported inconsistent state (Mongo doc created, no
+  // Shopify customer). The email still sends in the background.
+  notifyApplicationSubmitted({
     email: payload.email,
     firstName: payload.firstName,
     lastName: payload.lastName,
@@ -556,8 +560,9 @@ export async function action({ request }) {
       },
     );
 
-    // Best-effort — never blocks approval on an SMTP hiccup.
-    await notifyApplicationApproved({
+    // Best-effort + FIRE-AND-FORGET — never blocks the response (or the CDO
+    // step below) on an SMTP hiccup. The Mongo doc is already marked approved.
+    notifyApplicationApproved({
       email: payload.email,
       firstName: payload.firstName,
       lastName: payload.lastName,
@@ -570,23 +575,29 @@ export async function action({ request }) {
     // an admin can re-generate manually from the ns-retail CDO admin if
     // this throws. We do NOT want a transient DB blip in the CDO
     // collection to fail an otherwise-successful registration.
-    try {
-      const cdoResult = await generatePractitionerCode({
-        applicationId: app._id,
-        firstName: payload.firstName,
-        lastName: payload.lastName,
-        email: payload.email,
-        shop: payload.shop,
-      });
-      console.log(
-        `[proxy/submit] CDO code ${cdoResult.code} ${cdoResult.alreadyExisted ? "reused (idempotent)" : "generated"} for application=${app._id}`,
+    // FIRE-AND-FORGET: generatePractitionerCode makes a cross-store retail
+    // Shopify Admin call (creates the referral discount) that can be slow —
+    // keep it off the response path so it can't push the request toward the
+    // gateway timeout. It's idempotent + already non-fatal, and an admin can
+    // regenerate from the ns-retail CDO admin if it fails.
+    generatePractitionerCode({
+      applicationId: app._id,
+      firstName: payload.firstName,
+      lastName: payload.lastName,
+      email: payload.email,
+      shop: payload.shop,
+    })
+      .then((cdoResult) =>
+        console.log(
+          `[proxy/submit] CDO code ${cdoResult.code} ${cdoResult.alreadyExisted ? "reused (idempotent)" : "generated"} for application=${app._id}`,
+        ),
+      )
+      .catch((cdoErr) =>
+        console.error(
+          "[proxy/submit] CDO code generation failed (non-fatal):",
+          cdoErr?.message || cdoErr,
+        ),
       );
-    } catch (cdoErr) {
-      console.error(
-        "[proxy/submit] CDO code generation failed (non-fatal):",
-        cdoErr?.message || cdoErr,
-      );
-    }
 
     // NOTE: We intentionally do NOT send the Shopify account-invite email
     // that includes an account-activation / password-set link. The system
