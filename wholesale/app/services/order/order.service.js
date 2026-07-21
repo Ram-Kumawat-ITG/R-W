@@ -25,6 +25,7 @@ import {
   carrierDisplayName,
   shipmentStatusLabel,
   resolveCarrierTrackingUrl,
+  deriveFulfillmentStatus,
 } from '../../utils/shipping.constants'
 import { trackingConfig } from './tracking.config'
 import { isRetailCustomerEmail } from '../dropship/dropship.config'
@@ -1093,6 +1094,20 @@ export async function handleFulfillmentUpdate({ shop, fulfillment, webhookId, ev
   )
   recomputeShipDate(localOrder)
   recomputeDeliveredAt(localOrder)
+  // Self-heal the order-level fulfillment status: recording a shipped
+  // fulfillment must never leave the order reading "unfulfilled" (the webhook
+  // captures tracking + shipmentStatus but Shopify's order-level
+  // displayFulfillmentStatus only reaches us via the page-load live-pull,
+  // which can lag or read UNFULFILLED for a drop-ship order). Only UPGRADE
+  // from an empty/unfulfilled value — never clobber a Shopify-reported
+  // partial/restocked/returned. Mirrors the ns-retail intake self-heal.
+  {
+    const curFf = String(localOrder.fulfillmentStatus || '').toLowerCase()
+    if (!['fulfilled', 'partial', 'partially_fulfilled', 'restocked', 'returned'].includes(curFf)) {
+      const healed = deriveFulfillmentStatus(localOrder.fulfillmentStatus, localOrder.fulfillments)
+      if (healed !== curFf) localOrder.fulfillmentStatus = healed
+    }
+  }
   if (!changed) console.log(`[orders] fulfillment ${fulfillmentId} unchanged — no history row`)
 
   if (webhookId) {

@@ -19,6 +19,7 @@ import { getInvoiceWebUrl } from "../services/qbo/qbo.service";
 import {
   carrierDisplayName,
   deriveDeliveryStatus,
+  deriveFulfillmentStatus,
 } from "../utils/shipping.constants";
 import {
   ShipmentStatusBadge,
@@ -269,7 +270,9 @@ export const loader = async ({ request }) => {
         currency: r.currency || "USD",
         totalAmount: r.totalAmount ?? null,
         financialStatus: r.financialStatus || null,
-        fulfillmentStatus: r.fulfillmentStatus || null,
+        // Self-healed from fulfillments[] so a shipped order never shows
+        // "Unfulfilled" while its Delivery status reads "Shipped".
+        fulfillmentStatus: deriveFulfillmentStatus(r.fulfillmentStatus, fulfillments),
         processingStatus: r.processingStatus || null,
         // Fulfillment (ship) date — earliest fulfillment date across
         // fulfillments[], denormalized onto the order. Shown under the
