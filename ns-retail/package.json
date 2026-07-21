@@ -8,7 +8,7 @@
     "build:client-portal": "npm --prefix client-portal run build",
     "sync:extension-app-url": "node scripts/sync-extension-app-url.js",
     "predev": "npm run sync:extension-app-url",
-    "predeploy": "npm run build:signup && npm run build:practitioner-code && npm run build:client-portal && npm run sync:extension-app-url",
+    "predeploy": "npm run build:signup && npm run build:client-portal && npm run sync:extension-app-url",
     "dev": "shopify app dev --graphiql-port=13458 --theme-app-extension-port=19293",
     "dev:local": "shopify app dev --config localhost --use-localhost --graphiql-port=13458 --theme-app-extension-port=19293",
     "config:link": "shopify app config link",
