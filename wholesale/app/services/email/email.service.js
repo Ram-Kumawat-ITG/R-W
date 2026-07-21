@@ -82,8 +82,13 @@ export async function sendEmail({ to, cc, bcc, subject, html, text, attachments,
         log.warn('send.retry', { ...context, attempt, err, nextDelayMs }),
     })
 
-    log.info('send.success', { ...context, messageId: info.messageId })
-    return { success: true, messageId: info.messageId }
+    // On a test transport (Ethereal) nodemailer returns a preview URL where the
+    // captured message can be viewed — no real delivery happens. Logging it lets
+    // staging verify that a notification actually fired + see its content.
+    // Returns undefined on a real SMTP provider, so this is a no-op in prod.
+    const previewUrl = nodemailer.getTestMessageUrl(info) || null
+    log.info('send.success', { ...context, messageId: info.messageId, previewUrl })
+    return { success: true, messageId: info.messageId, previewUrl }
   } catch (err) {
     log.error('send.failed', { ...context, err })
     return { success: false, error: err.message || 'Failed to send email' }
