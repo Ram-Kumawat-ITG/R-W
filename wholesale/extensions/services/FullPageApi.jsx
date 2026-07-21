@@ -20,7 +20,7 @@
 //   const token = await shopify.sessionToken.get()
 //   const res   = await api.fetchProfile(token, customerId)
 
-const SERVER_URL = "https://sierra-raised-jaguar-settings.trycloudflare.com" || process.env.SHOPIFY_APP_URL;
+const SERVER_URL = "https://natural-solutions-wholesale.onrender.com" || process.env.SHOPIFY_APP_URL;
 
 export default class FullPageApi {
   // Static helper exposed so non-API callers (e.g. card-update popup
