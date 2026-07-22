@@ -17,20 +17,30 @@
   practitioner assigned (portal "Assign discount code"). Read here in Liquid —
   no backend round-trip.
 
-  Self-correcting: if the cart carries a code that is NOT the patient's
-  currently-assigned one (e.g. left over after the practitioner reassigned or
-  revoked it), that stale code is cleared and the assigned one re-applied — so a
-  reassignment actually takes effect on an existing cart. Loop-safe: the
-  sessionStorage guard is keyed on BOTH the assigned code AND the stale-code set,
-  so each distinct situation gets exactly ONE apply attempt per tab session
-  (set BEFORE the redirect, because a Function-based ORDER discount may not
-  surface in /cart.json so "already applied" can't always be confirmed). A new
-  assignment or a changed stale set gets its own single attempt.
+  Re-applies on every cart refresh: if the assigned code is NOT currently on the
+  cart — because the buyer REMOVED it, or they went straight to the cart without
+  it ever being applied — it is (re)applied. If a DIFFERENT/stale code is on the
+  cart (e.g. left over after the practitioner reassigned/revoked), it's cleared
+  and the assigned one applied. So "buyer removes the code → refresh → it comes
+  back" works, and a reassignment takes effect on an existing cart.
 
-  NOTE: this only runs when the customer still has a code:<code> tag. If a code
-  is fully revoked (no assigned code / no tag) this block does not render, so a
-  since-revoked code left on a cart is not force-cleared here — the checkout-time
-  discount Function still declines it, so it can't actually discount the order.
+  Loop-safe: "present on the cart" is judged regardless of `applicable`, so once
+  the code is on the cart we stop (no reload loop even if a Function ORDER
+  discount computes $0 or isn't fully surfaced in /cart.json). A per-code attempt
+  budget (sessionStorage `cdo_apply_n:<code>`, cap MAX) is RESET to 0 whenever the
+  code is confirmed present — so a later manual removal always gets a fresh
+  budget to re-apply — and only caps a code that can NEVER land, bounding a
+  worst-case loop to MAX reloads instead of forever.
+
+  NOTE 1 — CHECKOUT: this is an Online Store app embed, so it runs on the cart
+  (and other storefront pages), NOT on the checkout pages. On Shopify Grow,
+  checkout UI extensions on the core checkout steps are Plus-only, so a code
+  removed INSIDE checkout cannot be re-applied there by an extension; the code
+  applied at the cart carries into checkout automatically. (On Plus, the
+  checkout-ui-code extension can be re-enabled to cover checkout.)
+  NOTE 2 — REVOKED: this only renders when the customer still has a code:<code>
+  tag. A fully-revoked patient (no tag) isn't force-cleared here — the checkout
+  Function declines a stale code regardless, so it can't discount the order.
 {% endcomment %}
 
 {%- assign cdo_code = '' -%}
@@ -49,6 +59,13 @@
   var code = {{ cdo_code | json }};
   if (!code) return;
   var lower = String(code).toLowerCase();
+  // Attempt budget per code per tab session. It is RESET to 0 every time the
+  // code is confirmed present on the cart, so a later manual removal always
+  // gets a fresh budget to re-apply on the next refresh. The cap only bites
+  // when a code can NEVER land (declined / not surfaced) — bounding a runaway
+  // reload loop to MAX attempts instead of looping forever.
+  var countKey = 'cdo_apply_n:' + lower;
+  var MAX = 6;
 
   fetch('/cart.json', { headers: { Accept: 'application/json' }, credentials: 'include' })
     .then(function (r) { return r.ok ? r.json() : null; })
@@ -56,39 +73,45 @@
       if (!cart) return;
 
       // Only act once there's something to discount. If the cart is empty we
-      // return WITHOUT recording an attempt, so it re-checks on the next
+      // return WITHOUT touching the budget, so it re-checks on the next
       // navigation and applies as soon as the buyer adds an item — covering
       // cart-drawer themes with no visit to the /cart page.
       var itemCount = typeof cart.item_count === 'number' ? cart.item_count : 0;
       if (itemCount <= 0) return;
 
-      // Every discount code currently on the cart (normalized, applicable only).
+      // Every discount code currently ON the cart. NOTE: presence is judged
+      // regardless of `applicable` — a code that's on the cart (even if the
+      // Function currently gives it $0) is still "present", and re-adding it
+      // wouldn't change that. Presence is what lets us re-apply after a removal
+      // WITHOUT looping: once it's on the cart we stop.
       var flat = Array.isArray(cart.discount_codes) ? cart.discount_codes : [];
       var lvl = Array.isArray(cart.cart_level_discount_applications)
         ? cart.cart_level_discount_applications : [];
-      var applied = flat.concat(lvl)
-        .filter(function (dc) { return dc && dc.applicable !== false; })
-        .map(function (dc) { return String((dc.code || dc.title) || '').toLowerCase(); })
+      var present = flat.concat(lvl)
+        .map(function (dc) { return String((dc && (dc.code || dc.title)) || '').toLowerCase(); })
         .filter(Boolean);
 
-      var assignedApplied = applied.indexOf(lower) !== -1;
+      var assignedPresent = present.indexOf(lower) !== -1;
       // Any code on the cart that is NOT the patient's currently-assigned one —
-      // e.g. a code left over after the practitioner reassigned/revoked it. The
+      // e.g. left over after the practitioner reassigned/revoked it. The
       // practitioner discount is non-combinable, so a stale one must be cleared.
-      var stale = applied.filter(function (c) { return c !== lower; });
+      var stale = present.filter(function (c) { return c !== lower; });
 
-      // Perfect state: exactly the assigned code is applied, nothing stale.
-      if (assignedApplied && stale.length === 0) return;
+      // Correct state: the assigned code is on the cart and nothing stale is.
+      // Reset the attempt budget so a future removal re-applies from scratch.
+      if (assignedPresent && stale.length === 0) {
+        try { sessionStorage.removeItem(countKey); } catch (e) {}
+        return;
+      }
 
-      // Otherwise act: the assigned code isn't applied, or a stale/foreign code
-      // is sitting on the cart. Guard is keyed on BOTH the assigned code AND the
-      // stale set, so each distinct situation gets exactly ONE attempt per tab
-      // session — loop-safe even if the clear is flaky or the assigned code
-      // can't apply (declined / not surfaced in /cart.json). A NEW assignment or
-      // a changed stale set produces a new key and gets its own single attempt.
-      var key = 'cdo_auto_apply:' + lower + '|' + stale.slice().sort().join(',');
-      try { if (sessionStorage.getItem(key) === '1') return; } catch (e) {}
-      try { sessionStorage.setItem(key, '1'); } catch (e) {}
+      // Otherwise (re)apply: the assigned code is missing (removed by the buyer,
+      // or never applied — e.g. straight-to-cart), or a stale code is present.
+      // This is what makes "buyer removes the code → refresh → it comes back"
+      // work. Bounded by MAX so a code that can't land can't reload forever.
+      var n = 0;
+      try { n = parseInt(sessionStorage.getItem(countKey) || '0', 10) || 0; } catch (e) {}
+      if (n >= MAX) return;
+      try { sessionStorage.setItem(countKey, String(n + 1)); } catch (e) {}
 
       var back = window.location.pathname + window.location.search;
       var go = function () {
