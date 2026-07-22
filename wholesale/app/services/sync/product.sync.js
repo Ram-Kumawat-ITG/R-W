@@ -435,6 +435,22 @@ export async function syncProductUpdate(wholesaleProduct, { shop } = {}) {
     retailData?.product?.variants || [],
   );
 
+  // ── Mirror inventory to retail (2026-07-22 fix) ─────────────────────
+  //
+  // Shopify's Spring '26 variant edit page fires ONLY products/update when
+  // inventory is edited from there — no separate inventory_levels/update
+  // is emitted (unlike the product list's Available column, which fires
+  // both). Without this mirror step, variant-page inventory edits never
+  // propagated to retail. Idempotent when the wholesale inventory-levels
+  // webhook already ran the same set (Shopify accepts identical writes
+  // without side effects), and safe under the double-webhook case because
+  // both paths end up calling `inventory_levels/set` with the same value.
+  await setRetailInventoryForProduct(
+    wholesaleProduct.variants || [],
+    retailData?.product?.variants || [],
+    wholesaleProduct.location_id ?? null,
+  );
+
   log.info("product_update.done", { wholesaleId, retailId });
 }
 
