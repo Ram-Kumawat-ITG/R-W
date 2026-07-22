@@ -1,11 +1,16 @@
 {% comment %}
-  Practitioner Auto-Apply — HEADLESS (renders no visible UI).
+  Practitioner Auto-Apply — HEADLESS APP EMBED (renders no visible UI).
 
   For a logged-in patient already attributed to a practitioner, this auto-applies
-  their currently-assigned practitioner code to the cart session, so the discount
-  is live on the cart + carries into checkout without the buyer typing anything.
-  Replaces the removed "Do you have a practitioner code?" input widget — same
-  auto-apply behavior, no input field.
+  their currently-assigned practitioner code to the cart session using Shopify's
+  NATIVE /discount/<code> endpoint — so the discount lands as a normal applied
+  discount and carries into checkout, with the buyer typing nothing and NO block
+  placed on any page.
+
+  APP EMBED (target: "body"): enabled once under Theme editor → App embeds →
+  "Practitioner Auto-Apply". It is NOT a section block — the merchant never drops
+  it on the Cart template. It renders site-wide but only ACTS once the cart has
+  items (so browsing with an empty cart never triggers a redirect).
 
   Source of the code: the customer's `code:<code>` Shopify tag, which
   syncCustomerCodeTag keeps to exactly ONE entry = the LATEST code the
@@ -13,13 +18,10 @@
   no backend round-trip.
 
   Loop-safe: applies at most ONCE per code per tab session (sessionStorage
-  guard) and skips when the code is already applied — so it can never
-  infinite-reload the way the old widget's reconcile could. Clears any existing
-  (possibly stale / different, non-combinable) code first so the assigned code
-  actually takes effect, then hits Shopify's native /discount/<code> endpoint.
-
-  Placement: drop this block on the Cart template (it's invisible). For broader
-  coverage you could instead make it an app embed (target "body").
+  guard, set BEFORE the redirect because a Function-based ORDER discount may not
+  surface in /cart.json, so "already applied" can't always be confirmed). Clears
+  any existing (possibly stale / different, non-combinable) code first so the
+  assigned code actually takes effect.
 {% endcomment %}
 
 {%- assign cdo_code = '' -%}
@@ -39,26 +41,32 @@
   if (!code) return;
   var lower = String(code).toLowerCase();
   var key = 'cdo_auto_apply:' + lower;
-  // Only attempt once per code per tab session — the redirect reloads /cart,
-  // so without this guard a code that never reports "applied" (e.g. declined by
-  // the practitioner-discount Function, or a Function discount not surfaced in
-  // /cart.json) would reload forever.
+  // Attempt at most once per code per tab session — the redirect reloads the
+  // page, so without this guard a code that never reports "applied" (e.g.
+  // declined by the practitioner-discount Function, or a Function discount not
+  // surfaced in /cart.json) would reload forever.
   try { if (sessionStorage.getItem(key) === '1') return; } catch (e) {}
 
   fetch('/cart.json', { headers: { Accept: 'application/json' }, credentials: 'include' })
     .then(function (r) { return r.ok ? r.json() : null; })
     .then(function (cart) {
-      var applied = false;
-      if (cart) {
-        var flat = Array.isArray(cart.discount_codes) ? cart.discount_codes : [];
-        var lvl = Array.isArray(cart.cart_level_discount_applications)
-          ? cart.cart_level_discount_applications : [];
-        applied = flat.concat(lvl).some(function (dc) {
-          var c = String((dc && (dc.code || dc.title)) || '').toLowerCase();
-          return c === lower && (dc && dc.applicable) !== false;
-        });
-      }
-      if (applied) return; // already active — nothing to do.
+      if (!cart) return;
+
+      // Only act once there's something to discount. If the cart is empty we do
+      // NOT set the guard, so it re-checks on the next navigation and applies as
+      // soon as the buyer adds an item — covering cart-drawer themes with no
+      // visit to the /cart page.
+      var itemCount = typeof cart.item_count === 'number' ? cart.item_count : 0;
+      if (itemCount <= 0) return;
+
+      var flat = Array.isArray(cart.discount_codes) ? cart.discount_codes : [];
+      var lvl = Array.isArray(cart.cart_level_discount_applications)
+        ? cart.cart_level_discount_applications : [];
+      var applied = flat.concat(lvl).some(function (dc) {
+        var c = String((dc && (dc.code || dc.title)) || '').toLowerCase();
+        return c === lower && (dc && dc.applicable) !== false;
+      });
+      if (applied) { try { sessionStorage.setItem(key, '1'); } catch (e) {} return; }
 
       try { sessionStorage.setItem(key, '1'); } catch (e) {}
       var back = window.location.pathname + window.location.search;
@@ -83,8 +91,7 @@
 {% schema %}
 {
   "name": "Practitioner Auto-Apply",
-  "target": "section",
-  "enabled_on": { "templates": ["cart"] },
+  "target": "body",
   "settings": []
 }
 {% endschema %}
