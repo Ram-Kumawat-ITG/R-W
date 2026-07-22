@@ -171,16 +171,52 @@ async function resolveDefaultItemId() {
   // Create it. Uses a cycle-safe income resolver (NOT resolveIncomeAccountRef,
   // which derives income FROM the default item — that would recurse).
   const incomeRef = await resolveAnyIncomeAccountRef()
-  const created = await qbo.post('/item', {
-    Name: wantName,
-    Type: 'Service',
-    ...(incomeRef ? { IncomeAccountRef: incomeRef } : {}),
-  })
-  const item = created?.Item
-  if (!item?.Id) throw new Error(`QBO: failed to create the default item "${wantName}"`)
-  _defaultItemId = String(item.Id)
-  log.info('default_item.created', { itemId: _defaultItemId, name: wantName })
-  return _defaultItemId
+  try {
+    const created = await qbo.post('/item', {
+      Name: wantName,
+      Type: 'Service',
+      ...(incomeRef ? { IncomeAccountRef: incomeRef } : {}),
+    })
+    const item = created?.Item
+    if (item?.Id) {
+      _defaultItemId = String(item.Id)
+      log.info('default_item.created', { itemId: _defaultItemId, name: wantName })
+      return _defaultItemId
+    }
+  } catch (err) {
+    // Duplicate name (6240): an item/customer/vendor already owns this name —
+    // adopt the existing item rather than failing.
+    if (/duplicate name|6240/i.test(err?.message || '')) {
+      const dup = await qbo.query(
+        `SELECT * FROM Item WHERE Name = '${escapeQboQuery(wantName)}' MAXRESULTS 1`,
+      )
+      const existing = dup?.QueryResponse?.Item?.[0]
+      if (existing?.Id) {
+        _defaultItemId = String(existing.Id)
+        log.info('default_item.adopted_duplicate', { itemId: _defaultItemId, name: wantName })
+        return _defaultItemId
+      }
+    }
+    log.warn('default_item.create_failed', { name: wantName, err: err?.message || String(err) })
+  }
+
+  // Last resort: adopt ANY existing item so a create failure (e.g. no
+  // resolvable income account) can never take down invoice creation on the
+  // fallback ItemRef. This matches the pre-change behavior of referencing
+  // whatever item already existed; only a truly empty QBO company falls past it.
+  try {
+    const anyItem = await qbo.query('SELECT * FROM Item MAXRESULTS 1')
+    const it = anyItem?.QueryResponse?.Item?.[0]
+    if (it?.Id) {
+      _defaultItemId = String(it.Id)
+      log.warn('default_item.adopted_any', { itemId: _defaultItemId, name: it.Name })
+      return _defaultItemId
+    }
+  } catch (err) {
+    log.warn('default_item.any_lookup_failed', { err: err?.message || String(err) })
+  }
+
+  throw new Error(`QBO: could not resolve or create a default item ("${wantName}")`)
 }
 
 // Income account chosen WITHOUT reading the default item (so it's safe to call
