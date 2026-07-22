@@ -12,7 +12,7 @@
 // At checkout Shopify POSTs the cart's origin + destination + items here
 // and expects this exact response shape:
 //
-//   { rates: [{ service_name, service_code, total_price, currency, ... }] }
+//   { rates: [{ service_name, service_code, total_price, currency, ... }] }        
 //
 // Critical contract:
 //   • total_price is a STRING in MINOR UNITS (cents). "500" = $5.00.
@@ -1287,21 +1287,26 @@ export async function action({ request }) {
 
   // ── 1. Aggregate cart ────────────────────────────────────────────────
   //
-  // Strip the Processing Fee cart line out of EVERY downstream calculation
-  // (markup tier, carrier weight). See `isProcessingFeeItem` for detection
-  // rules. `realItems` is the items array we treat as the customer's
-  // actual merchandise; `rate.items` is the raw Shopify payload we keep
-  // around only for logging.
+  // `realItems` = the physical merchandise the carrier will actually ship.
+  // Two categories are excluded here BEFORE classification / weight math:
+  //   1. Processing-fee cart lines (see `isProcessingFeeItem`) — legacy
+  //      UI-extension mechanism that inflates quantity + weight if left in.
+  //   2. Items with `requires_shipping: false` — digital products, gift
+  //      cards, service SKUs. Shopify still includes these in the carrier
+  //      callback payload, but they have no packaging cost and no `pack:`
+  //      tag. Without this filter, a mixed cart (1 physical + 1 digital)
+  //      would fail the tag-classification guard and return empty rates
+  //      for the whole cart. Fixed 2026-07-20.
   const realItems = (rate.items || []).filter(
-    (it) => !isProcessingFeeItem(it),
+    (it) => !isProcessingFeeItem(it) && it?.requires_shipping !== false,
   );
-  const feeLinesExcluded = rate.items.length - realItems.length;
+  const nonShippingLinesExcluded = rate.items.length - realItems.length;
 
   const totalQty = sumQuantity(realItems);
   if (totalQty === 0) return ratesResponse([]);
 
   console.log(
-    `[shipping.rates] inbound: ${rate.items.length} line(s) (${feeLinesExcluded} processing-fee excluded), realQty=${totalQty}, dest=${rate.destination?.country}/${rate.destination?.province}/${rate.destination?.postal_code}`,
+    `[shipping.rates] inbound: ${rate.items.length} line(s) (${nonShippingLinesExcluded} fee/digital excluded), realQty=${totalQty}, dest=${rate.destination?.country}/${rate.destination?.province}/${rate.destination?.postal_code}`,
   );
 
 
