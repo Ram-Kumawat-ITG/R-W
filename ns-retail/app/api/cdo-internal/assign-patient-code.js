@@ -24,8 +24,8 @@
 //          or { status:'error', message } with an appropriate HTTP code.
 
 import { assignPatientCode } from "../../services/cdo/cdo.service";
-import { setCustomerActiveCode } from "../../utils/practitionerMetafields";
-import { syncCustomerCodeTag, lookupCustomerByEmail } from "../../utils/customerTags";
+import { lookupCustomerByEmail } from "../../utils/customerTags";
+import { syncPatientCode } from "../../utils/patientCode";
 
 function json(status, body) {
   return new Response(JSON.stringify(body), {
@@ -94,21 +94,18 @@ export async function action({ request }) {
     }
   }
 
+  // Write the enforcement metafield (cdo.active_code) AND the code: tag
+  // together via the single consistent writer, so the storefront auto-apply
+  // and the discount Function can never disagree on which code is active.
+  let shopifySync = { ok: false, reason: "no_customer" };
   if (customerGid) {
-    try {
-      await setCustomerActiveCode(shop, customerGid, result.code);
-    } catch (err) {
+    shopifySync = await syncPatientCode(shop, customerGid, result.code, {
+      practitionerEmail: result.practitionerEmail,
+    });
+    if (!shopifySync.ok) {
       console.error(
-        `[cdo-internal/assign-patient-code] set active_code failed for ${customerGid}:`,
-        err?.message || err,
-      );
-    }
-    try {
-      await syncCustomerCodeTag(shop, customerGid, result.code, result.practitionerEmail);
-    } catch (err) {
-      console.error(
-        `[cdo-internal/assign-patient-code] tag sync failed for ${customerGid}:`,
-        err?.message || err,
+        `[cdo-internal/assign-patient-code] Shopify sync incomplete for ${customerGid} (${shopifySync.reason}) — ` +
+          `the discount may not auto-apply until the code: tag + cdo.active_code metafield are both set to "${result.code}".`,
       );
     }
   } else {
@@ -120,6 +117,12 @@ export async function action({ request }) {
   return json(200, {
     status: "success",
     result: { email: result.email, code: result.code, oldCode: result.oldCode },
+    // Surface the Shopify-side outcome so a partial write is visible to the
+    // caller (the wholesale portal) instead of silently reported as success.
+    shopifySync: { ok: shopifySync.ok, reason: shopifySync.reason || null },
+    ...(shopifySync.ok
+      ? {}
+      : { warning: "Code reassigned in the system, but the Shopify tag/metafield sync did not fully complete — the discount may not auto-apply until it does." }),
   });
 }
 

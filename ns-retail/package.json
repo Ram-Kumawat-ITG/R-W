@@ -26,6 +26,7 @@
     "migrate:practitioner-discounts:apply": "node --experimental-loader ./scripts/extensionless-loader.mjs --env-file-if-exists=.env scripts/migrate-practitioner-discounts.js --apply",
     "backfill:qbo-products": "node --experimental-loader ./scripts/extensionless-loader.mjs --env-file-if-exists=.env scripts/backfill-retail-qbo-products.js",
     "backfill:qbo-products:apply": "node --experimental-loader ./scripts/extensionless-loader.mjs --env-file-if-exists=.env scripts/backfill-retail-qbo-products.js --apply",
+    "diagnose:patient-code": "node --experimental-loader ./scripts/extensionless-loader.mjs --env-file-if-exists=.env scripts/check-patient-code.js",
     "env": "shopify app env",
     "start": "react-router-serve ./build/server/index.js",
     "docker-start": "npm run setup && npm run start",
