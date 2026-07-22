@@ -64,11 +64,19 @@ function buildRetailPayload(
 }
 
 // Build one variant entry for the retail payload. Returns null if the
-// variant should be skipped (update path only — no retail SKU match).
+// variant should be skipped (update path only — no SKU at all on the
+// wholesale variant, so we can't pair with the retail side).
+//
+// New-variant behaviour (2026-07-22 fix): when the wholesale variant has
+// a SKU but no matching retail variant exists yet, we DO include it in
+// the payload — just without an `id` field. Shopify's PUT `/products/{id}`
+// treats variants-without-id as new variants to create on that product.
+// This unlocks the "merchant added a fresh variant to an existing product"
+// flow, which previously silently dropped the new variant.
 function buildRetailVariant(v, { includePrice, pricingBySku, retailVariantsBySku }) {
   const wholesaleSku = String(v?.sku || "").trim();
 
-  // Update path — require SKU match against existing retail variants.
+  // Update path — try to pair with an existing retail variant by SKU.
   let retailVariantId = null;
   if (retailVariantsBySku) {
     if (!wholesaleSku) {
@@ -76,14 +84,18 @@ function buildRetailVariant(v, { includePrice, pricingBySku, retailVariantsBySku
       return null;
     }
     const retailVariant = retailVariantsBySku.get(wholesaleSku);
-    if (!retailVariant) {
-      log.warn("variant.skip_no_retail_match", {
+    if (retailVariant) {
+      // Existing retail variant → update in place with its id.
+      retailVariantId = retailVariant.id;
+    } else {
+      // Fresh wholesale variant with no retail counterpart yet — include
+      // in the payload without `id` so Shopify creates it on the retail
+      // product. Log at info (not warn) — this is expected behaviour.
+      log.info("variant.new_variant_will_create_in_retail", {
         wholesaleVariantId: v?.id,
         sku: wholesaleSku,
       });
-      return null;
     }
-    retailVariantId = retailVariant.id;
   }
 
   const base = {
@@ -421,6 +433,22 @@ export async function syncProductUpdate(wholesaleProduct, { shop } = {}) {
   await upsertVariantMappings(
     wholesaleProduct.variants || [],
     retailData?.product?.variants || [],
+  );
+
+  // ── Mirror inventory to retail (2026-07-22 fix) ─────────────────────
+  //
+  // Shopify's Spring '26 variant edit page fires ONLY products/update when
+  // inventory is edited from there — no separate inventory_levels/update
+  // is emitted (unlike the product list's Available column, which fires
+  // both). Without this mirror step, variant-page inventory edits never
+  // propagated to retail. Idempotent when the wholesale inventory-levels
+  // webhook already ran the same set (Shopify accepts identical writes
+  // without side effects), and safe under the double-webhook case because
+  // both paths end up calling `inventory_levels/set` with the same value.
+  await setRetailInventoryForProduct(
+    wholesaleProduct.variants || [],
+    retailData?.product?.variants || [],
+    wholesaleProduct.location_id ?? null,
   );
 
   log.info("product_update.done", { wholesaleId, retailId });

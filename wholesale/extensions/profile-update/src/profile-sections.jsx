@@ -718,10 +718,11 @@ function CredentialsSection({ form, setForm, pendingFiles, setPendingFiles, prof
             )}
             {c.hasFile && (
               <>
-                {existingUrl && !newFile && (
+                {existingUrl && (
                   <s-text color="subdued">
                     On file:{' '}
                     <s-link href={existingUrl} target="_blank">View</s-link>
+                    {newFile ? ' (will be replaced on Save)' : ''}
                   </s-text>
                 )}
                 <s-drop-zone
@@ -2041,13 +2042,12 @@ export function ProfileSections({ api, customerId, profile, onSaved }) {
       </s-grid>
 
       {/* Card on file — inline card inputs, tokenized server-side on Save.
-          Rendered ONLY when payment.method === 'card' so a Check / ACH /
-          Immediate customer doesn't see card fields that don't apply to them.
-          Their stored card (if any from a prior method) stays on the backend
-          and reappears if they switch back to 'card'. */}
-      {form.payment.method === 'card' && (
-        <CardSection form={form} setForm={setForm} />
-      )}
+          Always rendered (2026-07-22 — TL request): a practitioner may want
+          to view or replace their saved card even when their active payment
+          preference is Check or ACH. The card sub-doc persists across
+          method switches on the backend, so this section shows it whenever
+          card data exists AND lets the practitioner add/update it freely. */}
+      <CardSection form={form} setForm={setForm} />
 
       {/* ACH bank account — rendered ONLY when payment.method === 'ach'.
           Same reasoning as CardSection above: hides fields that don't
