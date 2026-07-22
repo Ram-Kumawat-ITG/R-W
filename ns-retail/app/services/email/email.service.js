@@ -24,6 +24,14 @@ function getTransporter() {
     port: emailConfig.port,
     secure: emailConfig.secure,
     auth: { user: emailConfig.user, pass: emailConfig.password },
+    // Hard SMTP timeouts so a slow/unreachable mail server can never hang the
+    // caller for the OS-default TCP timeout (minutes) × the 3 retry attempts.
+    // A send that exceeds these fails fast as a TransientError. (Parity with
+    // the wholesale transport — ns-retail was previously missing these, so an
+    // unreachable SMTP could block for minutes.)
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 15_000,
   });
   return transporter;
 }

@@ -4,7 +4,7 @@
 // utility + best-effort-never-throws convention as
 // applicationLifecycleNotification.service.js.
 
-import { sendEmail } from '../email/email.service'
+import { enqueueEmail } from '../email/emailQueue.service'
 import { accountNotificationConfig as config } from './accountNotification.config'
 import { createLogger } from '../../utils/logger.utils'
 
@@ -24,11 +24,11 @@ function wrapHtml(bodyHtml) {
 }
 
 async function send({ to, subject, html, context }) {
-  const result = await sendEmail({ to, cc: config.adminEmail, subject, html })
+  const result = await enqueueEmail({ to, cc: config.adminEmail, subject, html }, { label: context?.event })
   if (!result.success) {
     log.error('send.failed', { ...context, error: result.error })
   } else {
-    log.info('send.success', { ...context, messageId: result.messageId })
+    log.info('send.queued', { ...context })
   }
   return result
 }

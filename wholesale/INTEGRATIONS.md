@@ -2782,6 +2782,69 @@ heals it almost immediately.
 
 ---
 
+### 10.7 Async (durable) email delivery — `send-email` / `send-invoice-email`
+
+Every email the app sends is delivered by a **background Agenda job**, never
+inline on the request / order / CRON path. This guarantees the requirement:
+the primary operation (registration, order processing, payment, payout, an
+admin action) completes without waiting on SMTP or QBO, and a slow/unreachable
+mail server can never add latency or trip a gateway timeout.
+
+**SMTP path (`send-email`).** `services/email/emailQueue.service.enqueueEmail(message, { label })`
+is the front door. It persists a `send-email` Agenda job (via the existing
+`scheduleNow` helper) carrying the fully-rendered `sendEmail()` message object,
+then returns `{ success: true, queued: true }` after a fast Mongo insert. Every
+SMTP notification *definition* calls `enqueueEmail` instead of `sendEmail`:
+
+- `services/notifications/*` — application-lifecycle, account, NMI-alert,
+  QBO-alert, referral-code, fulfillment-sync
+- `services/payment/paymentFailureNotification.service.js`
+- `services/scheduler/batchSummaryNotification.service.js`
+
+Because the swap is at the definition layer, **every caller** (registration
+endpoints, admin endpoints, order/customer/payment services, the CRON jobs)
+becomes async automatically. The `isEmailNotificationsPaused()` guard on the two
+CRON emails still runs *before* the enqueue, so a paused notification is never
+queued.
+
+`enqueueEmail` never throws. If the queue itself is unreachable it falls back to
+an un-awaited inline `sendEmail` so an email is never silently dropped.
+
+**QBO invoice-email path (`send-invoice-email`).** The admin "Send invoice"
+button (`api/admin/send-invoice.js`) previously **awaited** QBO's
+`/invoice/<id>/send`, blocking the request. It now calls
+`enqueueInvoiceEmail({ shop, invoiceId, sendTo, triggerType, triggeredBy, source, remark })`
+and returns `202`. The `send-invoice-email` job reloads the live invoice, sends,
+advances the lifecycle-dispatcher baseline (`invoiceEmailSentAt` /
+`invoiceEmailedStatus` / `invoiceEmailedAmountPaid`), and writes the
+`emailEvents[]` audit ledger + admin remark itself — so the Order Details page
+still shows the outcome, just moments later. The order/CRON-path lifecycle sends
+(`dispatchInvoiceLifecycleEmails` on `created`/`payment`/`fulfillment`) are
+**unchanged** — they already run inside background webhook/CRON flows and rely on
+the emailEvents ledger + CRON self-heal.
+
+**Retry semantics.** The transport keeps its own 3 in-process attempts
+(§ email.service). On top of that, a failed job **reschedules itself on a
+2 / 5 / 15 / 60-minute backoff ladder** (5 attempts total, ~1h22m horizon) via
+`job.agenda.schedule('in N minutes', …)`. Because the job document is persisted
+in `agenda_jobs`, an in-flight retry **survives a deploy/restart** — the durable
+guarantee the previous in-process `.catch()` fire-and-forget could not provide.
+When the ladder is exhausted the failure is logged loudly (`send.exhausted` /
+`invoice_email.exhausted`); the primary operation already succeeded regardless.
+
+Both jobs are registered in `services/scheduler/jobs/index.js`
+(`JOB_NAMES.SEND_EMAIL` / `SEND_INVOICE_EMAIL`).
+
+**ns-retail** mirrors this: a `send-email` job + `enqueueEmail` (its own
+`cdo_agenda_jobs` collection), with payout + vendor-bill notifications rerouted;
+its admin "Send invoice" order action enqueues a `send-retail-invoice-email` job
+(re-invokes `sendRetailInvoiceForOrder` with the same backoff ladder; terminal
+reasons such as `no_invoice`/`no_email` are not retried). ns-retail's SMTP
+transport also gained the `connectionTimeout`/`greetingTimeout`/`socketTimeout`
+guards the wholesale transport already had.
+
+---
+
 ## 11. Payment retry mechanism
 
 `scheduler/jobs/processPendingPayments.job.server.js` runs **two passes** per tick.

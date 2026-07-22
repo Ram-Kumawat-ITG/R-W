@@ -7,7 +7,7 @@
 // Unlike applicationLifecycleNotification / accountNotification, these
 // have NO customer recipient — `to` is the admin address, no `cc`.
 
-import { sendEmail } from '../email/email.service'
+import { enqueueEmail } from '../email/emailQueue.service'
 import { qboAlertNotificationConfig as config } from './qboAlertNotification.config'
 import { createLogger } from '../../utils/logger.utils'
 
@@ -42,11 +42,11 @@ function errorDetailsHtml(error) {
 }
 
 async function send({ subject, html, context }) {
-  const result = await sendEmail({ to: config.adminEmail, subject, html })
+  const result = await enqueueEmail({ to: config.adminEmail, subject, html }, { label: context?.event })
   if (!result.success) {
     log.error('send.failed', { ...context, error: result.error })
   } else {
-    log.info('send.success', { ...context, messageId: result.messageId })
+    log.info('send.queued', { ...context })
   }
   return result
 }

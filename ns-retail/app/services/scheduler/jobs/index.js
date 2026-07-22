@@ -17,12 +17,19 @@ import {
   registerProcessWholesaleFulfillmentReconcileJob,
   PROCESS_WHOLESALE_FULFILLMENT_RECONCILE_JOB,
 } from "./processWholesaleFulfillmentReconcile.job";
+import { registerSendEmailJob, SEND_EMAIL_JOB } from "./sendEmail.job";
+import {
+  registerSendRetailInvoiceEmailJob,
+  SEND_RETAIL_INVOICE_EMAIL_JOB,
+} from "./sendRetailInvoiceEmail.job";
 
 export const JOB_NAMES = {
   PROCESS_COMMISSION_PAYOUTS: PROCESS_COMMISSION_PAYOUTS_JOB,
   PROCESS_PAYOUT_SETTLEMENTS: PROCESS_PAYOUT_SETTLEMENTS_JOB,
   PROCESS_BILL_RECONCILIATION: PROCESS_BILL_RECONCILIATION_JOB,
   PROCESS_WHOLESALE_FULFILLMENT_RECONCILE: PROCESS_WHOLESALE_FULFILLMENT_RECONCILE_JOB,
+  SEND_EMAIL: SEND_EMAIL_JOB,
+  SEND_RETAIL_INVOICE_EMAIL: SEND_RETAIL_INVOICE_EMAIL_JOB,
 };
 
 export function registerJobs(agenda) {
@@ -30,4 +37,6 @@ export function registerJobs(agenda) {
   registerProcessPayoutSettlementsJob(agenda);
   registerProcessBillReconciliationJob(agenda);
   registerProcessWholesaleFulfillmentReconcileJob(agenda);
+  registerSendEmailJob(agenda);
+  registerSendRetailInvoiceEmailJob(agenda);
 }

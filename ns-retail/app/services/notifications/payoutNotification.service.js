@@ -7,7 +7,7 @@
 // notification failure must never surface as a payout-processing failure
 // (the settlement/check-issue already succeeded by the time this is called).
 
-import { sendEmail } from "../email/email.service";
+import { enqueueEmail } from "../email/emailQueue.service";
 import { payoutNotificationConfig as config } from "./payoutNotification.config";
 import { createLogger } from "../../utils/logger.utils";
 import { formatCurrency, formatDate, formatDateTime } from "../../utils/format";
@@ -65,13 +65,12 @@ export async function notifyCommissionPayoutProcessed({
     <p style="margin-top:16px">If you have any questions about this payout, please contact us.</p>
   `);
 
-  const result = await sendEmail({ to: email, cc: config.adminEmail, subject, html });
-
   const context = { event: "commission_payout_processed", email, amount, method, reference };
+  const result = await enqueueEmail({ to: email, cc: config.adminEmail, subject, html }, { label: context.event });
   if (!result.success) {
     log.error("send.failed", { ...context, error: result.error });
   } else {
-    log.info("send.success", { ...context, messageId: result.messageId });
+    log.info("send.queued", { ...context });
   }
   return result;
 }
@@ -117,13 +116,12 @@ export async function notifyCommissionPayoutFailed({
     <p style="margin-top:12px">We'll retry automatically on our next payout run. If this relates to your bank account details, please review them in your practitioner profile or contact us.</p>
   `);
 
-  const result = await sendEmail({ to: email, cc: config.adminEmail, subject, html });
-
   const context = { event: "commission_payout_failed", email, amount, reference, reason };
+  const result = await enqueueEmail({ to: email, cc: config.adminEmail, subject, html }, { label: context.event });
   if (!result.success) {
     log.error("send.failed", { ...context, error: result.error });
   } else {
-    log.info("send.success", { ...context, messageId: result.messageId });
+    log.info("send.queued", { ...context });
   }
   return result;
 }
@@ -229,13 +227,12 @@ export async function notifyPayoutBatchSummary({
     ${buildBatchSummaryTable(rows)}
   `);
 
-  const result = await sendEmail({ to: config.adminEmail, subject, html });
-
   const context = { event: "commission_payout_batch_summary", reference, status, rowCount: (rows || []).length };
+  const result = await enqueueEmail({ to: config.adminEmail, subject, html }, { label: context.event });
   if (!result.success) {
     log.error("send.failed", { ...context, error: result.error });
   } else {
-    log.info("send.success", { ...context, messageId: result.messageId });
+    log.info("send.queued", { ...context });
   }
   return result;
 }
@@ -312,13 +309,12 @@ export async function notifyPendingCheckPayouts({ rows, totalAmount, currency, g
     ${buildPendingCheckTable(rows)}
   `);
 
-  const result = await sendEmail({ to: config.adminEmail, subject, html });
-
   const context = { event: "pending_check_payouts", totalAmount, rowCount: rows.length };
+  const result = await enqueueEmail({ to: config.adminEmail, subject, html }, { label: context.event });
   if (!result.success) {
     log.error("send.failed", { ...context, error: result.error });
   } else {
-    log.info("send.success", { ...context, messageId: result.messageId });
+    log.info("send.queued", { ...context });
   }
   return result;
 }

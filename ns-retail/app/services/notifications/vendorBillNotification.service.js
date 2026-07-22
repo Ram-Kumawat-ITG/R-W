@@ -9,7 +9,7 @@
 // this workspace — a notification failure must never surface as a vendor-bill
 // processing failure.
 
-import { sendEmail } from "../email/email.service";
+import { enqueueEmail } from "../email/emailQueue.service";
 import { payoutNotificationConfig as config } from "./payoutNotification.config";
 import { createLogger } from "../../utils/logger.utils";
 import { formatCurrency, formatDateTime } from "../../utils/format";
@@ -30,11 +30,11 @@ async function send({ subject, html, context }) {
     log.warn("send.skipped_no_email", context);
     return { success: false, skipped: true, reason: "no admin email configured" };
   }
-  const result = await sendEmail({ to: config.adminEmail, subject, html });
+  const result = await enqueueEmail({ to: config.adminEmail, subject, html }, { label: context?.event });
   if (!result.success) {
     log.error("send.failed", { ...context, error: result.error });
   } else {
-    log.info("send.success", { ...context, messageId: result.messageId });
+    log.info("send.queued", { ...context });
   }
   return result;
 }

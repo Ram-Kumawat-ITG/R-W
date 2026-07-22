@@ -6,7 +6,7 @@
 // portal-action failure (the code create/pause/resume already succeeded
 // by the time these are called).
 
-import { sendEmail } from '../email/email.service'
+import { enqueueEmail } from '../email/emailQueue.service'
 import { referralCodeNotificationConfig as config } from './referralCodeNotification.config'
 import { createLogger } from '../../utils/logger.utils'
 
@@ -31,11 +31,11 @@ async function send({ to, subject, html, context }) {
     log.warn('send.skipped_no_email', context)
     return { success: false, skipped: true, reason: 'no practitioner email' }
   }
-  const result = await sendEmail({ to, cc: config.adminEmail, subject, html })
+  const result = await enqueueEmail({ to, cc: config.adminEmail, subject, html }, { label: context?.event })
   if (!result.success) {
     log.error('send.failed', { ...context, error: result.error })
   } else {
-    log.info('send.success', { ...context, messageId: result.messageId })
+    log.info('send.queued', { ...context })
   }
   return result
 }
