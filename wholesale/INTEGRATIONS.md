@@ -720,10 +720,17 @@ match it hands off to `invoiceDropshipOrder`, which:
 
 1. `ensureDropshipCustomerMap({ shop, order })` — find-or-create the QBO
    customer (by email, so every drop-ship invoice consolidates under one QBO
-   customer) and upsert a `CustomerMap`. Unlike the wholesale
-   `ensureCustomerForOrder`, this does **not** source/validate an NMI vault and
-   does **not** hard-fail on a missing billing address (the drop-ship customer
-   has no `wholesale_applications` doc and may arrive without billing).
+   customer) and upsert a `CustomerMap`. The resolved id is stored durably on
+   `CustomerMap.qboCustomerId` and reused for every future invoice (there is **no
+   hardcoded QBO customer id** — the only env anchor is the routing email
+   `DROPSHIP_RETAIL_CUSTOMER_EMAIL`). `createCustomer` is duplicate-safe: on a
+   QBO `6240` duplicate-name collision it **adopts** the existing customer
+   (exact `DisplayName` lookup — active then inactive — then falls back to
+   email; sparse-reactivates an inactive match) instead of throwing or creating
+   a second record. Unlike the wholesale `ensureCustomerForOrder`, this does
+   **not** source/validate an NMI vault and does **not** hard-fail on a missing
+   billing address (the drop-ship customer has no `wholesale_applications` doc
+   and may arrive without billing).
 2. `createInvoiceForOrder({ ..., isDropship: true })` — the SAME claim-first,
    duplicate-safe QBO invoice creation as the wholesale path, but with
    `paymentMethod` locked to `'dropship'` and `isDropship: true` stamped on the
@@ -778,6 +785,21 @@ two documents match by construction. (The bill-payment reconciliation in
 `retailBillReconcile.service.js` is amount-agnostic — it pays the bill's full
 balance when the wholesale invoice is `paid` — so this change does not alter
 reconciliation behavior.)
+
+> **Vendor auto-creation + durable id (no hardcoded env id).** The QBO **Vendor**
+> the bill posts to (the "Natural Solution Wholesale" supplier) no longer
+> requires a hardcoded `QBO_RETAIL_DROPSHIP_VENDOR_ID`. `resolveDropshipVendorId`
+> (ns-retail `retailQbo.service.js`) resolves in order: in-process memo → env
+> override (still authoritative when set, backward compatible) → the durable
+> singleton mapping `retail_qbo_dropship_vendor`
+> (`models/retailDropshipVendorMap.server.js`) → find-or-create in QBO (adopt an
+> existing vendor by email/`DisplayName` incl. inactive, else `POST /vendor`; on a
+> `6240` duplicate re-query by name; reactivate if inactive) → **persist** the id
+> to the mapping. So with no env id set the vendor is created once and its id
+> reused for every future bill + process restart, never re-querying QBO and never
+> duplicating. The customer side stores its id on `CustomerMap.qboCustomerId` (see
+> step 1). Both are duplicate-safe via `6240` adopt + the bill's `requestid`
+> idempotency.
 
 **Separation in the UI.**
 
@@ -1270,8 +1292,20 @@ POST /v3/company/{realmId}/invoice?minorversion=73
 ```
 
 Line items mirror Shopify's: per-product line + Shipping line + Tax
-line. Every line needs an `Item` reference — `QBO_WHOLESALE_DEFAULT_ITEM_ID`
-(default `"1"`) is used unless `line.qboItemId` is set.
+line. Every line needs an `Item` reference — the resolved **default item** is
+used unless `line.qboItemId` is set.
+
+> **Default item is find-or-created (no hardcoded id needed).** The fallback
+> `ItemRef` comes from `qbo.service.resolveDefaultItemId()`, not a hardcoded id:
+> `QBO_WHOLESALE_DEFAULT_ITEM_ID` (verbatim, if set) → an item named
+> `QBO_WHOLESALE_DEFAULT_ITEM_NAME` (default "Wholesale Sales") → **any existing
+> Service item** (adopts the company's seeded generic item, e.g. "Services"/id
+> 1) → **create** a "Wholesale Sales" Service item. So nothing has to be created
+> manually in QBO. `QBO_WHOLESALE_DEFAULT_ITEM_ID` is now OPTIONAL (no longer
+> defaults to the literal `"1"`); pin it only for determinism. The income
+> account for auto-created items derives from this resolved item, with a
+> cycle-safe fallback (`QBO_WHOLESALE_INCOME_ACCOUNT_ID` → first Income account)
+> used when the default item is itself being created.
 
 `DueDate` is computed in this app per **fixed, method-specific billing
 rules** (not a flat day-count), then sent explicitly to QBO. This makes
@@ -3425,7 +3459,8 @@ required values throw immediately.
 | `QBO_WHOLESALE_REFRESH_TOKEN` | _required first run_ | Seed refresh token (from OAuth Playground) |
 | `QBO_ENVIRONMENT` | `sandbox` | `sandbox` or `production` |
 | `QBO_MINOR_VERSION` | `73` | API minor version |
-| `QBO_WHOLESALE_DEFAULT_ITEM_ID` | `1` | QBO Item Id for invoice lines |
+| `QBO_WHOLESALE_DEFAULT_ITEM_ID` | _(optional)_ | Fallback QBO Item Id for invoice lines. When unset, `resolveDefaultItemId()` adopts an existing Service item or creates `QBO_WHOLESALE_DEFAULT_ITEM_NAME` — no id need pre-exist. |
+| `QBO_WHOLESALE_DEFAULT_ITEM_NAME` | `Wholesale Sales` | Name of the auto-created fallback item (only used when the id is unset and no Service item exists to adopt). |
 | `QBO_API_BASE_URL` | _auto_ | Override API host |
 | `QBO_OAUTH_TOKEN_URL` | _auto_ | Override OAuth endpoint |
 | **NMI** | | |

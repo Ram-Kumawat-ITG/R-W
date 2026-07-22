@@ -107,10 +107,12 @@ export const retailQboConfig = {
   //    the same order. Default ON; set QBO_RETAIL_CREATE_VENDOR_BILL=false to
   //    disable without touching the invoice flow.
   createVendorBill: readBool("QBO_RETAIL_CREATE_VENDOR_BILL", true),
-  // The QBO Vendor the dropship bills post to. Prefer an explicit id; the
-  // existing QBO_RETAIL_ADMIN_VENDOR alias ("all patient bills are recorded as
-  // bills from this vendor") is accepted as a fallback. When NO id is set, the
-  // service find-or-creates the vendor by name/email below.
+  // The QBO Vendor the dropship bills post to. OPTIONAL — when set it's an
+  // authoritative override (backward compatible; the legacy QBO_RETAIL_ADMIN_VENDOR
+  // alias is still accepted). When NO id is set (the intended default now), the
+  // service find-or-creates the vendor by name/email below and PERSISTS the
+  // resolved id in the `retail_qbo_dropship_vendor` mapping for reuse — so no
+  // hardcoded id is required in production. See resolveDropshipVendorId().
   dropshipVendorId:
     readEnv("QBO_RETAIL_DROPSHIP_VENDOR_ID") || readEnv("QBO_RETAIL_ADMIN_VENDOR"),
   dropshipVendorName: readEnv("QBO_RETAIL_DROPSHIP_VENDOR_NAME", {
