@@ -42,6 +42,8 @@ import {
   MUTATION_ORDER_DELETE,
   MUTATION_STAGED_UPLOADS_CREATE,
   MUTATION_FILE_CREATE,
+  MUTATION_METAFIELDS_SET,
+  MUTATION_METAFIELD_DELETE,
 } from './shopify.mutations'
 import {
   getUnauthenticatedAdmin,
@@ -582,6 +584,65 @@ export async function deleteCustomer(admin, customerId) {
   );
   if (userErrors.length)
     throw new Error(userErrors.map((e) => e.message).join("; "));
+  return true;
+}
+
+// App-owned customer metafield that mirrors the payment order-hold, read by
+// the checkout-validation Function. `$app:` reserves the namespace to this app
+// so its Functions can read it. `held=true` writes value "held"; `held=false`
+// DELETES it (absent metafield = no hold). Resolves an offline admin from
+// `shop` (called from webhook/CRON contexts with no request admin).
+export const ORDER_HOLD_METAFIELD = {
+  namespace: "$app:wholesale",
+  key: "order_hold",
+  heldValue: "held",
+};
+
+export async function setCustomerOrderHoldMetafield({ shop, customerId, held }) {
+  if (!shop || !customerId) {
+    throw new Error("setCustomerOrderHoldMetafield: shop and customerId are required");
+  }
+  const gid = String(customerId).startsWith("gid://")
+    ? String(customerId)
+    : `gid://shopify/Customer/${customerId}`;
+  const { admin } = await getUnauthenticatedAdmin(shop);
+
+  if (held) {
+    const { userErrors } = await executeMutation(
+      admin,
+      MUTATION_METAFIELDS_SET,
+      {
+        metafields: [
+          {
+            ownerId: gid,
+            namespace: ORDER_HOLD_METAFIELD.namespace,
+            key: ORDER_HOLD_METAFIELD.key,
+            type: "single_line_text_field",
+            value: ORDER_HOLD_METAFIELD.heldValue,
+          },
+        ],
+      },
+      "metafieldsSet",
+    );
+    if (userErrors.length) throw new Error(userErrors.map((e) => e.message).join("; "));
+    return true;
+  }
+
+  // Clear = delete the metafield. Treat "not found" as success (idempotent).
+  const { userErrors } = await executeMutation(
+    admin,
+    MUTATION_METAFIELD_DELETE,
+    {
+      input: {
+        ownerId: gid,
+        namespace: ORDER_HOLD_METAFIELD.namespace,
+        key: ORDER_HOLD_METAFIELD.key,
+      },
+    },
+    "metafieldDelete",
+  );
+  const fatal = userErrors.filter((e) => !/not\s*found|does not exist/i.test(e.message || ""));
+  if (fatal.length) throw new Error(fatal.map((e) => e.message).join("; "));
   return true;
 }
 

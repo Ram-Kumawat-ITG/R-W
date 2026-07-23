@@ -19,6 +19,7 @@
     "setup": "prisma generate && prisma migrate deploy",
     "cleanup:pay-links": "vite-node --config scripts/vite-node.config.js scripts/strip-invoice-pay-links.js",
     "backfill:cron-batch-amounts": "vite-node --config scripts/vite-node.config.js scripts/backfill-cron-batch-item-amounts.js",
+    "reconcile:order-holds": "vite-node --config scripts/vite-node.config.js scripts/reconcile-order-holds.js",
     "delete:wholesale-products": "vite-node --config scripts/vite-node.config.js scripts/delete-all-wholesale-products.js",
     "delete:retail-products": "vite-node --config scripts/vite-node.config.js scripts/delete-all-retail-products.js",
     "lint": "eslint --ignore-path .gitignore --cache --cache-location ./node_modules/.cache/eslint .",

@@ -25,6 +25,7 @@ import CustomerMap from '../../models/customerMap.server'
 import WholesaleApplication from '../../models/wholesaleApplication.server'
 import { chargeInvoice } from './payment.service'
 import { paymentRetryConfig } from './paymentRetry.config'
+import { reconcilePractitionerOrderHold } from '../order/orderHold.service'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('paymentRetry.service')
@@ -210,6 +211,19 @@ export async function processFailedCardRetries({ now = new Date() } = {}) {
       invoice.markModified('cardRetry')
       await invoice.save()
       released = true
+
+      // All card retries exhausted → put the practitioner on a payment order
+      // hold (blocks NEW orders at checkout until the invoice is paid).
+      // Idempotent + best-effort (never throws); a successful retry instead
+      // went through chargeInvoice → propagateSuccessfulPayment, which
+      // re-reconciles and clears the hold if nothing else is outstanding.
+      if (invoice.paymentStatus === 'failed') {
+        await reconcilePractitionerOrderHold({
+          shop: invoice.shop,
+          email: invoice.customerEmail,
+          reason: 'card_retries_exhausted',
+        })
+      }
     } catch (err) {
       log.error('retry.invoice_failed', { invoiceId: String(invoice._id), err: err?.message || err })
     } finally {

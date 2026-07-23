@@ -106,3 +106,27 @@ export const MUTATION_FILE_CREATE = `#graphql
     }
   }
 `
+
+// Set an (app-owned) metafield. Used to mirror the practitioner's payment
+// order-hold onto their Shopify customer so the cart/checkout validation
+// Function can read it (Functions can't call our DB/API). The `$app:` reserved
+// namespace makes the metafield owned by — and readable to — this app's
+// Functions.
+export const MUTATION_METAFIELDS_SET = `#graphql
+  mutation MetafieldsSet($metafields: [MetafieldsSetInput!]!) {
+    metafieldsSet(metafields: $metafields) {
+      metafields { id namespace key value }
+      userErrors { field message code }
+    }
+  }
+`
+
+// Delete a metafield (used to CLEAR the order hold — absent metafield = no hold).
+export const MUTATION_METAFIELD_DELETE = `#graphql
+  mutation MetafieldDelete($input: MetafieldIdentifierInput!) {
+    metafieldDelete: metafieldsDelete(metafields: [$input]) {
+      deletedMetafields { key namespace ownerId }
+      userErrors { field message }
+    }
+  }
+`

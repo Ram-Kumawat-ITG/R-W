@@ -41,6 +41,7 @@ import {
   applyDerivedPaymentStatus,
 } from './invoice.utils'
 import { buildProfileFromShopifyOrder } from '../customer/customer.utils'
+import { reconcilePractitionerOrderHold } from '../order/orderHold.service'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('invoice.service')
@@ -698,6 +699,19 @@ export async function propagateSuccessfulPayment({ invoice, customerMap, transac
   await dispatchInvoiceLifecycleEmails({ invoice, customerMap, event: 'payment' })
 
   await invoice.save()
+
+  // Auto-unblock: if this invoice is now fully paid, re-evaluate the
+  // practitioner's payment order hold. The reconciler clears the hold only
+  // when NO outstanding failed invoice remains (paying one of several does not
+  // prematurely unblock). Idempotent + best-effort — never throws.
+  if (invoice.paymentStatus === 'paid') {
+    await reconcilePractitionerOrderHold({
+      shop: invoice.shop,
+      email: invoice.customerEmail,
+      reason: 'outstanding_invoice',
+    })
+  }
+
   return { syncErrors }
 }
 

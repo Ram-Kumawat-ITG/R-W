@@ -93,6 +93,12 @@ export default function CustomerDetail() {
     feeFetcher.state === "submitting" || feeFetcher.state === "loading";
   const handledFeeRef = useRef(null);
 
+  // Payment order-hold (checkout block from an exhausted/failed invoice).
+  const holdFetcher = useFetcher();
+  const clearingHold =
+    holdFetcher.state === "submitting" || holdFetcher.state === "loading";
+  const handledHoldRef = useRef(null);
+
   const fullName =
     `${a.firstName || ""} ${a.lastName || ""}`.trim() || "(no name)";
   const declining =
@@ -218,6 +224,33 @@ export default function CustomerDetail() {
       );
     }
   }, [feeFetcher.data, feeFetcher.state, shopify]);
+
+  // Surface the clear-order-hold result.
+  useEffect(() => {
+    if (!holdFetcher.data) return;
+    if (holdFetcher.state !== "idle") return;
+    if (handledHoldRef.current === holdFetcher.data) return;
+    handledHoldRef.current = holdFetcher.data;
+    const d = holdFetcher.data;
+    if (d.status === "success") {
+      shopify?.toast?.show(
+        "Order hold cleared" +
+          (d.result?.stillOutstanding
+            ? " — note: an unpaid failed invoice remains, so the hold may re-apply until it's resolved"
+            : ""),
+      );
+    } else {
+      setBannerError(d.message || "Couldn't clear the order hold.");
+    }
+  }, [holdFetcher.data, holdFetcher.state, shopify]);
+
+  const onClearOrderHold = () => {
+    setBannerError(null);
+    holdFetcher.submit(null, {
+      method: "POST",
+      action: `/api/admin/customers/${a._id}/clear-order-hold`,
+    });
+  };
 
   const selectedCreds = CREDENTIAL_MAP.map((c) => {
     const v = a.credentials?.[c.id];
@@ -569,6 +602,52 @@ export default function CustomerDetail() {
       {/* ───── Payment details ───── */}
       <s-section heading="Payment details">
         <s-stack direction="block" gap="large-100">
+          {/* Payment order hold — auto-set when an invoice's card retries are
+              exhausted; blocks new orders at checkout until paid. Separate from
+              the admin Blocked flow. */}
+          {a.orderHold ? (
+            <s-box
+              padding="base"
+              borderWidth="base"
+              borderColor="critical"
+              borderRadius="base"
+            >
+              <s-stack direction="block" gap="tight">
+                <s-stack direction="inline" gap="base" alignItems="center">
+                  <s-badge tone="critical">Order hold — checkout blocked</s-badge>
+                </s-stack>
+                <s-text tone="subdued">
+                  This practitioner has an outstanding failed invoice, so new
+                  orders are blocked at checkout. It clears automatically once
+                  the invoice is paid. Reason: {a.orderHoldReason || "outstanding_invoice"}
+                  {a.orderHoldAt
+                    ? ` · since ${new Date(a.orderHoldAt).toLocaleString()}`
+                    : ""}
+                </s-text>
+                <s-stack direction="inline" gap="base" alignItems="center">
+                  <s-button
+                    tone="critical"
+                    onClick={onClearOrderHold}
+                    {...(clearingHold ? { loading: true } : {})}
+                  >
+                    Clear order hold (override)
+                  </s-button>
+                  <s-text tone="subdued">
+                    Override only — if the unpaid invoice remains, the hold may
+                    re-apply. Resolve the invoice to remove it permanently.
+                  </s-text>
+                </s-stack>
+              </s-stack>
+            </s-box>
+          ) : (
+            <s-text tone="subdued">
+              Order hold: none — this practitioner can place orders.
+              {a.orderHoldClearedAt
+                ? ` (last cleared ${new Date(a.orderHoldClearedAt).toLocaleString()})`
+                : ""}
+            </s-text>
+          )}
+
           {!a.payment || !a.payment.method ? (
             <s-paragraph tone="subdued">
               No payment details on file.

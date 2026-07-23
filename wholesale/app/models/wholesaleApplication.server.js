@@ -212,6 +212,22 @@ const wholesaleApplicationSchema = new mongoose.Schema(
     cardFeeOverrideUpdatedAt: { type: Date, default: null },
     cardFeeOverrideUpdatedBy: { type: String, default: null },
 
+    // Payment-driven order hold — set automatically when this practitioner has
+    // an outstanding FAILED invoice (card retries exhausted / unpaid), cleared
+    // automatically once no outstanding failed invoice remains. Blocks NEW
+    // orders at checkout (via a mirrored customer metafield read by the
+    // cart.validations.generate.run Function). DISTINCT from the admin
+    // `status: 'blocked'` flow — an admin block is a manual decision and is
+    // never touched by this auto-managed hold, and vice-versa. Reconciled from
+    // live invoice state by orderHold.service.reconcilePractitionerOrderHold,
+    // so it is self-healing and never blocks a practitioner whose invoices are
+    // resolved.
+    orderHold: { type: Boolean, default: false, index: true },
+    orderHoldReason: { type: String, default: null },
+    orderHoldAt: { type: Date, default: null },
+    orderHoldClearedAt: { type: Date, default: null },
+    orderHoldClearedBy: { type: String, default: null },
+
     signature: { type: signatureSchema, default: null },
 
     // Commission payout bank account (Step 3 — collapsed by default).
