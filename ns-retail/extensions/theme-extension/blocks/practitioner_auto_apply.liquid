@@ -32,6 +32,14 @@
   budget to re-apply — and only caps a code that can NEVER land, bounding a
   worst-case loop to MAX reloads instead of forever.
 
+  STALE detection uses REAL entered codes only (cart.discount_codes[].code) —
+  NOT cart_level_discount_applications titles. This Function-backed discount's
+  application title is its ADMIN title ("Practitioner code — <code>"), not the
+  bare code; counting it as a "stale foreign code" meant the correct-state
+  branch never fired, the budget never reset, and MAX was exhausted so a removed
+  code never came back. Application titles are used only to CONFIRM the assigned
+  code is applied, never to flag a stale one.
+
   NOTE 1 — CHECKOUT: this is an Online Store app embed, so it runs on the cart
   (and other storefront pages), NOT on the checkout pages. On Shopify Grow,
   checkout UI extensions on the core checkout steps are Plus-only, so a code
@@ -79,23 +87,42 @@
       var itemCount = typeof cart.item_count === 'number' ? cart.item_count : 0;
       if (itemCount <= 0) return;
 
-      // Every discount code currently ON the cart. NOTE: presence is judged
-      // regardless of `applicable` — a code that's on the cart (even if the
-      // Function currently gives it $0) is still "present", and re-adding it
-      // wouldn't change that. Presence is what lets us re-apply after a removal
-      // WITHOUT looping: once it's on the cart we stop.
-      var flat = Array.isArray(cart.discount_codes) ? cart.discount_codes : [];
-      var lvl = Array.isArray(cart.cart_level_discount_applications)
-        ? cart.cart_level_discount_applications : [];
-      var present = flat.concat(lvl)
-        .map(function (dc) { return String((dc && (dc.code || dc.title)) || '').toLowerCase(); })
+      // REAL, removable discount codes entered on the cart. Each entry in
+      // `discount_codes` carries a `.code` — the only thing a shopper can
+      // actually type into (or remove from) the native discount field. This
+      // drives BOTH "is the assigned code present" and "is a stale/foreign code
+      // present". NOTE: presence is judged regardless of `applicable` — a code
+      // that's on the cart (even if the Function currently gives it $0) is still
+      // "present", and re-adding it wouldn't change that. Presence is what lets
+      // us re-apply after a removal WITHOUT looping: once it's on the cart we
+      // stop.
+      var codes = (Array.isArray(cart.discount_codes) ? cart.discount_codes : [])
+        .map(function (dc) { return String((dc && dc.code) || '').toLowerCase(); })
         .filter(Boolean);
 
-      var assignedPresent = present.indexOf(lower) !== -1;
-      // Any code on the cart that is NOT the patient's currently-assigned one —
-      // e.g. left over after the practitioner reassigned/revoked it. The
+      // Order-level discount APPLICATIONS. For this Function-backed code
+      // discount the application `title` is the discount's ADMIN title
+      // ("Practitioner code — <code>"), NOT the bare code — so it must NEVER be
+      // treated as a foreign/stale code: you can't remove an application by
+      // title, and doing so mistook the assigned discount's OWN application for
+      // a stale code, which meant the "correct state" branch never fired, the
+      // attempt budget was never reset, and it burned through MAX so a later
+      // manual removal never re-applied ("removed code doesn't come back").
+      // Used ONLY as a secondary confirmation the assigned code is applied.
+      var appTitles = (Array.isArray(cart.cart_level_discount_applications)
+        ? cart.cart_level_discount_applications : [])
+        .map(function (a) { return String((a && (a.code || a.title)) || '').toLowerCase(); })
+        .filter(Boolean);
+
+      var assignedPresent =
+        codes.indexOf(lower) !== -1 ||
+        appTitles.some(function (t) { return t === lower || t.indexOf(lower) !== -1; });
+      // Any REAL code on the cart that is NOT the patient's currently-assigned
+      // one — e.g. left over after the practitioner reassigned/revoked it. The
       // practitioner discount is non-combinable, so a stale one must be cleared.
-      var stale = present.filter(function (c) { return c !== lower; });
+      // Derived from real codes only, so the assigned discount's own application
+      // title is never mistaken for a stale code.
+      var stale = codes.filter(function (c) { return c !== lower; });
 
       // Correct state: the assigned code is on the cart and nothing stale is.
       // Reset the attempt budget so a future removal re-applies from scratch.
