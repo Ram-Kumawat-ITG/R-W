@@ -237,6 +237,23 @@ export function computeProcessingFee({ baseAmount, method, rates }) {
   return { amount, rate, method, label: processingFeeLabel(method) }
 }
 
+// Apply a per-practitioner CARD-fee override to the base per-method rate map.
+// The override replaces ONLY the `card` rate — `ach` and `check` are left at
+// their configured defaults, so a practitioner who pays by ACH always gets the
+// standard ACH rate regardless of any card override. Pass the result as the
+// `rates` argument to computeProcessingFee.
+//
+// `cardFeeOverridePercent` is a fraction (0 = 0%, 0.015 = 1.5%); `null`/
+// undefined (or an invalid/negative value) means "no override — use the
+// defaults". NOTE 0 is a valid, distinct override (explicit "no card fee") and
+// is preserved here; only null/undefined falls through to the default.
+export function effectiveFeeRates(baseRates, cardFeeOverridePercent) {
+  if (cardFeeOverridePercent === null || cardFeeOverridePercent === undefined) return baseRates
+  const n = Number(cardFeeOverridePercent)
+  if (!Number.isFinite(n) || n < 0) return baseRates
+  return { ...baseRates, card: n }
+}
+
 // Build a processing-fee invoice line. Used to append the line to a QBO
 // invoice at settlement. The description encodes the method label, the rate
 // as a percentage, AND the calculation basis when known, so the line is

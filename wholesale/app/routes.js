@@ -60,6 +60,7 @@ export default [
   route("/api/admin/customers/:id/decline", "api/admin/decline.js"),
   route("/api/admin/customers/:id/block", "api/admin/block.js"),
   route("/api/admin/customers/:id/payment-method", "api/admin/payment-method.js"),
+  route("/api/admin/customers/:id/card-fee-override", "api/admin/card-fee-override.js"),
   route("/api/admin/orders/:id/retry-payment", "api/admin/retry-payment.js"),
   route("/api/admin/orders/:id/sync-ach-status", "api/admin/sync-ach-status.js"),
   route("/api/admin/orders/:id/mark-cheque-paid", "api/admin/mark-cheque-paid.js"),

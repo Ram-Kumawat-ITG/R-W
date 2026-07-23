@@ -198,6 +198,20 @@ const wholesaleApplicationSchema = new mongoose.Schema(
 
     payment: { type: paymentSchema, default: null },
     paymentMethodHistory: { type: [paymentMethodHistorySchema], default: [] },
+
+    // Per-practitioner CARD-fee override, set by an admin (see
+    // /api/admin/customers/:id/card-fee-override). A fraction where 0 = 0%
+    // (no card fee) and 0.015 = 1.5%; `null` means "use the default card rate"
+    // (invoiceConfig.processingFeeRates.card, 3%). NOTE: null and 0 are
+    // intentionally distinct — 0 is an EXPLICIT "charge no card fee", not the
+    // default. Card-only by design: this never affects the ACH or cheque fee
+    // (a practitioner who pays by ACH always gets the standard ACH rate).
+    // Mirrored onto customer_maps.cardFeeOverridePercent for fast read at
+    // charge time.
+    cardFeeOverridePercent: { type: Number, default: null },
+    cardFeeOverrideUpdatedAt: { type: Date, default: null },
+    cardFeeOverrideUpdatedBy: { type: String, default: null },
+
     signature: { type: signatureSchema, default: null },
 
     // Commission payout bank account (Step 3 — collapsed by default).

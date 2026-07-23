@@ -36,6 +36,14 @@ const customerMapSchema = new mongoose.Schema(
       index: true,
     },
 
+    // Per-practitioner CARD-fee override, mirrored from
+    // wholesale_applications.cardFeeOverridePercent at customer-sync time so
+    // the fee compute sites (invoice creation, charge) can read it without an
+    // extra lookup. A fraction (0 = 0%, 0.015 = 1.5%); null = use the default
+    // per-method rate (invoiceConfig.processingFeeRates.card, 3%). Card-only —
+    // ACH/cheque always use the standard rate.
+    cardFeeOverridePercent: { type: Number, default: null },
+
     // Snapshot used for matching/recreating in either system. Kept here
     // (not just referenced from Shopify) so jobs running async don't
     // need a fresh admin API call.

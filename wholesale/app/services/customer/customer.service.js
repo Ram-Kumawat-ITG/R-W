@@ -122,7 +122,7 @@ export async function ensureCustomerForOrder({ shop, order }) {
   // history. The cheque → card admin fallback mutates
   // `Invoice.paymentMethod`, never this customer-level value.
   const app = await WholesaleApplication.findOne({ shop, email: profile.email })
-    .select('payment.method payment.card payment.ach nmiCustomerVaultId')
+    .select('payment.method payment.card payment.ach nmiCustomerVaultId cardFeeOverridePercent')
     .lean()
 
   {
@@ -144,6 +144,21 @@ export async function ensureCustomerForOrder({ shop, order }) {
       mapping.paymentMethod = resolved
     } else {
       console.log(`[customers] payment-method preference unchanged ("${resolved}")`)
+    }
+  }
+
+  // Mirror the per-practitioner CARD-fee override onto the customer map so the
+  // fee compute sites (invoice creation, chargeInvoice) can read it without a
+  // separate lookup. Source of truth is wholesale_applications; null = default
+  // card rate. Normalized to a finite >= 0 number or null.
+  {
+    const raw = app?.cardFeeOverridePercent
+    const resolvedOverride =
+      raw === null || raw === undefined || !Number.isFinite(Number(raw)) || Number(raw) < 0
+        ? null
+        : Number(raw)
+    if (mapping.cardFeeOverridePercent !== resolvedOverride) {
+      mapping.cardFeeOverridePercent = resolvedOverride
     }
   }
 

@@ -74,6 +74,25 @@ export default function CustomerDetail() {
     ? [...a.paymentMethodHistory].reverse()
     : [];
 
+  // Per-practitioner CARD-fee override control. Stored as a fraction; edited
+  // here as a percent. Blank = default card rate (3%); 0 = explicit no card fee.
+  const feeFetcher = useFetcher();
+  const feeModalRef = useRef(null);
+  const currentOverrideFraction =
+    a.cardFeeOverridePercent === null || a.cardFeeOverridePercent === undefined
+      ? null
+      : Number(a.cardFeeOverridePercent);
+  const currentOverridePercentStr =
+    currentOverrideFraction === null
+      ? ""
+      : String(+(currentOverrideFraction * 100).toFixed(4));
+  const [feePercentInput, setFeePercentInput] = useState(currentOverridePercentStr);
+  const feeInputTrimmed = String(feePercentInput ?? "").trim();
+  const feeUnchanged = feeInputTrimmed === currentOverridePercentStr;
+  const savingFee =
+    feeFetcher.state === "submitting" || feeFetcher.state === "loading";
+  const handledFeeRef = useRef(null);
+
   const fullName =
     `${a.firstName || ""} ${a.lastName || ""}`.trim() || "(no name)";
   const declining =
@@ -162,6 +181,43 @@ export default function CustomerDetail() {
       },
     );
   };
+
+  const openFeeModal = () => feeModalRef.current?.showOverlay?.();
+  const closeFeeModal = () => feeModalRef.current?.hideOverlay?.();
+  const onConfirmFeeOverride = () => {
+    setBannerError(null);
+    closeFeeModal();
+    // Blank clears the override (null); a number is sent as a percent.
+    feeFetcher.submit(
+      { percent: feeInputTrimmed === "" ? null : Number(feeInputTrimmed) },
+      {
+        method: "POST",
+        action: `/api/admin/customers/${a._id}/card-fee-override`,
+        encType: "application/json",
+      },
+    );
+  };
+
+  // Surface the card-fee-override result (toast on success, banner on error).
+  useEffect(() => {
+    if (!feeFetcher.data) return;
+    if (feeFetcher.state !== "idle") return;
+    if (handledFeeRef.current === feeFetcher.data) return;
+    handledFeeRef.current = feeFetcher.data;
+    const d = feeFetcher.data;
+    if (d.status === "success") {
+      const r = d.result || {};
+      const label = r.newPercent == null ? "default (3%)" : `${r.newPercent}%`;
+      shopify?.toast?.show(
+        `Card fee set to ${label}` +
+          (r.reprice ? ` — ${r.reprice.updated || 0} open invoice(s) re-priced` : ""),
+      );
+    } else {
+      setBannerError(
+        d.result?.detail || d.message || "Couldn't update the card fee override.",
+      );
+    }
+  }, [feeFetcher.data, feeFetcher.state, shopify]);
 
   const selectedCreds = CREDENTIAL_MAP.map((c) => {
     const v = a.credentials?.[c.id];
@@ -600,6 +656,61 @@ export default function CustomerDetail() {
             </s-stack>
           </s-box>
 
+          <s-box
+            padding="base"
+            borderWidth="base"
+            borderColor="border"
+            borderRadius="base"
+          >
+            <s-stack direction="block" gap="base">
+              <s-text>
+                <strong>Card fee override</strong>
+              </s-text>
+              <s-paragraph tone="subdued">
+                Set a custom credit-card processing fee for this practitioner,
+                overriding the default 3%. Enter a percent — e.g.{" "}
+                <strong>1.5</strong> for 1.5%, or <strong>0</strong> to charge no
+                card fee. Leave blank to use the default. Applies to{" "}
+                <strong>card payments only</strong> — ACH and cheque always use
+                the standard rate (1% / 0%). Saving re-prices this
+                practitioner&apos;s open card invoices.
+              </s-paragraph>
+              <s-stack direction="inline" gap="base" alignItems="end">
+                <s-text-field
+                  label="Card fee %"
+                  type="number"
+                  inputMode="decimal"
+                  placeholder="Default (3%)"
+                  value={feePercentInput}
+                  onInput={(e) =>
+                    setFeePercentInput(e?.currentTarget?.value ?? "")
+                  }
+                  onChange={(e) => setFeePercentInput(e?.target?.value ?? "")}
+                />
+                <s-button
+                  variant="primary"
+                  onClick={openFeeModal}
+                  {...(feeUnchanged ? { disabled: true } : {})}
+                  {...(savingFee ? { loading: true } : {})}
+                >
+                  Save card fee
+                </s-button>
+              </s-stack>
+              <s-text tone="subdued">
+                Current card fee:{" "}
+                {currentOverrideFraction === null
+                  ? "Default (3%)"
+                  : `${+(currentOverrideFraction * 100).toFixed(4)}% (override)`}
+                {a.cardFeeOverrideUpdatedAt
+                  ? ` · set ${new Date(a.cardFeeOverrideUpdatedAt).toLocaleString()}` +
+                    (a.cardFeeOverrideUpdatedBy
+                      ? ` by ${a.cardFeeOverrideUpdatedBy}`
+                      : "")
+                  : ""}
+              </s-text>
+            </s-stack>
+          </s-box>
+
           {methodHistory.length > 0 && (
             <s-stack direction="block" gap="tight">
               <s-text>
@@ -971,6 +1082,46 @@ export default function CustomerDetail() {
           Apply
         </s-button>
         <s-button slot="secondary-actions" onClick={closePrefModal}>
+          Cancel
+        </s-button>
+      </s-modal>
+
+      <s-modal
+        ref={feeModalRef}
+        id="apply-card-fee-override-modal"
+        heading="Save card fee override?"
+        accessibilityLabel="Confirm card fee override"
+      >
+        <s-paragraph>
+          {feeInputTrimmed === "" ? (
+            <>
+              This <strong>clears</strong> the card fee override — future card
+              payments use the default 3%.
+            </>
+          ) : (
+            <>
+              This sets the credit-card processing fee for this practitioner to{" "}
+              <strong>{feeInputTrimmed}%</strong>
+              {Number(feeInputTrimmed) === 0
+                ? " (no card fee will be charged)"
+                : ""}
+              .
+            </>
+          )}{" "}
+          If they currently pay by card, their unpaid / open card invoices are
+          re-priced and QuickBooks is updated. ACH and cheque invoices are not
+          affected. Paid, partially-paid, and in-flight invoices are left
+          unchanged.
+        </s-paragraph>
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          onClick={onConfirmFeeOverride}
+          {...(savingFee ? { loading: true } : {})}
+        >
+          Save
+        </s-button>
+        <s-button slot="secondary-actions" onClick={closeFeeModal}>
           Cancel
         </s-button>
       </s-modal>
