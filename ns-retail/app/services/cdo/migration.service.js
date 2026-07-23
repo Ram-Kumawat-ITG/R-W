@@ -162,8 +162,13 @@ function pushError(section, rowId, message) {
 // `commit=true` performs the same walk but actually persists + calls
 // Shopify. Both modes return the identical report shape so the UI can show
 // one preview and, on commit, the same shape again with real outcomes.
-export async function runMigrationImport({ parsed, actor, commit }) {
+export async function runMigrationImport({ parsed, actor, commit, migrationRunId = null }) {
   await connectDB();
+
+  // Stamped on every record this importer creates, so migrated data is
+  // uniformly recognizable afterwards ({ migrationSource: "goaffpro" }) and
+  // each record links back to its cdo_migration_runs audit entry.
+  const prov = { migrationSource: "goaffpro", migrationRunId: migrationRunId || null };
 
   const report = {
     dryRun: !commit,
@@ -299,6 +304,7 @@ export async function runMigrationImport({ parsed, actor, commit }) {
         status: ["active", "paused", "archived"].includes(s(row.status)) ? s(row.status) : "active",
         note: "Migrated from GoAffPro",
         createdBy: actor,
+        ...prov,
       });
 
       if (shop) {
@@ -426,6 +432,7 @@ export async function runMigrationImport({ parsed, actor, commit }) {
         status,
         referredAt: dateOrNull(row.first_referred_at),
         convertedAt: dateOrNull(row.converted_at),
+        ...prov,
       });
       report.referredCustomers.created += 1;
     } catch (err) {
@@ -519,6 +526,7 @@ export async function runMigrationImport({ parsed, actor, commit }) {
         // the live ingestion pipeline.
         migratedFromGoAffPro: true,
         goaffproOrderId: s(row.goaffpro_order_id) || null,
+        ...prov,
       });
 
       const commission = await CdoCommission.create({
@@ -535,6 +543,7 @@ export async function runMigrationImport({ parsed, actor, commit }) {
         payoutStatus: commissionStatus === "reversed" ? "cancelled" : payoutStatus,
         earnedAt: dateOrNull(row.earned_at) || placedAt,
         payoutDate: dateOrNull(row.paid_at),
+        ...prov,
       });
       commissionIdByRowId.set(String(row.row_id), commission._id);
       report.historicalOrders.created += 1;
@@ -624,6 +633,7 @@ export async function runMigrationImport({ parsed, actor, commit }) {
             source: "admin",
           },
         ],
+        ...prov,
       });
       await CdoCommission.updateMany(
         { _id: { $in: commissionIds } },

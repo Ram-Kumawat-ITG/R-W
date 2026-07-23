@@ -3,6 +3,7 @@ import { authenticate } from "../shopify.server";
 import { listReferrals } from "../services/cdo/cdo.service";
 import DataTable from "../components/cdo/DataTable";
 import StatusBadge from "../components/cdo/StatusBadge";
+import { MigratedBadge, MIGRATED_FILTER } from "../components/cdo/MigratedBadge";
 import { formatDate } from "../utils/format";
 
 export const loader = async ({ request }) => {
@@ -15,7 +16,16 @@ const COLUMNS = [
   { key: "practitionerName", header: "Practitioner" },
   { key: "referredName", header: "Referred" },
   { key: "referralCode", header: "Code" },
-  { key: "status", header: "Status", render: (r) => <StatusBadge status={r.status} /> },
+  {
+    key: "status",
+    header: "Status",
+    render: (r) => (
+      <s-stack direction="inline" gap="small-200" alignItems="center">
+        <StatusBadge status={r.status} />
+        <MigratedBadge migrated={r.migrated} />
+      </s-stack>
+    ),
+  },
   {
     key: "referredAt",
     header: "Referred",
@@ -34,6 +44,7 @@ export default function CdoReferrals() {
     <DataTable
       columns={COLUMNS}
       rows={rows}
+      filters={[MIGRATED_FILTER]}
       searchKeys={["practitionerName", "referredName", "referralCode", "status"]}
       searchPlaceholder="Search by practitioner, referred contact, or code"
       description="Prospects referred by practitioners, tracked from first touch through conversion."

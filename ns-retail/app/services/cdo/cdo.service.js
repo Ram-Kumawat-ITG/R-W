@@ -230,6 +230,10 @@ export async function listOrders({ limit = 0 } = {}) {
     currency: r.currency || "USD",
     status: r.status || "pending",
     placedAt: r.placedAt || r.createdAt || null,
+    // True for records created by a bulk migration (GoAffPro import). The
+    // legacy `migratedFromGoAffPro` flag is honored for orders imported
+    // before `migrationSource` existed.
+    migrated: Boolean(r.migrationSource) || r.migratedFromGoAffPro === true,
   }));
 }
 
@@ -275,6 +279,7 @@ export async function listCommissions() {
       qboBillId: payout?.qboBillId || null,
       qboBillUrl: payout?.qboBillUrl || null,
       payoutReference: payout?.reference || null,
+      migrated: Boolean(r.migrationSource),
     };
   });
 }
@@ -370,6 +375,7 @@ export async function listCheckPayouts() {
     lastError: r.lastError || null,
     approvedBy: r.approvedBy || null,
     approvedAt: r.approvedAt || null,
+    migrated: Boolean(r.migrationSource),
   }));
 }
 
@@ -752,6 +758,7 @@ export async function listReferrals() {
     status: r.status || "pending",
     referredAt: r.referredAt || r.createdAt || null,
     convertedAt: r.convertedAt || null,
+    migrated: Boolean(r.migrationSource),
   }));
 }
 
@@ -1568,6 +1575,7 @@ export async function listPractitionerCodes(practitionerId) {
     updatedAt: r.updatedAt || null,
     createdBy: r.createdBy || null,
     updatedBy: r.updatedBy || null,
+    migrated: Boolean(r.migrationSource),
   }));
 }
 

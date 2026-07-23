@@ -1,3 +1,4 @@
+/* eslint-disable react/prop-types */
 import { useEffect, useMemo, useState } from "react";
 import { useNavigation, useRevalidator } from "react-router";
 
@@ -9,6 +10,10 @@ import { useNavigation, useRevalidator } from "react-router";
 // `columns`: [{ key, header, render?(row) => node, align? }]
 // `searchKeys`: row keys concatenated into the search haystack. Omit to
 //   hide the search field.
+// `filters`: optional [{ key, label, options:[{label,value}], predicate(row,value) }]
+//   — rendered as <s-select> chips next to the search box and applied
+//   client-side (before search). The first option is the default/"no filter"
+//   choice; a falsy value means "don't filter".
 
 const DEFAULT_PAGE_SIZE = 15;
 
@@ -21,6 +26,7 @@ export default function DataTable({
   emptyBody = "Records will appear here once they exist.",
   pageSize = DEFAULT_PAGE_SIZE,
   description,
+  filters,
 }) {
   const navigation = useNavigation();
   const revalidator = useRevalidator();
@@ -28,15 +34,27 @@ export default function DataTable({
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(1);
   const searchable = Array.isArray(searchKeys) && searchKeys.length > 0;
+  const hasFilters = Array.isArray(filters) && filters.length > 0;
+
+  const [filterValues, setFilterValues] = useState(() =>
+    hasFilters ? Object.fromEntries(filters.map((f) => [f.key, f.options[0]?.value ?? ""])) : {},
+  );
 
   useEffect(() => {
     setPage(1);
-  }, [search]);
+  }, [search, filterValues]);
 
   const filtered = useMemo(() => {
+    let base = rows;
+    if (hasFilters) {
+      for (const f of filters) {
+        const v = filterValues[f.key];
+        if (v) base = base.filter((r) => f.predicate(r, v));
+      }
+    }
     const q = search.trim().toLowerCase();
-    if (!searchable || !q) return rows;
-    return rows.filter((r) =>
+    if (!searchable || !q) return base;
+    return base.filter((r) =>
       searchKeys
         .map((k) => r[k])
         .filter((v) => v != null && v !== "")
@@ -44,7 +62,7 @@ export default function DataTable({
         .toLowerCase()
         .includes(q),
     );
-  }, [rows, search, searchKeys, searchable]);
+  }, [rows, search, searchKeys, searchable, hasFilters, filters, filterValues]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
   const currentPage = Math.min(page, totalPages);
@@ -61,21 +79,45 @@ export default function DataTable({
 
   return (
     <s-section padding="none">
-      {(description || searchable) && (
+      {(description || searchable || hasFilters) && (
         <s-box padding="base">
           <s-stack direction="block" gap="base">
             {description ? (
               <s-paragraph tone="subdued">{description}</s-paragraph>
             ) : null}
-            {searchable ? (
-              <s-stack direction="inline" gap="base" alignItems="center">
-                <s-search-field
-                  label="Search"
-                  labelAccessibilityVisibility="exclusive"
-                  placeholder={searchPlaceholder}
-                  value={search}
-                  onInput={(e) => setSearch(e?.currentTarget?.value ?? "")}
-                />
+            {searchable || hasFilters ? (
+              <s-stack direction="inline" gap="base" alignItems="end" wrap>
+                {searchable ? (
+                  <s-search-field
+                    label="Search"
+                    labelAccessibilityVisibility="exclusive"
+                    placeholder={searchPlaceholder}
+                    value={search}
+                    onInput={(e) => setSearch(e?.currentTarget?.value ?? "")}
+                  />
+                ) : null}
+                {hasFilters
+                  ? filters.map((f) => (
+                      <s-select
+                        key={f.key}
+                        label={f.label}
+                        labelAccessibilityVisibility={f.label ? "visible" : "exclusive"}
+                        value={filterValues[f.key] ?? f.options[0]?.value ?? ""}
+                        onChange={(e) =>
+                          setFilterValues((prev) => ({
+                            ...prev,
+                            [f.key]: e?.target?.value ?? "",
+                          }))
+                        }
+                      >
+                        {f.options.map((o) => (
+                          <s-option key={o.value} value={o.value}>
+                            {o.label}
+                          </s-option>
+                        ))}
+                      </s-select>
+                    ))
+                  : null}
                 <s-button
                   variant="tertiary"
                   icon="refresh"

@@ -398,6 +398,21 @@ const cdoOrderSchema = new mongoose.Schema(
     // until the retail-invoice flow first writes it (which uses an
     // $ifNull/$mergeObjects pipeline so existing null rows still work).
     retailQbo: { type: retailQboSchema },
+
+    // ── Provenance ──────────────────────────────────────────────────────
+    // Set when this order was created by a bulk data migration (e.g. the
+    // GoAffPro import writes a synthetic `legacy:goaffpro:*` shopifyOrderId)
+    // rather than the live orders/create pipeline. `migrationSource` gives a
+    // uniform, indexed filter shared with every other CDO collection; the
+    // legacy boolean `migratedFromGoAffPro` (set by earlier imports) is kept
+    // for backward compatibility. Both null/absent for organic orders.
+    migrationSource: { type: String, default: null, index: true },
+    migrationRunId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "CdoMigrationRun",
+      default: null,
+      index: true,
+    },
   },
   { collection: "cdo_orders", timestamps: true, strict: false },
 );

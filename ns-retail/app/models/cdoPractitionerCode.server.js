@@ -50,6 +50,20 @@ const cdoPractitionerCodeSchema = new mongoose.Schema(
 
     note: String,
 
+    // Provenance — set when this record was created by a bulk data migration
+    // (e.g. the GoAffPro import) rather than the live pipeline / portal.
+    // `migrationSource` gives a uniform, indexed filter across every CDO
+    // collection ({ migrationSource: "goaffpro" }); `migrationRunId` ties the
+    // record back to its cdo_migration_runs audit entry. Both null for
+    // organically-created records.
+    migrationSource: { type: String, default: null, index: true },
+    migrationRunId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "CdoMigrationRun",
+      default: null,
+      index: true,
+    },
+
     createdBy: String,
     updatedBy: String,
   },

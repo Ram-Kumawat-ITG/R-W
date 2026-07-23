@@ -17,6 +17,7 @@ import {
   markCheckPayoutPaid,
 } from "../services/cdo/cdo.service";
 import StatusBadge from "../components/cdo/StatusBadge";
+import { MigratedBadge } from "../components/cdo/MigratedBadge";
 import { formatCurrency, formatDate, formatDateTime, formatPercent } from "../utils/format";
 
 // ── Loader ────────────────────────────────────────────────────────────────────
@@ -602,6 +603,7 @@ function CheckPayoutCard({ payout }) {
         <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
           <StatusBadge status={payout.status} />
           <s-badge>Check</s-badge>
+          <MigratedBadge migrated={payout.migrated} />
         </div>
 
         {/* Check # */}

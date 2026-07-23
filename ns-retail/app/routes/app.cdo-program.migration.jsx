@@ -38,16 +38,27 @@ export const action = async ({ request }) => {
     const data = new Uint8Array(await file.arrayBuffer());
     const parsed = parseMigrationWorkbook(data);
     const commit = op === "commit";
-    const report = await runMigrationImport({ parsed, actor, commit });
 
+    // On commit, create the audit run FIRST so its _id can be stamped onto
+    // every record the importer writes (migrationRunId), then fill in the
+    // final report once the import completes. Dry runs write nothing, so no
+    // run record and a null migrationRunId.
+    let migrationRunId = null;
     if (commit) {
       await connectDB();
-      await CdoMigrationRun.create({
+      const run = await CdoMigrationRun.create({
         shop: session?.shop || null,
         fileName: file.name,
         actor,
-        report,
+        report: {},
       });
+      migrationRunId = run._id;
+    }
+
+    const report = await runMigrationImport({ parsed, actor, commit, migrationRunId });
+
+    if (commit && migrationRunId) {
+      await CdoMigrationRun.findByIdAndUpdate(migrationRunId, { report });
     }
 
     return { status: "success", op, report };

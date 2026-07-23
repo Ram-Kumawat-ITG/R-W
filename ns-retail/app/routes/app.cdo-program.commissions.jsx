@@ -10,6 +10,7 @@ import {
 } from "../services/cdo/cdo.service";
 import DataTable from "../components/cdo/DataTable";
 import StatusBadge from "../components/cdo/StatusBadge";
+import { MigratedBadge, MIGRATED_FILTER } from "../components/cdo/MigratedBadge";
 import { formatCurrency, formatPercent, formatDate } from "../utils/format";
 
 export const loader = async ({ request }) => {
@@ -85,6 +86,7 @@ export default function CdoCommissions() {
         <s-stack direction="inline" gap="small-200" alignItems="center">
           <StatusBadge status={r.status} />
           {r.paused ? <s-badge tone="warning">Paused</s-badge> : null}
+          <MigratedBadge migrated={r.migrated} />
         </s-stack>
       ),
     },
@@ -138,6 +140,7 @@ export default function CdoCommissions() {
     <DataTable
       columns={columns}
       rows={rows}
+      filters={[MIGRATED_FILTER]}
       searchKeys={["practitionerName", "orderName", "status"]}
       searchPlaceholder="Search by practitioner or order"
       description="Commission history accrued by practitioners on attributed orders. Pause holds a commission out of the automated payout run; resume returns it."

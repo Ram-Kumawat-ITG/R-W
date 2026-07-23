@@ -60,6 +60,16 @@ const cdoCommissionSchema = new mongoose.Schema(
 
     payoutId: { type: mongoose.Schema.Types.ObjectId, ref: "CdoPayout" },
     earnedAt: { type: Date, index: true },
+
+    // Provenance — set when created by a bulk data migration (e.g. GoAffPro)
+    // rather than the live pipeline. See cdoPractitionerCode for the rationale.
+    migrationSource: { type: String, default: null, index: true },
+    migrationRunId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "CdoMigrationRun",
+      default: null,
+      index: true,
+    },
   },
   { collection: "cdo_commissions", timestamps: true, strict: true },
 );
