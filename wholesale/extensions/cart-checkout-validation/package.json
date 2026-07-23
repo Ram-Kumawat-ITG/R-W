@@ -1,5 +1,5 @@
 {
-  "name": "order-hold-check",
+  "name": "cart-checkout-validation",
   "version": "0.0.1",
   "license": "UNLICENSED",
   "type": "module",
@@ -15,7 +15,10 @@
     "documents": "src/*.graphql",
     "generates": {
       "./generated/api.ts": {
-        "plugins": ["typescript", "typescript-operations"]
+        "plugins": [
+          "typescript",
+          "typescript-operations"
+        ]
       }
     },
     "config": {

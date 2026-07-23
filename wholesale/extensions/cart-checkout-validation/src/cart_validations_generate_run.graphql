@@ -1,0 +1,15 @@
+query CartValidationsGenerateRunInput {
+  cart {
+    buyerIdentity {
+      customer {
+        # App-owned metafield mirrored from wholesale_applications.orderHold
+        # (see services/order/orderHold.service + shopify.service
+        # setCustomerOrderHoldMetafield). Present with value "held" ⇒ the
+        # practitioner has an outstanding failed invoice and is blocked.
+        orderHold: metafield(namespace: "$app:wholesale", key: "order_hold") {
+          value
+        }
+      }
+    }
+  }
+}
