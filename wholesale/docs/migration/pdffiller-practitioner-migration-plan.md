@@ -1,5 +1,13 @@
 # PDFfiller → Wholesale Practitioner Registration Migration — Analysis & Plan
 
+> **SUPERSEDED (2026-07-23).** The practitioner-migration source is now the
+> **Talon Advanced Registration** app — see
+> [talon-practitioner-migration-plan.md](talon-practitioner-migration-plan.md)
+> and `2Practitioner_Migration_Template.xlsx`. The importer described below is
+> built and source-agnostic; only the two provenance columns were renamed
+> (`pdffiller_*` → `talon_*`, old names still accepted). This document is kept
+> for history — do not use it for a new migration.
+
 Status: **Planning stage.** This document + the accompanying
 [PDFfiller_Practitioner_Migration_Template.xlsx](PDFfiller_Practitioner_Migration_Template.xlsx)
 are for the project owner to fill in with real PDFfiller export data. The

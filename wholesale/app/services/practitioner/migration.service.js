@@ -1,12 +1,28 @@
-// PDFfiller → Wholesale Practitioner Registration migration import.
+// Talon Advanced Registration → Wholesale Practitioner Registration migration import.
+//
+// Source: the "Talon Advanced Registration" Shopify app, which stores each
+// practitioner's registration as a Shopify CUSTOMER (custom fields in the
+// customer's metafields — VAT/Tax id, EIN, business info, license/file
+// uploads — plus an approval tag like `advanced-registration:approved`). The
+// operator exports that data (app customer-list export / Shopify customer
+// metafields) and maps it into the normalized workbook this parser reads.
+// Because every Talon practitioner is ALREADY a Shopify customer, set
+// `existing_shopify_customer_id` (or rely on the email match) so the importer
+// LINKS to that customer instead of creating a duplicate — preserving order
+// history (see the commit loop's find-existing-customer branch).
 //
 // Parses the Excel workbook described in
-// docs/migration/pdffiller-practitioner-migration-plan.md +
-// PDFfiller_Practitioner_Migration_Template.xlsx, validates it, and (when
+// docs/migration/talon-practitioner-migration-plan.md +
+// 2Practitioner_Migration_Template.xlsx, validates it, and (when
 // commit=true) recreates practitioner accounts through the SAME pipeline a
 // live registration-form submit uses (app/api/registration-form.js): NMI
 // Customer Vault → WholesaleApplication → Shopify customer + invite → CDO
 // referral code.
+//
+// Source-agnostic by design: every column except the two provenance columns
+// (`talon_submission_id`, `talon_form_url`) maps to a wholesale_applications
+// field regardless of where the data came from. The legacy `pdffiller_*`
+// column names are still accepted as a fallback so older workbooks import.
 //
 // Hard constraint (see plan §6): a card payment method cannot be migrated
 // from a spreadsheet — there is no way to produce a valid NMI payment token
@@ -365,8 +381,10 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
         blockedAt: dateOrNull(row.blocked_at),
         existingShopifyCustomerId: s(row.existing_shopify_customer_id) || null,
         referredByPractitionerEmail: lc(row.referred_by_practitioner_email) || null,
-        pdffillerSubmissionId: s(row.pdffiller_submission_id) || null,
-        pdffillerFormUrl: s(row.pdffiller_form_url) || null,
+        // Provenance — prefer the Talon column, fall back to the legacy
+        // pdffiller column name so pre-existing workbooks still import.
+        talonSubmissionId: s(row.talon_submission_id) || s(row.pdffiller_submission_id) || null,
+        talonFormUrl: s(row.talon_form_url) || s(row.pdffiller_form_url) || null,
         notes: s(row.notes) || null,
         credentials: {},
         referrals: {},
@@ -781,14 +799,14 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
       reviewedAt: data.status === "approved" ? data.reviewedAt || new Date() : data.reviewedAt,
       blockedAt: data.status === "blocked" ? data.blockedAt : null,
       referredBy: data.referredByPractitionerEmail
-        ? { email: data.referredByPractitionerEmail, source: "pdffiller_migration" }
+        ? { email: data.referredByPractitionerEmail, source: "talon_migration" }
         : null,
       nmiCustomerVaultId,
       // Non-schema fields (strict:false) — traceability + the card-capture
       // flag, never read by the live registration/order pipeline.
-      migratedFromPdffiller: true,
-      pdffillerSubmissionId: data.pdffillerSubmissionId,
-      pdffillerFormUrl: data.pdffillerFormUrl,
+      migratedFromTalon: true,
+      talonSubmissionId: data.talonSubmissionId,
+      talonFormUrl: data.talonFormUrl,
       needsCardCapture: data.status === "approved" ? payment.needsCardCapture : false,
       migrationNotes: data.notes,
       migrationImportedBy: actor,
@@ -816,7 +834,7 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
           app.credentials[`${credId}`][spec.fileKey] = hosted;
           app.markModified("credentials");
         } else {
-          pushWarning(report.credentials, null, `Could not re-host license file for "${email}" (${credId}) — left as the original PDFfiller URL`);
+          pushWarning(report.credentials, null, `Could not re-host license file for "${email}" (${credId}) — left as the original source URL`);
         }
       }
       if (signature.type === "drawn") {
@@ -827,7 +845,7 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
           app.markModified("signature");
           app.markModified("w9");
         } else {
-          pushWarning(report.w9, null, `Could not re-host signature image for "${email}" — left as the original PDFfiller URL`);
+          pushWarning(report.w9, null, `Could not re-host signature image for "${email}" — left as the original source URL`);
         }
       }
       await app.save();
