@@ -23,9 +23,11 @@ import connectDB from '../APIService/mongo.service'
 import Invoice from '../../models/invoice.server'
 import CustomerMap from '../../models/customerMap.server'
 import WholesaleApplication from '../../models/wholesaleApplication.server'
+import ShopifyOrder from '../../models/order.server'
 import { chargeInvoice } from './payment.service'
 import { paymentRetryConfig } from './paymentRetry.config'
 import { reconcilePractitionerOrderHold } from '../order/orderHold.service'
+import { notifyOrderBlocked } from '../order/orderBlockNotification.service'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('paymentRetry.service')
@@ -36,6 +38,35 @@ const unit = () => (paymentRetryConfig.useMinutes ? 'min' : 'day')
 
 function firstPendingEntry(invoice) {
   return (invoice.cardRetry?.schedule || []).find((e) => e.status === 'pending') || null
+}
+
+// Best-effort lookups for the order-block email — used only on the rare
+// finalize-to-failed path, so a per-invoice query is fine. Both swallow their
+// own errors and return null so they can never break the retry flow.
+async function resolveOrderNumber(orderRef) {
+  if (!orderRef) return null
+  try {
+    const order = await ShopifyOrder.findById(orderRef)
+      .select('shopifyOrderName shopifyOrderNumber')
+      .lean()
+    if (!order) return null
+    return order.shopifyOrderName || (order.shopifyOrderNumber ? `#${order.shopifyOrderNumber}` : null)
+  } catch {
+    return null
+  }
+}
+
+async function resolvePractitionerName(email) {
+  if (!email) return null
+  try {
+    const app = await WholesaleApplication.findOne({ email })
+      .select('firstName lastName businessName')
+      .lean()
+    if (!app) return null
+    return [app.firstName, app.lastName].filter(Boolean).join(' ') || app.businessName || null
+  } catch {
+    return null
+  }
 }
 
 function dueEntry(invoice, now) {
@@ -218,11 +249,36 @@ export async function processFailedCardRetries({ now = new Date() } = {}) {
       // went through chargeInvoice → propagateSuccessfulPayment, which
       // re-reconciles and clears the hold if nothing else is outstanding.
       if (invoice.paymentStatus === 'failed') {
-        await reconcilePractitionerOrderHold({
+        const holdResult = await reconcilePractitionerOrderHold({
           shop: invoice.shop,
           email: invoice.customerEmail,
           reason: 'card_retries_exhausted',
         })
+
+        // Email the practitioner (admin CC'd) the moment the block is newly
+        // applied — `changed && held` = the transition INTO the blocked state,
+        // so an already-blocked practitioner (another failed invoice) isn't
+        // spammed. Best-effort: notify never throws, but guard anyway so a
+        // notification defect can never abort the retry CRON.
+        if (holdResult?.changed && holdResult?.held) {
+          try {
+            const orderNumber = await resolveOrderNumber(invoice.orderRef)
+            const practitionerName = await resolvePractitionerName(invoice.customerEmail)
+            await notifyOrderBlocked({
+              invoice,
+              practitionerName,
+              orderNumber,
+              retryCount: invoice.cardRetry?.retryCount,
+              maxRetries: invoice.cardRetry?.maxRetries,
+              lastFailedAt: now,
+            })
+          } catch (notifyErr) {
+            log.error('retry.block_email_failed', {
+              invoiceId: String(invoice._id),
+              err: notifyErr?.message || notifyErr,
+            })
+          }
+        }
       }
     } catch (err) {
       log.error('retry.invoice_failed', { invoiceId: String(invoice._id), err: err?.message || err })

@@ -3086,6 +3086,21 @@ on ladder exhaustion (block) and `propagateSuccessfulPayment` (unblock).
    re-renders. This is what actually prevents reaching checkout + shows the
    message — the requirement the Function alone can't meet.
 
+**Block email notification.** The moment the hold is newly applied on card-retry
+exhaustion, the practitioner is emailed (admin CC'd) via
+`services/order/orderBlockNotification.service.notifyOrderBlocked`, enqueued on
+the durable SMTP queue (`enqueueEmail` → `send-email` job). Triggered from
+`paymentRetry.service.js` right after `reconcilePractitionerOrderHold`, gated on
+`changed && held` (fires only on the transition into blocked, never re-spams an
+already-blocked practitioner). The email explains new orders are temporarily
+blocked, that the account auto-unblocks once the invoice is paid, includes a
+support line, and lists: Invoice Number, Order Number, Outstanding Amount,
+Invoice Due Date (if available), Last Failed Payment Date, and Retry Attempts.
+Config: `ORDER_BLOCK_SUPPORT_EMAIL` (→ `PAYMENT_FAILURE_SUPPORT_EMAIL` → generic),
+admin CC via `CRON_ADMIN_EMAIL`. Best-effort — never throws into the retry CRON.
+Currently wired to the card path only (the ACH-failure block trigger is still a
+known gap).
+
 **Admin override.** `POST /api/admin/customers/:id/clear-order-hold` +
 a control on the customer detail page. **Backfill sweep:**
 `npm run reconcile:order-holds`. **Deploy:** `shopify app deploy`, then enable
