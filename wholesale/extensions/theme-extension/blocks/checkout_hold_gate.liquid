@@ -75,7 +75,7 @@
     e.preventDefault();
     e.stopPropagation();
     if (e.stopImmediatePropagation) e.stopImmediatePropagation();
-    ensureBanner(trigger);
+    ensureBanner();
   }
   function onSubmitCapture(e) {
     if (!state.held) return;
@@ -88,7 +88,7 @@
     e.preventDefault();
     e.stopPropagation();
     if (e.stopImmediatePropagation) e.stopImmediatePropagation();
-    ensureBanner(form);
+    ensureBanner();
   }
 
   function disableTriggers() {
@@ -106,72 +106,76 @@
     }
   }
 
+  // The banner is position:FIXED with a max z-index and appended to <body>, so
+  // it is immune to the theme's flex/grid/overflow clipping (which was hiding
+  // earlier in-flow insertions). It's then positioned right below the checkout
+  // button by tracking the button's viewport rect (re-tracked on scroll/resize
+  // + cart re-renders). No dependency on the theme's container structure.
   function buildBanner() {
     var el = document.createElement("div");
     el.id = "ns-order-hold-banner";
     el.setAttribute("role", "alert");
     el.style.cssText =
-      "display:block;width:100%;box-sizing:border-box;margin:0 0 16px 0;" +
+      "position:fixed;z-index:2147483647;box-sizing:border-box;margin:0;" +
       "padding:14px 16px;border:1px solid #fecaca;background:#fef2f2;" +
       "color:#991b1b;border-radius:8px;font-size:15px;line-height:1.5;" +
-      "font-family:inherit;text-align:left;";
+      "font-family:inherit;text-align:left;box-shadow:0 4px 16px rgba(0,0,0,0.14);";
     el.textContent = state.message || FALLBACK_MESSAGE;
     return el;
   }
 
-  function insertAfter(newNode, refNode) {
-    if (refNode.insertAdjacentElement) {
-      refNode.insertAdjacentElement("afterend", newNode);
-    } else if (refNode.parentNode) {
-      refNode.parentNode.insertBefore(newNode, refNode.nextSibling);
+  // First VISIBLE checkout button/link (a theme can have hidden drawer copies).
+  function findVisibleCheckout() {
+    var nodes = document.querySelectorAll(CHECKOUT_SELECTOR);
+    for (var i = 0; i < nodes.length; i++) {
+      var r = nodes[i].getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) return nodes[i];
+    }
+    return null;
+  }
+
+  function positionBanner(banner) {
+    var btn = findVisibleCheckout();
+    if (btn) {
+      var r = btn.getBoundingClientRect();
+      var top = r.bottom + 8;
+      // Keep it on-screen if the button is scrolled near the bottom edge.
+      var maxTop = window.innerHeight - banner.offsetHeight - 8;
+      if (top > maxTop) top = Math.max(8, maxTop);
+      banner.style.top = top + "px";
+      banner.style.left = r.left + "px";
+      banner.style.width = Math.max(r.width, 260) + "px";
+      banner.style.right = "auto";
+      banner.style.bottom = "auto";
+    } else {
+      // No visible checkout button (e.g. drawer closed) — pin bottom-center.
+      banner.style.top = "auto";
+      banner.style.bottom = "16px";
+      banner.style.left = "50%";
+      banner.style.right = "auto";
+      banner.style.width = "min(560px, calc(100% - 32px))";
+      banner.style.transform = "translateX(-50%)";
     }
   }
 
-  function ensureBanner(nearEl) {
+  function ensureBanner() {
     if (!state.held) return;
     try {
       var banner = document.getElementById("ns-order-hold-banner");
-      // Already in the DOM — done. (Don't re-place on a transient 0-height read;
-      // that would fight the MutationObserver in an infinite insert loop.)
-      if (banner && banner.isConnected) return;
-      if (banner && banner.parentNode) banner.parentNode.removeChild(banner);
-      banner = buildBanner();
-
-      // Place the banner DIRECTLY below the checkout button.
-      var btn =
-        (nearEl && isCheckoutTrigger(nearEl)) ||
-        document.querySelector(
-          '[name="checkout"], .cart__checkout-button, #checkout, button[value="Checkout"], a[href$="/checkout"]'
-        );
-
-      if (btn) {
-        insertAfter(banner, btn);
-      } else {
-        (document.querySelector('form[action*="/cart"]') ||
-          document.querySelector("#MainContent, main, .cart, #cart") ||
-          document.body).appendChild(banner);
+      if (!banner) {
+        banner = buildBanner();
+        document.body.appendChild(banner);
       }
-
-      // If it landed somewhere invisible (0 height — e.g. clipped flex cell),
-      // fall back to a guaranteed-visible spot at the top of the cart region.
-      if (banner.offsetHeight === 0) {
-        if (banner.parentNode) banner.parentNode.removeChild(banner);
-        var visibleHost =
-          document.querySelector("#MainContent, main, .cart, #cart") || document.body;
-        visibleHost.insertBefore(banner, visibleHost.firstChild);
-      }
-
-      try { banner.scrollIntoView({ behavior: "smooth", block: "center" }); } catch (e) {}
+      positionBanner(banner);
     } catch (err) {
-      // Never let a placement failure break the checkout-disable enforcement.
-      if (window.console) console.warn("[ns-hold] banner insert failed:", err);
+      if (window.console) console.warn("[ns-hold] banner failed:", err);
     }
   }
 
   function enforce() {
     if (!state.held) return;
     disableTriggers();
-    ensureBanner(null); // the checkout button only exists on cart/drawer anyway
+    ensureBanner();
   }
 
   function applyStatus(held, message) {
@@ -218,6 +222,16 @@
       childList: true, subtree: true
     });
   }
+
+  // Keep the fixed banner tracked to the checkout button as the page scrolls
+  // or resizes (reposition only — cheap, no DOM insert).
+  function reposition() {
+    if (!state.held) return;
+    var banner = document.getElementById("ns-order-hold-banner");
+    if (banner) positionBanner(banner);
+  }
+  window.addEventListener("scroll", reposition, { passive: true });
+  window.addEventListener("resize", reposition);
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", fetchStatus);
