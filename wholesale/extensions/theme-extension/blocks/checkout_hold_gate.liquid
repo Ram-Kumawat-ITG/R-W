@@ -123,25 +123,26 @@
     if (banner && banner.isConnected) return; // already visible
     if (!banner) banner = buildBanner();
 
-    // Prefer placing the banner right ABOVE the checkout button (where the
-    // buyer is looking), spanning its summary container. Fall back to the top
-    // of the cart form, then the page.
+    // Place the banner right BELOW the checkout button, spanning its summary
+    // container. Fall back to the bottom of the cart form, then the page.
     var btn =
       (nearEl && isCheckoutTrigger(nearEl)) ||
       document.querySelector('[name="checkout"], .cart__checkout-button, #checkout, button[value="Checkout"]');
 
     if (btn) {
+      // Walk up to the checkout button's own block container (the CTA area),
+      // then drop the banner immediately after it — reliably visible + below.
       var anchor =
         btn.closest(".cart__ctas, .cart__footer, .cart-summary, .totals, .cart__blocks") ||
         btn;
       var host = anchor.parentNode || anchor;
-      host.insertBefore(banner, anchor);
+      host.insertBefore(banner, anchor.nextSibling);
     } else {
       var fallbackHost =
         document.querySelector('form[action*="/cart"]') ||
         document.querySelector("#MainContent, main, .cart, #cart") ||
         document.body;
-      fallbackHost.insertBefore(banner, fallbackHost.firstChild);
+      fallbackHost.appendChild(banner);
     }
     try { banner.scrollIntoView({ behavior: "smooth", block: "center" }); } catch (e) {}
   }
