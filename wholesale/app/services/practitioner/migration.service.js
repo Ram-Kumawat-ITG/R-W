@@ -310,14 +310,25 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
       errs.push(`shipping_property_type must be "Residential" or "Commercial" (got "${row.shipping_property_type}")`);
     }
 
+    // Deferred tax/W-9: when defer_tax_w9=TRUE the practitioner migrates now
+    // WITHOUT tax + W-9 data and is flagged `needsTaxInfo` to complete it later
+    // (a separate collection step). An explicit, per-row, auditable opt-in —
+    // the tax requirements below (and the W-9 requirement) are relaxed only for
+    // these rows; every other row is validated in full.
+    const deferTax = bool(row.defer_tax_w9);
     const taxIdType = lc(row.tax_id_type);
-    if (!["ein", "ssn"].includes(taxIdType)) {
-      errs.push(`tax_id_type must be "ein" or "ssn" (got "${row.tax_id_type}")`);
+    if (!deferTax) {
+      if (!["ein", "ssn"].includes(taxIdType)) {
+        errs.push(`tax_id_type must be "ein" or "ssn" (got "${row.tax_id_type}")`);
+      }
+      req("tax_id", row.tax_id);
+      req("exempt_state", row.exempt_state);
+      req("items_to_resell", row.items_to_resell);
+      req("business_activity", row.business_activity);
+    } else if (taxIdType && !["ein", "ssn"].includes(taxIdType)) {
+      // Deferred, but a value was still supplied → it must be valid if present.
+      errs.push(`tax_id_type must be "ein" or "ssn" when provided (got "${row.tax_id_type}")`);
     }
-    req("tax_id", row.tax_id);
-    req("exempt_state", row.exempt_state);
-    req("items_to_resell", row.items_to_resell);
-    req("business_activity", row.business_activity);
 
     const status = STATUSES.includes(lc(row.status)) ? lc(row.status) : "approved";
     const termsAccepted = bool(row.terms_accepted);
@@ -386,10 +397,18 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
         talonSubmissionId: s(row.talon_submission_id) || s(row.pdffiller_submission_id) || null,
         talonFormUrl: s(row.talon_form_url) || s(row.pdffiller_form_url) || null,
         notes: s(row.notes) || null,
+        deferredTaxInfo: deferTax,
         credentials: {},
         referrals: {},
       },
     });
+    if (deferTax) {
+      pushWarning(
+        report.practitioners,
+        rowId,
+        `tax/W-9 deferred (defer_tax_w9=TRUE) — imports with needsTaxInfo=true; practitioner must complete tax + W-9 later`,
+      );
+    }
     report.practitioners.created += 1; // "resolved for creation"
   }
 
@@ -665,7 +684,8 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
     report.w9.created += 1;
   }
   for (const [email, practitioner] of practitioners) {
-    if (!practitioner.skip && !w9ByEmail.has(email)) {
+    // Deferred-tax practitioners are allowed to import without a W-9 row.
+    if (!practitioner.skip && !w9ByEmail.has(email) && !practitioner.data?.deferredTaxInfo) {
       pushError(report.w9, null, `Practitioner "${email}" has no W9_Tax_Certification row — a signed W-9 is required`);
       practitioner.skip = true;
       practitioner.reason = "missing W-9";
@@ -681,7 +701,10 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
     if (practitioner.skip) continue;
     const payment = paymentByEmail.get(email);
     const w9Row = w9ByEmail.get(email);
-    if (!payment || !w9Row) continue; // already flagged as an error above
+    // Payment is always required; the W-9 is required UNLESS this practitioner
+    // is a deferred-tax import (then w9Row may be absent — see below).
+    if (!payment) continue;
+    if (!w9Row && !practitioner.data?.deferredTaxInfo) continue; // already flagged as an error above
 
     const data = practitioner.data;
     let nmiCustomerVaultId = null;
@@ -739,11 +762,14 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
       }
     }
 
-    const signature = {
-      type: w9Row.signatureType,
-      value: w9Row.signatureValueOrFileUrl,
-      signedAt: w9Row.signedAt,
-    };
+    // A deferred-tax practitioner may have no W-9 row → no signature yet.
+    const signature = w9Row
+      ? {
+          type: w9Row.signatureType,
+          value: w9Row.signatureValueOrFileUrl,
+          signedAt: w9Row.signedAt,
+        }
+      : null;
 
     const payload = {
       shop,
@@ -782,16 +808,18 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
       },
       signature,
       commission: commissionDoc,
-      w9: {
-        legalName: w9Row.legalName,
-        taxClassification: w9Row.taxClassification,
-        llcClassification: w9Row.llcClassification,
-        otherClassification: w9Row.otherClassification,
-        exemptPayeeCode: w9Row.exemptPayeeCode,
-        fatcaCode: w9Row.fatcaCode,
-        signature,
-        submittedAt: w9Row.signedAt,
-      },
+      w9: w9Row
+        ? {
+            legalName: w9Row.legalName,
+            taxClassification: w9Row.taxClassification,
+            llcClassification: w9Row.llcClassification,
+            otherClassification: w9Row.otherClassification,
+            exemptPayeeCode: w9Row.exemptPayeeCode,
+            fatcaCode: w9Row.fatcaCode,
+            signature,
+            submittedAt: w9Row.signedAt,
+          }
+        : null,
       termsAccepted: data.termsAccepted,
       subscribeNews: data.subscribeNews,
       status: data.status,
@@ -808,6 +836,9 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
       talonSubmissionId: data.talonSubmissionId,
       talonFormUrl: data.talonFormUrl,
       needsCardCapture: data.status === "approved" ? payment.needsCardCapture : false,
+      // Deferred tax/W-9 migration — practitioner must complete tax + a signed
+      // W-9 later (a separate collection step). Flagged for admin/portal follow-up.
+      needsTaxInfo: data.deferredTaxInfo === true,
       migrationNotes: data.notes,
       migrationImportedBy: actor,
     };
