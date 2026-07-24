@@ -2621,6 +2621,19 @@ payment-retry ticks. It only *notifies*; it never charges. Registered in
 Cadence is the daily cron in production, or a fast `REMINDER_INTERVAL`
 sweep in dev/test (currently every minute).
 
+**Delivery: SMTP with a dynamic per-stage template** (changed 2026-07-24 —
+was QuickBooks `/invoice/{id}/send`). QBO can't render a fully dynamic body,
+so each reminder is now built by `services/reminder/reminderEmail.service.buildReminderEmail({ stage, … })`
+(per-stage subject/heading/intro/CTA keyed off the stage) and delivered via
+the shared durable SMTP queue (`enqueueEmail` → `send-email` job) — the same
+transport every other notification uses. The email carries full details:
+Practitioner Name, Order Number (from the linked `ShopifyOrder`), Invoice
+Number, Invoice Date, Payment Status, Due Date, Outstanding Amount, and a
+Product Summary (from the order's `rawPayload.line_items`). Recipient is the
+invoice's `customerEmail`; support address is `REMINDER_SUPPORT_EMAIL`
+(→ `PAYMENT_FAILURE_SUPPORT_EMAIL` → generic). Optional admin CC via
+`REMINDER_ADMIN_CC` (OFF by default — the recurring stage fires often).
+
 ```
 REMINDER_CRON=0 2 * * *        # default: 02:00 daily (scheduler timezone)
 REMINDER_INTERVAL=1 minute     # dev/test override (Agenda "every" expression)
