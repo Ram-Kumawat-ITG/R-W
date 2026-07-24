@@ -289,25 +289,41 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
     const req = (field, val) => {
       if (!s(val)) errs.push(`${field} is required`);
     };
+    // Name is the only hard requirement. Phone + billing/shipping ADDRESS are
+    // NOT required for migration: the data is often absent in the source, no NMI
+    // vault is created at import (check-method), and the real address is
+    // re-collected at checkout / via the profile page. Missing contact/address
+    // is tracked as a warning (`needsContactInfo`) rather than blocking the row.
     req("first_name", row.first_name);
     req("last_name", row.last_name);
-    req("phone", row.phone);
-    req("billing_line1", row.billing_line1);
-    req("billing_city", row.billing_city);
-    req("billing_state", row.billing_state);
-    req("billing_zip", row.billing_zip);
-    req("billing_country", row.billing_country);
 
     const shippingSameAsBilling = bool(row.shipping_same_as_billing);
-    if (!shippingSameAsBilling) {
-      req("shipping_line1", row.shipping_line1);
-      req("shipping_city", row.shipping_city);
-      req("shipping_state", row.shipping_state);
-      req("shipping_zip", row.shipping_zip);
-      req("shipping_country", row.shipping_country);
+    const missingContact = [];
+    for (const [f, v] of [
+      ["phone", row.phone],
+      ["billing_line1", row.billing_line1],
+      ["billing_city", row.billing_city],
+      ["billing_state", row.billing_state],
+      ["billing_zip", row.billing_zip],
+      ["billing_country", row.billing_country],
+    ]) {
+      if (!s(v)) missingContact.push(f);
     }
-    if (!["Residential", "Commercial"].includes(s(row.shipping_property_type))) {
-      errs.push(`shipping_property_type must be "Residential" or "Commercial" (got "${row.shipping_property_type}")`);
+    if (!shippingSameAsBilling) {
+      for (const [f, v] of [
+        ["shipping_line1", row.shipping_line1],
+        ["shipping_city", row.shipping_city],
+        ["shipping_state", row.shipping_state],
+        ["shipping_zip", row.shipping_zip],
+        ["shipping_country", row.shipping_country],
+      ]) {
+        if (!s(v)) missingContact.push(f);
+      }
+    }
+    // shipping_property_type, when provided, must be a valid value — but it's no
+    // longer required (defaults are applied downstream / it's a shipping hint).
+    if (s(row.shipping_property_type) && !["Residential", "Commercial"].includes(s(row.shipping_property_type))) {
+      errs.push(`shipping_property_type must be "Residential" or "Commercial" when provided (got "${row.shipping_property_type}")`);
     }
 
     // Deferred tax/W-9: when defer_tax_w9=TRUE the practitioner migrates now
@@ -398,6 +414,7 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
         talonFormUrl: s(row.talon_form_url) || s(row.pdffiller_form_url) || null,
         notes: s(row.notes) || null,
         deferredTaxInfo: deferTax,
+        needsContactInfo: missingContact.length > 0,
         credentials: {},
         referrals: {},
       },
@@ -407,6 +424,13 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
         report.practitioners,
         rowId,
         `tax/W-9 deferred (defer_tax_w9=TRUE) — imports with needsTaxInfo=true; practitioner must complete tax + W-9 later`,
+      );
+    }
+    if (missingContact.length) {
+      pushWarning(
+        report.practitioners,
+        rowId,
+        `incomplete contact/address (${missingContact.join(", ")}) — imported blank with needsContactInfo=true; practitioner completes via profile / at checkout`,
       );
     }
     report.practitioners.created += 1; // "resolved for creation"
@@ -839,6 +863,9 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
       // Deferred tax/W-9 migration — practitioner must complete tax + a signed
       // W-9 later (a separate collection step). Flagged for admin/portal follow-up.
       needsTaxInfo: data.deferredTaxInfo === true,
+      // Imported with missing phone/billing/shipping — practitioner completes
+      // via profile (or it's captured at checkout). Flagged for admin follow-up.
+      needsContactInfo: data.needsContactInfo === true,
       migrationNotes: data.notes,
       migrationImportedBy: actor,
     };
