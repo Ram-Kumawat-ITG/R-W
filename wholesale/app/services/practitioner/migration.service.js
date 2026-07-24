@@ -908,11 +908,12 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
           pushWarning(report.credentials, null, `Could not re-host license file for "${email}" (${credId}) — left as the original source URL`);
         }
       }
-      if (signature.type === "drawn") {
+      // Deferred practitioners have no W-9 → signature is null; skip re-hosting.
+      if (signature?.type === "drawn") {
         const hosted = await rehostFileUrl(admin, signature.value, `signature-${email}`);
         if (hosted) {
-          app.signature.value = hosted;
-          app.w9.signature.value = hosted;
+          if (app.signature) app.signature.value = hosted;
+          if (app.w9?.signature) app.w9.signature.value = hosted;
           app.markModified("signature");
           app.markModified("w9");
         } else {
