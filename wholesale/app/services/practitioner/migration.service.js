@@ -456,21 +456,25 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
       pushError(report.credentials, rowId, `Unknown credential_id "${row.credential_id}"`);
       continue;
     }
+    // Migration: a credential's detail text + license file are NOT required
+    // (the Talon export rarely includes the license documents). The credential
+    // still attaches with whatever is present; missing pieces are flagged
+    // (`needsCredentialFiles`) for the practitioner to upload via profile. Only
+    // a qest4 systemType, IF supplied, must still be a valid value.
     const errs = [];
     const values = [s(row.detail_value_1), s(row.detail_value_2)];
-    spec.textKeys.forEach((key, i) => {
-      if (!values[i]) errs.push(`${key} is required for credential "${credentialId}"`);
-    });
     if (credentialId === "qest4" && values[1] && !QEST4_SYSTEM_TYPES.includes(values[1])) {
       errs.push(`systemType must be one of: ${QEST4_SYSTEM_TYPES.join(", ")} (got "${values[1]}")`);
-    }
-    if (spec.fileKey && !s(row.file_url)) {
-      errs.push(`file_url is required for credential "${credentialId}"`);
     }
     if (errs.length) {
       pushError(report.credentials, rowId, errs.join("; "));
       continue;
     }
+    const missingCred = [];
+    spec.textKeys.forEach((key, i) => {
+      if (!values[i]) missingCred.push(key);
+    });
+    if (spec.fileKey && !s(row.file_url)) missingCred.push("file_url");
 
     const entry = { selected: true };
     spec.textKeys.forEach((key, i) => {
@@ -478,6 +482,10 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
     });
     if (spec.fileKey) entry[spec.fileKey] = s(row.file_url); // re-hosted at commit time
     practitioner.data.credentials[credentialId] = entry;
+    if (missingCred.length) {
+      practitioner.data.needsCredentialFiles = true;
+      pushWarning(report.credentials, rowId, `credential "${credentialId}" imported without ${missingCred.join(", ")} — practitioner uploads/completes via profile`);
+    }
     report.credentials.created += 1;
   }
 
@@ -501,13 +509,15 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
       pushError(report.referralSources, rowId, `Unknown referral_id "${row.referral_id}"`);
       continue;
     }
-    if (spec.requiresDetail && !s(row.detail_value)) {
-      pushError(report.referralSources, rowId, `detail_value is required for referral "${referralId}"`);
-      continue;
-    }
+    // Migration: a referral's detail_value is NOT required (the Talon export
+    // often lacks the referring-practitioner name / detail). Store whatever is
+    // present; flag a missing detail as a warning instead of erroring.
     practitioner.data.referrals[referralId] = spec.requiresDetail
       ? { selected: true, value: s(row.detail_value) }
       : { selected: true };
+    if (spec.requiresDetail && !s(row.detail_value)) {
+      pushWarning(report.referralSources, rowId, `referral "${referralId}" imported without detail_value — practitioner completes via profile`);
+    }
     report.referralSources.created += 1;
   }
 
@@ -866,6 +876,9 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
       // Imported with missing phone/billing/shipping — practitioner completes
       // via profile (or it's captured at checkout). Flagged for admin follow-up.
       needsContactInfo: data.needsContactInfo === true,
+      // Credential(s) imported without their license file / detail — practitioner
+      // uploads the document(s) via the profile Credentials section.
+      needsCredentialFiles: data.needsCredentialFiles === true,
       migrationNotes: data.notes,
       migrationImportedBy: actor,
     };
