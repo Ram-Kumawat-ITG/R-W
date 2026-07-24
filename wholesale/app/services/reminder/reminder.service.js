@@ -10,8 +10,10 @@
 //   • identify eligible invoices (payment type + order date + status)
 //   • decide which reminder stage is due
 //   • build a per-stage dynamic email (services/reminder/reminderEmail)
-//     with full order + invoice details and send it via the shared SMTP
-//     queue (enqueueEmail) — NOT QBO, which can't render a dynamic body
+//     with full order + invoice details and send it DIRECTLY via the shared
+//     SMTP service (sendEmail) — NOT QBO, which can't render a dynamic body.
+//     The CRON triggers the send itself, so paymentReminders[] reflects the
+//     real SMTP outcome and a failed stage is retried on the next tick.
 //   • record notification history (Invoice.paymentReminders) to dedup
 //   • log the activity (emailEvents[] + remarks[]) for audit
 //
@@ -23,7 +25,7 @@ import connectDB from '../APIService/mongo.service'
 import Invoice from '../../models/invoice.server'
 import ShopifyOrder from '../../models/order.server'
 import WholesaleApplication from '../../models/wholesaleApplication.server'
-import { enqueueEmail } from '../email/emailQueue.service'
+import { sendEmail } from '../email/email.service'
 import { recordEmailEvent } from '../invoice/invoice.service'
 import { buildReminderEmail } from './reminderEmail.service'
 import { reminderEmailConfig } from './reminderEmail.config'
@@ -226,19 +228,21 @@ export async function processCheckPaymentReminders({ now = new Date() } = {}) {
         supportEmail: reminderEmailConfig.supportEmail,
       })
 
-      const result = await enqueueEmail(
-        {
-          to: recipient,
-          cc: reminderEmailConfig.adminEmail || undefined,
-          subject,
-          text,
-          html,
-        },
-        { label: `payment_reminder_${stage.stage}` },
-      )
+      // Send DIRECTLY (inline) — this CRON triggers the email itself and the
+      // paymentReminders[] status reflects the ACTUAL SMTP result. sendEmail
+      // never throws; on a false result we drop into the catch below, which
+      // records the stage as `failed` so the next tick retries it (a named
+      // stage is only ever skipped once it's recorded `sent`).
+      const result = await sendEmail({
+        to: recipient,
+        cc: reminderEmailConfig.adminEmail || undefined,
+        subject,
+        text,
+        html,
+      })
 
       if (!result?.success) {
-        throw new Error(result?.error || 'email enqueue failed')
+        throw new Error(result?.error || 'email send failed')
       }
 
       invoice.paymentReminders.push({
@@ -269,8 +273,11 @@ export async function processCheckPaymentReminders({ now = new Date() } = {}) {
         invoiceId: String(invoice._id),
         qboInvoiceId: invoice.qboInvoiceId,
         stage: stage.stage,
+        recipient,
         elapsed,
         unit,
+        messageId: result.messageId,
+        previewUrl: result.previewUrl, // populated on the Ethereal test transport
       })
     } catch (err) {
       const message = err?.message || String(err)

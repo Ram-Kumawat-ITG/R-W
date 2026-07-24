@@ -2624,9 +2624,11 @@ sweep in dev/test (currently every minute).
 **Delivery: SMTP with a dynamic per-stage template** (changed 2026-07-24 —
 was QuickBooks `/invoice/{id}/send`). QBO can't render a fully dynamic body,
 so each reminder is now built by `services/reminder/reminderEmail.service.buildReminderEmail({ stage, … })`
-(per-stage subject/heading/intro/CTA keyed off the stage) and delivered via
-the shared durable SMTP queue (`enqueueEmail` → `send-email` job) — the same
-transport every other notification uses. The email carries full details:
+(per-stage subject/heading/intro/CTA keyed off the stage) and sent **directly
+by the CRON** via the shared SMTP service (`email.service.sendEmail`) — so the
+`paymentReminders[]` sent/failed status reflects the real SMTP result, and a
+`failed` stage is retried on the next tick (a named stage is only skipped once
+recorded `sent`). The email carries full details:
 Practitioner Name, Order Number (from the linked `ShopifyOrder`), Invoice
 Number, Invoice Date, Payment Status, Due Date, Outstanding Amount, and a
 Product Summary (from the order's `rawPayload.line_items`). Recipient is the
