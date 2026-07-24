@@ -3049,6 +3049,48 @@ remaining, the current payment status, the first-failure time+reason, and the
 full per-attempt schedule (scheduled date · status · execution time+outcome).
 Tone = info (pending) / success (finalised paid) / warning (finalised failed).
 
+### 11.6 Payment order hold (block new orders on an outstanding failed invoice)
+
+A practitioner with an outstanding **failed** invoice (`paymentStatus:'failed'`,
+non-drop-ship — the card-retry ladder exhausted, or `chargeInvoice` hit
+`maxAttempts`) is put on a **payment order hold** and blocked from placing new
+orders. Cleared automatically once no failed invoice remains. This is a separate
+concept from the admin `status:'blocked'` flow (a manual decision; neither
+touches the other).
+
+**Signal + reconciler.** `wholesale_applications.orderHold` is the flag,
+mirrored onto the app-owned customer metafield `$app:wholesale.order_hold`
+(value `"held"`). `orderHold.service.reconcilePractitionerOrderHold({shop,email})`
+is idempotent + self-healing: it recomputes the hold from live invoice state
+(`hasOutstandingFailedInvoice`) and syncs both the flag and the metafield. Hooked
+on ladder exhaustion (block) and `propagateSuccessfulPayment` (unblock).
+
+**Two enforcement layers — both required:**
+
+1. **Checkout Function (hard block)** —
+   `extensions/cart-checkout-validation/` (`cart.validations.generate.run`) reads
+   the customer metafield and, when held, returns a cart validation error with
+   the support message. This is the un-bypassable server-side block on **order
+   completion** — it covers even a direct `/checkout` URL visit. But by design it
+   **cannot** prevent navigating to `/checkout` or show anything on the cart page.
+
+2. **Storefront cart gate (UX layer)** — app-embed theme block
+   `extensions/theme-extension/blocks/checkout_hold_gate.liquid` (`target:body`,
+   enabled once under Theme editor → App embeds). For a logged-in customer it
+   fetches `GET /apps/<proxy>/api/storefront/order-hold` (App Proxy →
+   `app/api/storefront/order-hold.js`, `logged_in_customer_id` → live hold
+   recompute; **fails open**), and when held it **disables every checkout
+   trigger**, installs capturing click/submit guards (so it wins even if theme JS
+   binds the same button), and shows the message banner on the cart. A
+   `MutationObserver` + `cart:*` listeners re-apply after ajax-cart / drawer
+   re-renders. This is what actually prevents reaching checkout + shows the
+   message — the requirement the Function alone can't meet.
+
+**Admin override.** `POST /api/admin/customers/:id/clear-order-hold` +
+a control on the customer detail page. **Backfill sweep:**
+`npm run reconcile:order-holds`. **Deploy:** `shopify app deploy`, then enable
+the "Checkout Hold Gate" app embed in the theme editor.
+
 ---
 
 ## 12. Status synchronization across QBO, Shopify, and local DB

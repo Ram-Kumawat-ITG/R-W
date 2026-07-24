@@ -1,0 +1,209 @@
+{% comment %}
+  Checkout Hold Gate (app embed).
+
+  Prevents a practitioner who is on a PAYMENT order hold (an outstanding failed
+  invoice) from reaching checkout, and shows the support message on the cart.
+
+  This is the storefront UX layer. The un-bypassable server-side block is the
+  cart.validations.generate.run Function (extensions/cart-checkout-validation),
+  which blocks ORDER COMPLETION at checkout but cannot stop the buyer from
+  navigating to /checkout or render a message on the cart. This embed closes
+  that gap: for a logged-in customer it asks the app whether they're held
+  (source of truth = live invoice state, via the app proxy), and if so it
+  disables every checkout button/link and shows the message.
+
+  Enabled once by the merchant under Theme editor → App embeds. Runs on every
+  storefront page (cheap: one proxy call per session, cached), and acts wherever
+  a checkout trigger appears — the cart page AND the cart drawer.
+{% endcomment %}
+
+{%- if customer -%}
+<script>
+(function () {
+  "use strict";
+
+  var PROXY_BASE = {{ block.settings.proxy_base | default: "wholesale-application" | json }};
+  var STATUS_URL = "/apps/" + PROXY_BASE + "/api/storefront/order-hold";
+  var CACHE_KEY = "ns_order_hold_status";
+  var CACHE_TTL_MS = 30000; // re-check at most every 30s per session
+  var FALLBACK_MESSAGE =
+    "You have an outstanding invoice payment. Please pay your existing invoice before placing a new order. If you need assistance, please contact our support team.";
+
+  // Selectors that trigger checkout across common themes (cart page + drawer).
+  var CHECKOUT_SELECTOR = [
+    '[name="checkout"]',
+    '[name="goto_pp"]',
+    'button[value="Checkout"]',
+    '.cart__checkout-button',
+    '.cart__checkout',
+    '#checkout',
+    '.shopify-payment-button',
+    '[data-shopify="payment-button"]',
+    'a[href$="/checkout"]',
+    'a[href*="/checkout?"]'
+  ].join(",");
+
+  var state = { held: false, message: FALLBACK_MESSAGE, loaded: false };
+
+  function readCache() {
+    try {
+      var raw = sessionStorage.getItem(CACHE_KEY);
+      if (!raw) return null;
+      var obj = JSON.parse(raw);
+      if (!obj || (Date.now() - obj.t) > CACHE_TTL_MS) return null;
+      return obj;
+    } catch (e) { return null; }
+  }
+  function writeCache(held, message) {
+    try {
+      sessionStorage.setItem(CACHE_KEY, JSON.stringify({ held: held, message: message, t: Date.now() }));
+    } catch (e) { /* ignore */ }
+  }
+
+  function isCheckoutTrigger(el) {
+    if (!el || !el.closest) return null;
+    return el.closest(CHECKOUT_SELECTOR);
+  }
+
+  // Capturing guards — block the action even if theme JS also binds it.
+  function onClickCapture(e) {
+    if (!state.held) return;
+    var trigger = isCheckoutTrigger(e.target);
+    if (!trigger) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+    ensureBanner(trigger);
+  }
+  function onSubmitCapture(e) {
+    if (!state.held) return;
+    var form = e.target;
+    var action = (form && form.getAttribute) ? (form.getAttribute("action") || "") : "";
+    // Cart form submits to /cart or /checkout; block when the submitter is a
+    // checkout button, or the form posts straight to checkout.
+    var submitter = e.submitter && isCheckoutTrigger(e.submitter);
+    if (!submitter && action.indexOf("/checkout") === -1) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+    ensureBanner(form);
+  }
+
+  function disableTriggers() {
+    if (!state.held) return;
+    var nodes = document.querySelectorAll(CHECKOUT_SELECTOR);
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      if (n.dataset.nsHoldLocked === "1") continue;
+      n.dataset.nsHoldLocked = "1";
+      n.setAttribute("aria-disabled", "true");
+      try { n.disabled = true; } catch (e) {}
+      n.style.opacity = "0.5";
+      n.style.pointerEvents = "none";
+      n.style.cursor = "not-allowed";
+    }
+  }
+
+  function ensureBanner(nearEl) {
+    if (!state.held) return;
+    var existing = document.getElementById("ns-order-hold-banner");
+    if (!existing) {
+      existing = document.createElement("div");
+      existing.id = "ns-order-hold-banner";
+      existing.setAttribute("role", "alert");
+      existing.style.cssText =
+        "margin:16px 0;padding:14px 16px;border:1px solid #fecaca;background:#fef2f2;" +
+        "color:#991b1b;border-radius:8px;font-size:15px;line-height:1.5;" +
+        "font-family:inherit;";
+      existing.textContent = state.message || FALLBACK_MESSAGE;
+    }
+    // Prefer placing it inside the main cart form/container; fall back to near
+    // the clicked trigger, then the top of the page.
+    var host =
+      document.querySelector('form[action$="/cart"]') ||
+      document.querySelector('form[action*="/cart"]') ||
+      document.querySelector(".cart, #cart, [id*='cart']") ||
+      (nearEl && nearEl.parentNode) ||
+      document.body;
+    if (!existing.isConnected) {
+      host.insertBefore(existing, host.firstChild);
+    }
+    try { existing.scrollIntoView({ behavior: "smooth", block: "center" }); } catch (e) {}
+  }
+
+  function enforce() {
+    if (!state.held) return;
+    disableTriggers();
+    // Show the message up-front on the cart page.
+    if (location.pathname.indexOf("/cart") !== -1) ensureBanner(null);
+  }
+
+  function applyStatus(held, message) {
+    state.held = !!held;
+    state.message = message || FALLBACK_MESSAGE;
+    state.loaded = true;
+    if (state.held) enforce();
+  }
+
+  function fetchStatus() {
+    var cached = readCache();
+    if (cached) { applyStatus(cached.held, cached.message); return; }
+    fetch(STATUS_URL, { headers: { "Accept": "application/json" }, credentials: "same-origin" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (json) {
+        // api.service wraps payload as { status, message, result }.
+        var data = (json && json.result) ? json.result : (json || {});
+        var held = !!data.held;
+        var message = data.message || FALLBACK_MESSAGE;
+        writeCache(held, message);
+        applyStatus(held, message);
+      })
+      .catch(function () { /* fail open — never block on a network error */ });
+  }
+
+  // Capturing listeners installed once, up front — they no-op until held.
+  document.addEventListener("click", onClickCapture, true);
+  document.addEventListener("submit", onSubmitCapture, true);
+
+  // Re-apply when the cart re-renders (drawer open, ajax cart update, etc.).
+  var reapply = (function () {
+    var scheduled = false;
+    return function () {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(function () { scheduled = false; enforce(); });
+    };
+  })();
+  ["cart:refresh", "cart:updated", "cart:change"].forEach(function (evt) {
+    document.addEventListener(evt, reapply);
+  });
+  if (window.MutationObserver) {
+    new MutationObserver(reapply).observe(document.documentElement, {
+      childList: true, subtree: true
+    });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", fetchStatus);
+  } else {
+    fetchStatus();
+  }
+})();
+</script>
+{%- endif -%}
+
+{% schema %}
+{
+  "name": "Checkout Hold Gate",
+  "target": "body",
+  "settings": [
+    {
+      "type": "text",
+      "id": "proxy_base",
+      "label": "App proxy subpath",
+      "default": "wholesale-application",
+      "info": "Must match shopify.app.toml [app_proxy].subpath"
+    }
+  ]
+}
+{% endschema %}
