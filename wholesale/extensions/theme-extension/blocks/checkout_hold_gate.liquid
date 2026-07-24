@@ -104,38 +104,52 @@
     }
   }
 
+  function buildBanner() {
+    var el = document.createElement("div");
+    el.id = "ns-order-hold-banner";
+    el.setAttribute("role", "alert");
+    el.style.cssText =
+      "display:block;width:100%;box-sizing:border-box;margin:0 0 16px 0;" +
+      "padding:14px 16px;border:1px solid #fecaca;background:#fef2f2;" +
+      "color:#991b1b;border-radius:8px;font-size:15px;line-height:1.5;" +
+      "font-family:inherit;text-align:left;";
+    el.textContent = state.message || FALLBACK_MESSAGE;
+    return el;
+  }
+
   function ensureBanner(nearEl) {
     if (!state.held) return;
-    var existing = document.getElementById("ns-order-hold-banner");
-    if (!existing) {
-      existing = document.createElement("div");
-      existing.id = "ns-order-hold-banner";
-      existing.setAttribute("role", "alert");
-      existing.style.cssText =
-        "margin:16px 0;padding:14px 16px;border:1px solid #fecaca;background:#fef2f2;" +
-        "color:#991b1b;border-radius:8px;font-size:15px;line-height:1.5;" +
-        "font-family:inherit;";
-      existing.textContent = state.message || FALLBACK_MESSAGE;
+    var banner = document.getElementById("ns-order-hold-banner");
+    if (banner && banner.isConnected) return; // already visible
+    if (!banner) banner = buildBanner();
+
+    // Prefer placing the banner right ABOVE the checkout button (where the
+    // buyer is looking), spanning its summary container. Fall back to the top
+    // of the cart form, then the page.
+    var btn =
+      (nearEl && isCheckoutTrigger(nearEl)) ||
+      document.querySelector('[name="checkout"], .cart__checkout-button, #checkout, button[value="Checkout"]');
+
+    if (btn) {
+      var anchor =
+        btn.closest(".cart__ctas, .cart__footer, .cart-summary, .totals, .cart__blocks") ||
+        btn;
+      var host = anchor.parentNode || anchor;
+      host.insertBefore(banner, anchor);
+    } else {
+      var fallbackHost =
+        document.querySelector('form[action*="/cart"]') ||
+        document.querySelector("#MainContent, main, .cart, #cart") ||
+        document.body;
+      fallbackHost.insertBefore(banner, fallbackHost.firstChild);
     }
-    // Prefer placing it inside the main cart form/container; fall back to near
-    // the clicked trigger, then the top of the page.
-    var host =
-      document.querySelector('form[action$="/cart"]') ||
-      document.querySelector('form[action*="/cart"]') ||
-      document.querySelector(".cart, #cart, [id*='cart']") ||
-      (nearEl && nearEl.parentNode) ||
-      document.body;
-    if (!existing.isConnected) {
-      host.insertBefore(existing, host.firstChild);
-    }
-    try { existing.scrollIntoView({ behavior: "smooth", block: "center" }); } catch (e) {}
+    try { banner.scrollIntoView({ behavior: "smooth", block: "center" }); } catch (e) {}
   }
 
   function enforce() {
     if (!state.held) return;
     disableTriggers();
-    // Show the message up-front on the cart page.
-    if (location.pathname.indexOf("/cart") !== -1) ensureBanner(null);
+    ensureBanner(null); // the checkout button only exists on cart/drawer anyway
   }
 
   function applyStatus(held, message) {
