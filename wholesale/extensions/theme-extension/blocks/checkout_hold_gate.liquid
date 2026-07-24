@@ -22,7 +22,9 @@
 (function () {
   "use strict";
 
-  var PROXY_BASE = {{ block.settings.proxy_base | default: "wholesale-application" | json }};
+  // App proxy subpath is fixed (shopify.app.toml [app_proxy].subpath). No
+  // merchant-facing setting — keep the embed config-free.
+  var PROXY_BASE = "wholesale-application";
   var STATUS_URL = "/apps/" + PROXY_BASE + "/api/storefront/order-hold";
   var CACHE_KEY = "ns_order_hold_status";
   var CACHE_TTL_MS = 30000; // re-check at most every 30s per session
@@ -230,14 +232,6 @@
 {
   "name": "Checkout Hold Gate",
   "target": "body",
-  "settings": [
-    {
-      "type": "text",
-      "id": "proxy_base",
-      "label": "App proxy subpath",
-      "default": "wholesale-application",
-      "info": "Must match shopify.app.toml [app_proxy].subpath"
-    }
-  ]
+  "settings": []
 }
 {% endschema %}
