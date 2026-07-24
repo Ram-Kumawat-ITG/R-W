@@ -117,34 +117,53 @@
     return el;
   }
 
+  function insertAfter(newNode, refNode) {
+    if (refNode.insertAdjacentElement) {
+      refNode.insertAdjacentElement("afterend", newNode);
+    } else if (refNode.parentNode) {
+      refNode.parentNode.insertBefore(newNode, refNode.nextSibling);
+    }
+  }
+
   function ensureBanner(nearEl) {
     if (!state.held) return;
-    var banner = document.getElementById("ns-order-hold-banner");
-    if (banner && banner.isConnected) return; // already visible
-    if (!banner) banner = buildBanner();
+    try {
+      var banner = document.getElementById("ns-order-hold-banner");
+      // Already in the DOM — done. (Don't re-place on a transient 0-height read;
+      // that would fight the MutationObserver in an infinite insert loop.)
+      if (banner && banner.isConnected) return;
+      if (banner && banner.parentNode) banner.parentNode.removeChild(banner);
+      banner = buildBanner();
 
-    // Place the banner right BELOW the checkout button, spanning its summary
-    // container. Fall back to the bottom of the cart form, then the page.
-    var btn =
-      (nearEl && isCheckoutTrigger(nearEl)) ||
-      document.querySelector('[name="checkout"], .cart__checkout-button, #checkout, button[value="Checkout"]');
+      // Place the banner DIRECTLY below the checkout button.
+      var btn =
+        (nearEl && isCheckoutTrigger(nearEl)) ||
+        document.querySelector(
+          '[name="checkout"], .cart__checkout-button, #checkout, button[value="Checkout"], a[href$="/checkout"]'
+        );
 
-    if (btn) {
-      // Walk up to the checkout button's own block container (the CTA area),
-      // then drop the banner immediately after it — reliably visible + below.
-      var anchor =
-        btn.closest(".cart__ctas, .cart__footer, .cart-summary, .totals, .cart__blocks") ||
-        btn;
-      var host = anchor.parentNode || anchor;
-      host.insertBefore(banner, anchor.nextSibling);
-    } else {
-      var fallbackHost =
-        document.querySelector('form[action*="/cart"]') ||
-        document.querySelector("#MainContent, main, .cart, #cart") ||
-        document.body;
-      fallbackHost.appendChild(banner);
+      if (btn) {
+        insertAfter(banner, btn);
+      } else {
+        (document.querySelector('form[action*="/cart"]') ||
+          document.querySelector("#MainContent, main, .cart, #cart") ||
+          document.body).appendChild(banner);
+      }
+
+      // If it landed somewhere invisible (0 height — e.g. clipped flex cell),
+      // fall back to a guaranteed-visible spot at the top of the cart region.
+      if (banner.offsetHeight === 0) {
+        if (banner.parentNode) banner.parentNode.removeChild(banner);
+        var visibleHost =
+          document.querySelector("#MainContent, main, .cart, #cart") || document.body;
+        visibleHost.insertBefore(banner, visibleHost.firstChild);
+      }
+
+      try { banner.scrollIntoView({ behavior: "smooth", block: "center" }); } catch (e) {}
+    } catch (err) {
+      // Never let a placement failure break the checkout-disable enforcement.
+      if (window.console) console.warn("[ns-hold] banner insert failed:", err);
     }
-    try { banner.scrollIntoView({ behavior: "smooth", block: "center" }); } catch (e) {}
   }
 
   function enforce() {
