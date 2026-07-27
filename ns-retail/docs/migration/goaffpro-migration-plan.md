@@ -3,7 +3,23 @@
 Status: **Admin Import Interface built (CDO Program → Migration tab).**
 Fill in [GoAffPro_Migration_Template.xlsx](GoAffPro_Migration_Template.xlsx),
 upload it there, run **Validate (dry run)** first, review the per-sheet
-report, then **Commit Import**. Implementation: `app/services/cdo/migration.service.js`
+report, then **Commit Import**.
+
+**Template revision — v4 (2026-07-23):** the workbook was rebuilt and
+re-verified column-by-column against `app/services/cdo/migration.service.js`.
+Every column the importer actually reads is present and correctly named (no
+mapping drift — the importer and template were and remain consistent). The
+rebuild is documentation/safety only: (1) added an **Instructions** sheet (a
+per-sheet field dictionary marking each column Required / Imported / enum
+values, the fraction rule, and the paid-vs-owed rule); (2) the 7 import sheets
+are now **header-only** and the example rows moved to a **"Samples (reference
+only)"** sheet the importer ignores — so uploading the blank template can no
+longer accidentally import the sample rows; (3) two columns are explicitly
+flagged **NOT IMPORTED** to correct a misleading impression — the
+`Practitioners` banking columns (wholesale_applications is read-only here) and
+`Historical_Payouts.payout_status` (the importer always records a historical
+payout as `paid`). The mirror copy at the workspace root
+`docs/3GoAffPro_Migration_Template.xlsx` is kept byte-for-byte identical. Implementation: `app/services/cdo/migration.service.js`
 (parse + validate + write), `app/models/cdoMigrationRun.server.js` (audit
 log of committed runs), `app/routes/app.cdo-program.migration.jsx` (the
 page). Re-running the same file is safe — every write path checks for an

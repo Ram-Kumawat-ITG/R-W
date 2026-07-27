@@ -18,6 +18,7 @@ import {
 } from "../services/cdo/cdo.service";
 import MetricCard from "../components/cdo/MetricCard";
 import StatusBadge from "../components/cdo/StatusBadge";
+import { MigratedBadge } from "../components/cdo/MigratedBadge";
 import {
   formatCurrency,
   formatDate,
@@ -406,17 +407,20 @@ export default function CdoCustomerDetails() {
                       {formatPercent(c.discountPercent)}
                     </s-table-cell>
                     <s-table-cell>
-                      <s-badge
-                        tone={
-                          c.status === "active"
-                            ? "success"
-                            : c.status === "paused"
-                              ? "warning"
-                              : "neutral"
-                        }
-                      >
-                        {c.status}
-                      </s-badge>
+                      <s-stack direction="inline" gap="small-200" alignItems="center">
+                        <s-badge
+                          tone={
+                            c.status === "active"
+                              ? "success"
+                              : c.status === "paused"
+                                ? "warning"
+                                : "neutral"
+                          }
+                        >
+                          {c.status}
+                        </s-badge>
+                        <MigratedBadge migrated={c.migrated} />
+                      </s-stack>
                     </s-table-cell>
                     <s-table-cell>{formatDateTime(c.createdAt)}</s-table-cell>
                     <s-table-cell>

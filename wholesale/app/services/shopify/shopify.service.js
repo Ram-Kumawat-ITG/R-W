@@ -23,7 +23,8 @@ export class ShopifyUserError extends Error {
 
 import { shopifyConfig } from "./shopify.config";
 import { REQUIRED_SUBSCRIPTIONS } from "./shopify.constants";
-import { toE164US, mapAddress, toOrderGid } from "./shopify.utils";
+import { toE164US, mapAddress, hasUsableAddress, toOrderGid } from "./shopify.utils";
+import { isEmailNotificationsPaused } from "../scheduler/cronNotificationSettings.service";
 import {
   QUERY_WEBHOOK_SUBSCRIPTIONS_BY_TOPIC,
   QUERY_ALL_WEBHOOK_SUBSCRIPTIONS,
@@ -42,6 +43,8 @@ import {
   MUTATION_ORDER_DELETE,
   MUTATION_STAGED_UPLOADS_CREATE,
   MUTATION_FILE_CREATE,
+  MUTATION_METAFIELDS_SET,
+  MUTATION_METAFIELD_DELETE,
 } from './shopify.mutations'
 import {
   getUnauthenticatedAdmin,
@@ -336,15 +339,22 @@ export async function createCustomer(
   admin,
   { application, note, tags = ["Pending"], subscribeNews = false },
 ) {
+  // Only attach an address that actually carries data. A migrated
+  // practitioner may have no address on file yet (imported blank with
+  // needsContactInfo) — pushing an all-empty MailingAddressInput makes
+  // Shopify reject the whole customerCreate, so skip it entirely.
   const addresses = [];
-  if (application.billingAddress) {
+  if (hasUsableAddress(application.billingAddress)) {
     addresses.push({
       ...mapAddress(application.billingAddress),
       firstName: application.firstName,
       lastName: application.lastName,
     });
   }
-  if (!application.shippingSameAsBilling && application.shippingAddress) {
+  if (
+    !application.shippingSameAsBilling &&
+    hasUsableAddress(application.shippingAddress)
+  ) {
     addresses.push({
       ...mapAddress(application.shippingAddress),
       firstName: application.firstName,
@@ -357,11 +367,23 @@ export async function createCustomer(
   // collisions (Shopify auto-promotes address phone to top-level under some
   // conditions). Top-level is deterministic: either accepts or returns a
   // clean userError that the caller surfaces as a fieldError.
+  //
+  // toE164US THROWS on an ambiguous number (e.g. a bare 10-digit US number
+  // with no country code) — a large share of migrated practitioners have
+  // exactly that. A bad/unparseable phone must NOT abort the whole customer
+  // create: fall back to omitting the phone so the customer is still created
+  // (phone can be re-collected via the profile page / at checkout).
+  let e164Phone = null;
+  try {
+    e164Phone = toE164US(application.phone);
+  } catch {
+    e164Phone = null;
+  }
+
   const input = {
     email: application.email,
     firstName: application.firstName,
     lastName: application.lastName,
-    phone: toE164US(application.phone),
     tags,
     note,
     addresses,
@@ -372,6 +394,7 @@ export async function createCustomer(
       consentUpdatedAt: new Date(Date.now() - 60_000).toISOString(),
     },
   };
+  if (e164Phone) input.phone = e164Phone;
 
   const { data, userErrors } = await executeMutation(
     admin,
@@ -389,6 +412,22 @@ export async function sendCustomerInvite(
   admin,
   { customerId, subject, message, fromEmail },
 ) {
+  // GLOBAL EMAIL KILL SWITCH — this triggers a Shopify-sent account invite
+  // email to the customer, so honor the global pause here too. Skips the
+  // mutation when paused (returns a skipped marker instead of sending). Fails
+  // OPEN on a read error.
+  try {
+    if (await isEmailNotificationsPaused()) {
+      log.warn("customer_invite.skipped_paused", { customerId });
+      return { skipped: true, reason: "notifications_paused" };
+    }
+  } catch (err) {
+    log.error("customer_invite.pause_check_failed", {
+      customerId,
+      err: err?.message || String(err),
+    });
+  }
+
   const emailInput = {};
   if (subject) emailInput.subject = subject;
   if (message) emailInput.customMessage = message;
@@ -582,6 +621,65 @@ export async function deleteCustomer(admin, customerId) {
   );
   if (userErrors.length)
     throw new Error(userErrors.map((e) => e.message).join("; "));
+  return true;
+}
+
+// App-owned customer metafield that mirrors the payment order-hold, read by
+// the checkout-validation Function. `$app:` reserves the namespace to this app
+// so its Functions can read it. `held=true` writes value "held"; `held=false`
+// DELETES it (absent metafield = no hold). Resolves an offline admin from
+// `shop` (called from webhook/CRON contexts with no request admin).
+export const ORDER_HOLD_METAFIELD = {
+  namespace: "$app:wholesale",
+  key: "order_hold",
+  heldValue: "held",
+};
+
+export async function setCustomerOrderHoldMetafield({ shop, customerId, held }) {
+  if (!shop || !customerId) {
+    throw new Error("setCustomerOrderHoldMetafield: shop and customerId are required");
+  }
+  const gid = String(customerId).startsWith("gid://")
+    ? String(customerId)
+    : `gid://shopify/Customer/${customerId}`;
+  const { admin } = await getUnauthenticatedAdmin(shop);
+
+  if (held) {
+    const { userErrors } = await executeMutation(
+      admin,
+      MUTATION_METAFIELDS_SET,
+      {
+        metafields: [
+          {
+            ownerId: gid,
+            namespace: ORDER_HOLD_METAFIELD.namespace,
+            key: ORDER_HOLD_METAFIELD.key,
+            type: "single_line_text_field",
+            value: ORDER_HOLD_METAFIELD.heldValue,
+          },
+        ],
+      },
+      "metafieldsSet",
+    );
+    if (userErrors.length) throw new Error(userErrors.map((e) => e.message).join("; "));
+    return true;
+  }
+
+  // Clear = delete the metafield. Treat "not found" as success (idempotent).
+  const { userErrors } = await executeMutation(
+    admin,
+    MUTATION_METAFIELD_DELETE,
+    {
+      input: {
+        ownerId: gid,
+        namespace: ORDER_HOLD_METAFIELD.namespace,
+        key: ORDER_HOLD_METAFIELD.key,
+      },
+    },
+    "metafieldDelete",
+  );
+  const fatal = userErrors.filter((e) => !/not\s*found|does not exist/i.test(e.message || ""));
+  if (fatal.length) throw new Error(fatal.map((e) => e.message).join("; "));
   return true;
 }
 

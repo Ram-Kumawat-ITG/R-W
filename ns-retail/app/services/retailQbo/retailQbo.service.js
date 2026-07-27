@@ -6,6 +6,8 @@
 import { retailQbo, qboRetailRequest, qboRetailGetBinary } from "./retailQbo.apis";
 import { retailQboConfig } from "./retailQbo.config";
 import RetailQboProductMap from "../../models/retailQboProductMap.server";
+import RetailDropshipVendorMap, { DROPSHIP_VENDOR_KEY } from "../../models/retailDropshipVendorMap.server";
+import connectDB from "../../db/mongo.server";
 import { createLogger } from "../../utils/logger.utils";
 
 const log = createLogger("retail.qbo.service");
@@ -1015,24 +1017,74 @@ async function reactivateVendor(vendor) {
 // Module-memoized so we resolve the wholesale-supplier vendor once per process.
 let _dropshipVendorId = null;
 
-// Resolve the QBO Vendor id the dropship bills post to:
-//   1. configured id (QBO_RETAIL_DROPSHIP_VENDOR_ID / QBO_RETAIL_ADMIN_VENDOR) — verbatim
-//   2. adopt an existing vendor by email / DisplayName (incl. inactive)
-//   3. create it under the configured name + email
-// Returns the vendor id as a string.
+// Persist (best-effort) the resolved id to the durable singleton mapping so
+// every future bill + process restart reuses it without re-querying QBO. A
+// write failure never breaks resolution — the id is already memoized in-proc.
+async function persistDropshipVendorMap({ qboVendorId, displayName, email, resolvedVia }) {
+  try {
+    await connectDB();
+    await RetailDropshipVendorMap.findOneAndUpdate(
+      { key: DROPSHIP_VENDOR_KEY },
+      {
+        $set: {
+          qboVendorId: String(qboVendorId),
+          displayName: displayName || undefined,
+          email: email || undefined,
+          resolvedVia,
+          syncedAt: new Date(),
+        },
+        $setOnInsert: { key: DROPSHIP_VENDOR_KEY },
+      },
+      { upsert: true, new: true },
+    );
+  } catch (err) {
+    log.warn("dropship_vendor.persist_failed", { qboVendorId: String(qboVendorId), err: err?.message || err });
+  }
+}
+
+// Resolve the QBO Vendor id the dropship bills post to. Order:
+//   1. in-process memo
+//   2. QBO_RETAIL_DROPSHIP_VENDOR_ID / QBO_RETAIL_ADMIN_VENDOR override — verbatim
+//      (backward compatible; when set it stays authoritative, and is mirrored
+//      into the durable map for the record)
+//   3. durable singleton mapping (retail_qbo_dropship_vendor) — reuse the id
+//      created/adopted on a previous run (survives restarts, no QBO call)
+//   4. find-or-create in QBO: adopt an existing vendor by email / DisplayName
+//      (incl. inactive), else create it; on a 6240 duplicate re-query by name;
+//      reactivate if inactive — then persist the id to the durable map
+// So the flow works with NO env var configured: it auto-creates the vendor if
+// missing and stores the id for reuse. Returns the vendor id as a string.
 export async function resolveDropshipVendorId() {
   if (_dropshipVendorId) return _dropshipVendorId;
-
-  if (retailQboConfig.dropshipVendorId) {
-    _dropshipVendorId = String(retailQboConfig.dropshipVendorId);
-    return _dropshipVendorId;
-  }
 
   const name = retailQboConfig.dropshipVendorName;
   const email = retailQboConfig.dropshipVendorEmail;
 
+  // 2. Explicit env override stays authoritative (backward compatible).
+  if (retailQboConfig.dropshipVendorId) {
+    _dropshipVendorId = String(retailQboConfig.dropshipVendorId);
+    await persistDropshipVendorMap({ qboVendorId: _dropshipVendorId, displayName: name, email, resolvedVia: "env" });
+    return _dropshipVendorId;
+  }
+
+  // 3. Durable mapping from a previous auto-resolve — reuse without a QBO call.
+  try {
+    await connectDB();
+    const mapped = await RetailDropshipVendorMap.findOne({ key: DROPSHIP_VENDOR_KEY }).lean();
+    if (mapped?.qboVendorId) {
+      _dropshipVendorId = String(mapped.qboVendorId);
+      log.info("dropship_vendor.reused", { qboVendorId: _dropshipVendorId, source: "durable_map" });
+      return _dropshipVendorId;
+    }
+  } catch (err) {
+    // A read failure just falls through to find-or-create — never fatal.
+    log.warn("dropship_vendor.map_read_failed", { err: err?.message || err });
+  }
+
+  // 4. Find-or-create in QBO, then persist the resolved id.
   let vendor =
     (await queryVendorByEmail(email)) || (await queryVendorByDisplayName(name));
+  let resolvedVia = vendor ? "adopted" : "created";
 
   if (!vendor) {
     const payload = {
@@ -1045,7 +1097,10 @@ export async function resolveDropshipVendorId() {
     } catch (err) {
       const code = err?.body?.Fault?.Error?.[0]?.code;
       if (code === "6240" || /duplicate/i.test(err?.message || "")) {
+        // Someone/something already created it (QBO's Customer+Vendor+Employee
+        // name list collided) — adopt the existing one instead of duplicating.
         vendor = await queryVendorByDisplayName(name);
+        resolvedVia = "adopted";
       }
       if (!vendor) throw err;
     }
@@ -1057,7 +1112,13 @@ export async function resolveDropshipVendorId() {
   if (vendor.Active === false) vendor = await reactivateVendor(vendor);
 
   _dropshipVendorId = String(vendor.Id);
-  log.info("dropship_vendor.resolved", { qboVendorId: _dropshipVendorId, name });
+  await persistDropshipVendorMap({
+    qboVendorId: _dropshipVendorId,
+    displayName: vendor.DisplayName || name,
+    email,
+    resolvedVia,
+  });
+  log.info("dropship_vendor.resolved", { qboVendorId: _dropshipVendorId, name, resolvedVia });
   return _dropshipVendorId;
 }
 

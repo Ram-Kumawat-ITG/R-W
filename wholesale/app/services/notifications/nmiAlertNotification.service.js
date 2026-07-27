@@ -3,7 +3,7 @@
 // convention as qboAlertNotification.service.js — read that file's header
 // comment for the full rationale; not repeated here.
 
-import { sendEmail } from '../email/email.service'
+import { enqueueEmail } from '../email/emailQueue.service'
 import { nmiAlertNotificationConfig as config } from './nmiAlertNotification.config'
 import { createLogger } from '../../utils/logger.utils'
 
@@ -35,11 +35,11 @@ function errorDetailsHtml(error) {
 }
 
 async function send({ subject, html, context }) {
-  const result = await sendEmail({ to: config.adminEmail, subject, html })
+  const result = await enqueueEmail({ to: config.adminEmail, subject, html }, { label: context?.event })
   if (!result.success) {
     log.error('send.failed', { ...context, error: result.error })
   } else {
-    log.info('send.success', { ...context, messageId: result.messageId })
+    log.info('send.queued', { ...context })
   }
   return result
 }

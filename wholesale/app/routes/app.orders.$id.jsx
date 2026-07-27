@@ -25,6 +25,7 @@ import { syncFulfillmentsFromShopify } from "../services/order/order.service";
 import { invoiceConfig } from "../services/invoice/invoice.config";
 import {
   computeProcessingFee,
+  effectiveFeeRates,
   processingFeeLabel,
   computeInvoiceCalculation,
 } from "../services/invoice/invoice.utils";
@@ -388,11 +389,15 @@ export const loader = async ({ request, params }) => {
     businessName,
     breakdown,
     cardOnFile,
-    // Processing-fee rates by settlement method. Surfaced to the client
-    // so confirmation modals (charge-card, mark-cheque-paid) can show the
-    // fee breakdown + new total before the admin commits. Matches the
-    // values that propagateSuccessfulPayment will append to QBO.
-    processingFeeRates: { ...invoiceConfig.processingFeeRates },
+    // Processing-fee rates by settlement method, with this practitioner's
+    // per-practitioner CARD override applied (card-only). Surfaced to the
+    // client so confirmation modals (charge-card, mark-cheque-paid) show the
+    // same fee that will actually be charged. Matches the values that
+    // createInvoiceForOrder / chargeInvoice compute.
+    processingFeeRates: effectiveFeeRates(
+      { ...invoiceConfig.processingFeeRates },
+      application?.cardFeeOverridePercent ?? customerMap?.cardFeeOverridePercent,
+    ),
     qbo: {
       invoice: qboInvoice,
       error: qboInvoiceError,

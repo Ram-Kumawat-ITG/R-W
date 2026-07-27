@@ -10,7 +10,7 @@
 // invoice via remarks[]/PaymentAttempt regardless of whether this email
 // goes out.
 
-import { sendEmail } from '../email/email.service'
+import { enqueueEmail } from '../email/emailQueue.service'
 import { paymentFailureNotificationConfig } from './paymentFailureNotification.config'
 import { isEmailNotificationsPaused } from '../scheduler/cronNotificationSettings.service'
 import { formatAmount } from '../../utils/format.utils'
@@ -119,19 +119,21 @@ export async function notifyPaymentFailure({ invoice, reason, customerName, orde
       supportEmail: paymentFailureNotificationConfig.supportEmail,
     })
 
-    const result = await sendEmail({
-      to: invoice.customerEmail,
-      cc: paymentFailureNotificationConfig.adminEmail || undefined,
-      subject,
-      text,
-      html,
-    })
+    const result = await enqueueEmail(
+      {
+        to: invoice.customerEmail,
+        cc: paymentFailureNotificationConfig.adminEmail || undefined,
+        subject,
+        text,
+        html,
+      },
+      { label: 'payment_failed' },
+    )
 
     if (result.success) {
-      log.info('notify.sent', {
+      log.info('notify.queued', {
         ...context,
         cc: paymentFailureNotificationConfig.adminEmail,
-        messageId: result.messageId,
       })
     } else {
       log.error('notify.send_failed', { ...context, error: result.error })

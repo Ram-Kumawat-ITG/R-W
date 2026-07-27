@@ -26,7 +26,17 @@ export const qboConfig = {
   apiBaseUrl: readEnv('QBO_API_BASE_URL', { fallback: QBO_BASE_URLS[qboEnvironment] }),
   oauthTokenUrl: readEnv('QBO_OAUTH_TOKEN_URL', { fallback: QBO_OAUTH_TOKEN_URL }),
   minorVersion: readEnv('QBO_MINOR_VERSION', { fallback: '73' }),
-  defaultItemId: readEnv('QBO_WHOLESALE_DEFAULT_ITEM_ID', { fallback: '1' }),
+  // Fallback QBO Item every invoice line references when it has no per-product
+  // Item (shipping / discount / processing-fee lines, and product lines whose
+  // SKU couldn't resolve). OPTIONAL — when unset the service find-or-creates a
+  // Service item named `defaultItemName` and reuses it (see
+  // qbo.service.resolveDefaultItemId), so no item id needs to pre-exist in QBO.
+  // Previously defaulted to the literal id '1' (an implicit "QBO seeds item 1"
+  // assumption); that assumption is gone.
+  defaultItemId: readEnv('QBO_WHOLESALE_DEFAULT_ITEM_ID', { fallback: null }),
+  // Name of the auto-created fallback item (only used when defaultItemId is unset
+  // AND the QBO company has no existing Service item to adopt).
+  defaultItemName: readEnv('QBO_WHOLESALE_DEFAULT_ITEM_NAME', { fallback: 'Wholesale Sales' }),
   // Income account for auto-created per-product Items (SKU column support).
   // Optional — normally we derive the income account from the default item
   // (QBO_WHOLESALE_DEFAULT_ITEM_ID); this is only the fallback when that item

@@ -720,10 +720,17 @@ match it hands off to `invoiceDropshipOrder`, which:
 
 1. `ensureDropshipCustomerMap({ shop, order })` — find-or-create the QBO
    customer (by email, so every drop-ship invoice consolidates under one QBO
-   customer) and upsert a `CustomerMap`. Unlike the wholesale
-   `ensureCustomerForOrder`, this does **not** source/validate an NMI vault and
-   does **not** hard-fail on a missing billing address (the drop-ship customer
-   has no `wholesale_applications` doc and may arrive without billing).
+   customer) and upsert a `CustomerMap`. The resolved id is stored durably on
+   `CustomerMap.qboCustomerId` and reused for every future invoice (there is **no
+   hardcoded QBO customer id** — the only env anchor is the routing email
+   `DROPSHIP_RETAIL_CUSTOMER_EMAIL`). `createCustomer` is duplicate-safe: on a
+   QBO `6240` duplicate-name collision it **adopts** the existing customer
+   (exact `DisplayName` lookup — active then inactive — then falls back to
+   email; sparse-reactivates an inactive match) instead of throwing or creating
+   a second record. Unlike the wholesale `ensureCustomerForOrder`, this does
+   **not** source/validate an NMI vault and does **not** hard-fail on a missing
+   billing address (the drop-ship customer has no `wholesale_applications` doc
+   and may arrive without billing).
 2. `createInvoiceForOrder({ ..., isDropship: true })` — the SAME claim-first,
    duplicate-safe QBO invoice creation as the wholesale path, but with
    `paymentMethod` locked to `'dropship'` and `isDropship: true` stamped on the
@@ -778,6 +785,21 @@ two documents match by construction. (The bill-payment reconciliation in
 `retailBillReconcile.service.js` is amount-agnostic — it pays the bill's full
 balance when the wholesale invoice is `paid` — so this change does not alter
 reconciliation behavior.)
+
+> **Vendor auto-creation + durable id (no hardcoded env id).** The QBO **Vendor**
+> the bill posts to (the "Natural Solution Wholesale" supplier) no longer
+> requires a hardcoded `QBO_RETAIL_DROPSHIP_VENDOR_ID`. `resolveDropshipVendorId`
+> (ns-retail `retailQbo.service.js`) resolves in order: in-process memo → env
+> override (still authoritative when set, backward compatible) → the durable
+> singleton mapping `retail_qbo_dropship_vendor`
+> (`models/retailDropshipVendorMap.server.js`) → find-or-create in QBO (adopt an
+> existing vendor by email/`DisplayName` incl. inactive, else `POST /vendor`; on a
+> `6240` duplicate re-query by name; reactivate if inactive) → **persist** the id
+> to the mapping. So with no env id set the vendor is created once and its id
+> reused for every future bill + process restart, never re-querying QBO and never
+> duplicating. The customer side stores its id on `CustomerMap.qboCustomerId` (see
+> step 1). Both are duplicate-safe via `6240` adopt + the bill's `requestid`
+> idempotency.
 
 **Separation in the UI.**
 
@@ -1270,8 +1292,20 @@ POST /v3/company/{realmId}/invoice?minorversion=73
 ```
 
 Line items mirror Shopify's: per-product line + Shipping line + Tax
-line. Every line needs an `Item` reference — `QBO_WHOLESALE_DEFAULT_ITEM_ID`
-(default `"1"`) is used unless `line.qboItemId` is set.
+line. Every line needs an `Item` reference — the resolved **default item** is
+used unless `line.qboItemId` is set.
+
+> **Default item is find-or-created (no hardcoded id needed).** The fallback
+> `ItemRef` comes from `qbo.service.resolveDefaultItemId()`, not a hardcoded id:
+> `QBO_WHOLESALE_DEFAULT_ITEM_ID` (verbatim, if set) → an item named
+> `QBO_WHOLESALE_DEFAULT_ITEM_NAME` (default "Wholesale Sales") → **any existing
+> Service item** (adopts the company's seeded generic item, e.g. "Services"/id
+> 1) → **create** a "Wholesale Sales" Service item. So nothing has to be created
+> manually in QBO. `QBO_WHOLESALE_DEFAULT_ITEM_ID` is now OPTIONAL (no longer
+> defaults to the literal `"1"`); pin it only for determinism. The income
+> account for auto-created items derives from this resolved item, with a
+> cycle-safe fallback (`QBO_WHOLESALE_INCOME_ACCOUNT_ID` → first Income account)
+> used when the default item is itself being created.
 
 `DueDate` is computed in this app per **fixed, method-specific billing
 rules** (not a flat day-count), then sent explicitly to QBO. This makes
@@ -1552,6 +1586,60 @@ absent the scheduler's ACH charge skips with a reason (existing
 `resolveInvoiceVault` behavior). The immutable order-time snapshot
 `customerPaymentPreference` is intentionally **not** rewritten — only the
 operational `paymentMethod`.
+
+### 7.3.2 QBO customer update on profile edit (account section)
+
+The QBO **Customer** entity is created find-or-create ONCE, from the order
+details, at a practitioner's first order (`qbo.service.findOrCreateCustomer`,
+via `ensureCustomerForOrder`) — and thereafter never refreshed by the order
+path (once `customer_maps.qboCustomerId` is set, intake short-circuits). So a
+practitioner who edits their profile after ordering would leave a **stale** QBO
+customer record.
+
+**Triggers.** Two edit surfaces, each best-effort + fire-and-forget so a QBO
+hiccup can never block/fail the originating operation:
+
+1. **Account-section edit** — `POST /api/update-profile` when contact/business
+   info or the billing address changed (`hasProfileUpdate || hasAddressUpdate`).
+   Profile built from the **post-update `WholesaleApplication` doc** via
+   `customer.service.syncQboCustomerFromApplication` (`businessName`→
+   `companyName`; single `billingAddress` mirrors to `shippingAddress`).
+2. **Admin-section edit** — an admin editing the customer in the **Shopify
+   admin** fires the `customers/update` webhook (`webhooks.customers.update.jsx`).
+   That edit does **not** touch the Mongo `WholesaleApplication` doc, so the
+   **Shopify webhook payload** is the source of truth (the just-edited state) —
+   profile built from `payload.first_name/last_name/email/phone` +
+   `normalizeAddress(payload.default_address)`.
+
+Both cases:
+
+- **Invoices are never rewritten.** Each invoice keeps the `BillAddr`/`ShipAddr`
+  captured on its originating Shopify order (invoices are generated from order
+  details, per requirement). Fee/due-date realignment on a *payment-method*
+  change is the separate §7.3.1 flow.
+- **No-op when there is no QBO customer yet (LAZY)** — the QBO customer is
+  created at order time, so a practitioner who has never ordered has no
+  `customer_maps.qboCustomerId`; the sync returns
+  `{ synced:false, reason:'no_qbo_customer' }` and their QBO customer is created
+  from order details on their first order (deliberate — no QBO records for
+  never-transacted registrants). For that first order to carry the latest
+  profile, the account-section edit (`/api/update-profile`) pushes name + phone
+  (`customerUpdatePersonalInfo`) AND the address (`customerUpdateDefaultAddress`)
+  to the Shopify customer, so the order details — and thus the created QBO
+  customer — reflect the edits. Email is intentionally not changed there.
+
+**Path.** Both triggers converge on
+`customer.service.syncQboCustomerProfile({ shop, email, profile })`, which
+resolves `customer_maps.qboCustomerId` (keyed by `shop`+`email`) →
+`qbo.service.updateCustomer({ qboCustomerId, profile })`.
+
+`updateCustomer` does a GET (`getCustomer`, for the current `SyncToken`) → a
+**sparse** `POST /customer` writing only the present fields (`GivenName`,
+`FamilyName`, `CompanyName`, `PrimaryEmailAddr`, `PrimaryPhone`, `BillAddr`,
+`ShipAddr` — addresses via `toQboAddress`). `DisplayName` is recomputed and
+included so the name tracks the profile; on a **6240 duplicate-name** collision
+it retries WITHOUT `DisplayName` so the contact/address changes still land
+(mirrors `createCustomer`'s adopt-on-6240 behavior). Added 2026-07-27.
 
 ### 7.4 Payment recording
 
@@ -2587,6 +2675,21 @@ payment-retry ticks. It only *notifies*; it never charges. Registered in
 Cadence is the daily cron in production, or a fast `REMINDER_INTERVAL`
 sweep in dev/test (currently every minute).
 
+**Delivery: SMTP with a dynamic per-stage template** (changed 2026-07-24 —
+was QuickBooks `/invoice/{id}/send`). QBO can't render a fully dynamic body,
+so each reminder is now built by `services/reminder/reminderEmail.service.buildReminderEmail({ stage, … })`
+(per-stage subject/heading/intro/CTA keyed off the stage) and sent **directly
+by the CRON** via the shared SMTP service (`email.service.sendEmail`) — so the
+`paymentReminders[]` sent/failed status reflects the real SMTP result, and a
+`failed` stage is retried on the next tick (a named stage is only skipped once
+recorded `sent`). The email carries full details:
+Practitioner Name, Order Number (from the linked `ShopifyOrder`), Invoice
+Number, Invoice Date, Payment Status, Due Date, Outstanding Amount, and a
+Product Summary (from the order's `rawPayload.line_items`). Recipient is the
+invoice's `customerEmail`; support address is `REMINDER_SUPPORT_EMAIL`
+(→ `PAYMENT_FAILURE_SUPPORT_EMAIL` → generic). Optional admin CC via
+`REMINDER_ADMIN_CC` (OFF by default — the recurring stage fires often).
+
 ```
 REMINDER_CRON=0 2 * * *        # default: 02:00 daily (scheduler timezone)
 REMINDER_INTERVAL=1 minute     # dev/test override (Agenda "every" expression)
@@ -2782,6 +2885,69 @@ heals it almost immediately.
 
 ---
 
+### 10.7 Async (durable) email delivery — `send-email` / `send-invoice-email`
+
+Every email the app sends is delivered by a **background Agenda job**, never
+inline on the request / order / CRON path. This guarantees the requirement:
+the primary operation (registration, order processing, payment, payout, an
+admin action) completes without waiting on SMTP or QBO, and a slow/unreachable
+mail server can never add latency or trip a gateway timeout.
+
+**SMTP path (`send-email`).** `services/email/emailQueue.service.enqueueEmail(message, { label })`
+is the front door. It persists a `send-email` Agenda job (via the existing
+`scheduleNow` helper) carrying the fully-rendered `sendEmail()` message object,
+then returns `{ success: true, queued: true }` after a fast Mongo insert. Every
+SMTP notification *definition* calls `enqueueEmail` instead of `sendEmail`:
+
+- `services/notifications/*` — application-lifecycle, account, NMI-alert,
+  QBO-alert, referral-code, fulfillment-sync
+- `services/payment/paymentFailureNotification.service.js`
+- `services/scheduler/batchSummaryNotification.service.js`
+
+Because the swap is at the definition layer, **every caller** (registration
+endpoints, admin endpoints, order/customer/payment services, the CRON jobs)
+becomes async automatically. The `isEmailNotificationsPaused()` guard on the two
+CRON emails still runs *before* the enqueue, so a paused notification is never
+queued.
+
+`enqueueEmail` never throws. If the queue itself is unreachable it falls back to
+an un-awaited inline `sendEmail` so an email is never silently dropped.
+
+**QBO invoice-email path (`send-invoice-email`).** The admin "Send invoice"
+button (`api/admin/send-invoice.js`) previously **awaited** QBO's
+`/invoice/<id>/send`, blocking the request. It now calls
+`enqueueInvoiceEmail({ shop, invoiceId, sendTo, triggerType, triggeredBy, source, remark })`
+and returns `202`. The `send-invoice-email` job reloads the live invoice, sends,
+advances the lifecycle-dispatcher baseline (`invoiceEmailSentAt` /
+`invoiceEmailedStatus` / `invoiceEmailedAmountPaid`), and writes the
+`emailEvents[]` audit ledger + admin remark itself — so the Order Details page
+still shows the outcome, just moments later. The order/CRON-path lifecycle sends
+(`dispatchInvoiceLifecycleEmails` on `created`/`payment`/`fulfillment`) are
+**unchanged** — they already run inside background webhook/CRON flows and rely on
+the emailEvents ledger + CRON self-heal.
+
+**Retry semantics.** The transport keeps its own 3 in-process attempts
+(§ email.service). On top of that, a failed job **reschedules itself on a
+2 / 5 / 15 / 60-minute backoff ladder** (5 attempts total, ~1h22m horizon) via
+`job.agenda.schedule('in N minutes', …)`. Because the job document is persisted
+in `agenda_jobs`, an in-flight retry **survives a deploy/restart** — the durable
+guarantee the previous in-process `.catch()` fire-and-forget could not provide.
+When the ladder is exhausted the failure is logged loudly (`send.exhausted` /
+`invoice_email.exhausted`); the primary operation already succeeded regardless.
+
+Both jobs are registered in `services/scheduler/jobs/index.js`
+(`JOB_NAMES.SEND_EMAIL` / `SEND_INVOICE_EMAIL`).
+
+**ns-retail** mirrors this: a `send-email` job + `enqueueEmail` (its own
+`cdo_agenda_jobs` collection), with payout + vendor-bill notifications rerouted;
+its admin "Send invoice" order action enqueues a `send-retail-invoice-email` job
+(re-invokes `sendRetailInvoiceForOrder` with the same backoff ladder; terminal
+reasons such as `no_invoice`/`no_email` are not retried). ns-retail's SMTP
+transport also gained the `connectionTimeout`/`greetingTimeout`/`socketTimeout`
+guards the wholesale transport already had.
+
+---
+
 ## 11. Payment retry mechanism
 
 `scheduler/jobs/processPendingPayments.job.server.js` runs **two passes** per tick.
@@ -2951,6 +3117,63 @@ ladder exists: next scheduled retry date (while active), attempts used / max /
 remaining, the current payment status, the first-failure time+reason, and the
 full per-attempt schedule (scheduled date · status · execution time+outcome).
 Tone = info (pending) / success (finalised paid) / warning (finalised failed).
+
+### 11.6 Payment order hold (block new orders on an outstanding failed invoice)
+
+A practitioner with an outstanding **failed** invoice (`paymentStatus:'failed'`,
+non-drop-ship — the card-retry ladder exhausted, or `chargeInvoice` hit
+`maxAttempts`) is put on a **payment order hold** and blocked from placing new
+orders. Cleared automatically once no failed invoice remains. This is a separate
+concept from the admin `status:'blocked'` flow (a manual decision; neither
+touches the other).
+
+**Signal + reconciler.** `wholesale_applications.orderHold` is the flag,
+mirrored onto the app-owned customer metafield `$app:wholesale.order_hold`
+(value `"held"`). `orderHold.service.reconcilePractitionerOrderHold({shop,email})`
+is idempotent + self-healing: it recomputes the hold from live invoice state
+(`hasOutstandingFailedInvoice`) and syncs both the flag and the metafield. Hooked
+on ladder exhaustion (block) and `propagateSuccessfulPayment` (unblock).
+
+**Two enforcement layers — both required:**
+
+1. **Checkout Function (hard block)** —
+   `extensions/cart-checkout-validation/` (`cart.validations.generate.run`) reads
+   the customer metafield and, when held, returns a cart validation error with
+   the support message. This is the un-bypassable server-side block on **order
+   completion** — it covers even a direct `/checkout` URL visit. But by design it
+   **cannot** prevent navigating to `/checkout` or show anything on the cart page.
+
+2. **Storefront cart gate (UX layer)** — app-embed theme block
+   `extensions/theme-extension/blocks/checkout_hold_gate.liquid` (`target:body`,
+   enabled once under Theme editor → App embeds). For a logged-in customer it
+   fetches `GET /apps/<proxy>/api/storefront/order-hold` (App Proxy →
+   `app/api/storefront/order-hold.js`, `logged_in_customer_id` → live hold
+   recompute; **fails open**), and when held it **disables every checkout
+   trigger**, installs capturing click/submit guards (so it wins even if theme JS
+   binds the same button), and shows the message banner on the cart. A
+   `MutationObserver` + `cart:*` listeners re-apply after ajax-cart / drawer
+   re-renders. This is what actually prevents reaching checkout + shows the
+   message — the requirement the Function alone can't meet.
+
+**Block email notification.** The moment the hold is newly applied on card-retry
+exhaustion, the practitioner is emailed (admin CC'd) via
+`services/order/orderBlockNotification.service.notifyOrderBlocked`, enqueued on
+the durable SMTP queue (`enqueueEmail` → `send-email` job). Triggered from
+`paymentRetry.service.js` right after `reconcilePractitionerOrderHold`, gated on
+`changed && held` (fires only on the transition into blocked, never re-spams an
+already-blocked practitioner). The email explains new orders are temporarily
+blocked, that the account auto-unblocks once the invoice is paid, includes a
+support line, and lists: Invoice Number, Order Number, Outstanding Amount,
+Invoice Due Date (if available), Last Failed Payment Date, and Retry Attempts.
+Config: `ORDER_BLOCK_SUPPORT_EMAIL` (→ `PAYMENT_FAILURE_SUPPORT_EMAIL` → generic),
+admin CC via `CRON_ADMIN_EMAIL`. Best-effort — never throws into the retry CRON.
+Currently wired to the card path only (the ACH-failure block trigger is still a
+known gap).
+
+**Admin override.** `POST /api/admin/customers/:id/clear-order-hold` +
+a control on the customer detail page. **Backfill sweep:**
+`npm run reconcile:order-holds`. **Deploy:** `shopify app deploy`, then enable
+the "Checkout Hold Gate" app embed in the theme editor.
 
 ---
 
@@ -3362,7 +3585,8 @@ required values throw immediately.
 | `QBO_WHOLESALE_REFRESH_TOKEN` | _required first run_ | Seed refresh token (from OAuth Playground) |
 | `QBO_ENVIRONMENT` | `sandbox` | `sandbox` or `production` |
 | `QBO_MINOR_VERSION` | `73` | API minor version |
-| `QBO_WHOLESALE_DEFAULT_ITEM_ID` | `1` | QBO Item Id for invoice lines |
+| `QBO_WHOLESALE_DEFAULT_ITEM_ID` | _(optional)_ | Fallback QBO Item Id for invoice lines. When unset, `resolveDefaultItemId()` adopts an existing Service item or creates `QBO_WHOLESALE_DEFAULT_ITEM_NAME` — no id need pre-exist. |
+| `QBO_WHOLESALE_DEFAULT_ITEM_NAME` | `Wholesale Sales` | Name of the auto-created fallback item (only used when the id is unset and no Service item exists to adopt). |
 | `QBO_API_BASE_URL` | _auto_ | Override API host |
 | `QBO_OAUTH_TOKEN_URL` | _auto_ | Override OAuth endpoint |
 | **NMI** | | |

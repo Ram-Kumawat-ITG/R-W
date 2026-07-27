@@ -180,10 +180,10 @@ export default function PractitionerMigration() {
   return (
     <s-page inlineSize="large" heading="Practitioner Migration">
       <s-stack direction="block" gap="base">
-        <s-section heading="PDFfiller Migration Import">
+        <s-section heading="Talon Advanced Registration Migration Import">
           <s-stack direction="block" gap="base">
             <s-paragraph tone="subdued">
-              Upload the completed PDFfiller_Practitioner_Migration_Template.xlsx workbook (see
+              Upload the completed 2Practitioner_Migration_Template.xlsx workbook (see
               docs/migration in the repo for the format + full plan). Always run Validate first —
               it performs every check without writing anything or calling NMI/Shopify — then
               Commit Import once the results look right. Re-running the same file after a partial

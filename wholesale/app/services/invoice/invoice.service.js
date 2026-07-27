@@ -35,11 +35,13 @@ import {
   syncWithRetry,
   shopifyLinesToQboLines,
   computeProcessingFee,
+  effectiveFeeRates,
   buildProcessingFeeLine,
   findExistingProcessingFeeLine,
   applyDerivedPaymentStatus,
 } from './invoice.utils'
 import { buildProfileFromShopifyOrder } from '../customer/customer.utils'
+import { reconcilePractitionerOrderHold } from '../order/orderHold.service'
 import { createLogger } from '../../utils/logger.utils'
 
 const log = createLogger('invoice.service')
@@ -125,10 +127,14 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
   // sized on the post-discount grand total (order.total_price = adjusted
   // subtotal + shipping + tax), which the QBO sales lines now sum to.
   const feeBase = Number(order.total_price ?? 0)
+  // Per-practitioner CARD-fee override (mirrored onto the customer map at
+  // sync time). Replaces ONLY the card rate; ACH/cheque keep their defaults.
+  const cardFeeOverride = customerMap.cardFeeOverridePercent
+  const feeRates = effectiveFeeRates(invoiceConfig.processingFeeRates, cardFeeOverride)
   const creationFee = computeProcessingFee({
     baseAmount: feeBase,
     method: invoice.paymentMethod,
-    rates: invoiceConfig.processingFeeRates,
+    rates: feeRates,
   })
   if (creationFee) {
     const feeLine = buildProcessingFeeLine({ ...creationFee, baseAmount: feeBase })
@@ -143,6 +149,22 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
           `$${creationFee.amount.toFixed(2)} (${(creationFee.rate * 100).toFixed(2)}% of $${feeBase.toFixed(2)})`,
       )
     }
+  } else if (
+    invoice.paymentMethod === 'card' &&
+    cardFeeOverride != null &&
+    Number(cardFeeOverride) === 0 &&
+    feeBase > 0
+  ) {
+    // EXPLICIT 0% card override — record it as "0% applied" (rate 0, method
+    // card, AppliedAt stamped) so it's auditable AND the settlement-time
+    // fallback (chargeInvoice / recordManualPayment, which guard on
+    // processingFeeAppliedAt) treats the fee as resolved rather than
+    // recomputing it. No QBO fee line is added.
+    invoice.processingFeeAmount = 0
+    invoice.processingFeeRate = 0
+    invoice.processingFeeMethod = 'card'
+    invoice.processingFeeAppliedAt = new Date()
+    console.log(`[invoice] card fee override 0% for ${customerMap.email} — no fee line (explicit zero recorded)`)
   }
   // Due date is selected by the invoice's locked paymentMethod, per the
   // production billing rules (ACH and Card both use the same billing-cycle
@@ -677,6 +699,19 @@ export async function propagateSuccessfulPayment({ invoice, customerMap, transac
   await dispatchInvoiceLifecycleEmails({ invoice, customerMap, event: 'payment' })
 
   await invoice.save()
+
+  // Auto-unblock: if this invoice is now fully paid, re-evaluate the
+  // practitioner's payment order hold. The reconciler clears the hold only
+  // when NO outstanding failed invoice remains (paying one of several does not
+  // prematurely unblock). Idempotent + best-effort — never throws.
+  if (invoice.paymentStatus === 'paid') {
+    await reconcilePractitionerOrderHold({
+      shop: invoice.shop,
+      email: invoice.customerEmail,
+      reason: 'outstanding_invoice',
+    })
+  }
+
   return { syncErrors }
 }
 

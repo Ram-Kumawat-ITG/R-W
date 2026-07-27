@@ -168,6 +168,17 @@ const cdoPayoutSchema = new mongoose.Schema(
     periodEnd: Date,
     reference: String,
     paidAt: Date,
+
+    // Provenance — set when created by a bulk data migration (e.g. GoAffPro
+    // historical payout) rather than the live payout pipeline. See
+    // cdoPractitionerCode for the rationale.
+    migrationSource: { type: String, default: null, index: true },
+    migrationRunId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "CdoMigrationRun",
+      default: null,
+      index: true,
+    },
   },
   { collection: "cdo_payouts", timestamps: true, strict: true },
 );

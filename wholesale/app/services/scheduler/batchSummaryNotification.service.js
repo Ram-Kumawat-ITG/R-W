@@ -8,7 +8,7 @@
 // processing or the CronBatchRun history write, both of which have
 // already fully completed by the time this is called.
 
-import { sendEmail } from '../email/email.service'
+import { enqueueEmail } from '../email/emailQueue.service'
 import { batchSummaryNotificationConfig } from './batchSummaryNotification.config'
 import { isEmailNotificationsPaused } from './cronNotificationSettings.service'
 import { createLogger } from '../../utils/logger.utils'
@@ -106,9 +106,12 @@ export async function sendBatchSummaryEmail(params) {
     }
 
     const { subject, text, html } = buildBatchSummaryEmail(params)
-    const result = await sendEmail({ to: batchSummaryNotificationConfig.adminEmail, subject, text, html })
+    const result = await enqueueEmail(
+      { to: batchSummaryNotificationConfig.adminEmail, subject, text, html },
+      { label: 'batch_summary' },
+    )
     if (result.success) {
-      log.info('summary.sent', { ...context, to: batchSummaryNotificationConfig.adminEmail, messageId: result.messageId })
+      log.info('summary.queued', { ...context, to: batchSummaryNotificationConfig.adminEmail })
     } else {
       log.error('summary.send_failed', { ...context, error: result.error })
     }

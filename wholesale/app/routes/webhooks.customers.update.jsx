@@ -14,6 +14,8 @@ import { sendResponse } from "../services/APIService/api.service";
 import { createLogger } from "../utils/logger.utils";
 import connectDB from "../services/APIService/mongo.service";
 import WholesaleApplication from "../models/wholesaleApplication.server";
+import { syncQboCustomerProfile } from "../services/customer/customer.service";
+import { normalizeAddress } from "../services/customer/customer.utils";
 
 const log = createLogger("webhook.customers_update");
 
@@ -97,6 +99,43 @@ export const action = async ({ request }) => {
           email: customerEmail,
         });
         return;
+      }
+
+      // ── Sync the QBO customer record ──────────────────────────────
+      // An admin editing the customer in the Shopify admin does NOT touch
+      // the WholesaleApplication doc, so the Shopify PAYLOAD is the source
+      // of truth here (the just-edited state) — not the Mongo doc. Update
+      // the QBO Customer entity only; invoices are generated from order
+      // details and are never rewritten. Best-effort — no-op when the
+      // practitioner has no QBO customer yet.
+      try {
+        const addr = normalizeAddress(payload.default_address);
+        const profile = {
+          firstName: payload.first_name || "",
+          lastName: payload.last_name || "",
+          companyName: payload.default_address?.company || "",
+          email: (payload.email || application.email || "").toLowerCase(),
+          phone: payload.phone || payload.default_address?.phone || "",
+          billingAddress: addr,
+          shippingAddress: addr,
+        };
+        const r = await syncQboCustomerProfile({
+          shop,
+          email: profile.email,
+          profile,
+        });
+        log.info("qbo_sync.update", {
+          customerId,
+          email: profile.email,
+          synced: r?.synced,
+          reason: r?.reason,
+        });
+      } catch (err) {
+        log.error("qbo_sync.update_failed", {
+          customerId,
+          email: customerEmail,
+          err: err?.message || String(err),
+        });
       }
 
       // ⚠️ DISABLED (2026-07-06) — wholesale → retail practitioner mirror

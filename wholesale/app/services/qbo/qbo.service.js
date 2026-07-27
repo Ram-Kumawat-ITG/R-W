@@ -9,6 +9,7 @@ import { escapeQboQuery, toCustomerPayload, toInvoiceLine, toQboAddress } from '
 import QboItemMap from '../../models/qboItemMap.server'
 import QboProductMap from '../../models/qboProductMap.server'
 import { createLogger } from '../../utils/logger.utils'
+import { isEmailNotificationsPaused } from '../scheduler/cronNotificationSettings.service'
 
 const log = createLogger('qbo.service')
 
@@ -48,11 +49,55 @@ export async function findCustomerByEmail(email) {
   return customer || null
 }
 
+// Exact DisplayName lookup (active first, then inactive). QBO returns only
+// ACTIVE entities by default, so a deactivated customer needs the explicit
+// `Active = false` query. Used to adopt an existing customer on a duplicate-
+// name (6240) collision instead of failing / duplicating.
+async function findCustomerByDisplayName(displayName) {
+  if (!displayName) return null
+  const esc = escapeQboQuery(displayName)
+  let res = await qbo.query(`SELECT * FROM Customer WHERE DisplayName = '${esc}' MAXRESULTS 1`)
+  let customer = res?.QueryResponse?.Customer?.[0]
+  if (customer) return customer
+  res = await qbo.query(`SELECT * FROM Customer WHERE DisplayName = '${esc}' AND Active = false MAXRESULTS 1`)
+  return res?.QueryResponse?.Customer?.[0] || null
+}
+
 export async function createCustomer(profile) {
   const payload = toCustomerPayload(profile)
   log.info('customer.create.request', { displayName: payload.DisplayName })
-  const res = await qbo.post('/customer', payload)
-  const created = res?.Customer
+  let created
+  try {
+    const res = await qbo.post('/customer', payload)
+    created = res?.Customer
+  } catch (err) {
+    // 6240 = duplicate name (QBO's Customer+Vendor+Employee name list collided,
+    // e.g. two racing dropship-order webhooks, or a name already taken). Adopt
+    // the existing customer instead of throwing / creating a duplicate.
+    const code = err?.body?.Fault?.Error?.[0]?.code
+    if (code === '6240' || /duplicate name|6240/i.test(err?.message || '')) {
+      log.warn('customer.create.duplicate_adopt', { displayName: payload.DisplayName })
+      let existing =
+        (await findCustomerByDisplayName(payload.DisplayName)) ||
+        (await findCustomerByEmail(profile.email))
+      if (existing?.Active === false) {
+        // A Customer can't be referenced on a new invoice while inactive —
+        // sparse-reactivate it.
+        const upd = await qbo.post('/customer', {
+          Id: String(existing.Id),
+          SyncToken: existing.SyncToken,
+          Active: true,
+          sparse: true,
+        })
+        existing = upd?.Customer || existing
+      }
+      if (existing?.Id) {
+        log.info('customer.create.adopted', { qboId: existing.Id })
+        return existing
+      }
+    }
+    throw err
+  }
   if (!created?.Id) {
     throw new Error('QBO customer create returned no Id')
   }
@@ -74,6 +119,97 @@ export async function findOrCreateCustomer(profile) {
   return { customer: created, created: true }
 }
 
+// Fetch a single QBO customer by Id — needed for its current SyncToken
+// before a sparse update. Returns null if not found.
+export async function getCustomer(qboCustomerId) {
+  if (!qboCustomerId) return null
+  const res = await qbo.get(`/customer/${encodeURIComponent(qboCustomerId)}`)
+  return res?.Customer || null
+}
+
+// Sparse-update an existing QBO customer's contact + address fields from a
+// normalized profile ({ firstName, lastName, companyName, email, phone,
+// billingAddress, shippingAddress }). Used when a practitioner edits their
+// profile in the account section — the QBO Customer entity must stay current.
+//
+// Scope note: this updates the CUSTOMER record only. Invoices are NOT
+// rewritten — each invoice keeps the address captured on its originating
+// order (invoices are generated from order details), so past invoices are
+// left intact by design.
+//
+// Only fields present on `profile` are written (sparse). DisplayName is
+// recomputed and included so the customer's name in QBO tracks the profile;
+// on a 6240 duplicate-name collision we retry WITHOUT DisplayName so the rest
+// of the update (name parts / email / phone / address) still lands.
+export async function updateCustomer({ qboCustomerId, profile }) {
+  if (!qboCustomerId) throw new Error('updateCustomer: qboCustomerId is required')
+  const current = await getCustomer(qboCustomerId)
+  if (!current?.Id) {
+    throw new Error(`updateCustomer: QBO customer ${qboCustomerId} not found`)
+  }
+
+  const { firstName, lastName, companyName, email, phone, billingAddress, shippingAddress } =
+    profile || {}
+  const billAddr = toQboAddress(billingAddress)
+  // The account section stores one address (billing), mirrored to shipping —
+  // keep both QBO fields consistent, falling back to billing when no explicit
+  // shipping is supplied.
+  const shipAddr = toQboAddress(shippingAddress || billingAddress)
+
+  const base = {
+    Id: String(current.Id),
+    SyncToken: String(current.SyncToken),
+    sparse: true,
+  }
+  if (firstName) base.GivenName = firstName
+  if (lastName) base.FamilyName = lastName
+  if (companyName) base.CompanyName = companyName
+  if (email) base.PrimaryEmailAddr = { Address: email }
+  if (phone) base.PrimaryPhone = { FreeFormNumber: phone }
+  if (billAddr) base.BillAddr = billAddr
+  if (shipAddr) base.ShipAddr = shipAddr
+
+  const fieldKeys = ['GivenName', 'FamilyName', 'CompanyName', 'PrimaryEmailAddr', 'PrimaryPhone', 'BillAddr', 'ShipAddr']
+  if (!fieldKeys.some((k) => base[k] !== undefined)) {
+    log.info('customer.update.noop', { qboCustomerId })
+    return current
+  }
+
+  const desiredDisplayName =
+    companyName?.trim() ||
+    [firstName, lastName].filter(Boolean).join(' ').trim() ||
+    email ||
+    ''
+  const withName = desiredDisplayName ? { ...base, DisplayName: desiredDisplayName } : base
+
+  log.info('customer.update.request', {
+    qboCustomerId,
+    syncToken: current.SyncToken,
+    fields: fieldKeys.filter((k) => base[k] !== undefined),
+  })
+  try {
+    const res = await qbo.post('/customer', withName)
+    const updated = res?.Customer
+    if (!updated?.Id) throw new Error('QBO customer update returned no Id')
+    log.info('customer.update.success', { qboCustomerId: updated.Id })
+    return updated
+  } catch (err) {
+    const code = err?.body?.Fault?.Error?.[0]?.code
+    if (desiredDisplayName && (code === '6240' || /duplicate name|6240/i.test(err?.message || ''))) {
+      // DisplayName collides with another QBO name-list entry — retry without
+      // it so the contact/address changes still apply. The failed POST did not
+      // advance SyncToken, so `base` (same token) is still valid.
+      log.warn('customer.update.displayname_conflict_retry', { qboCustomerId })
+      const res = await qbo.post('/customer', base)
+      const updated = res?.Customer
+      if (!updated?.Id) throw new Error('QBO customer update (no DisplayName) returned no Id')
+      log.info('customer.update.success_without_displayname', { qboCustomerId: updated.Id })
+      return updated
+    }
+    throw err
+  }
+}
+
 // ── Items (SKU column support) ───────────────────────────────────────
 //
 // QBO sources an invoice's SKU column from the referenced Item's `Sku`
@@ -83,15 +219,130 @@ export async function findOrCreateCustomer(profile) {
 // here is best-effort: createInvoice falls back to the default item when an
 // item can't be resolved, so invoicing never breaks.
 
-// Income account for newly-created Items. Resolved once from the default
-// item's IncomeAccountRef (so new items book to the same account as the
-// existing generic item), falling back to QBO_WHOLESALE_INCOME_ACCOUNT_ID. Cached
-// in-module; `undefined` = not yet resolved, `null` = resolved-but-none.
+// The fallback QBO Item every invoice line references when it has no
+// per-product Item (shipping / discount / fee lines, and product lines whose
+// SKU couldn't resolve). Resolved ONCE per process — mirrors ns-retail's
+// resolveSalesItemId so nothing has to pre-exist in the QBO company:
+//   1. QBO_WHOLESALE_DEFAULT_ITEM_ID override — verbatim
+//   2. an existing item named QBO_WHOLESALE_DEFAULT_ITEM_NAME
+//   3. any existing Service item (adopts QBO's seeded generic item, e.g.
+//      "Services" / id 1 — so existing companies keep using what they had)
+//   4. CREATE a Service item named defaultItemName against a resolved income
+//      account
+// Replaces the old implicit "item id '1' exists in QBO" assumption.
+let _defaultItemId
+async function resolveDefaultItemId() {
+  if (_defaultItemId) return _defaultItemId
+
+  if (qboConfig.defaultItemId) {
+    _defaultItemId = String(qboConfig.defaultItemId)
+    return _defaultItemId
+  }
+
+  const wantName = qboConfig.defaultItemName
+  try {
+    const byName = await qbo.query(
+      `SELECT * FROM Item WHERE Name = '${escapeQboQuery(wantName)}' MAXRESULTS 1`,
+    )
+    const named = byName?.QueryResponse?.Item?.[0]
+    if (named?.Id) {
+      _defaultItemId = String(named.Id)
+      return _defaultItemId
+    }
+    const anySvc = await qbo.query(`SELECT * FROM Item WHERE Type = 'Service' MAXRESULTS 1`)
+    const svc = anySvc?.QueryResponse?.Item?.[0]
+    if (svc?.Id) {
+      _defaultItemId = String(svc.Id)
+      log.info('default_item.adopted_service', { itemId: _defaultItemId, name: svc.Name })
+      return _defaultItemId
+    }
+  } catch (err) {
+    log.warn('default_item.lookup_failed', { err: err?.message || String(err) })
+  }
+
+  // Create it. Uses a cycle-safe income resolver (NOT resolveIncomeAccountRef,
+  // which derives income FROM the default item — that would recurse).
+  const incomeRef = await resolveAnyIncomeAccountRef()
+  try {
+    const created = await qbo.post('/item', {
+      Name: wantName,
+      Type: 'Service',
+      ...(incomeRef ? { IncomeAccountRef: incomeRef } : {}),
+    })
+    const item = created?.Item
+    if (item?.Id) {
+      _defaultItemId = String(item.Id)
+      log.info('default_item.created', { itemId: _defaultItemId, name: wantName })
+      return _defaultItemId
+    }
+  } catch (err) {
+    // Duplicate name (6240): an item/customer/vendor already owns this name —
+    // adopt the existing item rather than failing.
+    if (/duplicate name|6240/i.test(err?.message || '')) {
+      const dup = await qbo.query(
+        `SELECT * FROM Item WHERE Name = '${escapeQboQuery(wantName)}' MAXRESULTS 1`,
+      )
+      const existing = dup?.QueryResponse?.Item?.[0]
+      if (existing?.Id) {
+        _defaultItemId = String(existing.Id)
+        log.info('default_item.adopted_duplicate', { itemId: _defaultItemId, name: wantName })
+        return _defaultItemId
+      }
+    }
+    log.warn('default_item.create_failed', { name: wantName, err: err?.message || String(err) })
+  }
+
+  // Last resort: adopt ANY existing item so a create failure (e.g. no
+  // resolvable income account) can never take down invoice creation on the
+  // fallback ItemRef. This matches the pre-change behavior of referencing
+  // whatever item already existed; only a truly empty QBO company falls past it.
+  try {
+    const anyItem = await qbo.query('SELECT * FROM Item MAXRESULTS 1')
+    const it = anyItem?.QueryResponse?.Item?.[0]
+    if (it?.Id) {
+      _defaultItemId = String(it.Id)
+      log.warn('default_item.adopted_any', { itemId: _defaultItemId, name: it.Name })
+      return _defaultItemId
+    }
+  } catch (err) {
+    log.warn('default_item.any_lookup_failed', { err: err?.message || String(err) })
+  }
+
+  throw new Error(`QBO: could not resolve or create a default item ("${wantName}")`)
+}
+
+// Income account chosen WITHOUT reading the default item (so it's safe to call
+// while creating the default item itself): env override → first Income account
+// → null. Cached in-module.
+let cachedAnyIncomeAccountRef
+async function resolveAnyIncomeAccountRef() {
+  if (cachedAnyIncomeAccountRef !== undefined) return cachedAnyIncomeAccountRef
+  if (qboConfig.incomeAccountId) {
+    cachedAnyIncomeAccountRef = { value: String(qboConfig.incomeAccountId) }
+    return cachedAnyIncomeAccountRef
+  }
+  try {
+    const res = await qbo.query(`SELECT * FROM Account WHERE AccountType = 'Income' MAXRESULTS 1`)
+    const acct = res?.QueryResponse?.Account?.[0]
+    cachedAnyIncomeAccountRef = acct?.Id ? { value: String(acct.Id) } : null
+  } catch (err) {
+    log.warn('item.any_income_account.lookup_failed', { err: err?.message || String(err) })
+    cachedAnyIncomeAccountRef = null
+  }
+  return cachedAnyIncomeAccountRef
+}
+
+// Income account for newly-created per-product Items. Derived once from the
+// resolved default item's IncomeAccountRef (so new items book to the same
+// account as the generic fallback item), falling back to
+// QBO_WHOLESALE_INCOME_ACCOUNT_ID, then any Income account. Cached in-module;
+// `undefined` = not yet resolved, `null` = resolved-but-none.
 let cachedIncomeAccountRef
 async function resolveIncomeAccountRef() {
   if (cachedIncomeAccountRef !== undefined) return cachedIncomeAccountRef
   try {
-    const res = await qbo.get(`/item/${encodeURIComponent(qboConfig.defaultItemId)}`)
+    const defaultItemId = await resolveDefaultItemId()
+    const res = await qbo.get(`/item/${encodeURIComponent(defaultItemId)}`)
     const ref = res?.Item?.IncomeAccountRef
     if (ref?.value) {
       cachedIncomeAccountRef = { value: String(ref.value) }
@@ -100,9 +351,7 @@ async function resolveIncomeAccountRef() {
   } catch (err) {
     log.warn('item.income_account.lookup_failed', { err: err?.message || String(err) })
   }
-  cachedIncomeAccountRef = qboConfig.incomeAccountId
-    ? { value: String(qboConfig.incomeAccountId) }
-    : null
+  cachedIncomeAccountRef = await resolveAnyIncomeAccountRef()
   return cachedIncomeAccountRef
 }
 
@@ -599,9 +848,10 @@ export async function createInvoice({
     ...(taxable && taxCodeId ? { TxnTaxCodeRef: { value: taxCodeId } } : {}),
     TotalTax: Number(tax.toFixed(2)),
   }
+  const defaultItemId = await resolveDefaultItemId()
   const payload = {
     CustomerRef: { value: String(qboCustomerId) },
-    Line: lines.map((l) => toInvoiceLine(l, qboConfig.defaultItemId, lineTaxCode(l))),
+    Line: lines.map((l) => toInvoiceLine(l, defaultItemId, lineTaxCode(l))),
     CurrencyRef: currency ? { value: currency } : undefined,
     CustomerMemo: memo ? { value: memo } : undefined,
     DueDate: dueDate || undefined,
@@ -668,7 +918,8 @@ export async function appendInvoiceLines({ qboInvoiceId, newLines }) {
     throw new Error(`appendInvoiceLines: QBO invoice ${qboInvoiceId} not found`)
   }
   const existingLines = Array.isArray(current.Line) ? current.Line : []
-  const appended = newLines.map((l) => toInvoiceLine(l, qboConfig.defaultItemId))
+  const defaultItemId = await resolveDefaultItemId()
+  const appended = newLines.map((l) => toInvoiceLine(l, defaultItemId))
   const payload = {
     Id: String(current.Id),
     SyncToken: String(current.SyncToken),
@@ -722,8 +973,9 @@ export async function setInvoiceProcessingFee({ qboInvoiceId, feeLine = null, du
   const withoutFee = existingLines.filter(
     (l) => !/Processing Fee/i.test(String(l?.Description || '')),
   )
+  const defaultItemId = feeLine ? await resolveDefaultItemId() : null
   const nextLines = feeLine
-    ? [...withoutFee, toInvoiceLine(feeLine, qboConfig.defaultItemId)]
+    ? [...withoutFee, toInvoiceLine(feeLine, defaultItemId)]
     : withoutFee
   const payload = {
     Id: String(current.Id),
@@ -961,6 +1213,21 @@ export async function voidInvoice(qboInvoiceId) {
 // email failures from blocking payment sync.
 export async function sendInvoiceEmail({ qboInvoiceId, sendTo }) {
   if (!qboInvoiceId) throw new Error('sendInvoiceEmail: qboInvoiceId is required')
+
+  // GLOBAL EMAIL KILL SWITCH — QuickBooks renders + sends this customer-facing
+  // invoice email, so gate it here alongside the SMTP transport. When the
+  // global pause is on we skip the QBO /send call entirely (returns skipped
+  // so callers/jobs treat it as done, not a failure to retry). Fails OPEN on a
+  // read error so a DB blip can't silently drop invoice emails in normal ops.
+  try {
+    if (await isEmailNotificationsPaused()) {
+      log.warn('invoice.send.skipped_paused', { qboInvoiceId })
+      return { skipped: true, reason: 'notifications_paused' }
+    }
+  } catch (err) {
+    log.error('invoice.send.pause_check_failed', { qboInvoiceId, err: err?.message || String(err) })
+  }
+
   const query = sendTo ? { sendTo } : undefined
   console.log(
     `\n[QBO email] sending invoice Id=${qboInvoiceId}${sendTo ? ` to ${sendTo}` : ' (using BillEmail)'}`,

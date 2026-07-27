@@ -20,7 +20,7 @@ import {
 } from '../nmi/nmi.service'
 import { propagateSuccessfulPayment } from '../invoice/invoice.service'
 import { invoiceConfig } from '../invoice/invoice.config'
-import { computeProcessingFee, applyDerivedPaymentStatus } from '../invoice/invoice.utils'
+import { computeProcessingFee, effectiveFeeRates, applyDerivedPaymentStatus } from '../invoice/invoice.utils'
 import { createLogger } from '../../utils/logger.utils'
 import { notifyNmiVaultInvalid, notifyNmiDuplicateTransaction } from '../notifications/nmiAlertNotification.service'
 import { resolveCustomerCardBillingId, resolveCustomerAchBillingId } from '../customer/customer.service'
@@ -282,12 +282,13 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
   // Processing fee is sized off the FULL remaining outstanding (it's a
   // per-invoice fee, not per-charge). It's only staged the first time —
   // subsequent partial charges of the same invoice don't re-stage.
+  // Per-practitioner CARD-fee override (card-only; ACH/cheque unaffected).
   const feePreview =
     !invoice.processingFeeAppliedAt &&
     computeProcessingFee({
       baseAmount: remainingOutstanding,
       method: invoice.paymentMethod,
-      rates: invoiceConfig.processingFeeRates,
+      rates: effectiveFeeRates(invoiceConfig.processingFeeRates, customerMap?.cardFeeOverridePercent),
     })
   // The fee only rides along on the charge that actually settles the
   // invoice. Partial charges send just the base portion; the final

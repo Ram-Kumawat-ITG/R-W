@@ -7,9 +7,9 @@ import {
   ensureRetailInvoiceForOrder,
   ensureRetailPaymentForOrder,
   resyncInvoiceShippingForOrder,
-  sendRetailInvoiceForOrder,
   getRetailInvoicePdf,
 } from "../services/retailQbo/retailOrderInvoice.service";
+import { enqueueRetailInvoiceEmail } from "../services/email/emailQueue.service";
 import { ensureRetailVendorBillForOrder } from "../services/retailQbo/retailVendorBill.service";
 import { reconcileRetailVendorBillForOrder } from "../services/retailQbo/retailBillReconcile.service";
 import StatusBadge from "../components/cdo/StatusBadge";
@@ -141,15 +141,12 @@ export const action = async ({ request }) => {
       return { status: "error", message: r.error || "Nothing to sync yet." };
     }
     if (op === "send-invoice") {
-      const r = await sendRetailInvoiceForOrder({ shop, shopifyOrderId });
-      if (r.ok) return { status: "success", message: `Invoice emailed to ${r.email}.` };
-      if (r.reason === "no_invoice") {
-        return { status: "error", message: "Create the QBO invoice first, then send it." };
-      }
-      if (r.reason === "no_email") {
-        return { status: "error", message: "This order has no customer email to send the invoice to." };
-      }
-      return { status: "error", message: r.error || "Could not send the invoice." };
+      // Hand the QBO send off to the durable background job so this admin
+      // request returns immediately instead of blocking on the QBO round-trip.
+      // The job retries across restarts; failures land in the retailQbo syncLog.
+      const r = await enqueueRetailInvoiceEmail({ shop, shopifyOrderId });
+      if (r.success) return { status: "success", message: "Invoice email queued for sending." };
+      return { status: "error", message: r.error || "Could not queue the invoice email." };
     }
     if (op === "invoice-pdf") {
       const r = await getRetailInvoicePdf({ shop, shopifyOrderId });

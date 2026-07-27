@@ -3,9 +3,10 @@ import { authenticate } from '../../shopify.server'
 import connectDB from '../../services/APIService/mongo.service'
 import ShopifyOrder from '../../models/order.server'
 import Invoice from '../../models/invoice.server'
+import CustomerMap from '../../models/customerMap.server'
 import { sendResponse } from '../../services/APIService/api.service'
 import { invoiceConfig } from '../../services/invoice/invoice.config'
-import { computeProcessingFee, processingFeeLabel } from '../../services/invoice/invoice.utils'
+import { computeProcessingFee, effectiveFeeRates, processingFeeLabel } from '../../services/invoice/invoice.utils'
 
 // POST /api/admin/orders/:id/preview-payment
 //
@@ -73,16 +74,23 @@ export async function action({ request, params }) {
   const alreadyPaid = Number((invoice.amountPaid ?? 0).toFixed(2))
   const baseAmount = Number((currentAmountDue - alreadyPaid).toFixed(2))
 
+  // Apply this practitioner's CARD-fee override (card-only) so the quote
+  // matches what will actually be charged. Read from the mirrored customer map.
+  const customerMap = invoice.customerEmail
+    ? await CustomerMap.findOne({ shop: session.shop, email: invoice.customerEmail }).select('cardFeeOverridePercent').lean()
+    : null
+  const rates = effectiveFeeRates(invoiceConfig.processingFeeRates, customerMap?.cardFeeOverridePercent)
+
   const fee = alreadyApplied
     ? null
     : computeProcessingFee({
         baseAmount,
         method,
-        rates: invoiceConfig.processingFeeRates,
+        rates,
       })
 
   const feeAmount = fee ? fee.amount : 0
-  const feeRate = fee ? fee.rate : invoiceConfig.processingFeeRates?.[method] || 0
+  const feeRate = fee ? fee.rate : rates?.[method] || 0
   const newTotal = Number((baseAmount + feeAmount).toFixed(2))
 
   return sendResponse(200, 'success', 'Preview computed', {

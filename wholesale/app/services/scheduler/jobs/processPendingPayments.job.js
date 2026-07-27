@@ -316,7 +316,7 @@ export function registerProcessPendingPaymentsJob(agenda) {
       // CHEQUE REMINDERS DO NOT LIVE HERE. Customer-facing payment
       // reminders for unpaid cheque invoices are owned exclusively by the
       // dedicated reminder CRON (`process-check-reminders` /
-      // services/reminder), which sends QBO emails on the Day 9 / 11 / 13
+      // services/reminder), which sends SMTP emails on the Day 9 / 11 / 13
       // ladder + recurring phase. This payment CRON is responsible only
       // for charging, status updates, and payment/audit logs — keeping
       // the two concerns separate avoids duplicate reminders. The legacy

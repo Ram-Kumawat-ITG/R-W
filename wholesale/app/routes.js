@@ -21,6 +21,12 @@ export default [
   route("/api/registration-form", "api/registration-form.js"),
   route("/api/auth/check-email", "api/auth/check-email.js"),
   route("/api/update-profile",   "api/update-profile.js"),
+  // Storefront cart gate — reports the logged-in practitioner's PAYMENT
+  // order-hold status so the theme app-embed block (checkout_hold_gate)
+  // can disable the checkout button + show the message BEFORE the buyer
+  // reaches checkout. The checkout-validation Function is the hard block;
+  // this is the UX layer that prevents navigating to /checkout at all.
+  route("/api/storefront/order-hold", "api/storefront/order-hold.js"),
   // Practitioner Portal moved to the ns-retail app (extension + /api/portal/*
   // backend now live there — it owns the cdo_* collections). See ns-retail.
   //
@@ -60,6 +66,8 @@ export default [
   route("/api/admin/customers/:id/decline", "api/admin/decline.js"),
   route("/api/admin/customers/:id/block", "api/admin/block.js"),
   route("/api/admin/customers/:id/payment-method", "api/admin/payment-method.js"),
+  route("/api/admin/customers/:id/card-fee-override", "api/admin/card-fee-override.js"),
+  route("/api/admin/customers/:id/clear-order-hold", "api/admin/clear-order-hold.js"),
   route("/api/admin/orders/:id/retry-payment", "api/admin/retry-payment.js"),
   route("/api/admin/orders/:id/sync-ach-status", "api/admin/sync-ach-status.js"),
   route("/api/admin/orders/:id/mark-cheque-paid", "api/admin/mark-cheque-paid.js"),

@@ -1,12 +1,28 @@
-// PDFfiller → Wholesale Practitioner Registration migration import.
+// Talon Advanced Registration → Wholesale Practitioner Registration migration import.
+//
+// Source: the "Talon Advanced Registration" Shopify app, which stores each
+// practitioner's registration as a Shopify CUSTOMER (custom fields in the
+// customer's metafields — VAT/Tax id, EIN, business info, license/file
+// uploads — plus an approval tag like `advanced-registration:approved`). The
+// operator exports that data (app customer-list export / Shopify customer
+// metafields) and maps it into the normalized workbook this parser reads.
+// Because every Talon practitioner is ALREADY a Shopify customer, set
+// `existing_shopify_customer_id` (or rely on the email match) so the importer
+// LINKS to that customer instead of creating a duplicate — preserving order
+// history (see the commit loop's find-existing-customer branch).
 //
 // Parses the Excel workbook described in
-// docs/migration/pdffiller-practitioner-migration-plan.md +
-// PDFfiller_Practitioner_Migration_Template.xlsx, validates it, and (when
+// docs/migration/talon-practitioner-migration-plan.md +
+// 2Practitioner_Migration_Template.xlsx, validates it, and (when
 // commit=true) recreates practitioner accounts through the SAME pipeline a
 // live registration-form submit uses (app/api/registration-form.js): NMI
 // Customer Vault → WholesaleApplication → Shopify customer + invite → CDO
 // referral code.
+//
+// Source-agnostic by design: every column except the two provenance columns
+// (`talon_submission_id`, `talon_form_url`) maps to a wholesale_applications
+// field regardless of where the data came from. The legacy `pdffiller_*`
+// column names are still accepted as a fallback so older workbooks import.
 //
 // Hard constraint (see plan §6): a card payment method cannot be migrated
 // from a spreadsheet — there is no way to produce a valid NMI payment token
@@ -44,6 +60,18 @@ import { createCustomerVault, deleteCustomerVault } from "../nmi/nmi.service";
 import { generatePractitionerCode } from "../cdo/cdo.service";
 import { encryptField } from "../../utils/crypto.utils";
 import { createLogger } from "../../utils/logger.utils";
+import { retry } from "../../utils/retry.utils";
+
+// Shopify Admin GraphQL is a leaky-bucket rate limiter. A bulk migration
+// (1000+ practitioners) fires customer mutations far faster than the bucket
+// refills, so most calls come back THROTTLED. executeGraphQL now classifies
+// that as a TransientError — this wrapper retries it with generous backoff so
+// each call waits for the bucket to refill instead of failing the row. Also
+// used for the customer lookup + tag/note update.
+const SHOPIFY_RETRY_OPTS = { attempts: 8, baseMs: 1500, maxMs: 30000, factor: 2 };
+function withShopifyRetry(fn) {
+  return retry(fn, SHOPIFY_RETRY_OPTS);
+}
 
 const log = createLogger("practitionerMigration.service");
 
@@ -273,35 +301,62 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
     const req = (field, val) => {
       if (!s(val)) errs.push(`${field} is required`);
     };
+    // Name is the only hard requirement. Phone + billing/shipping ADDRESS are
+    // NOT required for migration: the data is often absent in the source, no NMI
+    // vault is created at import (check-method), and the real address is
+    // re-collected at checkout / via the profile page. Missing contact/address
+    // is tracked as a warning (`needsContactInfo`) rather than blocking the row.
     req("first_name", row.first_name);
     req("last_name", row.last_name);
-    req("phone", row.phone);
-    req("billing_line1", row.billing_line1);
-    req("billing_city", row.billing_city);
-    req("billing_state", row.billing_state);
-    req("billing_zip", row.billing_zip);
-    req("billing_country", row.billing_country);
 
     const shippingSameAsBilling = bool(row.shipping_same_as_billing);
-    if (!shippingSameAsBilling) {
-      req("shipping_line1", row.shipping_line1);
-      req("shipping_city", row.shipping_city);
-      req("shipping_state", row.shipping_state);
-      req("shipping_zip", row.shipping_zip);
-      req("shipping_country", row.shipping_country);
+    const missingContact = [];
+    for (const [f, v] of [
+      ["phone", row.phone],
+      ["billing_line1", row.billing_line1],
+      ["billing_city", row.billing_city],
+      ["billing_state", row.billing_state],
+      ["billing_zip", row.billing_zip],
+      ["billing_country", row.billing_country],
+    ]) {
+      if (!s(v)) missingContact.push(f);
     }
-    if (!["Residential", "Commercial"].includes(s(row.shipping_property_type))) {
-      errs.push(`shipping_property_type must be "Residential" or "Commercial" (got "${row.shipping_property_type}")`);
+    if (!shippingSameAsBilling) {
+      for (const [f, v] of [
+        ["shipping_line1", row.shipping_line1],
+        ["shipping_city", row.shipping_city],
+        ["shipping_state", row.shipping_state],
+        ["shipping_zip", row.shipping_zip],
+        ["shipping_country", row.shipping_country],
+      ]) {
+        if (!s(v)) missingContact.push(f);
+      }
+    }
+    // shipping_property_type, when provided, must be a valid value — but it's no
+    // longer required (defaults are applied downstream / it's a shipping hint).
+    if (s(row.shipping_property_type) && !["Residential", "Commercial"].includes(s(row.shipping_property_type))) {
+      errs.push(`shipping_property_type must be "Residential" or "Commercial" when provided (got "${row.shipping_property_type}")`);
     }
 
+    // Deferred tax/W-9: when defer_tax_w9=TRUE the practitioner migrates now
+    // WITHOUT tax + W-9 data and is flagged `needsTaxInfo` to complete it later
+    // (a separate collection step). An explicit, per-row, auditable opt-in —
+    // the tax requirements below (and the W-9 requirement) are relaxed only for
+    // these rows; every other row is validated in full.
+    const deferTax = bool(row.defer_tax_w9);
     const taxIdType = lc(row.tax_id_type);
-    if (!["ein", "ssn"].includes(taxIdType)) {
-      errs.push(`tax_id_type must be "ein" or "ssn" (got "${row.tax_id_type}")`);
+    if (!deferTax) {
+      if (!["ein", "ssn"].includes(taxIdType)) {
+        errs.push(`tax_id_type must be "ein" or "ssn" (got "${row.tax_id_type}")`);
+      }
+      req("tax_id", row.tax_id);
+      req("exempt_state", row.exempt_state);
+      req("items_to_resell", row.items_to_resell);
+      req("business_activity", row.business_activity);
+    } else if (taxIdType && !["ein", "ssn"].includes(taxIdType)) {
+      // Deferred, but a value was still supplied → it must be valid if present.
+      errs.push(`tax_id_type must be "ein" or "ssn" when provided (got "${row.tax_id_type}")`);
     }
-    req("tax_id", row.tax_id);
-    req("exempt_state", row.exempt_state);
-    req("items_to_resell", row.items_to_resell);
-    req("business_activity", row.business_activity);
 
     const status = STATUSES.includes(lc(row.status)) ? lc(row.status) : "approved";
     const termsAccepted = bool(row.terms_accepted);
@@ -365,13 +420,31 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
         blockedAt: dateOrNull(row.blocked_at),
         existingShopifyCustomerId: s(row.existing_shopify_customer_id) || null,
         referredByPractitionerEmail: lc(row.referred_by_practitioner_email) || null,
-        pdffillerSubmissionId: s(row.pdffiller_submission_id) || null,
-        pdffillerFormUrl: s(row.pdffiller_form_url) || null,
+        // Provenance — prefer the Talon column, fall back to the legacy
+        // pdffiller column name so pre-existing workbooks still import.
+        talonSubmissionId: s(row.talon_submission_id) || s(row.pdffiller_submission_id) || null,
+        talonFormUrl: s(row.talon_form_url) || s(row.pdffiller_form_url) || null,
         notes: s(row.notes) || null,
+        deferredTaxInfo: deferTax,
+        needsContactInfo: missingContact.length > 0,
         credentials: {},
         referrals: {},
       },
     });
+    if (deferTax) {
+      pushWarning(
+        report.practitioners,
+        rowId,
+        `tax/W-9 deferred (defer_tax_w9=TRUE) — imports with needsTaxInfo=true; practitioner must complete tax + W-9 later`,
+      );
+    }
+    if (missingContact.length) {
+      pushWarning(
+        report.practitioners,
+        rowId,
+        `incomplete contact/address (${missingContact.join(", ")}) — imported blank with needsContactInfo=true; practitioner completes via profile / at checkout`,
+      );
+    }
     report.practitioners.created += 1; // "resolved for creation"
   }
 
@@ -395,21 +468,25 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
       pushError(report.credentials, rowId, `Unknown credential_id "${row.credential_id}"`);
       continue;
     }
+    // Migration: a credential's detail text + license file are NOT required
+    // (the Talon export rarely includes the license documents). The credential
+    // still attaches with whatever is present; missing pieces are flagged
+    // (`needsCredentialFiles`) for the practitioner to upload via profile. Only
+    // a qest4 systemType, IF supplied, must still be a valid value.
     const errs = [];
     const values = [s(row.detail_value_1), s(row.detail_value_2)];
-    spec.textKeys.forEach((key, i) => {
-      if (!values[i]) errs.push(`${key} is required for credential "${credentialId}"`);
-    });
     if (credentialId === "qest4" && values[1] && !QEST4_SYSTEM_TYPES.includes(values[1])) {
       errs.push(`systemType must be one of: ${QEST4_SYSTEM_TYPES.join(", ")} (got "${values[1]}")`);
-    }
-    if (spec.fileKey && !s(row.file_url)) {
-      errs.push(`file_url is required for credential "${credentialId}"`);
     }
     if (errs.length) {
       pushError(report.credentials, rowId, errs.join("; "));
       continue;
     }
+    const missingCred = [];
+    spec.textKeys.forEach((key, i) => {
+      if (!values[i]) missingCred.push(key);
+    });
+    if (spec.fileKey && !s(row.file_url)) missingCred.push("file_url");
 
     const entry = { selected: true };
     spec.textKeys.forEach((key, i) => {
@@ -417,6 +494,10 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
     });
     if (spec.fileKey) entry[spec.fileKey] = s(row.file_url); // re-hosted at commit time
     practitioner.data.credentials[credentialId] = entry;
+    if (missingCred.length) {
+      practitioner.data.needsCredentialFiles = true;
+      pushWarning(report.credentials, rowId, `credential "${credentialId}" imported without ${missingCred.join(", ")} — practitioner uploads/completes via profile`);
+    }
     report.credentials.created += 1;
   }
 
@@ -440,13 +521,15 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
       pushError(report.referralSources, rowId, `Unknown referral_id "${row.referral_id}"`);
       continue;
     }
-    if (spec.requiresDetail && !s(row.detail_value)) {
-      pushError(report.referralSources, rowId, `detail_value is required for referral "${referralId}"`);
-      continue;
-    }
+    // Migration: a referral's detail_value is NOT required (the Talon export
+    // often lacks the referring-practitioner name / detail). Store whatever is
+    // present; flag a missing detail as a warning instead of erroring.
     practitioner.data.referrals[referralId] = spec.requiresDetail
       ? { selected: true, value: s(row.detail_value) }
       : { selected: true };
+    if (spec.requiresDetail && !s(row.detail_value)) {
+      pushWarning(report.referralSources, rowId, `referral "${referralId}" imported without detail_value — practitioner completes via profile`);
+    }
     report.referralSources.created += 1;
   }
 
@@ -647,7 +730,8 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
     report.w9.created += 1;
   }
   for (const [email, practitioner] of practitioners) {
-    if (!practitioner.skip && !w9ByEmail.has(email)) {
+    // Deferred-tax practitioners are allowed to import without a W-9 row.
+    if (!practitioner.skip && !w9ByEmail.has(email) && !practitioner.data?.deferredTaxInfo) {
       pushError(report.w9, null, `Practitioner "${email}" has no W9_Tax_Certification row — a signed W-9 is required`);
       practitioner.skip = true;
       practitioner.reason = "missing W-9";
@@ -663,7 +747,10 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
     if (practitioner.skip) continue;
     const payment = paymentByEmail.get(email);
     const w9Row = w9ByEmail.get(email);
-    if (!payment || !w9Row) continue; // already flagged as an error above
+    // Payment is always required; the W-9 is required UNLESS this practitioner
+    // is a deferred-tax import (then w9Row may be absent — see below).
+    if (!payment) continue;
+    if (!w9Row && !practitioner.data?.deferredTaxInfo) continue; // already flagged as an error above
 
     const data = practitioner.data;
     let nmiCustomerVaultId = null;
@@ -721,11 +808,14 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
       }
     }
 
-    const signature = {
-      type: w9Row.signatureType,
-      value: w9Row.signatureValueOrFileUrl,
-      signedAt: w9Row.signedAt,
-    };
+    // A deferred-tax practitioner may have no W-9 row → no signature yet.
+    const signature = w9Row
+      ? {
+          type: w9Row.signatureType,
+          value: w9Row.signatureValueOrFileUrl,
+          signedAt: w9Row.signedAt,
+        }
+      : null;
 
     const payload = {
       shop,
@@ -764,16 +854,18 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
       },
       signature,
       commission: commissionDoc,
-      w9: {
-        legalName: w9Row.legalName,
-        taxClassification: w9Row.taxClassification,
-        llcClassification: w9Row.llcClassification,
-        otherClassification: w9Row.otherClassification,
-        exemptPayeeCode: w9Row.exemptPayeeCode,
-        fatcaCode: w9Row.fatcaCode,
-        signature,
-        submittedAt: w9Row.signedAt,
-      },
+      w9: w9Row
+        ? {
+            legalName: w9Row.legalName,
+            taxClassification: w9Row.taxClassification,
+            llcClassification: w9Row.llcClassification,
+            otherClassification: w9Row.otherClassification,
+            exemptPayeeCode: w9Row.exemptPayeeCode,
+            fatcaCode: w9Row.fatcaCode,
+            signature,
+            submittedAt: w9Row.signedAt,
+          }
+        : null,
       termsAccepted: data.termsAccepted,
       subscribeNews: data.subscribeNews,
       status: data.status,
@@ -781,15 +873,24 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
       reviewedAt: data.status === "approved" ? data.reviewedAt || new Date() : data.reviewedAt,
       blockedAt: data.status === "blocked" ? data.blockedAt : null,
       referredBy: data.referredByPractitionerEmail
-        ? { email: data.referredByPractitionerEmail, source: "pdffiller_migration" }
+        ? { email: data.referredByPractitionerEmail, source: "talon_migration" }
         : null,
       nmiCustomerVaultId,
       // Non-schema fields (strict:false) — traceability + the card-capture
       // flag, never read by the live registration/order pipeline.
-      migratedFromPdffiller: true,
-      pdffillerSubmissionId: data.pdffillerSubmissionId,
-      pdffillerFormUrl: data.pdffillerFormUrl,
+      migratedFromTalon: true,
+      talonSubmissionId: data.talonSubmissionId,
+      talonFormUrl: data.talonFormUrl,
       needsCardCapture: data.status === "approved" ? payment.needsCardCapture : false,
+      // Deferred tax/W-9 migration — practitioner must complete tax + a signed
+      // W-9 later (a separate collection step). Flagged for admin/portal follow-up.
+      needsTaxInfo: data.deferredTaxInfo === true,
+      // Imported with missing phone/billing/shipping — practitioner completes
+      // via profile (or it's captured at checkout). Flagged for admin follow-up.
+      needsContactInfo: data.needsContactInfo === true,
+      // Credential(s) imported without their license file / detail — practitioner
+      // uploads the document(s) via the profile Credentials section.
+      needsCredentialFiles: data.needsCredentialFiles === true,
       migrationNotes: data.notes,
       migrationImportedBy: actor,
     };
@@ -816,18 +917,19 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
           app.credentials[`${credId}`][spec.fileKey] = hosted;
           app.markModified("credentials");
         } else {
-          pushWarning(report.credentials, null, `Could not re-host license file for "${email}" (${credId}) — left as the original PDFfiller URL`);
+          pushWarning(report.credentials, null, `Could not re-host license file for "${email}" (${credId}) — left as the original source URL`);
         }
       }
-      if (signature.type === "drawn") {
+      // Deferred practitioners have no W-9 → signature is null; skip re-hosting.
+      if (signature?.type === "drawn") {
         const hosted = await rehostFileUrl(admin, signature.value, `signature-${email}`);
         if (hosted) {
-          app.signature.value = hosted;
-          app.w9.signature.value = hosted;
+          if (app.signature) app.signature.value = hosted;
+          if (app.w9?.signature) app.w9.signature.value = hosted;
           app.markModified("signature");
           app.markModified("w9");
         } else {
-          pushWarning(report.w9, null, `Could not re-host signature image for "${email}" — left as the original PDFfiller URL`);
+          pushWarning(report.w9, null, `Could not re-host signature image for "${email}" — left as the original source URL`);
         }
       }
       await app.save();
@@ -859,14 +961,16 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
       // it); otherwise look it up by email.
       let customerId = data.existingShopifyCustomerId || null;
       if (!customerId) {
-        const found = await findCustomerByEmail(admin, data.email);
+        const found = await withShopifyRetry(() => findCustomerByEmail(admin, data.email));
         customerId = found?.id || null;
       }
 
       if (customerId) {
         const addTags = data.status === "blocked" ? ["Blocked", "practitioner"] : ["Approved", "practitioner"];
         const removeTags = data.status === "blocked" ? ["Approved"] : ["Blocked"];
-        await updateCustomerTagsAndNote(admin, { customerId, addTags, removeTags, note });
+        await withShopifyRetry(() =>
+          updateCustomerTagsAndNote(admin, { customerId, addTags, removeTags, note }),
+        );
         app.customerId = customerId;
         app.shopifyCreateFailed = false;
         app.shopifyCreateError = null;
@@ -877,12 +981,14 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
           `Practitioner "${email}" linked to their EXISTING Shopify customer (${customerId}) instead of creating a new one — tags/note updated, order history preserved.`,
         );
       } else if (data.status === "approved") {
-        customerId = await createCustomer(admin, {
-          application: payload,
-          note,
-          tags: ["Approved", "practitioner"],
-          subscribeNews: Boolean(payload.subscribeNews),
-        });
+        customerId = await withShopifyRetry(() =>
+          createCustomer(admin, {
+            application: payload,
+            note,
+            tags: ["Approved", "practitioner"],
+            subscribeNews: Boolean(payload.subscribeNews),
+          }),
+        );
         app.customerId = customerId;
         app.shopifyCreateFailed = false;
         app.shopifyCreateError = null;

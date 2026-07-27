@@ -26,6 +26,16 @@ const cdoReferralSchema = new mongoose.Schema(
     orderId: { type: mongoose.Schema.Types.ObjectId, ref: "CdoOrder" },
     referredAt: { type: Date, index: true },
     convertedAt: Date,
+
+    // Provenance — set when created by a bulk data migration (e.g. GoAffPro)
+    // rather than the live pipeline. See cdoPractitionerCode for the rationale.
+    migrationSource: { type: String, default: null, index: true },
+    migrationRunId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "CdoMigrationRun",
+      default: null,
+      index: true,
+    },
   },
   { collection: "cdo_referrals", timestamps: true, strict: true },
 );

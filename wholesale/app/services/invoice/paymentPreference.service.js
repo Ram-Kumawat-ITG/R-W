@@ -33,6 +33,7 @@ import { setInvoiceProcessingFee } from '../qbo/qbo.service'
 import { invoiceConfig, resolveInvoiceDueDate } from './invoice.config'
 import {
   computeProcessingFee,
+  effectiveFeeRates,
   buildProcessingFeeLine,
 } from './invoice.utils'
 import { appendInvoiceRemark } from './invoice.service'
@@ -54,6 +55,11 @@ export async function applyPaymentPreferenceToOpenInvoices({
   newMethod,
   performedBy,
   source, // 'customer' | 'admin'
+  // When true, realign each open invoice even if its method is unchanged —
+  // used for a per-practitioner CARD-fee override change (the fee, not the
+  // method, changed). The new override is read from the (already-updated)
+  // customer map inside this function.
+  forceFeeRecompute = false,
 }) {
   const method = normalizePaymentMethod(newMethod)
   const normalizedEmail = String(email || '').toLowerCase()
@@ -99,7 +105,14 @@ export async function applyPaymentPreferenceToOpenInvoices({
 
   for (const { _id } of candidates) {
     try {
-      const outcome = await realignOneInvoice({ invoiceId: _id, method, performedBy, source })
+      const outcome = await realignOneInvoice({
+        invoiceId: _id,
+        method,
+        performedBy,
+        source,
+        cardFeeOverride: customerMap?.cardFeeOverridePercent,
+        forceFeeRecompute,
+      })
       if (outcome.status === 'updated') {
         summary.updated += 1
         summary.affectedInvoiceIds.push(String(_id))
@@ -118,7 +131,10 @@ export async function applyPaymentPreferenceToOpenInvoices({
   // Append the change-event audit entry to the customer's application.
   // Best-effort: a missing application (customer with no app row) just
   // means no customer-level history — the per-invoice remarks still stand.
+  // Skip when this was a fee-override-only realign (method unchanged) — that
+  // isn't a payment-method change and shouldn't pollute paymentMethodHistory.
   try {
+    if (previousMethod !== method) {
     await WholesaleApplication.updateOne(
       { shop, email: normalizedEmail },
       {
@@ -135,6 +151,7 @@ export async function applyPaymentPreferenceToOpenInvoices({
         },
       },
     )
+    }
   } catch (auditErr) {
     console.error(`[pref] audit-history write failed: ${auditErr.message}`)
     log.error('pref.audit_failed', { shop, email: normalizedEmail, err: auditErr })
@@ -161,7 +178,7 @@ export async function applyPaymentPreferenceToOpenInvoices({
 // eligibility, rewrites the QBO fee line + due date, then persists. Returns
 // a per-invoice outcome record (never throws for the "skip" cases — only
 // genuine QBO/DB errors propagate to the caller's try/catch).
-async function realignOneInvoice({ invoiceId, method, performedBy, source }) {
+async function realignOneInvoice({ invoiceId, method, performedBy, source, cardFeeOverride, forceFeeRecompute }) {
   const invoice = await Invoice.findById(invoiceId)
   if (!invoice) return { invoiceId: String(invoiceId), status: 'skipped', reason: 'not_found' }
 
@@ -176,7 +193,7 @@ async function realignOneInvoice({ invoiceId, method, performedBy, source }) {
   if (invoice.achSyncInProgress) {
     return { invoiceId: String(invoiceId), status: 'skipped', reason: 'ach_sync_in_progress' }
   }
-  if (fromMethod === method) {
+  if (fromMethod === method && !forceFeeRecompute) {
     return { invoiceId: String(invoiceId), status: 'skipped', reason: 'same_method' }
   }
   if (!invoice.qboInvoiceId) {
@@ -189,11 +206,12 @@ async function realignOneInvoice({ invoiceId, method, performedBy, source }) {
   const oldFee = Number(invoice.processingFeeAmount || 0)
   const base = Number((Number(invoice.amountDue || 0) - oldFee).toFixed(2))
 
-  // New per-method fee on the same base.
+  // New per-method fee on the same base. A per-practitioner CARD override
+  // applies only when realigning TO card; ACH/cheque keep their defaults.
   const newFee = computeProcessingFee({
     baseAmount: base,
     method,
-    rates: invoiceConfig.processingFeeRates,
+    rates: effectiveFeeRates(invoiceConfig.processingFeeRates, cardFeeOverride),
   })
   const feeLine = newFee ? buildProcessingFeeLine({ ...newFee, baseAmount: base }) : null
 
@@ -237,12 +255,14 @@ async function realignOneInvoice({ invoiceId, method, performedBy, source }) {
   await invoice.save()
 
   const feeMsg = `fee $${oldFee.toFixed(2)} → $${(newFee?.amount || 0).toFixed(2)}`
+  const actor = performedBy || (source === 'admin' ? 'admin' : 'customer')
   await appendInvoiceRemark(invoice._id, {
     kind: 'admin_action',
     source: source === 'admin' ? 'admin' : 'system',
     message:
-      `Payment method changed ${fromMethod} → ${method} (${feeMsg}, ` +
-      `due ${newDueDate || 'n/a'}) by ${performedBy || (source === 'admin' ? 'admin' : 'customer')}`,
+      fromMethod === method
+        ? `Card fee override applied (${feeMsg}, due ${newDueDate || 'n/a'}) by ${actor}`
+        : `Payment method changed ${fromMethod} → ${method} (${feeMsg}, due ${newDueDate || 'n/a'}) by ${actor}`,
     currency: invoice.currency,
   })
 
