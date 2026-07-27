@@ -2,11 +2,11 @@
 
 **File:** [`ns-retail/app/api/shipping/rates.js`](app/api/shipping/rates.js)
 **Endpoint:** `POST /api/shipping/rates` (Shopify Carrier Service callback)
-**Purpose:** On every checkout re-render, Shopify POSTs the cart + destination to this endpoint. We classify each product by its `pack:XXX` tag, pick the smallest packing box that fits, compute the real package weight, call USPS + UPS with those dimensions, and return the live shipping options + the picked box to the customer.
+**Purpose:** On every checkout re-render, Shopify POSTs the cart + destination to this endpoint. We classify each product by its `custom.pack_category` metafield, pick the smallest packing box that fits, compute the real package weight, call USPS + UPS with those dimensions, and return the live shipping options + the picked box to the customer.
 
-> **Living doc.** Update this file **every time** we change anything in `rates.js` (algorithm, thresholds, tag mapping, carrier config, etc.). If code and doc disagree, code wins — but that's a bug in this doc, fix it.
+> **Living doc.** Update this file **every time** we change anything in `rates.js` (algorithm, thresholds, category mapping, carrier config, etc.). If code and doc disagree, code wins — but that's a bug in this doc, fix it.
 
-**Last updated:** 2026-07-16 (pure tag-based classifier rollout)
+**Last updated:** 2026-07-23 (metafield-based classifier — replaces tag-based system)
 
 ---
 
@@ -208,6 +208,7 @@ Derived from the 9x6x4 envelope baseline: 3 × S = 3 units budget, 1 × L = 3 un
 | 12x12x5 box | box | 12×12×5 | 9.6 | 4 | 4 | liquid tier |
 | 18x13x3 box | box | 18×13×3 | 9.3 | 1 | 6 | **tinyExtrasOnly** — rejects any M/L/S1/G* items |
 | 15x12x9 box | box | 15×12×9 | 11.5 | 6 | 12 | liquid tier |
+| 13x13x10 box | box | 13×13×10 | 13.6 | 6 | 12 | liquid tier; added 2026-07-23 (Trace-measured tare). Capacity is best-guess mirror of 15x12x9 — tune when client confirms real fit. |
 | 18x14x8 box | box | 18×14×8 | 17.0 | 8 | 16 | Trace-measured tare (was 14, corrected 2026-07-13) |
 | Enersync 1oz | box | 10×7×6 | 7.0 | 4 | 0 | partitioned; glassMin: 12, glassSize: 1oz; 4-unit extras budget for non-glass items |
 | Enersync 2oz | box | 11×7×8 | 13.2 | 4 | 0 | partitioned; glassMin: 12, glassSize: 2oz; 4-unit extras budget for non-glass items |
@@ -223,7 +224,7 @@ Field notes:
 - `tinyExtrasOnly` — 18×13×3 only accepts S + FA as extras alongside liquids, and even S is blocked when the box is at max liquid capacity (6). FA (flat cards) may sit alongside 6 liquids; S bottles cannot. See §7 Step 3.
 
 **Excluded tiers** (per client Q7): 16x12x10 explicitly not used.
-**Pending** (per Trace): 13x13x10 tare weight — not added to list until measured.
+**Excluded**: 16×12×10 (client Q7).
 
 ### 5.3 Packing-material buffer
 
@@ -240,72 +241,105 @@ Trace explicitly asked for **over-weight** rather than under (cited a real $3.15
 
 ---
 
-## 6. Product Classification — Pure Tag-Based
+## 6. Product Classification — Metafield-Based
 
 ### 6.1 Requirement
 
-Every retail Shopify product must carry ONE `pack:XXX` tag naming its packing category. Nine allowed values:
+Every retail Shopify product must carry the `custom.pack_category` metafield naming its packing category. **12 allowed values** — aligned with client's 2026-07-23 classification sheet (Stephanie's 8-tier + XL + OTHER + REVIEW):
 
-| Tag | Category | Meaning |
+| Value | Category | Meaning / example products |
 |---|---|---|
-| `pack:FA` | Frequency Apps | Flat card, ~0.1 oz |
-| `pack:LL` | Large liquid | Liquid Life, Miracle II, Zavita, Floradix Iron, Biomega |
-| `pack:G4` | 4 oz glass tincture | — |
-| `pack:G2` | 2 oz glass tincture | EQ Thyroid Herbal 2 oz (**NOT** EQ B-Complex 2 oz — that's capsules → tag S/S1) |
-| `pack:G1` | 1 oz glass tincture | — |
-| `pack:L` | Large bottle (non-liquid) | Amino Complex, Nerve Health, Stress Focus |
-| `pack:M` | Medium bottle | Magnesium Complex, Pain Relief Plus (definition under review — see §20) |
-| `pack:S1` | Small bottle | Adrenal TLP, Cardio Support, Body RGN |
-| `pack:S` | Extra-small bottle | Chromium, D3, Lypozyme, Aquamax |
-**Products currently un-mappable to any of the 9 categories** (need a new category from Trace):
-- Body FX — extra-large non-liquid
-- Circulatory Health — doesn't fit any current category (Trace's note)
-- Control — same
-- Three Lac — ships in its own box
-- Trimsulin — ships in its own box
+| `SS` | Extra small tablets / tiny bottles | AI-Chromium, AI-D3, AI-B12, AI-Biotin, AI-K2/D3, AI-IRON, NS-Aqua Max |
+| `S` | Small capsules | AI-ARWY Pro, NS-Adrenal TLP, NS-Cardio Support, most NS capsules |
+| `M` | Medium capsules | AI-Body DX, EQ-B-Complex, NS-Bone Health, FF-Cardio 1st |
+| `L` | Large non-liquid | AI-Enervimin Flora/Joint/Stress Focus, NS-Amino Complex, FF-SPN Energy |
+| `LL` | Large liquid | AI-V Max, FF-Biomega, FF-Zavita, NS-Liquid Life, M2-Miracle II, Floradix Iron |
+| `XL` | Extra large | **Body FX Chocolate + Vanilla only** (2 products) |
+| `G1` | 1 oz glass | 1oz droppers, sprays, essential oils (JW oils, EQ 1oz drops) |
+| `G2` | 2 oz glass | 2oz droppers, sprays (BL sprays, EQ 2oz drops, EQ Thyroid Herbal 2oz — **NOT** EQ B-Complex 2 oz which is capsules → tag `M`) |
+| `G4` | 4 oz glass | EQ-Organdrainex, NS-Filtering Organ Drainage 4oz, EQ-Recovatone |
+| `FA` | Frequency Apps | All Frequency App patches (flat cards, ~0.1 oz) |
+| `OTHER` | Ships in its own retail box | Bio Kits, Trimsulin Kit, EnerSync 24ct Cases, Services, Training, Red Laser |
+| `REVIEW` | Merchant-unmatched (blocks checkout) | Products the merchant hasn't classified yet — triggers "no shipping available" |
 
-These 5 products **cannot be tagged today** — they will trigger the "no shipping available" back-pressure at checkout until Trace confirms a proper category. PM proposed `pack:XL` + `pack:OTHER` on 2026-07-17 but Trace has NOT confirmed. Any preliminary code support for these two tags was **removed on 2026-07-20** to keep the allowed-category list to the 9 client-confirmed values only.
+### 6.2 Where the merchant sets it
 
-Tag is set by the merchant via Shopify admin → Product edit page → Tags column. Case-tolerant on read (`pack:s1` treated same as `pack:S1`).
+**Shopify admin → Product edit page → Metafields section → "Pack category"** (single-line text field with the allowed values listed above). Metafield definition:
 
-### 6.2 Runtime
+```
+Namespace + key : custom.pack_category
+Type            : single_line_text_field
+Owner           : PRODUCT (not variant — pack category is per-product)
+Pin             : Yes (visible without expanding "Show all")
+Allowed values  : SS, S, M, L, LL, XL, G1, G2, G4, FA, OTHER, REVIEW
+```
+
+Client's classification sheet ships with the correct value per SKU — merchant CSV-imports it once to bulk-set every product.
+
+### 6.3 Runtime
 
 On every carrier callback:
 
 1. Extract unique `product_id` values from `realItems`.
-2. One bulk GraphQL call: `nodes(ids: [Product/1, Product/2, ...]) { tags }` via `unauthenticated.admin(RETAIL_SHOP_DOMAIN)` — auth uses the app's stored OAuth session (same pattern as `customerTags.js` and `cdo.portal.service.js`).
-3. Build `Map<productId, tags[]>`.
-4. For each cart line, look for a tag starting with `pack:` and take the suffix as the category. Unknown values (typos like `pack:XX`) are treated as missing.
-5. Return `{ counts, perLine, missing }` — `counts` is the input to `selectBox`; `missing` is the list of items lacking a valid tag.
+2. One bulk GraphQL call:
+   ```graphql
+   nodes(ids: [Product/1, Product/2, ...]) {
+     ... on Product {
+       id
+       packCategory: metafield(namespace: "custom", key: "pack_category") { value }
+     }
+   }
+   ```
+   via `unauthenticated.admin(RETAIL_SHOP_DOMAIN)` (same session pattern as customerTags.js and cdo.portal.service.js).
+3. Build `Map<productId, rawMetafieldValue>`.
+4. For each cart line, `normalizePackCategory` uppercases + validates against the allow-list. Unknown values (typos like `pak:X`) are treated as missing.
+5. Return `{ counts, perLine, missing }` — `counts` is the input to `selectBox`; `missing` is the list of items with no metafield OR metafield = REVIEW.
 
-### 6.3 Why not from the carrier payload
+### 6.4 Missing / REVIEW policy
 
-The Shopify carrier-service payload does **not** include product tags — verified against the 2026-07-07 production payload dump. So we must fetch. One bulk GraphQL per callback is cheaper than one call per product.
+If ANY cart item lacks a valid `custom.pack_category` OR its value equals `REVIEW`:
+- Full rate response = empty (customer sees "no shipping available").
+- Log line: `[shipping.rates] ABORT — N cart item(s) missing/REVIEW pack_category` with per-item `reason=no_metafield|review_pending` and the raw value seen.
+- Forces the merchant to classify (or fix `REVIEW`) before shipping quotes will render.
 
-### 6.4 Why not weight/name/vendor cascade
+### 6.5 Migration note — tag-based system superseded
 
-The previous cascade (vendor → name regex → weight thresholds) was error-prone: SKUs with "1 oz" in the name (e.g. Enersync case) mis-classified as G1, unspecified products fell into weight buckets that didn't map cleanly, and merchants couldn't override without renaming products. Tag-based is 100% explicit and 100% merchant-controlled.
+Prior to 2026-07-23 the classifier read a `pack:XXX` tag from Shopify Admin API. That system had 9 categories (S / S1 / M / L / LL / G1 / G2 / G4 / FA). The switch to metafield brought a **renaming** to align with client's sheet:
+
+| Old tag | New metafield value |
+|---|---|
+| `pack:S` (extra small) | `SS` |
+| `pack:S1` (small capsule) | `S` |
+| `pack:M`, `pack:L`, `pack:LL`, `pack:G1`, `pack:G2`, `pack:G4`, `pack:FA` | Same names |
+| — | `XL` (new — Body FX only) |
+| — | `OTHER` (new — own-box shipping) |
+| — | `REVIEW` (new — blocks checkout) |
+
+The tag system is fully removed from code as of 2026-07-23 (clean cut). Products still carrying the old `pack:XXX` tags won't classify — merchant must set the metafield instead.
 
 ---
 
-## 7. Box Selection Algorithm — 6-Step Priority
+## 7. Box Selection Algorithm — 7-Step Priority
 
-Given the cart's classification counts, `selectBox()` walks 6 rules in order. First match wins. Returns `{ box, overflow }`.
+Given the cart's classification counts, `selectBox()` walks 7 rules in order. First match wins. Returns `{ box, overflow }`.
+
+**Step 0 — Any `OTHER` in cart → largest tier + overflow flag**
+`OTHER` products (kits, cases, services, EnerSync 24-count boxes) ship in their own retail box. No engine tier applies — we route the whole cart to `18×14×8` with `overflow: true` and log the reason. Merchant approval gate reviews and fixes the label at fulfillment time. (`REVIEW` never reaches this step — it's blocked earlier in the action handler with empty rates.)
 
 **Step 1 — 12+ glass items, no LL → Enersync**
-Enersync boxes are partitioned for glass safety but are **not** glass-only. Majority glass size decides which Enersync (`1oz` vs `2oz`). Ties → 2oz (bigger box, conservative for mixed carts). Non-glass extras (S/S1/M/L) are allowed as long as they fit within Enersync's `units: 4` budget. Confirmed by Trace 2026-07-14: a cart of 12× G1 + 3× Adrenal TLP (3× S1 = 3 units) fits comfortably in Enersync 1oz. If extras exceed the 4-unit budget, this step falls through to the box path.
+Enersync boxes are partitioned for glass safety but are **not** glass-only. Majority glass size decides which Enersync (`1oz` vs `2oz`). Ties → 2oz (bigger box, conservative for mixed carts). Non-glass extras (SS/S/M/L/XL) are allowed as long as they fit within Enersync's `units: 4` budget. Confirmed by Trace 2026-07-14: a cart of 12× G1 + 3× Adrenal TLP (3× S = 3 units) fits comfortably in Enersync 1oz. If extras exceed the 4-unit budget, this step falls through to the box path.
 
-**Step 2 — 3+ small glass (G1+G2), ≤5 total items, no L, no M, no LL → 8x6x3 UPS mini**
-Small-glass safety trigger (client Q6, broad-interpretation update 2026-07-20 — "no larger bottles" now excludes M too). `fragilePreferred: true`. Unit budget (6) + glassMax:6 checked. Fits 6×G1 (4.5u), 5×G2 (5u), or 4×G4 (6u) per Trace's specification.
+**Step 2 — 3+ small glass (G1+G2), ≤5 total items, no L, no M, no XL, no LL → 8x6x3 UPS mini**
+Small-glass safety trigger (client Q6, broad-interpretation update 2026-07-20 — "no larger bottles" excludes M and XL too). `fragilePreferred: true`. Unit budget (6) + glassMax:6 checked. Fits 6×G1 (4.5u), 5×G2 (5u), or 4×G4 (6u) per Trace's specification.
 
 **Step 3 — Any LL → smallest liquid box that fits**
 Iterate all boxes with `liquids > 0` in size order. First tier where `liquids ≥ llDemand` AND `units ≥ unitDemand` wins.
 
 Additional rules for `tinyExtrasOnly` (18×13×3, confirmed by Trace via PM 2026-07-17):
-- **Rejected outright** if cart has any M/L/S1/G* items.
-- **Skipped** when box is at MAX liquid capacity (6) AND cart has any S bottles → falls through to next tier (15×12×9). Even a single small bottle over-stuffs it when full.
+- **Rejected outright** if cart has any S/M/L/XL/G* items.
+- **Skipped** when box is at MAX liquid capacity (6) AND cart has any SS bottles → falls through to next tier (15×12×9). Even a single extra-small bottle over-stuffs it when full.
 - **FA (flat cards) allowed** alongside 6 full liquids — they're thin enough to slide in without displacing anything.
-- If box has leftover liquid room (llDemand < 6), both S + FA extras are permitted (guarded by the standard unit-budget check).
+- If box has leftover liquid room (llDemand < 6), both SS + FA extras are permitted (guarded by the standard unit-budget check).
 
 **Step 4 — Any FA (no LL) → 11x9x4 envelope**
 Checks `faMax: 60` + unit budget.
@@ -316,24 +350,30 @@ Iterates `liquids === 0 && !fragilePreferred && !partitioned && !tinyExtrasOnly`
 **Step 6 — Overflow**
 Nothing fit. Return largest tier (18×14×8) + `overflow: true`. Merchant approval gate handles it manually.
 
-### 7.1 Worked examples (`pack:` tags → box)
+### 7.1 Worked examples (`custom.pack_category` → box)
 
 | Cart | Category counts | Unit demand | Selected box |
 |---|---|---|---|
-| 1× `pack:S` | S=1 | 0.75 | 9x6x4 envelope |
-| 3× `pack:S` | S=3 | 2.25 | 9x6x4 envelope |
-| 1× `pack:L` | L=1 | 3 | 9x6x4 envelope |
-| 3× `pack:L` | L=3 | 9 | 11x9x4 envelope |
-| 4× `pack:L` | L=4 | 12 | 18x14x8 (overflow flag) |
-| **6× `pack:G1`** (small-order glass) | G1=6 | 4.5 | **8x6x3 UPS mini** (Step 2) |
-| **5× `pack:G2`** (small-order glass) | G2=5 | 5 | **8x6x3 UPS mini** (Step 2) |
-| **4× `pack:G4`** (small-order glass) | G4=4 | 6 | **8x6x3 UPS mini** (Step 2 — needs 3+ G1/G2 to trigger; 4×G4 alone falls to Step 5 → 11x9x4) |
-| 3× `pack:G1` + 1× `pack:M` | G1=3, M=1 | 4.25 | 11x9x4 envelope (Step 2 rejects due to M presence) |
-| 12× `pack:G1` | G1=12 | 9 | Enersync 1oz |
-| 12× `pack:G2` | G2=12 | 12 | Enersync 2oz |
-| 1× `pack:LL` | LL=1 | 0 | 8x6x6 box |
-| 3× `pack:LL` | LL=3 | 0 | 11x4x12 box |
-| 6× `pack:LL` | LL=6 | 0 | 18x13x3 box (only if no non-tiny extras) |
+| 1× `SS` | SS=1 | 0.75 | 9x6x4 envelope |
+| 3× `SS` | SS=3 | 2.25 | 9x6x4 envelope |
+| 1× `S` | S=1 | 1 | 9x6x4 envelope |
+| 1× `L` | L=1 | 3 | 9x6x4 envelope (fills exactly) |
+| 3× `L` | L=3 | 9 | 11x9x4 envelope |
+| 4× `L` | L=4 | 12 | 18x14x8 (overflow flag) |
+| **1× `XL`** (Body FX) | XL=1 | 3 | 9x6x4 envelope (fills like 1×L; physical fit may need merchant review — see §20) |
+| **1× `OTHER`** (Bio Kit) | OTHER=1 | — | **18×14×8 + overflow flag** (Step 0 — routes to overflow so merchant handles own-box labeling) |
+| **1× `REVIEW`** (unclassified) | REVIEW=1 | — | **empty rates** (blocked in action handler before selectBox) |
+| **5× `G1`** (small-order glass) | G1=5 | 3.75 | **8x6x3 UPS mini** (Step 2) |
+| **5× `G2`** | G2=5 | 5 | 8x6x3 UPS mini (Step 2) |
+| 3× `G1` + 1× `M` | G1=3, M=1 | 4.25 | 11x9x4 envelope (Step 2 rejects due to M presence) |
+| 12× `G1` | G1=12 | 9 | Enersync 1oz |
+| 12× `G2` | G2=12 | 12 | Enersync 2oz |
+| 12× `G1` + 3× `S` | G1=12, S=3 | 12 | Enersync 1oz (3×S = 3 units ≤ 4 budget — Trace confirmed) |
+| 1× `LL` | LL=1 | 0 | 8x6x6 box |
+| 3× `LL` | LL=3 | 0 | 11x4x12 box |
+| 6× `LL` | LL=6 | 0 | 18x13x3 box (only if no non-tiny extras) |
+| 6× `LL` + 1× `SS` | LL=6, SS=1 | 0.75 | 15x12x9 box (18×13×3 at-full-capacity guard blocks SS extra) |
+| 6× `LL` + 1× `FA` | LL=6, FA=1 | 0.15 | 18x13x3 box (FA allowed at full LL capacity) |
 
 ---
 
@@ -599,23 +639,29 @@ All logs prefixed with `[shipping.rates` for easy filtering in Render logs.
 2. Expected: empty rates + `No live carrier rates` log.
 
 ### 19.10 Two 4 oz glass fit 9×6×4 envelope
-1. Tag two different 4 oz glass products `pack:G4`, add both to cart (1× each).
+1. Set two different 4 oz glass products' `custom.pack_category = G4`, add both to cart (1× each).
 2. Expected box: `9x6x4 envelope` — math: 2 × G4 unit-cost 1.5 = 3.0 units = exactly fits the envelope's 3-unit budget. Trace confirmed she shipped this combination 2026-07-13.
 3. Verify subtitle shows `9x6x4 envelope (9×6×4 in)`, not a larger tier.
 
-### 19.11 18×13×3 at-full-capacity guard (S-blocked, FA-allowed)
-1. Tag 6 products `pack:LL` (max liquid capacity of 18×13×3) AND tag 1 product `pack:S` (Chromium-style). Add all to cart.
-2. Expected: **not** 18×13×3 — instead falls through to `15x12x9 box` (next tier with liquids:12 + units:6). S bottles do not fit alongside 6 full liquids.
-3. Second scenario: 6× LL + 1× FA (flat card). Expected: `18×13×3` selected (FA is allowed at full liquid capacity — flat card slides alongside).
-4. Third scenario: 5× LL + 1× S. Expected: `18×13×3` selected (1 liquid slot leftover, S fits within units budget).
+### 19.11 18×13×3 at-full-capacity guard (SS-blocked, FA-allowed)
+1. Set 6 products' `custom.pack_category = LL` (max liquid capacity of 18×13×3) AND set 1 product's `custom.pack_category = SS` (Chromium-style). Add all to cart.
+2. Expected: **not** 18×13×3 — instead falls through to `15x12x9 box`. SS bottles do not fit alongside 6 full liquids.
+3. Second scenario: 6× LL + 1× FA (flat card). Expected: `18×13×3` selected (FA is allowed at full liquid capacity).
+4. Third scenario: 5× LL + 1× SS. Expected: `18×13×3` selected (1 liquid slot leftover, SS fits within units budget).
 
 ### 19.12 UPS mini — concentrated small-glass carts route correctly
-1. **6× G1 only**: cart 6 products `pack:G1`. Expected box: `8x6x3 UPS mini` (Step 2 triggered: smallGlass=6, no L/M/LL, totalItems=6 ✗… wait, totalItems=6 > 5 → falls to Step 5 → 11×9×4 envelope). Correct: this test needs totalItems ≤ 5, so limit to **5× G1**.
-2. **5× G1**: totalItems=5, smallGlass=5, unitDemand=3.75. Expected: `8x6x3 UPS mini` (fits units:6, glassMax:6).
-3. **5× G2**: totalItems=5, smallGlass=5, unitDemand=5. Expected: `8x6x3 UPS mini` (fits units:6).
-4. **3× G1 + 2× G4** (mixed small + large glass): totalItems=5, smallGlass=3, unitDemand=3×0.75+2×1.5=5.25. Expected: `8x6x3 UPS mini`.
-5. **3× G1 + 1× M** (medium in cart): Expected: **NOT** UPS mini (Step 2 rejects due to M presence) → `11x9x4 envelope` via Step 5.
-6. **6× G1 + 1× S** (totalItems=7 > 5): Expected: **NOT** UPS mini (Step 2 rejects on totalItems) → `11x9x4 envelope`.
+1. **5× G1**: totalItems=5, smallGlass=5, unitDemand=3.75. Expected: `8x6x3 UPS mini` (fits units:6, glassMax:6).
+2. **5× G2**: totalItems=5, smallGlass=5, unitDemand=5. Expected: `8x6x3 UPS mini`.
+3. **3× G1 + 2× G4**: totalItems=5, smallGlass=3, unitDemand=5.25. Expected: `8x6x3 UPS mini`.
+4. **3× G1 + 1× M** (medium in cart): Expected: **NOT** UPS mini (Step 2 rejects due to M presence) → `11x9x4 envelope` via Step 5.
+5. **6× G1 + 1× SS** (totalItems=7 > 5): Expected: **NOT** UPS mini (Step 2 rejects on totalItems) → `11x9x4 envelope`.
+
+### 19.13 XL / OTHER / REVIEW routing (2026-07-23 rollout)
+1. **1× XL (Body FX)**: Expected — Step 5 → `9x6x4 envelope` (unit-cost 3 fills exactly). Merchant reviews if physical fit fails (see §20 known gap).
+2. **1× OTHER (Bio Kit) + 2× S**: Expected — **Step 0 triggers** → `18×14×8 box` + overflow flag + warn log `cart contains pack:OTHER(1)`. Merchant handles labeling.
+3. **1× REVIEW + 3× S**: Expected — **empty rates** (checkout shows "no shipping available"). Log: `ABORT — 1 cart item(s) missing/REVIEW pack_category reason=review_pending`.
+4. **Missing metafield** (product has no `custom.pack_category` set): Expected — empty rates, log `reason=no_metafield`.
+5. **Invalid value** (e.g., metafield = "xyz"): Expected — treated as missing → empty rates, log `raw="xyz"`.
 
 ---
 
@@ -623,21 +669,22 @@ All logs prefixed with `[shipping.rates` for easy filtering in Render logs.
 
 | Item | Status |
 |---|---|
-| Migration team to tag all retail products with `pack:XXX` (9 categories) | Pending migration-team action |
-| **New category for 5 un-mappable products** (Body FX, Circulatory Health, Control, Three Lac, Trimsulin) | Trace worksheet pending; PM proposed `pack:XL` + `pack:OTHER` — client not yet confirmed. Preliminary code support removed 2026-07-20. |
-| "Medium" definition + M unit-cost (Trace: her medium ≠ old table) | Trace worksheet pending; DO NOT change unit-cost until back |
-| Extras allowances per liquid box (Q3) — dev estimates unconfirmed except 18×13×3 at full = FA-only | Trace worksheet pending (tied to category lock-in) |
-| Sweep of "oz"-named products that are actually capsules (Q6 part 2) | List generation pending; Trace to validate |
-| S vs S1 boundary confirmation | Client to finalize taxonomy sheet |
-| 13×13×10 box tare weight | Trace to weigh next time it's back in stock |
-| 4+ pack:L items → dedicated non-liquid large box | Design gap; overflow path today, client review needed |
+| Merchant to set `custom.pack_category` metafield on every retail product via CSV import from client's classification sheet (2026-07-23) | Pending merchant action |
+| Metafield definition creation in retail Shopify admin (`custom.pack_category` on PRODUCT owner) | One-time setup — merchant task |
+| Client's REVIEW-flagged products (~5-10 unmatched — EnviroShield, Lipo K&B, Magnesium & Potassium, MasterZyme, Nerve Stim, Gift Card, etc.) | Pending Trace review; those products stay REVIEW until reclassified |
+| Client's "CAN BE REMOVED" flagged products (~20 duplicates / no-longer-selling) | Merchant to delete from Shopify catalog — code will treat them as missing until removed |
+| **XL physical routing** — code treats XL like L (unit-cost 3) per client 2026-07-23; 1× Body FX would fit in 9×6×4 envelope which is physically wrong | Client to confirm actual XL dimensions; may need dedicated tier or higher unit-cost |
+| ~~"Medium" definition + M unit-cost~~ | **RESOLVED 2026-07-23** — client confirmed 4 M bottles fit in 11×9×4. Current code (M unit-cost 2, 4×2=8 ≤ envelope's 9) already matches. |
+| Extras allowances per liquid box — dev estimates unconfirmed except 18×13×3 at full = FA-only | Trace to confirm per-box extras counts |
+| ~~13×13×10 box tare weight~~ | **RESOLVED 2026-07-23** — Trace confirmed tare 13.6 oz. Box added to tier list with best-guess capacity (12 LL + 6 units, mirrors 15×12×9). Real capacity to be tuned on merchant feedback. |
+| 4+ L items in cart → dedicated non-liquid large box | Design gap; overflow path today, client review needed |
 | Q9 packing-buffer worst-case measurement | Stephanie to provide, may adjust `packingBufferOz` |
-| Whether a single S bottle can squeeze in 18×13×3 at 6 full liquids | Trace to confirm; conservative default is S-blocked |
+| Whether a single SS bottle can squeeze in 18×13×3 at 6 full liquids | Trace to confirm; conservative default is SS-blocked |
 | "Estimate" note in checkout shipping description (customer-visible disclaimer) | Deferred 2026-07-17; awaiting exact wording + Option A/B choice for box name in title |
 | Merchant approval gate integration (currently `overflow: true` only logs, no downstream queue) | Separate workstream; scope confirmation pending |
 | Discount-aware free-shipping | Nice-to-have; would swap pre-discount subtotal for post-discount |
-| 13 Package Templates in retail Shopify admin (Settings → Shipping and delivery → Saved packages) | User to create manually — cheat-sheet provided |
-| Staging → Production deploy (fee removal, box engine, tag classifier) | Blocked on: (a) migration-team tagging complete, (b) 13 package templates created, (c) at minimum staging end-to-end test |
+| 13 Package Templates in retail Shopify admin (Settings → Shipping and delivery → Saved packages) | Merchant to create manually — cheat-sheet provided |
+| Staging → Production deploy (fee removal, box engine, metafield classifier) | Blocked on: (a) merchant metafield-set complete for all active products, (b) 13 package templates created, (c) at minimum staging end-to-end test |
 
 ---
 
@@ -647,6 +694,8 @@ Every meaningful shipping change lands here **and** in `PROGRAM.md`. Newest firs
 
 | Date | Change |
 |---|---|
+| 2026-07-23 | **Client Q4 + Q7 confirmations applied**: (1) Q4 — client confirmed **4 M bottles fit in 11×9×4**. Current M unit-cost 2 (4×2=8 ≤ envelope's 9) already matches — no code change; §20 "under review" note removed. (2) Q7 — client confirmed **13×13×10 box tare = 13.6 oz**. Added to `PACKING.boxTiers` between 15×12×9 and 18×14×8 with best-guess capacity (units:6, liquids:12 — mirrors 15×12×9 based on similar volume). §5.2 table + §20 known-gap updated. Real capacity to be tuned when merchant provides feedback from live orders. |
+| 2026-07-23 | **Classifier migrated to metafield (major)**: Tag-based `pack:XXX` system fully replaced with `custom.pack_category` product metafield. Client's product classification sheet (500+ SKUs) now the source of truth. Naming aligned with client sheet: (1) OLD `S` (extra small) → NEW **`SS`**; (2) OLD `S1` (small capsule) → NEW **`S`**. (3) `XL` re-added (Body FX only — treated like L, unit-cost 3). (4) `OTHER` re-added (own-box shipping — Step 0 routes to overflow flag). (5) `REVIEW` added (unclassified products → empty rates, back-pressure). (6) Old tag-fetching GraphQL replaced with metafield-fetching GraphQL (`custom.pack_category`). (7) `selectBox` renamed all internal category refs (S1→S, S→SS everywhere; added XL to unit demand + non-tiny-extras check). (8) Doc §6 fully rewritten (metafield table, migration note); §7 renamed 6-step → 7-step (Step 0 added); §7.1 examples updated; §19.13 added for XL/OTHER/REVIEW test scenarios; §20 rewritten to reflect metafield-based blockers. Zero backward-compat with old tags (clean cut). |
 | 2026-07-20 | **Digital-product bug fix** — `realItems` filter now excludes items with `requires_shipping: false` in addition to processing-fee lines. Previously a cart containing at least one digital product (no `pack:` tag by design) would fail the tag-classification guard and return empty rates for the whole cart, blocking checkout of the accompanying physical items. Fixed at [rates.js:~1295](app/api/shipping/rates.js). Log line updated: `N fee/digital excluded` replaces `N processing-fee excluded`. |
 | 2026-07-20 | **Client shipping-doc cross-check — 2 bugs fixed**: (1) **UPS mini units 3→6** — client's stated capacity (6×G1, 5×G2, 4×G4) requires 4.5-6 units, but the code had `units: 3`, silently routing these glass-heavy carts to 11×9×4 envelope and losing the intended glass-safety protection. (2) **Step 2 broad "larger bottles" fix** — client Q6 said UPS mini triggers only when "no large liquids or larger bottles" — Step 2 now rejects M (medium) in addition to L. A medium+glass mixed cart now correctly falls to 11×9×4 envelope. Test cases §19.12 added covering both fixes. Non-liquid-large-cart routing unchanged. |
 | 2026-07-20 | **Preliminary `pack:XL` + `pack:OTHER` support removed** — these two tags were structurally added on 2026-07-17 per PM's directive ("build now, I'll confirm with Trace"). Trace has NOT confirmed since. To keep `ALLOWED_CATEGORIES` limited to the 9 client-confirmed values, both tags are removed from the classifier + counts + `selectBox` Step 0 was dropped. The 5 un-mappable products (Body FX, Circulatory Health, Control, Three Lac, Trimsulin) now trigger the standard "no shipping available" back-pressure until Trace confirms a taxonomy. Doc §6.1, §7 (Step 0 gone), §19.12 (test removed), §20 updated. |
