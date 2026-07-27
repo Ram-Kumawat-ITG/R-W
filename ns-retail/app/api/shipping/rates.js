@@ -27,16 +27,18 @@
 //   2. Reads items + origin + destination from the Shopify payload and
 //      filters out any "Processing Fee" cart lines added by the UI
 //      extension (defensive — fee is disabled today).
-//   3. Fetches the `pack:XXX` tag for every cart product via one bulk
-//      GraphQL call to Shopify Admin API (auth via unauthenticated.admin
-//      using RETAIL_SHOP_DOMAIN). If ANY product is missing a valid
-//      `pack:` tag → returns empty rates (customer sees "no shipping
-//      available"). This is the back-pressure that forces the merchant
-//      to tag every product before it can ship.
-//   4. Classifies the cart into 9 packing categories (S / S1 / M / L /
-//      LL / G1 / G2 / G4 / FA), selects the smallest box tier that fits
-//      via the 6-step selectBox() algorithm, and computes the package
-//      weight = items + tare + packing buffer.
+//   3. Fetches the `custom.pack_category` metafield for every cart product
+//      via one bulk GraphQL call to Shopify Admin API (auth via
+//      unauthenticated.admin using RETAIL_SHOP_DOMAIN). If ANY product's
+//      metafield is missing OR set to REVIEW → returns empty rates
+//      (customer sees "no shipping available"). This is the back-pressure
+//      that forces the merchant to classify every product before it can
+//      ship.
+//   4. Classifies the cart into 12 packing categories (SS / S / M / L /
+//      LL / XL / G1 / G2 / G4 / FA / OTHER / REVIEW — per client sheet
+//      2026-07-23), selects the smallest box tier that fits via the 6-step
+//      selectBox() algorithm (OTHER routes to overflow), and computes the
+//      package weight = items + tare + packing buffer.
 //   5. Calls USPS + UPS direct-carrier APIs in parallel with the picked
 //      box's real dims + weight:
 //        • USPS Web Tools v3 (USPS_CLIENT_ID / USPS_CLIENT_SECRET)
@@ -102,28 +104,35 @@ const CONFIG = {
 //   2. Trace's July 2026 corrections after review (weight fix on 9x6x4,
 //      G4 fit correction, real-measured 18x14x8 tare, etc.).
 //
-// Client-provisional (2026-07-15): the new S/S1 split is being finalized
-// with Trace + Stephanie. Numbers can be tuned in seconds — merchant
-// approval gate + manual dim/weight override on every order acts as the
-// safety net for any algorithm miss.
+// Naming aligned with client's 2026-07-23 product classification sheet
+// (Stephanie's 8-tier + XL + OTHER). Compared to earlier code:
+//   • SS (extra small)   was S      — Chromium, D3, tiny tablets
+//   • S  (small capsule) was S1     — Adrenal TLP, most NS capsules
+//   • XL (extra large)   NEW        — Body FX only
+//   • OTHER (own box)    NEW        — kits, cases, services (overflow)
+//   • REVIEW             NEW        — merchant-unmatched → empty rates
 const PACKING = {
   // Unit-cost per category — how much "space" one of each takes in a
   // box, expressed as a unit fraction. Derived from the 9x6x4 envelope
   // baseline (capacity = 3 units):
-  //   - 3 × S = 3 units → 1 S = 0.75  (extra-small: Chromium, D3)
-  //   - 3 × S1 = 3 units → 1 S1 = 1   (small: Adrenal TLP, Body RGN)
-  //   - 1 × M + 1 × S1 = 3 units → 1 M = 2
+  //   - 3 × SS = 3 units → 1 SS = 0.75 (extra small: Chromium, D3)
+  //   - 3 × S  = 3 units → 1 S  = 1    (small capsule: Adrenal TLP, Body RGN)
+  //   - 1 × M + 1 × S = 3 units → 1 M = 2
   //   - 1 × L alone = 3 units → 1 L = 3
+  //   - 1 × XL treated like L (client 2026-07-23) → 1 XL = 3
   //   - 4 × G1 = 3 → 1 G1 = 0.75
   //   - 3 × G2 = 3 → 1 G2 = 1
   //   - 2 × G4 = 3 → 1 G4 = 1.5 (client corrected 2026-07-13; was 3)
   //   - 60 × FA = 9 (fits 11x9x4) → 1 FA = 0.15
   // LL uses the separate `liquids` capacity, not unitCost.
+  // OTHER and REVIEW never reach the unit-cost math — routed early in
+  // selectBox Step 0 (OTHER → overflow tier; REVIEW → empty rates).
   unitCost: {
-    S: 0.75,
-    S1: 1,
+    SS: 0.75,
+    S: 1,
     M: 2,
     L: 3,
+    XL: 3,
     G1: 0.75,
     G2: 1,
     G4: 1.5,
@@ -184,9 +193,16 @@ const PACKING = {
     { name: "12x12x5 box",      type: "box",      L: 12, W: 12, H: 5,  tareOz: 9.6,  units: 4, liquids: 4 },
     // 18x13x3 — per client Q2: "no extra room when full liquids, only FA or
     // very small bottle like Aquamax/Chromium might fit". `tinyExtrasOnly`
-    // flag makes selectBox reject any cart with L/M/S1/G* items.
+    // flag makes selectBox reject any cart with S/M/L/XL/G* items.
     { name: "18x13x3 box",      type: "box",      L: 18, W: 13, H: 3,  tareOz: 9.3,  units: 1, liquids: 6, tinyExtrasOnly: true },
     { name: "15x12x9 box",      type: "box",      L: 15, W: 12, H: 9,  tareOz: 11.5, units: 6, liquids: 12 },
+    // 13x13x10 — Trace confirmed tare 13.6 oz on 2026-07-23. Capacity is a
+    // best-guess from volume comparison: 1690 in³ is ~ 15x12x9's 1620 in³,
+    // so we mirror 15x12x9's capacity (12 liquids + 6 units). Ordered
+    // AFTER 15x12x9 because it's slightly heavier — selectBox iterates
+    // smallest-tare-first for equivalent capacity. Client to confirm real
+    // capacity when the box is next in use; tune here on feedback.
+    { name: "13x13x10 box",     type: "box",      L: 13, W: 13, H: 10, tareOz: 13.6, units: 6, liquids: 12 },
     // 18x14x8 — Trace measured 17 oz (1 lb 1 oz). Prior estimate was ~14.
     { name: "18x14x8 box",      type: "box",      L: 18, W: 14, H: 8,  tareOz: 17.0, units: 8, liquids: 16 },
     // ── Enersync (partitioned) — triggered by 12+ glass ───────────────
@@ -195,8 +211,7 @@ const PACKING = {
     // extras alongside the glass partitions.
     { name: "Enersync 1oz",     type: "box",      L: 10, W: 7,  H: 6,  tareOz: 7.0,  units: 4, liquids: 0, glassMin: 12, partitioned: true, glassSize: "1oz" },
     { name: "Enersync 2oz",     type: "box",      L: 11, W: 7,  H: 8,  tareOz: 13.2, units: 4, liquids: 0, glassMin: 12, partitioned: true, glassSize: "2oz" },
-    // 13x13x10 is pending — Trace will weigh when back in stock. NOT
-    // added to the tier list until she provides real tare weight.
+    // 13x13x10 was added on 2026-07-23 above (tare 13.6 oz per Trace).
     // 16x12x10 was explicitly excluded per Q7 answer.
   ],
 };
@@ -397,73 +412,75 @@ function gramsToLb(grams) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// PRODUCT CLASSIFICATION — pure tag-based (2026-07-16)
+// PRODUCT CLASSIFICATION — metafield-based (2026-07-23)
 // ═══════════════════════════════════════════════════════════════════════
 //
-// Every product in the retail Shopify store must carry ONE `pack:XXX` tag
-// naming its packing category. Nine allowed values:
+// Each product in the retail Shopify store carries a `custom.pack_category`
+// metafield naming its shipping pack category. Twelve allowed values (client
+// classification sheet, 2026-07-23):
 //
-//   pack:FA   Frequency App (flat card — vendor "Frequency Apps")
-//   pack:LL   Large liquid  (Liquid Life, Miracle II, Body FX-heavy, etc.)
-//   pack:G4   4 oz glass tincture
-//   pack:G2   2 oz glass tincture
-//   pack:G1   1 oz glass tincture
-//   pack:L    Large bottle (non-liquid)
-//   pack:M    Medium bottle
-//   pack:S1   Small bottle (capsules)
-//   pack:S    Extra small bottle (Chromium, D3, Lypozyme, Aquamax)
+//   SS      Extra small tablets / tiny bottles (Chromium, D3, B12, Biotin)
+//   S       Small capsules                     (Adrenal TLP, Cardio Support)
+//   M       Medium capsules                    (B-Complex, Bone Health)
+//   L       Large non-liquid                   (Amino Complex, Enervimin Focus)
+//   LL      Large liquid                       (Liquid Life, Zavita, Biomega)
+//   XL      Extra large                        (Body FX only — 2 products)
+//   G1      1 oz glass                         (droppers, sprays, essential oils)
+//   G2      2 oz glass                         (2oz droppers, sprays)
+//   G4      4 oz glass                         (Organdrainex, Colloidal Silver)
+//   FA      Frequency App                      (flat patches)
+//   OTHER   Ships in its own retail box        (kits, cases, services)
+//   REVIEW  Merchant-unmatched                 (blocks checkout — see below)
 //
-// The merchant assigns these via Shopify admin — Product edit page → Tags.
-// This gives 100 % explicit control per product (no weight/name guessing).
+// The merchant assigns these in Shopify admin → Product → Metafields →
+// "Pack category" (a text field with the allowed values above). Client's
+// classification sheet ships pre-filled with the correct value per SKU;
+// merchant CSV-imports it once. Superseded the `pack:XXX` tag system on
+// 2026-07-23 (see §21 changelog).
 //
 // Runtime: on every carrier callback we do ONE bulk GraphQL query to
-// Shopify Admin API asking for `tags` on all product IDs in the cart, then
-// parse each product's tags to find the `pack:` prefix.
+// Shopify Admin API asking for the `custom.pack_category` metafield on all
+// product IDs in the cart. Missing metafield → treated as REVIEW → empty
+// rates.
 //
-// Missing tag policy:
-//   If ANY cart item's product has no `pack:` tag, the whole rate
-//   response is EMPTY — customer sees "no shipping available." This is
-//   intentional back-pressure: it forces the merchant to tag every
-//   product before it can ship.
+// Missing / REVIEW policy:
+//   If ANY cart item's product has no valid `custom.pack_category`, or the
+//   metafield equals REVIEW, the whole rate response is EMPTY — customer
+//   sees "no shipping available." This is intentional back-pressure: it
+//   forces the merchant to classify every product before it can ship.
 
-const PACK_TAG_PREFIX = "pack:";
+const PACK_METAFIELD_NAMESPACE = "custom";
+const PACK_METAFIELD_KEY = "pack_category";
 const ALLOWED_CATEGORIES = new Set([
-  "FA", "LL", "G4", "G2", "G1", "L", "M", "S1", "S",
+  "SS", "S", "M", "L", "LL", "XL", "G1", "G2", "G4", "FA", "OTHER", "REVIEW",
 ]);
 
-// Extract the packing category from a product's `tags` array. Returns
-// null if no `pack:XXX` tag is present or the value is unrecognized.
-function extractPackingCategory(tags) {
-  if (!Array.isArray(tags)) return null;
-  for (const raw of tags) {
-    const tag = String(raw || "").trim();
-    if (!tag.toLowerCase().startsWith(PACK_TAG_PREFIX)) continue;
-    // Preserve the merchant's original casing after the prefix so
-    // "pack:S1" stays "S1", not "s1". The allow-list check below still
-    // uppercases for tolerance against typos like "pack:s1".
-    const value = tag.slice(PACK_TAG_PREFIX.length).trim();
-    const normalized = value.toUpperCase();
-    if (ALLOWED_CATEGORIES.has(normalized)) return normalized;
-    // Unknown category — treat as missing so operator can fix the typo.
-    return null;
-  }
+// Normalise a raw metafield value into a canonical PACK CATEGORY code, or
+// null if the value is missing / unrecognised. Case-tolerant on read so
+// "ss" and "Ss" both map to "SS".
+function normalizePackCategory(raw) {
+  if (raw == null) return null;
+  const trimmed = String(raw).trim();
+  if (!trimmed) return null;
+  const normalised = trimmed.toUpperCase();
+  if (ALLOWED_CATEGORIES.has(normalised)) return normalised;
   return null;
 }
 
-// Bulk-fetch tags for every product ID in the cart via one Shopify Admin
-// GraphQL call, using the app's stored OAuth session for the retail shop
-// (`unauthenticated.admin(shop)` — same pattern used by customerTags.js,
-// cdo.portal.service.js, etc.). Returns Map<productId string, tags array>.
-// Never throws — on any failure (missing session, network, GraphQL error)
-// returns an empty Map so the caller treats every item as "no tag" and
-// falls back to empty rates.
+// Bulk-fetch the `custom.pack_category` metafield for every product ID in
+// the cart via one Shopify Admin GraphQL call, using the app's stored OAuth
+// session for the retail shop (`unauthenticated.admin(shop)`). Returns
+// Map<productId string, packCategory string>. Never throws — on any
+// failure (missing session, network, GraphQL error) returns an empty Map
+// so the caller treats every item as "no category" and falls back to
+// empty rates.
 //
 // Shop resolution: the carrier-service callback doesn't include a shop
 // domain header, so we read RETAIL_SHOP_DOMAIN from env (falling back to
 // SHOPIFY_SHOP for parity with the rest of the file). This must match
 // the shop domain this app is installed on — the same one whose OAuth
 // session token was persisted at install time.
-async function fetchProductTagsFromShopify(productIds) {
+async function fetchProductPackCategoriesFromShopify(productIds) {
   if (!productIds || productIds.length === 0) return new Map();
 
   const rawShop =
@@ -474,7 +491,7 @@ async function fetchProductTagsFromShopify(productIds) {
     .replace(/\/+$/, "");
   if (!shop) {
     console.warn(
-      "[shipping.rates] RETAIL_SHOP_DOMAIN env var not set — cannot fetch product tags. Every quote will be empty until it's configured.",
+      "[shipping.rates] RETAIL_SHOP_DOMAIN env var not set — cannot fetch pack_category metafield. Every quote will be empty until it's configured.",
     );
     return new Map();
   }
@@ -485,7 +502,7 @@ async function fetchProductTagsFromShopify(productIds) {
     admin = authed.admin;
   } catch (err) {
     console.warn(
-      "[shipping.rates] product-tags session lookup failed:",
+      "[shipping.rates] pack_category session lookup failed:",
       err?.message || String(err),
     );
     return new Map();
@@ -493,11 +510,13 @@ async function fetchProductTagsFromShopify(productIds) {
 
   const gids = productIds.map((id) => `gid://shopify/Product/${id}`);
   const query = `#graphql
-    query CartProductTags($ids: [ID!]!) {
+    query CartProductPackCategories($ids: [ID!]!, $namespace: String!, $key: String!) {
       nodes(ids: $ids) {
         ... on Product {
           id
-          tags
+          packCategory: metafield(namespace: $namespace, key: $key) {
+            value
+          }
         }
       }
     }
@@ -506,11 +525,17 @@ async function fetchProductTagsFromShopify(productIds) {
   const startedAt = Date.now();
   let body;
   try {
-    const res = await admin.graphql(query, { variables: { ids: gids } });
+    const res = await admin.graphql(query, {
+      variables: {
+        ids: gids,
+        namespace: PACK_METAFIELD_NAMESPACE,
+        key: PACK_METAFIELD_KEY,
+      },
+    });
     body = await res.json();
   } catch (err) {
     console.warn(
-      "[shipping.rates] product-tags GraphQL call failed:",
+      "[shipping.rates] pack_category GraphQL call failed:",
       err?.message || String(err),
       `· elapsed=${Date.now() - startedAt}ms`,
     );
@@ -519,7 +544,7 @@ async function fetchProductTagsFromShopify(productIds) {
 
   if (Array.isArray(body?.errors) && body.errors.length) {
     console.warn(
-      "[shipping.rates] product-tags GraphQL errors:",
+      "[shipping.rates] pack_category GraphQL errors:",
       JSON.stringify(body.errors).slice(0, 400),
     );
     return new Map();
@@ -529,38 +554,45 @@ async function fetchProductTagsFromShopify(productIds) {
   for (const node of body?.data?.nodes || []) {
     if (!node?.id) continue;
     const idStr = String(node.id).replace("gid://shopify/Product/", "");
-    result.set(idStr, Array.isArray(node.tags) ? node.tags : []);
+    const rawValue = node.packCategory?.value ?? null;
+    result.set(idStr, rawValue); // may be null; classifier handles it
   }
   console.log(
-    `[shipping.rates] product-tags fetched · ${result.size}/${productIds.length} product(s) resolved · elapsed=${Date.now() - startedAt}ms`,
+    `[shipping.rates] pack_category fetched · ${result.size}/${productIds.length} product(s) resolved · elapsed=${Date.now() - startedAt}ms`,
   );
   return result;
 }
 
 // Aggregate cart-level classification. Given the cart's line items and a
-// pre-fetched Map<productId, tags[]>, produce per-line categories, the
-// bucketed counts, and a `missing` list of items that lack a valid
-// `pack:` tag. Callers should refuse to quote rates if `missing.length > 0`.
-function classifyCart(items, tagsByProductId) {
+// pre-fetched Map<productId, rawMetafieldValue>, produce per-line categories,
+// the bucketed counts, and a `missing` list of items whose product has no
+// valid `custom.pack_category` metafield (or has the value REVIEW).
+// Callers should refuse to quote rates if `missing.length > 0`.
+function classifyCart(items, categoriesByProductId) {
   const counts = {
-    FA: 0, LL: 0, G4: 0, G2: 0, G1: 0, L: 0, M: 0, S1: 0, S: 0,
+    SS: 0, S: 0, M: 0, L: 0, LL: 0, XL: 0,
+    G1: 0, G2: 0, G4: 0, FA: 0, OTHER: 0, REVIEW: 0,
   };
   const perLine = [];
   const missing = [];
 
   for (const it of items || []) {
     const productId = String(it?.product_id || "");
-    const tags = tagsByProductId.get(productId) || [];
-    const category = extractPackingCategory(tags);
+    const rawValue = categoriesByProductId.get(productId);
+    const category = normalizePackCategory(rawValue);
     const qty = Number(it?.quantity) || 1;
 
-    if (!category) {
+    // REVIEW is a valid metafield value that still blocks checkout —
+    // treat it like a missing classification so the front-end shows the
+    // same "no shipping available" back-pressure.
+    if (!category || category === "REVIEW") {
       missing.push({
         productId,
         variantId: it?.variant_id ?? null,
         sku: it?.sku || null,
         name: it?.name || "",
-        tagsFound: tags,
+        rawValue: rawValue ?? null,
+        reason: category === "REVIEW" ? "review_pending" : "no_metafield",
       });
       perLine.push({
         variantId: it?.variant_id ?? null,
@@ -568,8 +600,10 @@ function classifyCart(items, tagsByProductId) {
         name: it?.name || "",
         grams: Number(it?.grams) || 0,
         quantity: qty,
-        category: null,
+        category: category || null,
       });
+      // Still count REVIEW so ops sees it in the summary log.
+      if (category === "REVIEW") counts.REVIEW += qty;
       continue;
     }
 
@@ -617,14 +651,18 @@ function selectBox(cartCounts) {
   const c = cartCounts || {};
   const totalGlass = (c.G1 || 0) + (c.G2 || 0) + (c.G4 || 0);
   const totalItems =
-    (c.S || 0) + (c.S1 || 0) + (c.M || 0) + (c.L || 0) +
-    (c.LL || 0) + (c.G1 || 0) + (c.G2 || 0) + (c.G4 || 0) + (c.FA || 0);
+    (c.SS || 0) + (c.S || 0) + (c.M || 0) + (c.L || 0) + (c.XL || 0) +
+    (c.LL || 0) + (c.G1 || 0) + (c.G2 || 0) + (c.G4 || 0) + (c.FA || 0) +
+    (c.OTHER || 0);
   // Non-liquid, non-FA unit demand (LL uses `liquids`, FA uses `faMax`).
+  // XL is treated like L per client 2026-07-23 (unit-cost 3) — routes
+  // through the standard non-liquid path.
   const unitDemand =
+    (c.SS || 0) * PACKING.unitCost.SS +
     (c.S || 0) * PACKING.unitCost.S +
-    (c.S1 || 0) * PACKING.unitCost.S1 +
     (c.M || 0) * PACKING.unitCost.M +
     (c.L || 0) * PACKING.unitCost.L +
+    (c.XL || 0) * PACKING.unitCost.XL +
     (c.G1 || 0) * PACKING.unitCost.G1 +
     (c.G2 || 0) * PACKING.unitCost.G2 +
     (c.G4 || 0) * PACKING.unitCost.G4;
@@ -633,10 +671,29 @@ function selectBox(cartCounts) {
   const faDemand = c.FA || 0;
   const llDemand = c.LL || 0;
 
-  // Non-tiny categories used to check `tinyExtrasOnly` (18x13x3).
+  // Non-tiny categories used to check `tinyExtrasOnly` (18x13x3). SS is
+  // the only extra-small category that qualifies as a "tiny extra" alongside
+  // FA. Everything else — S (small capsules) up through XL — is non-tiny.
   const hasNonTinyExtras =
-    (c.S1 || 0) > 0 || (c.M || 0) > 0 || (c.L || 0) > 0 ||
+    (c.S || 0) > 0 || (c.M || 0) > 0 || (c.L || 0) > 0 || (c.XL || 0) > 0 ||
     (c.G1 || 0) > 0 || (c.G2 || 0) > 0 || (c.G4 || 0) > 0;
+
+  // ── STEP 0: OTHER (own-box) present in cart → overflow ─────────────
+  //
+  // Client's OTHER category (kits, cases, services, EnerSync 24-count boxes)
+  // ships in its own retail box. No engine tier can size it correctly, so we
+  // route the whole cart to the largest tier with overflow=true and warn.
+  // Merchant approval gate reviews and fixes the label at fulfillment time.
+  //
+  // REVIEW is already blocked earlier in the action handler (empty rates),
+  // so it never reaches this function.
+  if ((c.OTHER || 0) > 0) {
+    const largest = PACKING.boxTiers[PACKING.boxTiers.length - 1];
+    console.warn(
+      `[shipping.rates] cart contains pack:OTHER(${c.OTHER}) — routes in own retail box; falling back to ${largest.name} + overflow`,
+    );
+    return { box: largest, overflow: true };
+  }
 
   // ── STEP 1: 12+ glass → Enersync ────────────────────────────────────
   if (totalGlass >= 12 && llDemand === 0) {
@@ -648,12 +705,13 @@ function selectBox(cartCounts) {
       (b) => b.partitioned && b.glassSize === majoritySize,
     );
     // Verify the non-glass extras fit within Enersync's units budget.
-    // (Client Q5: 12×G1 + 3×Adrenal TLP fits — 3 S1 = 3 units, budget 4.)
+    // (Client Q5: 12×G1 + 3×Adrenal TLP fits — 3 S = 3 units, budget 4.)
     const nonGlassUnits =
+      (c.SS || 0) * PACKING.unitCost.SS +
       (c.S || 0) * PACKING.unitCost.S +
-      (c.S1 || 0) * PACKING.unitCost.S1 +
       (c.M || 0) * PACKING.unitCost.M +
-      (c.L || 0) * PACKING.unitCost.L;
+      (c.L || 0) * PACKING.unitCost.L +
+      (c.XL || 0) * PACKING.unitCost.XL;
     if (enersync && nonGlassUnits <= enersync.units) {
       return { box: enersync, overflow: false };
     }
@@ -663,7 +721,7 @@ function selectBox(cartCounts) {
   // ── STEP 2: Small order with 3+ small glass → UPS mini ─────────────
   // Client Q6 (broad interpretation, 2026-07-20): "small order" = ≤ 5 total
   // items, no LL, no L, AND no M ("no larger bottles"). This keeps UPS mini
-  // strictly for concentrated small-glass loads + tiny S/S1/FA extras. A
+  // strictly for concentrated small-glass loads + tiny SS/S/FA extras. A
   // medium+glass cart falls through to the 11×9×4 envelope path via Step 5.
   const smallGlassCount = (c.G1 || 0) + (c.G2 || 0);
   if (
@@ -671,6 +729,7 @@ function selectBox(cartCounts) {
     llDemand === 0 &&
     (c.L || 0) === 0 &&
     (c.M || 0) === 0 &&
+    (c.XL || 0) === 0 &&
     totalItems <= 5
   ) {
     const upsMini = PACKING.boxTiers.find((b) => b.fragilePreferred);
@@ -682,14 +741,14 @@ function selectBox(cartCounts) {
   // ── STEP 3: Any large liquid → smallest liquid box ─────────────────
   //
   // The `tinyExtrasOnly` flag (currently only on 18x13x3) is stricter than
-  // a simple non-tiny-extras rejection. Per Trace (2026-07-14 + 2026-07-17
-  // clarification via PM):
-  //   (a) Cart has any M/L/S1/G* items → reject outright.
-  //   (b) Box at MAX liquid capacity + cart has any S bottles → skip to
+  // a simple non-tiny-extras rejection. Per Trace (via PM 2026-07-17, still
+  // aligned with client sheet 2026-07-23):
+  //   (a) Cart has any S/M/L/XL/G* items → reject outright (hasNonTinyExtras).
+  //   (b) Box at MAX liquid capacity + cart has any SS bottles → skip to
   //       next tier. Only Frequency Apps (flat cards) may sit alongside
-  //       6 large liquids. Whether a single S bottle can squeeze in is
-  //       still under review; conservative default is S-blocked when full.
-  //   (c) Box has leftover liquid room → S + FA both fit (guarded by
+  //       6 large liquids. Whether a single SS bottle can squeeze in is
+  //       still under review; conservative default is SS-blocked when full.
+  //   (c) Box has leftover liquid room → SS + FA both fit (guarded by
   //       normal unit-budget check below).
   if (llDemand > 0) {
     const liquidBoxes = PACKING.boxTiers.filter((b) => b.liquids > 0);
@@ -697,7 +756,7 @@ function selectBox(cartCounts) {
       if (box.tinyExtrasOnly) {
         if (hasNonTinyExtras) continue;
         const liquidRoomLeft = box.liquids - llDemand;
-        if (liquidRoomLeft <= 0 && (c.S || 0) > 0) continue;
+        if (liquidRoomLeft <= 0 && (c.SS || 0) > 0) continue;
       }
       if (box.liquids >= llDemand && box.units >= unitDemand) {
         return { box, overflow: false };
@@ -1378,19 +1437,20 @@ export async function action({ request }) {
     );
   }
 
-  // ── Product classification (pure tag-based — 2026-07-16) ─────────────
+  // ── Product classification (metafield-based — 2026-07-23) ────────────
   //
-  // Each cart line's packing category is read from a `pack:XXX` tag on
-  // the Shopify product (assigned by the merchant in admin). We fetch
-  // those tags in one bulk GraphQL call using the product IDs from the
-  // carrier-service payload, then classify the cart. If ANY item is
-  // missing a valid `pack:` tag we refuse to quote rates — the customer
-  // sees "no shipping available" until the merchant tags the product.
+  // Each cart line's packing category is read from the `custom.pack_category`
+  // metafield on the Shopify product (assigned by the merchant in admin
+  // from the client's classification sheet). We fetch those metafields in
+  // one bulk GraphQL call using the product IDs from the carrier-service
+  // payload, then classify the cart. If ANY item's metafield is missing OR
+  // set to REVIEW we refuse to quote rates — the customer sees "no shipping
+  // available" until the merchant classifies the product.
   //
-  // Rationale: the carrier-service payload does NOT include product tags
-  // (verified 2026-07-07 payload dump), so we have to fetch. Empty rates
-  // is the deliberate back-pressure signal to force merchant to tag every
-  // product before shipping quotes will render.
+  // Rationale: the carrier-service payload does NOT include product
+  // metafields, so we have to fetch. Empty rates is the deliberate
+  // back-pressure signal to force merchant to classify every product
+  // before shipping quotes will render.
   const uniqueProductIds = Array.from(
     new Set(
       (realItems || [])
@@ -1398,16 +1458,17 @@ export async function action({ request }) {
         .filter(Boolean),
     ),
   );
-  const tagsByProductId = await fetchProductTagsFromShopify(uniqueProductIds);
-  const classification = classifyCart(realItems, tagsByProductId);
+  const categoriesByProductId =
+    await fetchProductPackCategoriesFromShopify(uniqueProductIds);
+  const classification = classifyCart(realItems, categoriesByProductId);
 
   if (classification.missing.length > 0) {
     console.warn(
-      `[shipping.rates] ABORT — ${classification.missing.length} cart item(s) missing pack: tag; returning empty rates. Missing:`,
+      `[shipping.rates] ABORT — ${classification.missing.length} cart item(s) missing/REVIEW pack_category; returning empty rates. Missing:`,
       classification.missing
         .map(
           (m) =>
-            `productId=${m.productId} "${m.name}"${m.sku ? ` [${m.sku}]` : ""} tagsFound=[${(m.tagsFound || []).join(", ")}]`,
+            `productId=${m.productId} "${m.name}"${m.sku ? ` [${m.sku}]` : ""} reason=${m.reason} raw=${JSON.stringify(m.rawValue)}`,
         )
         .join(" | "),
     );
