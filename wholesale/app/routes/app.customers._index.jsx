@@ -10,6 +10,7 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import connectDB from "../services/APIService/mongo.service";
 import WholesaleApplication from "../models/wholesaleApplication.server";
+import { getNotificationSettings } from "../services/scheduler/cronNotificationSettings.service";
 
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
@@ -22,7 +23,14 @@ export const loader = async ({ request }) => {
     )
     .lean();
 
+  const emailPause = await getNotificationSettings();
+
   return {
+    emailPause: {
+      paused: emailPause.emailNotificationsPaused === true,
+      pausedAt: emailPause.pausedAt ? new Date(emailPause.pausedAt).toISOString() : null,
+      pausedBy: emailPause.pausedBy || null,
+    },
     rows: rows.map((r) => ({
       id: r._id.toString(),
       firstName: r.firstName || "",
@@ -51,7 +59,7 @@ const STATUS_FILTERS = [
 const PAGE_SIZE = 15;
 
 export default function CustomersList() {
-  const { rows } = useLoaderData();
+  const { rows, emailPause } = useLoaderData();
   const navigate = useNavigate();
   const navigation = useNavigation();
   const shopify = useAppBridge();
@@ -68,6 +76,41 @@ export default function CustomersList() {
   const syncFetcher = useFetcher();
   const invFetcher = useFetcher();
   const tagFetcher = useFetcher();
+  const emailPauseFetcher = useFetcher();
+
+  // Global email kill switch. Optimistically reflect the in-flight toggle so
+  // the banner flips immediately; the loader revalidates on completion.
+  const emailBusy = emailPauseFetcher.state !== "idle";
+  const emailPaused =
+    emailPauseFetcher.data?.result?.emailNotificationsPaused ??
+    emailPause?.paused ??
+    false;
+
+  useEffect(() => {
+    if (emailPauseFetcher.state === "idle" && emailPauseFetcher.data) {
+      const paused = emailPauseFetcher.data?.result?.emailNotificationsPaused;
+      shopify.toast.show(
+        paused
+          ? "All email notifications are now PAUSED"
+          : "Email notifications resumed",
+      );
+      revalidator.revalidate();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [emailPauseFetcher.state, emailPauseFetcher.data]);
+
+  const toggleEmailPause = () => {
+    emailPauseFetcher.submit(
+      {},
+      {
+        method: "post",
+        action: emailPaused
+          ? "/api/admin/cron-notifications/resume"
+          : "/api/admin/cron-notifications/pause",
+        encType: "application/json",
+      },
+    );
+  };
   const handledSyncRef = useRef(null);
   const handledInvRef = useRef(null);
   const handledTagRef = useRef(null);
@@ -293,6 +336,52 @@ export default function CustomersList() {
       >
         {tagBusy ? "Backfilling…" : "Backfill customer tags"}
       </s-button>
+
+      {/* Global email kill switch — silences ALL outbound email (SMTP
+          notifications, QuickBooks invoice emails, Shopify invites) from a
+          single control. Does not affect charge processing, invoicing, or
+          data sync — only email delivery. */}
+      <s-section padding="none">
+        <s-banner
+          tone={emailPaused ? "critical" : "info"}
+          heading={
+            emailPaused
+              ? "All email notifications are PAUSED"
+              : "Email notifications are active"
+          }
+        >
+          <s-stack direction="block" gap="small-200">
+            <s-text>
+              {emailPaused
+                ? "No emails are being sent from any source — SMTP notifications, QuickBooks invoice emails, and Shopify invites are all suppressed. Charging, invoicing, and data sync are unaffected."
+                : "Use this to stop ALL outbound customer + admin email from every source (SMTP, QuickBooks invoices, Shopify invites) in one click — e.g. while working with migrated/real customer data."}
+            </s-text>
+            {emailPaused && emailPause?.pausedBy ? (
+              <s-text tone="subdued">
+                Paused by {emailPause.pausedBy}
+                {emailPause.pausedAt
+                  ? ` on ${new Date(emailPause.pausedAt).toLocaleString()}`
+                  : ""}
+              </s-text>
+            ) : null}
+            <s-box>
+              <s-button
+                variant={emailPaused ? "secondary" : "primary"}
+                tone={emailPaused ? undefined : "critical"}
+                onClick={toggleEmailPause}
+                {...(emailBusy ? { loading: true } : {})}
+              >
+                {emailBusy
+                  ? "Working…"
+                  : emailPaused
+                    ? "Resume email notifications"
+                    : "Stop all email notifications"}
+              </s-button>
+            </s-box>
+          </s-stack>
+        </s-banner>
+      </s-section>
+
       <s-section padding="none">
         <s-box padding="base">
           <s-stack direction="block" gap="base">

@@ -24,6 +24,7 @@ export class ShopifyUserError extends Error {
 import { shopifyConfig } from "./shopify.config";
 import { REQUIRED_SUBSCRIPTIONS } from "./shopify.constants";
 import { toE164US, mapAddress, hasUsableAddress, toOrderGid } from "./shopify.utils";
+import { isEmailNotificationsPaused } from "../scheduler/cronNotificationSettings.service";
 import {
   QUERY_WEBHOOK_SUBSCRIPTIONS_BY_TOPIC,
   QUERY_ALL_WEBHOOK_SUBSCRIPTIONS,
@@ -411,6 +412,22 @@ export async function sendCustomerInvite(
   admin,
   { customerId, subject, message, fromEmail },
 ) {
+  // GLOBAL EMAIL KILL SWITCH — this triggers a Shopify-sent account invite
+  // email to the customer, so honor the global pause here too. Skips the
+  // mutation when paused (returns a skipped marker instead of sending). Fails
+  // OPEN on a read error.
+  try {
+    if (await isEmailNotificationsPaused()) {
+      log.warn("customer_invite.skipped_paused", { customerId });
+      return { skipped: true, reason: "notifications_paused" };
+    }
+  } catch (err) {
+    log.error("customer_invite.pause_check_failed", {
+      customerId,
+      err: err?.message || String(err),
+    });
+  }
+
   const emailInput = {};
   if (subject) emailInput.subject = subject;
   if (message) emailInput.customMessage = message;

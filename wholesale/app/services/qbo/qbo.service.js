@@ -9,6 +9,7 @@ import { escapeQboQuery, toCustomerPayload, toInvoiceLine, toQboAddress } from '
 import QboItemMap from '../../models/qboItemMap.server'
 import QboProductMap from '../../models/qboProductMap.server'
 import { createLogger } from '../../utils/logger.utils'
+import { isEmailNotificationsPaused } from '../scheduler/cronNotificationSettings.service'
 
 const log = createLogger('qbo.service')
 
@@ -1212,6 +1213,21 @@ export async function voidInvoice(qboInvoiceId) {
 // email failures from blocking payment sync.
 export async function sendInvoiceEmail({ qboInvoiceId, sendTo }) {
   if (!qboInvoiceId) throw new Error('sendInvoiceEmail: qboInvoiceId is required')
+
+  // GLOBAL EMAIL KILL SWITCH — QuickBooks renders + sends this customer-facing
+  // invoice email, so gate it here alongside the SMTP transport. When the
+  // global pause is on we skip the QBO /send call entirely (returns skipped
+  // so callers/jobs treat it as done, not a failure to retry). Fails OPEN on a
+  // read error so a DB blip can't silently drop invoice emails in normal ops.
+  try {
+    if (await isEmailNotificationsPaused()) {
+      log.warn('invoice.send.skipped_paused', { qboInvoiceId })
+      return { skipped: true, reason: 'notifications_paused' }
+    }
+  } catch (err) {
+    log.error('invoice.send.pause_check_failed', { qboInvoiceId, err: err?.message || String(err) })
+  }
+
   const query = sendTo ? { sendTo } : undefined
   console.log(
     `\n[QBO email] sending invoice Id=${qboInvoiceId}${sendTo ? ` to ${sendTo}` : ' (using BillEmail)'}`,

@@ -9,6 +9,7 @@ import nodemailer from 'nodemailer'
 import { emailConfig, assertEmailConfigured } from './email.config'
 import { createLogger } from '../../utils/logger.utils'
 import { PermanentError, TransientError, retry } from '../../utils/retry.utils'
+import { isEmailNotificationsPaused } from '../scheduler/cronNotificationSettings.service'
 
 const log = createLogger('email.service')
 
@@ -58,6 +59,22 @@ export async function sendEmail({ to, cc, bcc, subject, html, text, attachments,
   if (!to) return failure('sendEmail: "to" is required', context)
   if (!subject) return failure('sendEmail: "subject" is required', context)
   if (!html && !text) return failure('sendEmail: one of "html" or "text" is required', context)
+
+  // GLOBAL EMAIL KILL SWITCH — every SMTP email in the app funnels through
+  // here (all notifications, reminders, admin alerts), so this is the single
+  // choke point that silences ALL SMTP mail when an admin flips the global
+  // pause. Returns success:true + skipped so the durable send-email job marks
+  // the message DONE (dropped, not retried) rather than piling up a backlog
+  // that would flood customers on resume. Fails OPEN on a read error so a
+  // transient DB blip can't silently swallow mail during normal operation.
+  try {
+    if (await isEmailNotificationsPaused()) {
+      log.warn('send.skipped_paused', context)
+      return { success: true, skipped: true, reason: 'notifications_paused' }
+    }
+  } catch (err) {
+    log.error('send.pause_check_failed', { ...context, err: err?.message || String(err) })
+  }
 
   try {
     const client = getTransporter()
