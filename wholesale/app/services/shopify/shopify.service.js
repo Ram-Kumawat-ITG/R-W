@@ -23,7 +23,7 @@ export class ShopifyUserError extends Error {
 
 import { shopifyConfig } from "./shopify.config";
 import { REQUIRED_SUBSCRIPTIONS } from "./shopify.constants";
-import { toE164US, mapAddress, toOrderGid } from "./shopify.utils";
+import { toE164US, mapAddress, hasUsableAddress, toOrderGid } from "./shopify.utils";
 import {
   QUERY_WEBHOOK_SUBSCRIPTIONS_BY_TOPIC,
   QUERY_ALL_WEBHOOK_SUBSCRIPTIONS,
@@ -338,15 +338,22 @@ export async function createCustomer(
   admin,
   { application, note, tags = ["Pending"], subscribeNews = false },
 ) {
+  // Only attach an address that actually carries data. A migrated
+  // practitioner may have no address on file yet (imported blank with
+  // needsContactInfo) — pushing an all-empty MailingAddressInput makes
+  // Shopify reject the whole customerCreate, so skip it entirely.
   const addresses = [];
-  if (application.billingAddress) {
+  if (hasUsableAddress(application.billingAddress)) {
     addresses.push({
       ...mapAddress(application.billingAddress),
       firstName: application.firstName,
       lastName: application.lastName,
     });
   }
-  if (!application.shippingSameAsBilling && application.shippingAddress) {
+  if (
+    !application.shippingSameAsBilling &&
+    hasUsableAddress(application.shippingAddress)
+  ) {
     addresses.push({
       ...mapAddress(application.shippingAddress),
       firstName: application.firstName,
@@ -359,11 +366,23 @@ export async function createCustomer(
   // collisions (Shopify auto-promotes address phone to top-level under some
   // conditions). Top-level is deterministic: either accepts or returns a
   // clean userError that the caller surfaces as a fieldError.
+  //
+  // toE164US THROWS on an ambiguous number (e.g. a bare 10-digit US number
+  // with no country code) — a large share of migrated practitioners have
+  // exactly that. A bad/unparseable phone must NOT abort the whole customer
+  // create: fall back to omitting the phone so the customer is still created
+  // (phone can be re-collected via the profile page / at checkout).
+  let e164Phone = null;
+  try {
+    e164Phone = toE164US(application.phone);
+  } catch {
+    e164Phone = null;
+  }
+
   const input = {
     email: application.email,
     firstName: application.firstName,
     lastName: application.lastName,
-    phone: toE164US(application.phone),
     tags,
     note,
     addresses,
@@ -374,6 +393,7 @@ export async function createCustomer(
       consentUpdatedAt: new Date(Date.now() - 60_000).toISOString(),
     },
   };
+  if (e164Phone) input.phone = e164Phone;
 
   const { data, userErrors } = await executeMutation(
     admin,

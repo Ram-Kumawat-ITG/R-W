@@ -60,6 +60,18 @@ import { createCustomerVault, deleteCustomerVault } from "../nmi/nmi.service";
 import { generatePractitionerCode } from "../cdo/cdo.service";
 import { encryptField } from "../../utils/crypto.utils";
 import { createLogger } from "../../utils/logger.utils";
+import { retry } from "../../utils/retry.utils";
+
+// Shopify Admin GraphQL is a leaky-bucket rate limiter. A bulk migration
+// (1000+ practitioners) fires customer mutations far faster than the bucket
+// refills, so most calls come back THROTTLED. executeGraphQL now classifies
+// that as a TransientError — this wrapper retries it with generous backoff so
+// each call waits for the bucket to refill instead of failing the row. Also
+// used for the customer lookup + tag/note update.
+const SHOPIFY_RETRY_OPTS = { attempts: 8, baseMs: 1500, maxMs: 30000, factor: 2 };
+function withShopifyRetry(fn) {
+  return retry(fn, SHOPIFY_RETRY_OPTS);
+}
 
 const log = createLogger("practitionerMigration.service");
 
@@ -949,14 +961,16 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
       // it); otherwise look it up by email.
       let customerId = data.existingShopifyCustomerId || null;
       if (!customerId) {
-        const found = await findCustomerByEmail(admin, data.email);
+        const found = await withShopifyRetry(() => findCustomerByEmail(admin, data.email));
         customerId = found?.id || null;
       }
 
       if (customerId) {
         const addTags = data.status === "blocked" ? ["Blocked", "practitioner"] : ["Approved", "practitioner"];
         const removeTags = data.status === "blocked" ? ["Approved"] : ["Blocked"];
-        await updateCustomerTagsAndNote(admin, { customerId, addTags, removeTags, note });
+        await withShopifyRetry(() =>
+          updateCustomerTagsAndNote(admin, { customerId, addTags, removeTags, note }),
+        );
         app.customerId = customerId;
         app.shopifyCreateFailed = false;
         app.shopifyCreateError = null;
@@ -967,12 +981,14 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
           `Practitioner "${email}" linked to their EXISTING Shopify customer (${customerId}) instead of creating a new one — tags/note updated, order history preserved.`,
         );
       } else if (data.status === "approved") {
-        customerId = await createCustomer(admin, {
-          application: payload,
-          note,
-          tags: ["Approved", "practitioner"],
-          subscribeNews: Boolean(payload.subscribeNews),
-        });
+        customerId = await withShopifyRetry(() =>
+          createCustomer(admin, {
+            application: payload,
+            note,
+            tags: ["Approved", "practitioner"],
+            subscribeNews: Boolean(payload.subscribeNews),
+          }),
+        );
         app.customerId = customerId;
         app.shopifyCreateFailed = false;
         app.shopifyCreateError = null;
