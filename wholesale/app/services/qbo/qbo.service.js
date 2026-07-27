@@ -118,6 +118,97 @@ export async function findOrCreateCustomer(profile) {
   return { customer: created, created: true }
 }
 
+// Fetch a single QBO customer by Id — needed for its current SyncToken
+// before a sparse update. Returns null if not found.
+export async function getCustomer(qboCustomerId) {
+  if (!qboCustomerId) return null
+  const res = await qbo.get(`/customer/${encodeURIComponent(qboCustomerId)}`)
+  return res?.Customer || null
+}
+
+// Sparse-update an existing QBO customer's contact + address fields from a
+// normalized profile ({ firstName, lastName, companyName, email, phone,
+// billingAddress, shippingAddress }). Used when a practitioner edits their
+// profile in the account section — the QBO Customer entity must stay current.
+//
+// Scope note: this updates the CUSTOMER record only. Invoices are NOT
+// rewritten — each invoice keeps the address captured on its originating
+// order (invoices are generated from order details), so past invoices are
+// left intact by design.
+//
+// Only fields present on `profile` are written (sparse). DisplayName is
+// recomputed and included so the customer's name in QBO tracks the profile;
+// on a 6240 duplicate-name collision we retry WITHOUT DisplayName so the rest
+// of the update (name parts / email / phone / address) still lands.
+export async function updateCustomer({ qboCustomerId, profile }) {
+  if (!qboCustomerId) throw new Error('updateCustomer: qboCustomerId is required')
+  const current = await getCustomer(qboCustomerId)
+  if (!current?.Id) {
+    throw new Error(`updateCustomer: QBO customer ${qboCustomerId} not found`)
+  }
+
+  const { firstName, lastName, companyName, email, phone, billingAddress, shippingAddress } =
+    profile || {}
+  const billAddr = toQboAddress(billingAddress)
+  // The account section stores one address (billing), mirrored to shipping —
+  // keep both QBO fields consistent, falling back to billing when no explicit
+  // shipping is supplied.
+  const shipAddr = toQboAddress(shippingAddress || billingAddress)
+
+  const base = {
+    Id: String(current.Id),
+    SyncToken: String(current.SyncToken),
+    sparse: true,
+  }
+  if (firstName) base.GivenName = firstName
+  if (lastName) base.FamilyName = lastName
+  if (companyName) base.CompanyName = companyName
+  if (email) base.PrimaryEmailAddr = { Address: email }
+  if (phone) base.PrimaryPhone = { FreeFormNumber: phone }
+  if (billAddr) base.BillAddr = billAddr
+  if (shipAddr) base.ShipAddr = shipAddr
+
+  const fieldKeys = ['GivenName', 'FamilyName', 'CompanyName', 'PrimaryEmailAddr', 'PrimaryPhone', 'BillAddr', 'ShipAddr']
+  if (!fieldKeys.some((k) => base[k] !== undefined)) {
+    log.info('customer.update.noop', { qboCustomerId })
+    return current
+  }
+
+  const desiredDisplayName =
+    companyName?.trim() ||
+    [firstName, lastName].filter(Boolean).join(' ').trim() ||
+    email ||
+    ''
+  const withName = desiredDisplayName ? { ...base, DisplayName: desiredDisplayName } : base
+
+  log.info('customer.update.request', {
+    qboCustomerId,
+    syncToken: current.SyncToken,
+    fields: fieldKeys.filter((k) => base[k] !== undefined),
+  })
+  try {
+    const res = await qbo.post('/customer', withName)
+    const updated = res?.Customer
+    if (!updated?.Id) throw new Error('QBO customer update returned no Id')
+    log.info('customer.update.success', { qboCustomerId: updated.Id })
+    return updated
+  } catch (err) {
+    const code = err?.body?.Fault?.Error?.[0]?.code
+    if (desiredDisplayName && (code === '6240' || /duplicate name|6240/i.test(err?.message || ''))) {
+      // DisplayName collides with another QBO name-list entry — retry without
+      // it so the contact/address changes still apply. The failed POST did not
+      // advance SyncToken, so `base` (same token) is still valid.
+      log.warn('customer.update.displayname_conflict_retry', { qboCustomerId })
+      const res = await qbo.post('/customer', base)
+      const updated = res?.Customer
+      if (!updated?.Id) throw new Error('QBO customer update (no DisplayName) returned no Id')
+      log.info('customer.update.success_without_displayname', { qboCustomerId: updated.Id })
+      return updated
+    }
+    throw err
+  }
+}
+
 // ── Items (SKU column support) ───────────────────────────────────────
 //
 // QBO sources an invoice's SKU column from the referenced Item's `Sku`

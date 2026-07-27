@@ -1587,6 +1587,60 @@ absent the scheduler's ACH charge skips with a reason (existing
 `customerPaymentPreference` is intentionally **not** rewritten — only the
 operational `paymentMethod`.
 
+### 7.3.2 QBO customer update on profile edit (account section)
+
+The QBO **Customer** entity is created find-or-create ONCE, from the order
+details, at a practitioner's first order (`qbo.service.findOrCreateCustomer`,
+via `ensureCustomerForOrder`) — and thereafter never refreshed by the order
+path (once `customer_maps.qboCustomerId` is set, intake short-circuits). So a
+practitioner who edits their profile after ordering would leave a **stale** QBO
+customer record.
+
+**Triggers.** Two edit surfaces, each best-effort + fire-and-forget so a QBO
+hiccup can never block/fail the originating operation:
+
+1. **Account-section edit** — `POST /api/update-profile` when contact/business
+   info or the billing address changed (`hasProfileUpdate || hasAddressUpdate`).
+   Profile built from the **post-update `WholesaleApplication` doc** via
+   `customer.service.syncQboCustomerFromApplication` (`businessName`→
+   `companyName`; single `billingAddress` mirrors to `shippingAddress`).
+2. **Admin-section edit** — an admin editing the customer in the **Shopify
+   admin** fires the `customers/update` webhook (`webhooks.customers.update.jsx`).
+   That edit does **not** touch the Mongo `WholesaleApplication` doc, so the
+   **Shopify webhook payload** is the source of truth (the just-edited state) —
+   profile built from `payload.first_name/last_name/email/phone` +
+   `normalizeAddress(payload.default_address)`.
+
+Both cases:
+
+- **Invoices are never rewritten.** Each invoice keeps the `BillAddr`/`ShipAddr`
+  captured on its originating Shopify order (invoices are generated from order
+  details, per requirement). Fee/due-date realignment on a *payment-method*
+  change is the separate §7.3.1 flow.
+- **No-op when there is no QBO customer yet (LAZY)** — the QBO customer is
+  created at order time, so a practitioner who has never ordered has no
+  `customer_maps.qboCustomerId`; the sync returns
+  `{ synced:false, reason:'no_qbo_customer' }` and their QBO customer is created
+  from order details on their first order (deliberate — no QBO records for
+  never-transacted registrants). For that first order to carry the latest
+  profile, the account-section edit (`/api/update-profile`) pushes name + phone
+  (`customerUpdatePersonalInfo`) AND the address (`customerUpdateDefaultAddress`)
+  to the Shopify customer, so the order details — and thus the created QBO
+  customer — reflect the edits. Email is intentionally not changed there.
+
+**Path.** Both triggers converge on
+`customer.service.syncQboCustomerProfile({ shop, email, profile })`, which
+resolves `customer_maps.qboCustomerId` (keyed by `shop`+`email`) →
+`qbo.service.updateCustomer({ qboCustomerId, profile })`.
+
+`updateCustomer` does a GET (`getCustomer`, for the current `SyncToken`) → a
+**sparse** `POST /customer` writing only the present fields (`GivenName`,
+`FamilyName`, `CompanyName`, `PrimaryEmailAddr`, `PrimaryPhone`, `BillAddr`,
+`ShipAddr` — addresses via `toQboAddress`). `DisplayName` is recomputed and
+included so the name tracks the profile; on a **6240 duplicate-name** collision
+it retries WITHOUT `DisplayName` so the contact/address changes still land
+(mirrors `createCustomer`'s adopt-on-6240 behavior). Added 2026-07-27.
+
 ### 7.4 Payment recording
 
 After a successful NMI charge:

@@ -3,8 +3,9 @@ import connectDB from '../services/APIService/mongo.service'
 import WholesaleApplication from '../models/wholesaleApplication.server'
 import { sendResponse } from '../services/APIService/api.service'
 import { buildShopifyNote } from '../services/shopify/shopify.utils'
-import { customerUpdateNote, customerUpdateDefaultAddress } from '../utils/shopifyCustomer'
+import { customerUpdateNote, customerUpdateDefaultAddress, customerUpdatePersonalInfo } from '../utils/shopifyCustomer'
 import { normalizePaymentMethod } from '../services/customer/customer.utils'
+import { syncQboCustomerFromApplication } from '../services/customer/customer.service'
 import { applyPaymentPreferenceToOpenInvoices } from '../services/invoice/paymentPreference.service'
 import { encryptField } from '../utils/crypto.utils'
 import { notifyProfileUpdated } from '../services/notifications/accountNotification.service'
@@ -318,6 +319,25 @@ export async function action({ request }) {
         }
       }
 
+      // Push updated name / phone to the Shopify customer record. Without
+      // this, a pre-order profile edit stays in Mongo only, so the QBO
+      // customer created from ORDER details on the first order would carry
+      // the stale name/phone (the "lazy" QBO-create path relies on Shopify
+      // holding the latest profile). Address is handled above; email is
+      // intentionally not changed here (see helper docs).
+      if (hasProfileUpdate) {
+        try {
+          await customerUpdatePersonalInfo(admin, {
+            customerId,
+            firstName: profile.firstName,
+            lastName: profile.lastName,
+            phone: profile.phone,
+          })
+        } catch (e) {
+          console.error('[proxy/update-profile] shopify personal-info update failed:', e?.message || e)
+        }
+      }
+
       // Rebuild and push customer note
       try {
         const merged = {
@@ -390,6 +410,25 @@ export async function action({ request }) {
   if (updatedDoc.payment) delete updatedDoc.payment.cardNumber
   // Never echo the encrypted account back to the client.
   if (updatedDoc.commission) delete updatedDoc.commission.bankAccountEncrypted
+
+  // ── Sync the QBO customer record (account-section profile edit) ───────────
+  //
+  // Keep the QuickBooks Customer entity current when contact / business info
+  // or the billing address changes. Invoices are generated from ORDER details
+  // and are never rewritten here — this only refreshes the customer record so
+  // future invoices + QBO reporting reflect the latest profile. No-op when the
+  // practitioner has no QBO customer yet (created from order details on their
+  // first order). Best-effort + FIRE-AND-FORGET — must never block or fail the
+  // profile save the customer just made (already persisted above).
+  if ((hasProfileUpdate || hasAddressUpdate) && doc.shop) {
+    syncQboCustomerFromApplication({ shop: doc.shop, email, application: updatedDoc })
+      .then((r) => {
+        if (r?.synced) {
+          console.log(`[proxy/update-profile] QBO customer synced: ${r.qboCustomerId}`)
+        }
+      })
+      .catch((e) => console.error('[proxy/update-profile] QBO customer sync failed:', e?.message || e))
+  }
 
   // ── Notify customer of what changed (best-effort) ─────────────────────────
   const changeSummary = []

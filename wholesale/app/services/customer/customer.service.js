@@ -4,7 +4,10 @@
 
 import CustomerMap from '../../models/customerMap.server'
 import WholesaleApplication from '../../models/wholesaleApplication.server'
-import { findOrCreateCustomer as findOrCreateQboCustomer } from '../qbo/qbo.service'
+import {
+  findOrCreateCustomer as findOrCreateQboCustomer,
+  updateCustomer as updateQboCustomer,
+} from '../qbo/qbo.service'
 import { validateCustomerVault } from '../nmi/nmi.service'
 import {
   buildProfileFromShopifyOrder,
@@ -234,6 +237,59 @@ export async function ensureCustomerForOrder({ shop, order }) {
   await mapping.save()
   console.log(`[customers] customer_maps saved _id=${mapping._id}`)
   return mapping
+}
+
+// Push an edited customer profile to their QBO Customer record.
+//
+// The QBO CUSTOMER entity is the only thing updated here — invoices are
+// generated from order details and are never rewritten, so past invoices keep
+// the address they were created with (by design).
+//
+// Resolution: the QBO customer id lives on customer_maps (mirrored at order
+// intake), keyed by (shop, email). If the practitioner has never placed an
+// order there is no QBO customer yet — nothing to update; one is created from
+// the order details on their first order. Best-effort: returns a status object
+// and lets the caller ignore failures rather than throwing.
+//
+// @param {object} args
+// @param {string} args.shop
+// @param {string} args.email
+// @param {object} args.profile  normalized profile
+//   ({ firstName, lastName, companyName, email, phone, billingAddress, shippingAddress })
+export async function syncQboCustomerProfile({ shop, email, profile }) {
+  const normEmail = String(email || profile?.email || '').toLowerCase()
+  if (!normEmail) return { synced: false, reason: 'no_email' }
+
+  const mapping = await CustomerMap.findOne({ shop, email: normEmail })
+    .select('qboCustomerId')
+    .lean()
+  const qboCustomerId = mapping?.qboCustomerId
+  if (!qboCustomerId) {
+    log.info('qbo.customer_update.skip_no_qbo_link', { shop, email: normEmail })
+    return { synced: false, reason: 'no_qbo_customer' }
+  }
+
+  const updated = await updateQboCustomer({ qboCustomerId, profile: { ...profile, email: normEmail } })
+  log.info('qbo.customer_update.done', { shop, email: normEmail, qboCustomerId })
+  return { synced: true, qboCustomerId: updated?.Id || qboCustomerId }
+}
+
+// Account-section variant: build the QBO profile from the (post-update)
+// WholesaleApplication doc, then delegate to syncQboCustomerProfile. Used by
+// POST /api/update-profile. `application` stores companyName as `businessName`
+// and a single `billingAddress`.
+export async function syncQboCustomerFromApplication({ shop, email, application }) {
+  const app = typeof application?.toObject === 'function' ? application.toObject() : application || {}
+  const profile = {
+    firstName: app.firstName || '',
+    lastName: app.lastName || '',
+    companyName: app.businessName || '',
+    email: String(email || app.email || '').toLowerCase(),
+    phone: app.phone || '',
+    billingAddress: app.billingAddress || null,
+    shippingAddress: app.shippingAddress || app.billingAddress || null,
+  }
+  return syncQboCustomerProfile({ shop, email, profile })
 }
 
 // Ensure the synthetic retail drop-ship customer
