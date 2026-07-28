@@ -5,6 +5,7 @@ import {
   fetchVariantRetailPricingBySku,
   resolveVariantPricing,
 } from "./retailPricing";
+import { fetchAllCustomMetafieldsForProduct } from "./productMetafields";
 import { createLogger } from "../../utils/logger.utils";
 
 const log = createLogger("sync.product");
@@ -34,16 +35,42 @@ const log = createLogger("sync.product");
 //   variant stays untouched. When `retailVariantsBySku` is null (create
 //   path), all wholesale variants are included and Shopify creates fresh
 //   retail variants.
+//
+// Metafield mirroring (2026-07-28):
+//   Pass `metafieldsData = { productMetafields, variantMetafieldsBySku }`
+//   from `fetchAllCustomMetafieldsForProduct`. Every `custom.*` metafield
+//   present on the wholesale product (product-level) or wholesale variant
+//   (variant-level, matched by SKU) is included in the retail payload's
+//   `metafields[]` — Shopify's REST products endpoint upserts them by
+//   (namespace, key) on create AND update. Values + types pass through
+//   verbatim so text/money/number_decimal/json/list.* all work uniformly.
+//   Definitions (Settings → Custom data) are NOT synced — merchants must
+//   create those on retail separately if they want the field to appear
+//   as a structured admin form input. Values remain readable via API
+//   regardless, which is all that downstream consumers (e.g. the
+//   shipping algorithm reading `custom.pack_category`) require.
 function buildRetailPayload(
   p,
   {
     includePrice = false,
     pricingBySku = null,
     retailVariantsBySku = null,
+    metafieldsData = null,
   } = {},
 ) {
+  const productMetafields = metafieldsData?.productMetafields || [];
+  const variantMetafieldsBySku =
+    metafieldsData?.variantMetafieldsBySku || new Map();
+
   const variants = (p.variants || [])
-    .map((v) => buildRetailVariant(v, { includePrice, pricingBySku, retailVariantsBySku }))
+    .map((v) =>
+      buildRetailVariant(v, {
+        includePrice,
+        pricingBySku,
+        retailVariantsBySku,
+        variantMetafieldsBySku,
+      }),
+    )
     .filter(Boolean);
 
   return {
@@ -59,6 +86,10 @@ function buildRetailPayload(
       images: p.images
         ?.filter((i) => i.src)
         .map((i) => ({ src: i.src, alt: i.alt || null })),
+      // Product-level `custom.*` metafields — omit the field entirely
+      // when empty (Shopify accepts either, but omission keeps the
+      // payload minimal + avoids a spurious "no changes" write).
+      ...(productMetafields.length > 0 && { metafields: productMetafields }),
     },
   };
 }
@@ -73,7 +104,15 @@ function buildRetailPayload(
 // treats variants-without-id as new variants to create on that product.
 // This unlocks the "merchant added a fresh variant to an existing product"
 // flow, which previously silently dropped the new variant.
-function buildRetailVariant(v, { includePrice, pricingBySku, retailVariantsBySku }) {
+function buildRetailVariant(
+  v,
+  {
+    includePrice,
+    pricingBySku,
+    retailVariantsBySku,
+    variantMetafieldsBySku = null,
+  },
+) {
   const wholesaleSku = String(v?.sku || "").trim();
 
   // Update path — try to pair with an existing retail variant by SKU.
@@ -130,6 +169,20 @@ function buildRetailVariant(v, { includePrice, pricingBySku, retailVariantsBySku
   } else if (includePrice) {
     base.price = v.price;
     base.compare_at_price = v.compare_at_price;
+  }
+
+  // Variant-level `custom.*` metafield mirror (2026-07-28): the wholesale
+  // variant may carry arbitrary merchant-owned metafields (color, material,
+  // internal codes, etc.). Include them verbatim so the retail variant
+  // gets the same values. Shopify's REST products endpoint upserts by
+  // (namespace, key) — no separate call needed. Omit the array entirely
+  // when this variant has no custom metafields (Shopify accepts either;
+  // omission keeps the payload minimal).
+  if (variantMetafieldsBySku && wholesaleSku) {
+    const variantMetafields = variantMetafieldsBySku.get(wholesaleSku);
+    if (Array.isArray(variantMetafields) && variantMetafields.length > 0) {
+      base.metafields = variantMetafields;
+    }
   }
 
   return base;
@@ -309,11 +362,24 @@ export async function syncProductCreate(wholesaleProduct, { shop } = {}) {
     variantsWithPricing: pricingBySku.size,
   });
 
+  // Fetch every `custom.*` metafield on the wholesale product + variants so
+  // they can be mirrored verbatim into the retail record on create.
+  // Best-effort (2026-07-28) — a fetch failure returns an empty result
+  // and the sync proceeds without metafields.
+  const metafieldsData = shop
+    ? await fetchAllCustomMetafieldsForProduct({ shop, productId: wholesaleId })
+    : { productMetafields: [], variantMetafieldsBySku: new Map() };
+  log.info("product_create.custom_metafields", {
+    wholesaleId,
+    productMetafieldCount: metafieldsData.productMetafields.length,
+    variantsWithMetafields: metafieldsData.variantMetafieldsBySku.size,
+  });
+
   let retailProduct;
   try {
     const data = await retailClient.post(
       "products.json",
-      buildRetailPayload(wholesaleProduct, { pricingBySku }),
+      buildRetailPayload(wholesaleProduct, { pricingBySku, metafieldsData }),
     );
     retailProduct = data?.product;
     if (!retailProduct?.id) {
@@ -381,6 +447,18 @@ export async function syncProductUpdate(wholesaleProduct, { shop } = {}) {
     variantsWithPricing: pricingBySku.size,
   });
 
+  // Re-fetch every `custom.*` metafield on the wholesale product + variants
+  // on every update — the merchant may have added, edited, or created new
+  // ones. Empty result → sync without metafield changes (no deletion).
+  const metafieldsData = shop
+    ? await fetchAllCustomMetafieldsForProduct({ shop, productId: wholesaleId })
+    : { productMetafields: [], variantMetafieldsBySku: new Map() };
+  log.info("product_update.custom_metafields", {
+    wholesaleId,
+    productMetafieldCount: metafieldsData.productMetafields.length,
+    variantsWithMetafields: metafieldsData.variantMetafieldsBySku.size,
+  });
+
   const retailId = mapping.retailId;
 
   // ── Pre-fetch retail product to pair variants by SKU (2026-07-14) ───
@@ -423,6 +501,7 @@ export async function syncProductUpdate(wholesaleProduct, { shop } = {}) {
     `products/${retailId}.json`,
     buildRetailPayload(wholesaleProduct, {
       pricingBySku,
+      metafieldsData,
       retailVariantsBySku:
         retailVariantsBySku.size > 0 ? retailVariantsBySku : null,
     }),
