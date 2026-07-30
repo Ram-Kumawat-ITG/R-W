@@ -1,0 +1,46 @@
+# practitioner-discount — Shopify Function enforcing practitioner-code
+# eligibility.
+#
+# A practitioner discount code must only be usable by a buyer who is
+# unbound, or already permanently associated with the SAME practitioner
+# that owns the code. This runs at checkout-CALCULATION time for every
+# redemption surface — Shopify's native cart discount box, the native
+# checkout discount field, a `/discount/<code>` marketing link, or a code
+# applied manually by staff in Admin — because all of them route through
+# Shopify's own discount engine, where this Function lives. That's what
+# makes the restriction unbypassable, unlike a check that only lives in the
+# app's own custom widget/API.
+#
+# Reads (see app/services/cdo/cdo.discount.service.js and
+# app/utils/practitionerMetafields.js for the write side):
+#   - discount.metafield("cdo", "config")            → { percentage, practitionerId }
+#   - cart.buyerIdentity.customer.metafield("cdo", "practitioner_id")
+#
+# If the customer has no `practitioner_id` metafield yet (first-time buyer,
+# unbound), the discount is ALLOWED — the permanent association is written
+# server-side by the orders/create webhook once the order lands. If the
+# customer is already bound to a DIFFERENT practitioner, the discount is
+# declined (no discount lines are added — Shopify shows the code as not
+# applicable).
+#
+# Order-discount-only (discountClasses: ["ORDER"], set at creation in
+# cdo.discount.service.js) — the delivery-options / shipping-discount target
+# the CLI scaffolds by default was removed since practitioner discounts never
+# touch shipping.
+api_version = "2026-04"
+
+[[extensions]]
+name = "t:name"
+handle = "practitioner-discount"
+type = "function"
+uid = "ce4fa6bb-36b0-4ffb-b245-33a9086b2cdc"
+description = "t:description"
+
+  [[extensions.targeting]]
+  target = "cart.lines.discounts.generate.run"
+  input_query = "src/cart_lines_discounts_generate_run.graphql"
+  export = "cart-lines-discounts-generate-run"
+
+  [extensions.build]
+  command = ""
+  path = "dist/function.wasm"

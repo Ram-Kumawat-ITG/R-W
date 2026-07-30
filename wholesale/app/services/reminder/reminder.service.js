@@ -1,15 +1,19 @@
 // Check-payment reminder service.
 //
-// Identifies unpaid CHECK-method invoices and triggers QBO invoice
-// reminder emails on a three-stage ladder (first / second / card-on-file)
-// measured from the order/invoice date. The ladder thresholds are
-// Day 9 / Day 11 / Day 13 in production and Minute 1 / 3 / 4 in testing
-// mode (see reminder.config). After the final stage, a RECURRING reminder
-// repeats at the configured interval (REMINDER_REPEAT_*) until the
-// invoice is paid. Responsibilities are intentionally narrow:
+// Identifies unpaid CHECK-method invoices and sends dynamic SMTP reminder
+// emails on a three-stage ladder (first / second / card-on-file) measured
+// from the order/invoice date. The ladder thresholds are Day 9 / Day 11 /
+// Day 13 in production and Minute 1 / 3 / 4 in testing mode (see
+// reminder.config). After the final stage, a RECURRING reminder repeats at
+// the configured interval (REMINDER_REPEAT_*) until the invoice is paid.
+// Responsibilities are intentionally narrow:
 //   • identify eligible invoices (payment type + order date + status)
 //   • decide which reminder stage is due
-//   • trigger the QBO invoice email (services/qbo.sendInvoiceEmail)
+//   • build a per-stage dynamic email (services/reminder/reminderEmail)
+//     with full order + invoice details and send it DIRECTLY via the shared
+//     SMTP service (sendEmail) — NOT QBO, which can't render a dynamic body.
+//     The CRON triggers the send itself, so paymentReminders[] reflects the
+//     real SMTP outcome and a failed stage is retried on the next tick.
 //   • record notification history (Invoice.paymentReminders) to dedup
 //   • log the activity (emailEvents[] + remarks[]) for audit
 //
@@ -19,8 +23,12 @@
 
 import connectDB from '../APIService/mongo.service'
 import Invoice from '../../models/invoice.server'
-import { sendInvoiceEmail } from '../qbo/qbo.service'
+import ShopifyOrder from '../../models/order.server'
+import WholesaleApplication from '../../models/wholesaleApplication.server'
+import { sendEmail } from '../email/email.service'
 import { recordEmailEvent } from '../invoice/invoice.service'
+import { buildReminderEmail } from './reminderEmail.service'
+import { reminderEmailConfig } from './reminderEmail.config'
 import { createLogger } from '../../utils/logger.utils'
 import {
   reminderConfig,
@@ -33,6 +41,47 @@ const log = createLogger('reminder.service')
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000
 const MS_PER_MIN = 60 * 1000
+
+// Resolve the practitioner's display name for the email greeting/details.
+async function resolvePractitionerName(email) {
+  if (!email) return null
+  try {
+    const app = await WholesaleApplication.findOne({ email })
+      .select('firstName lastName businessName')
+      .lean()
+    if (!app) return null
+    return [app.firstName, app.lastName].filter(Boolean).join(' ') || app.businessName || null
+  } catch {
+    return null
+  }
+}
+
+// Resolve the order number + product summary from the linked ShopifyOrder.
+// Products come from the raw Shopify payload's line_items (title/qty/price).
+async function resolveOrderContext(invoice) {
+  const empty = { orderNumber: null, products: [] }
+  if (!invoice.orderRef) return empty
+  try {
+    const order = await ShopifyOrder.findById(invoice.orderRef)
+      .select('shopifyOrderName shopifyOrderNumber rawPayload')
+      .lean()
+    if (!order) return empty
+    const orderNumber =
+      order.shopifyOrderName ||
+      (order.shopifyOrderNumber ? `#${order.shopifyOrderNumber}` : null)
+    const lineItems = Array.isArray(order.rawPayload?.line_items) ? order.rawPayload.line_items : []
+    const products = lineItems.slice(0, 25).map((li) => ({
+      title: [li.title, li.variant_title && li.variant_title !== 'Default Title' ? li.variant_title : null]
+        .filter(Boolean)
+        .join(' — '),
+      quantity: li.quantity != null ? Number(li.quantity) : null,
+      price: li.price != null ? Number(li.price) : null,
+    }))
+    return { orderNumber, products }
+  } catch {
+    return empty
+  }
+}
 
 // Order/issue date anchor. qboTxnDate is the invoice transaction date
 // (set to the order date at creation); fall back to the row's createdAt.
@@ -148,30 +197,71 @@ export async function processCheckPaymentReminders({ now = new Date() } = {}) {
     const recipient = invoice.customerEmail || undefined
     const unit = reminderConfig.useMinutes ? 'min' : 'day'
 
+    if (!recipient) {
+      // No email to send to — record a skip and move on (can't remind).
+      summary.skipped += 1
+      log.warn('reminder.skipped_no_email', { invoiceId: String(invoice._id), stage: stage.stage })
+      continue
+    }
+
     try {
-      const updated = await sendInvoiceEmail({
-        qboInvoiceId: invoice.qboInvoiceId,
-        sendTo: recipient,
+      // Gather full order + invoice details for the dynamic body.
+      const [practitionerName, orderCtx] = await Promise.all([
+        resolvePractitionerName(invoice.customerEmail),
+        resolveOrderContext(invoice),
+      ])
+
+      const { subject, text, html } = buildReminderEmail({
+        stage: stage.stage,
+        practitionerName,
+        orderNumber: orderCtx.orderNumber,
+        invoiceNumber: invoice.qboDocNumber || invoice.qboInvoiceId || null,
+        invoiceDate: invoice.qboTxnDate || invoice.createdAt || null,
+        outstandingAmount:
+          invoice.amountDue != null && invoice.amountPaid != null
+            ? invoice.amountDue - invoice.amountPaid
+            : invoice.amountDue,
+        currency: invoice.currency,
+        paymentStatus: invoice.paymentStatus,
+        dueDate: invoice.dueAt || invoice.qboDueDate || null,
+        products: orderCtx.products,
+        supportEmail: reminderEmailConfig.supportEmail,
       })
+
+      // Send DIRECTLY (inline) — this CRON triggers the email itself and the
+      // paymentReminders[] status reflects the ACTUAL SMTP result. sendEmail
+      // never throws; on a false result we drop into the catch below, which
+      // records the stage as `failed` so the next tick retries it (a named
+      // stage is only ever skipped once it's recorded `sent`).
+      const result = await sendEmail({
+        to: recipient,
+        cc: reminderEmailConfig.adminEmail || undefined,
+        subject,
+        text,
+        html,
+      })
+
+      if (!result?.success) {
+        throw new Error(result?.error || 'email send failed')
+      }
 
       invoice.paymentReminders.push({
         stage: stage.stage,
         sentAt: now,
         daysSinceOrder: elapsed,
-        recipient: recipient || '(QBO BillEmail)',
+        recipient,
         status: 'sent',
-        qboEmailStatus: updated?.EmailStatus,
       })
       recordEmailEvent(invoice, {
         triggerType: 'auto',
         triggeredBy: 'system',
         source: 'payment_reminder',
-        recipient: recipient || '(QBO BillEmail)',
+        recipient,
         status: 'sent',
       })
       invoice.remarks.push({
         kind: 'cron_payment_reminder',
-        message: `${stage.label} emailed via QBO (${unit} ${elapsed}). ${stage.message}`,
+        message: `${stage.label} emailed via SMTP (${unit} ${elapsed}). ${stage.message}`,
         source: 'cron',
         createdAt: now,
       })
@@ -183,8 +273,11 @@ export async function processCheckPaymentReminders({ now = new Date() } = {}) {
         invoiceId: String(invoice._id),
         qboInvoiceId: invoice.qboInvoiceId,
         stage: stage.stage,
+        recipient,
         elapsed,
         unit,
+        messageId: result.messageId,
+        previewUrl: result.previewUrl, // populated on the Ethereal test transport
       })
     } catch (err) {
       const message = err?.message || String(err)
@@ -192,7 +285,7 @@ export async function processCheckPaymentReminders({ now = new Date() } = {}) {
         stage: stage.stage,
         sentAt: now,
         daysSinceOrder: elapsed,
-        recipient: recipient || '(QBO BillEmail)',
+        recipient: recipient || '(none)',
         status: 'failed',
         errorMessage: message,
       })
@@ -200,7 +293,7 @@ export async function processCheckPaymentReminders({ now = new Date() } = {}) {
         triggerType: 'auto',
         triggeredBy: 'system',
         source: 'payment_reminder',
-        recipient: recipient || '(QBO BillEmail)',
+        recipient: recipient || '(none)',
         status: 'failed',
         errorMessage: message,
       })

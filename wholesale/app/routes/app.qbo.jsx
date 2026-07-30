@@ -12,6 +12,7 @@ import { authenticate } from "../shopify.server";
 //   app.qbo.customers.jsx     → /app/qbo/customers
 //   app.qbo.transactions.jsx  → /app/qbo/transactions
 //   app.qbo.invoices.jsx      → /app/qbo/invoices
+//   app.qbo.products.jsx      → /app/qbo/products
 //
 // Each child route owns its own loader so per-tab QBO API calls stay
 // isolated — a failure on the Customers tab does not block the
@@ -48,6 +49,13 @@ const TABS = [
     label: "Invoices",
     path: "/app/qbo/invoices",
     description: "Search, filter, and track every QuickBooks invoice.",
+  },
+  {
+    id: "products",
+    label: "Products",
+    path: "/app/qbo/products",
+    description:
+      "Best-selling products by revenue and quantity, from QuickBooks' Sales by Product/Service report.",
   },
 ];
 

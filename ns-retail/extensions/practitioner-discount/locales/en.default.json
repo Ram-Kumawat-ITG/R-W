@@ -1,0 +1,4 @@
+{
+  "name": "Practitioner discount",
+  "description": "Restricts a practitioner referral discount to buyers associated with that same practitioner."
+}

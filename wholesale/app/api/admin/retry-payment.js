@@ -9,6 +9,7 @@ import { appendInvoiceRemark } from '../../services/invoice/invoice.service'
 import {
   resolveCustomerVaultId,
   resolveCustomerAchBillingId,
+  resolveCustomerCardBillingId,
 } from '../../services/customer/customer.service'
 import { dropshipPaymentConfig } from '../../services/dropship/dropshipPayment.config'
 import { sendResponse } from '../../services/APIService/api.service'
@@ -183,6 +184,24 @@ export async function action({ request, params }) {
           'No NMI ACH billing id on file for this customer — capture the ACH billing profile in NMI (and store its id at wholesale_applications.payment.ach.nmi_billing_id) before retrying',
           null,
         )
+      }
+    } else {
+      // Card retry — re-resolve the CARD billing id from the source of truth so
+      // a card the practitioner UPDATED or ADDED (via the portal) after their
+      // last order was processed is targeted, not a stale/empty cache. Mirrors
+      // the ACH re-resolution above but is deliberately NON-FATAL when absent:
+      // chargeInvoice then leaves billingId undefined and NMI charges the
+      // vault's default (priority-1) billing — the pre-existing behavior — so a
+      // missing card billing id can never block a retry that used to work.
+      const resolvedCardBillingId = order.customerEmail
+        ? await resolveCustomerCardBillingId({
+            shop: session.shop,
+            email: order.customerEmail,
+            customerMap,
+          })
+        : null
+      if (customerMap && resolvedCardBillingId && !customerMap.nmiCardBillingId) {
+        customerMap.nmiCardBillingId = resolvedCardBillingId
       }
     }
   }

@@ -398,9 +398,41 @@ payout dimension — distinct from the accrual `status`.)
 
 Run flow inside a batch: snapshot eligible pool → `buildPayoutBatch` reserves the
 batched ones (→ **processing**, attempt++); eligible-but-unreserved (below-minimum
-/ open payout) → **skipped**; each payout `approve → execute` → its commissions
-**paid** (txnRef + payoutDate) or **failed** (failureReason). Counts + final
-status are written on completion.
+/ open payout / **batch_ceiling_deferred**) → **skipped**; each payout `approve →
+execute` → its commissions **paid** (txnRef + payoutDate) or **failed**
+(failureReason). Counts + final status are written on completion.
+
+**Batch transfer ceiling (ACH only)** — `payoutConfig.maxTransferAmount`
+(`CDO_PAYOUT_MAX_TRANSFER_AMOUNT`, default 2000) caps how much a single
+`buildPayoutBatch` run can wire-transfer, but **never applies to check
+payouts** — a human reviews, signs, and mails every check, so there's no
+automated-runaway-transfer risk to guard against. Since a group's eventual
+rail (ACH vs check) depends on the practitioner's preference plus a live
+banking probe, `buildPayoutBatch` resolves that method for every group
+FIRST, then runs a commission-level running total over ONLY the ACH-bound
+commissions (oldest-first, earnedAt ascending, re-sorted across groups). The
+first ACH commission that would push that total past the ceiling stops
+inclusion outright — it and every ACH commission after it are deferred
+(skipped with reason `batch_ceiling_deferred`, commissions left unreserved,
+no `payoutId`) — while check-bound groups are always batched in full
+regardless of amount. Deferred ACH commissions remain eligible and are
+automatically picked up by the next scheduled run, so a single automated run
+never wire-transfers more than the ceiling, and nothing is lost, only
+delayed. An ACH group whose own total already exceeds the ceiling is
+deferred every run until an admin intervenes (raise the ceiling, or have the
+practitioner switch to check). See also the per-payout ceiling check in
+`executeApprovedPayout` (§8), gated on `payout.method === "ach"`, which
+re-validates the same cap immediately before the transfer as
+defense-in-depth.
+
+The read-only upcoming-payout previews (`getUpcomingPayouts` /
+`getUpcomingPayoutBatchDetails`, driving this tab) approximate the same
+ceiling over the whole eligible set rather than resolving each
+practitioner's live payout method (an extra query pair per practitioner just
+for an estimate) — exact for the common case, since check-preferred
+practitioners are already excluded from eligibility at the query level here,
+and only slightly conservative for the rare edge case of an ACH-preferred
+practitioner whose banking currently happens to be invalid.
 
 **Reprocess** — `reprocessBatch(batchId)` spawns a fresh `manual_reprocess` batch
 that re-runs only the source batch's **failed** payouts via the resumable
@@ -423,6 +455,7 @@ QBO records the accounting; its `BillPayment` API does **not** move funds to a p
 ```
  approved ──(admin Execute)──▶ executeApprovedPayout
    │  banking gate (§6.5)
+   │  ceiling gate (§7 — reconciliation + CDO_PAYOUT_MAX_TRANSFER_AMOUNT)
    │  QBO Vendor + Bill            ← records the LIABILITY (we owe the commission)
    │  provider.initiateTransfer()  ← initiates the bank→bank ACH credit
    ▼
@@ -468,6 +501,15 @@ Adapters MUST be idempotent on `idempotencyKey` (`cdo-payout-<payoutId>-<attempt
 On settle/return, `finalizeSettledPayout` / the return branch also call `reflectPayoutOnBatches` to update the **batch snapshot** that processed the payout — its run-time items were recorded as `processing` (ACH is async, settled later by this CRON), so without this the Payout Batches view (Paid/Failed/Skipped/**Processing**) would stay frozen on `processing` after the payout actually settled. The reflect updates the matching `items[]` + recomputes the stored counts, so the batch reflects the final outcome.
 
 > **Still to lock before real go-live** (see Commission.md §9): choose + contract a real provider, bank-account ownership verification (micro-deposit/Plaid), encrypt/tokenize stored account numbers, funding-balance pre-check + payout caps, 1099/W-9 enforcement, and the NACHA originator agreement.
+
+### 8.5 Payout email notifications
+
+All four payout emails below live in `app/services/notifications/payoutNotification.{config,service}.js` and share the reusable SMTP utility (`app/services/email/email.service.js`, ported from the wholesale workspace for consistency — same nodemailer transport, retry, and `{success, messageId}`/`{success:false, error}` return shape). All sends are best-effort (fire-and-forget with a caught+logged rejection) — a notification failure never surfaces as a payout-processing failure.
+
+- **Commission Payout Processed** — once a payout reaches its terminal `paid` state, via ACH settlement (`finalizeSettledPayout`) or a manually-issued check (`markCheckPayoutPaid`). `notifyCommissionPayoutProcessed` emails the practitioner (amount, method, reference, date), admin (`CDO_ADMIN_EMAIL`) CC'd. **This is the practitioner-facing "your check payout has been processed" notice for check payouts** (method `check`, amount rendered from the payout).
+- **Commission Payout Failed** — fired from `alertPayoutFailure`, the single choke point every payout-failure path already runs through (banking validation failures in `executeApprovedPayout`, QBO/execution errors, ACH returns in `checkPayoutSettlement`). `notifyCommissionPayoutFailed` emails the practitioner with the failure reason + return code + reference, admin CC'd, plus a note that the reserved commission will auto-retry on the next batch run.
+- **Commission Payout Batch Summary** — admin-only, fired once per `runAutomatedPayouts` run (awaiting-approval, completed, completed-with-errors, or whole-run crash) via `sendPayoutBatchSummaryEmail`/`notifyPayoutBatchSummary`. Contains a per-practitioner HTML table (name, email, total commission amount, order/commission count, payout status, transaction/reference id, processed date+time), sourced fresh from `CdoPayout` via `buildBatchSummaryRows(batch.payoutIds)` rather than the batch's persisted (narrower, strict-schema) `practitionerPayouts` field.
+- **Pending Check Payouts (admin digest)** — admin-only (`CDO_ADMIN_EMAIL`), fired at the end of BOTH success paths of `runAutomatedPayouts` (the human-approval-gate early return and the full auto-disburse run) via best-effort helper `sendPendingCheckPayoutsDigest()` → `notifyPendingCheckPayouts`. Queries every OPEN check-method payout (`method:"check"`, status ∈ `draft`/`awaiting_approval`/`approved`/`processing` — checks still awaiting physical issue) and emails the **total pending check payout amount** plus a per-payout HTML table (practitioner name/email, amount, commission count, status, reference, period end). Gives the admin a recurring, actionable "here are the checks to cut and the total owed" reminder aligned with each payout cycle. No-ops (sends nothing) when there are no open check payouts. (Distinct from the Batch Summary, which reports what a single run just did; this reports the standing backlog of checks awaiting issue across all runs.)
 
 ---
 
@@ -1074,6 +1116,115 @@ webhook topics; ensure `QBO_RETAIL_REFRESH_TOKEN` is freshly minted (Intuit
 rotates the refresh token on every use — see the §14 token-reset note, which
 applies per realm).
 
+### 19.1 Drop-ship Vendor Bill (A/P) email notifications
+
+The drop-ship Vendor Bill flow itself (`app/services/retailQbo/retailVendorBill.service.js`
+creates the QBO Bill; `retailBillReconcile.service.js` reconciles it once the
+wholesale dropship invoice is paid) is the ns-retail half of the cross-repo
+drop-ship pipeline documented in the wholesale workspace's `CLAUDE.md` ("Drop-ship
+orders → unpaid QBO invoice + manual batch collection" row). Two admin-only
+emails hook into it, via `app/services/notifications/vendorBillNotification.service.js`
+(same reusable SMTP utility + `CDO_ADMIN_EMAIL` as the payout notifications in §8.5):
+
+- **Drop-ship Vendor Bill Created** — `notifyVendorBillCreated`, fired from
+  `ensureRetailVendorBillForOrder` right after the QBO Bill is created. Includes
+  the order, bill doc number, vendor, total amount, and QBO link.
+- **Drop-ship Vendor Bill (A/P) Creation or Reconciliation Failed** — one shared
+  template/event, `notifyVendorBillFailed({ stage: 'creation'|'reconciliation', ... })`,
+  fired from BOTH `ensureRetailVendorBillForOrder`'s catch block (creation) and
+  `reconcileRetailVendorBillForOrder`'s catch block (reconciliation) — the `stage`
+  field is the only thing that differs between the two call sites (subject line +
+  one explanatory paragraph); order/bill details, error message, and error detail
+  are otherwise identical. Notes that the bill stays unpaid/uncreated and will be
+  retried automatically on the next order sync / `process-bill-reconciliation`
+  CRON tick.
+
+Both are best-effort (fire-and-forget, logged on failure) — never affect the
+underlying bill creation/reconciliation outcome.
+
+---
+
+## 20. Client Portal (Theme App Extension, retail storefront) — IMPLEMENTED (2026-07-07)
+
+Self-service account dashboard for **retail customers** — regular customers,
+patients referred by a practitioner, and customers currently attributed to a
+practitioner via a CDO referral code. Distinct audience from §18's
+Practitioner Portal (practitioners, not their customers); no relation to that
+feature beyond sharing the CDO data model.
+
+**Architecture — follows this repo's own proven App-Proxy Theme-App-Extension
+pattern** (`signup-form/`, `practitioner-code-form/`), not the wholesale
+Practitioner Portal's pattern, since ns-retail owns its data directly (no
+cross-store mirroring needed here):
+- New Vite+React source workspace `ns-retail/client-portal/` (sibling to
+  `signup-form/`, `practitioner-code-form/`), building into
+  `extensions/theme-extension/assets/client-portal-bundle.{js,css}`
+  (`npm run build:client-portal`, folded into `predeploy`).
+- New Liquid block `extensions/theme-extension/blocks/client_portal.liquid` —
+  zero merchant-facing settings (same convention as `practitioner_code.liquid`);
+  merchant places it on an account/page template.
+- Backend reached via the existing single App Proxy
+  (`/apps/retail-signup/api/client-portal/*`) — no new app proxy config.
+- Auth guard `app/api/client-portal/_guard.js`: verifies
+  `authenticate.public.appProxy(request)`, resolves `logged_in_customer_id` →
+  a Shopify customer GID, and builds a customer-scoped context via
+  `resolveClientContext` in the new service below. **No approval gate** —
+  any logged-in retail customer is authorized (contrast with §18's
+  practitioner guard, which 403s a non-approved account). Only failure modes
+  are 401 (not signed in / bad App Proxy signature) and 500.
+- New service `app/services/cdo/cdo.clientPortal.service.js` — every query
+  scoped strictly by `customer.shopifyCustomerId` (the trusted GID from the
+  guard), never by client-supplied email or order id alone. Exports
+  `resolveClientContext`, `getDashboard`, `getOrders`, `getOrderDetail`,
+  `getPaymentHistory`, `getCdoInfo`, `getProfile`. Reuses the existing pure
+  `utils/orderStatus.js` helpers (`deriveShippingStatus`/`deriveDeliveryStatus`/
+  `extractTracking`) rather than re-deriving fulfillment state.
+- 7 new read-only API routes registered manually in `app/routes.js` (this
+  repo's convention for `/api/*`): `me`, `dashboard`, `orders`, `order`
+  (single detail, `?id=`), `payments`, `cdo`, `profile`. All GET-only —
+  **no writes in this feature** (Profile is read-only display; contrast with
+  §18's referral-code create/pause/resume mutation path).
+
+**Sections (tabs):**
+- **Dashboard** — order count, lifetime spend, last order date; a banner
+  when the customer is linked to a practitioner.
+- **Orders** — paginated list (`getOrders`, filterable by `financialStatus`/
+  `fulfillmentStatus`) with click-through to a full order detail view
+  (`getOrderDetail`) — line items, pricing breakdown, addresses, tracking.
+  "Current vs. history" is a UI filter over one endpoint, not two separate
+  endpoints/services.
+- **Payment History** — derived from `cdo_orders.retailQbo` (no new payments
+  model) — per-order payment status + a link to the QBO-emailed invoice when
+  one exists; `invoiceStatus: null` (sync pending/not started) renders as
+  "Processing" rather than a blank cell.
+- **CDO** — **hidden entirely** (not shown with an empty state) for
+  customers with no active practitioner referral. When attributed: current
+  practitioner name, discount code + percent, enrollment date, and the
+  customer's own discount-code usage history (from `cdo_orders.discountCodes`
+  matched against their bound code — never another customer's usage).
+- **Profile** — read-only: name, email, enrollment status, and the most
+  recent order's billing/shipping address snapshot. `cdo_applications.
+  billingAddress`/`shippingAddress` are always null (nothing populates
+  them), and a live Shopify Admin address lookup was deliberately avoided
+  (no extra latency/failure mode for an informational field) — so Profile
+  sources addresses from the customer's latest `cdo_orders` document
+  instead, with an explicit "no address on file yet" empty state for a
+  zero-order customer.
+
+**Security notes:**
+- `getOrderDetail`'s ownership check (`o.customer.shopifyCustomerId !==
+  ctx.customerId` → `null`) is enumeration-safe — a guessed/foreign order id
+  returns a generic "not found," never a 403 that would confirm the id
+  exists but belongs to someone else.
+- Orders/payments/dashboard queries are **GID-only** — a customer's
+  pre-account guest-checkout orders (placed under the same email before
+  creating an account) are intentionally excluded rather than joined by
+  email, since email is not an authenticated identity signal.
+
+**Nothing in the CDO data layer changed** — `cdo_orders`/`cdo_applications`
+are read-only from this feature's perspective (already owned and written by
+the existing order-ingestion pipeline, `cdo.service.ingestShopifyOrder`).
+
 ---
 
 ### Appendix — Environment variables
@@ -1101,7 +1252,7 @@ QBO_RETAIL_NOTIFY_ON_SHIP=true              # optional — re-send the invoice (
 QBO_RETAIL_RECORD_PAYMENT=true              # optional — record a QBO Payment when the Shopify order is paid (default on)
 
 # ── Payout scheduler (§7) ──
-# CDO_PAYOUT_CRON=30 0 25 * *               # optional — prod payout cron (defaults to 00:30 on the 25th)
+# CDO_PAYOUT_CRON=30 0 * * 1                # optional — prod payout cron (defaults to 00:30 every Monday)
 # CDO_PAYOUT_TZ=America/Los_Angeles         # optional — cron timezone (defaults to America/Los_Angeles)
 CDO_PAYOUT_INTERVAL=20 minutes              # DEV ONLY — overrides the payout cron; leave unset in prod
 CDO_SETTLEMENT_INTERVAL=1 minute            # DEV ONLY — overrides the 6-hourly settlement cron; leave unset in prod
@@ -1109,6 +1260,8 @@ CDO_SETTLEMENT_INTERVAL=1 minute            # DEV ONLY — overrides the 6-hourl
 # CDO_PAYOUT_ALERT_WEBHOOK_URL=             # optional — POSTed on a failed payout
 
 # ── Payout disbursement (§9) ──
+# CDO_PAYOUT_MAX_TRANSFER_AMOUNT=2000       # optional — safety-guard ceiling (default 2000); caps a single
+                                             # batch run's total AND each individual payout at execution
 CDO_PAYOUT_PROVIDER=sandbox|dwolla          # default "sandbox" (in-process simulator)
 # CDO_PAYOUT_REQUIRE_APPROVAL=false         # optional — gate real money behind manual approve+execute
 # CDO_PAYOUT_SANDBOX_SETTLE_SECONDS=60      # sandbox provider ONLY — seconds until a sim transfer settles
@@ -1117,4 +1270,10 @@ CDO_PAYOUT_PROVIDER=sandbox|dwolla          # default "sandbox" (in-process simu
 DWOLLA_ENVIRONMENT=sandbox|production       # required when CDO_PAYOUT_PROVIDER=dwolla
 DWOLLA_KEY=                  DWOLLA_SECRET=
 DWOLLA_FUNDING_SOURCE=                      # business funding source (URL or id)
+
+# ── SMTP email notifications (§8.5) ──
+SMTP_HOST=            SMTP_PORT=587          SMTP_SECURE=false
+SMTP_USER=            SMTP_PASSWORD=
+SMTP_FROM_NAME=Natural Solutions   SMTP_FROM_EMAIL=   SMTP_REPLY_TO=
+CDO_ADMIN_EMAIL=                            # CC'd on the Commission Payout Processed email
 ```

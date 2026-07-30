@@ -720,10 +720,17 @@ match it hands off to `invoiceDropshipOrder`, which:
 
 1. `ensureDropshipCustomerMap({ shop, order })` — find-or-create the QBO
    customer (by email, so every drop-ship invoice consolidates under one QBO
-   customer) and upsert a `CustomerMap`. Unlike the wholesale
-   `ensureCustomerForOrder`, this does **not** source/validate an NMI vault and
-   does **not** hard-fail on a missing billing address (the drop-ship customer
-   has no `wholesale_applications` doc and may arrive without billing).
+   customer) and upsert a `CustomerMap`. The resolved id is stored durably on
+   `CustomerMap.qboCustomerId` and reused for every future invoice (there is **no
+   hardcoded QBO customer id** — the only env anchor is the routing email
+   `DROPSHIP_RETAIL_CUSTOMER_EMAIL`). `createCustomer` is duplicate-safe: on a
+   QBO `6240` duplicate-name collision it **adopts** the existing customer
+   (exact `DisplayName` lookup — active then inactive — then falls back to
+   email; sparse-reactivates an inactive match) instead of throwing or creating
+   a second record. Unlike the wholesale `ensureCustomerForOrder`, this does
+   **not** source/validate an NMI vault and does **not** hard-fail on a missing
+   billing address (the drop-ship customer has no `wholesale_applications` doc
+   and may arrive without billing).
 2. `createInvoiceForOrder({ ..., isDropship: true })` — the SAME claim-first,
    duplicate-safe QBO invoice creation as the wholesale path, but with
    `paymentMethod` locked to `'dropship'` and `isDropship: true` stamped on the
@@ -778,6 +785,21 @@ two documents match by construction. (The bill-payment reconciliation in
 `retailBillReconcile.service.js` is amount-agnostic — it pays the bill's full
 balance when the wholesale invoice is `paid` — so this change does not alter
 reconciliation behavior.)
+
+> **Vendor auto-creation + durable id (no hardcoded env id).** The QBO **Vendor**
+> the bill posts to (the "Natural Solution Wholesale" supplier) no longer
+> requires a hardcoded `QBO_RETAIL_DROPSHIP_VENDOR_ID`. `resolveDropshipVendorId`
+> (ns-retail `retailQbo.service.js`) resolves in order: in-process memo → env
+> override (still authoritative when set, backward compatible) → the durable
+> singleton mapping `retail_qbo_dropship_vendor`
+> (`models/retailDropshipVendorMap.server.js`) → find-or-create in QBO (adopt an
+> existing vendor by email/`DisplayName` incl. inactive, else `POST /vendor`; on a
+> `6240` duplicate re-query by name; reactivate if inactive) → **persist** the id
+> to the mapping. So with no env id set the vendor is created once and its id
+> reused for every future bill + process restart, never re-querying QBO and never
+> duplicating. The customer side stores its id on `CustomerMap.qboCustomerId` (see
+> step 1). Both are duplicate-safe via `6240` adopt + the bill's `requestid`
+> idempotency.
 
 **Separation in the UI.**
 
@@ -923,6 +945,17 @@ with the shared `x-sync-secret` (`RETAIL_SYNC_SECRET`), gated by
 `isFulfillmentSyncEnabled()` (`NS_RETAIL_API_BASE` + secret set). The POST is
 bounded by `NS_RETAIL_SYNC_TIMEOUT_MS` (default 10 s, `AbortSignal.timeout`) so
 a hung tunnel can't stall the webhook / page load / CRON tick.
+
+**Admin alert on sync failure.** Every failure mode `notifyRetailOfDropshipChange`
+already tracks — network failure reaching ns-retail, a non-2xx HTTP response, or
+an unhandled error before either of those — fires
+`services/notifications/fulfillmentSyncNotification.notifyFulfillmentSyncFailed`
+(admin-only, SMTP via the shared `services/email/email.service.sendEmail`,
+`CRON_ADMIN_EMAIL`). Includes the wholesale + linked retail order, the event
+type, fulfillment status, failure reason (`network`/`http`/`unhandled`), the
+captured error detail, and the mapping's attempt count. Best-effort — never
+throws into the fulfillment path; a successful or skipped (unchanged-signature)
+sync never sends an email.
 
 **Reliability — single backstop on the ns-retail side.** The push above fires
 the sync **once** per fulfillment change; if that single POST fails (ns-retail
@@ -1175,9 +1208,11 @@ Downstream callers source the ids independently:
 | Caller | Card path | ACH path |
 |---|---|---|
 | `customer.service.ensureCustomerForOrder` | Reads `wholesale_applications.nmiCustomerVaultId`, validates via `validateCustomerVault`, mirrors onto `CustomerMap.nmiCustomerVaultId`. | Same vault validation as card. Additionally reads `wholesale_applications.payment.ach.nmi_billing_id` and mirrors it onto `CustomerMap.nmiAchBillingId`. The billing id is **not** validated via `validateCustomerVault` — that endpoint queries vaults, not billing entries; the billing id is trusted and any mismatch surfaces as a precise NMI decline on the next sale. |
-| `payment.service.chargeInvoice` | When `invoice.paymentMethod === 'card'`, reads `customerMap.nmiCustomerVaultId`; re-validates the vault before every NMI sale; passes `customer_vault_id` only. | When `invoice.paymentMethod === 'ach'`, reads BOTH `customerMap.nmiCustomerVaultId` (required) AND `customerMap.nmiAchBillingId` (required); validates the vault only; passes both `customer_vault_id` AND `billing_id` to NMI. The internal `resolveInvoiceVault(invoice, customerMap)` helper returns `{ vaultId, billingId, methodLabel, missingReason }` and centralises the per-method dispatch. |
-| `api/admin/retry-payment.js` | Reads vault via `resolveCustomerVaultId`. | Reads vault via `resolveCustomerVaultId` AND ACH billing id via `resolveCustomerAchBillingId`; rejects with a precise 409 if either is missing. Cheque-method invoices are rejected entirely (use mark-cheque-paid). |
-| `api/admin/charge-card.js` | Always routes through `resolveCustomerVaultId` and ignores the ACH billing id — this is the cross-method override path; the goal is "settle this invoice via the customer's card on file" regardless of the invoice's current paymentMethod. |
+| `payment.service.chargeInvoice` | When `invoice.paymentMethod === 'card'`, reads `customerMap.nmiCustomerVaultId`; re-validates the vault before every NMI sale; passes `customer_vault_id` only. On a `nmiCardBillingId` cache miss it lazily re-resolves it (see the note below). | When `invoice.paymentMethod === 'ach'`, reads BOTH `customerMap.nmiCustomerVaultId` (required) AND `customerMap.nmiAchBillingId` (required); validates the vault only; passes both `customer_vault_id` AND `billing_id` to NMI. On a `nmiAchBillingId` cache miss it lazily re-resolves it from the source of truth **before** the missing-billing gate, so a stale cache no longer skips (and eventually auto-fails) an ACH invoice whose bank profile is actually on file. The internal `resolveInvoiceVault(invoice, customerMap)` helper returns `{ vaultId, billingId, methodLabel, missingReason }` and centralises the per-method dispatch. |
+| `api/admin/retry-payment.js` | Reads vault via `resolveCustomerVaultId` AND re-resolves the card billing id via `resolveCustomerCardBillingId` (non-fatal — a missing card billing id falls back to the vault's default billing, never blocks the retry). | Reads vault via `resolveCustomerVaultId` AND ACH billing id via `resolveCustomerAchBillingId`; rejects with a precise 409 if either is missing. Cheque-method invoices are rejected entirely (use mark-cheque-paid). |
+| `api/admin/charge-card.js` | Routes through `resolveCustomerVaultId` AND `resolveCustomerCardBillingId` (non-fatal) and ignores the ACH billing id — this is the cross-method override path; the goal is "settle this invoice via the customer's card on file" regardless of the invoice's current paymentMethod. Re-resolving the card billing id matters here because flipping an ACH invoice to card must target the card billing, not the vault's priority-1 (ACH) billing. |
+
+> **Why re-resolve the card billing id at charge time?** `CustomerMap.nmiCardBillingId` is only mirrored from `wholesale_applications.payment.card.nmi_billing_id` at *order intake* (`ensureCustomerForOrder`). A practitioner who **updates or adds** their card via the portal (`api/portal/profile` → `profile.service`) *after* their last order leaves that cache stale/empty. `chargeInvoice` targets `customerMap.nmiCardBillingId` for card charges, so without a fresh read a manual retry / charge-card would hit the wrong (or default) billing. `resolveCustomerCardBillingId` (sibling of `resolveCustomerAchBillingId`) does the cache → `wholesale_applications` source-of-truth → lazy-sync fallback so the retry charges the card the practitioner just set. Note: updating a card *in place* keeps the same NMI `billing_id`, so single-card customers were already correct via the vault default; the gap this closes is the multi-billing / newly-added-card case. **`chargeInvoice` itself also performs this resolution** for BOTH methods (on a `CustomerMap.nmiCardBillingId` / `nmiAchBillingId` **cache miss** only — so no extra DB read once mirrored, and best-effort so a lookup failure just leaves the id as-is and the normal gate applies), which means the **CRON auto-retry** (`processPendingPayments`) — and every other `chargeInvoice` caller — targets the updated card/bank too, not just the manual admin endpoints. For **ACH** the resolution runs *before* `resolveInvoiceVault`'s missing-billing gate: previously a practitioner who added/updated their bank details after their last order left `nmiAchBillingId` stale, so the CRON skipped the ACH charge each tick and — because a skip still bumps `attemptCount` — eventually auto-**failed** a genuinely-payable invoice; now the CRON self-heals the same way the manual ACH retry already did. (The lazy read only ever heals a customer whose `wholesale_applications.payment.ach.nmi_billing_id` truly exists, so it can't charge someone who has no bank profile.)
 
 The order pipeline no longer creates vaults. Customers who registered
 without a payment method (or whose vault create failed in
@@ -1257,8 +1292,20 @@ POST /v3/company/{realmId}/invoice?minorversion=73
 ```
 
 Line items mirror Shopify's: per-product line + Shipping line + Tax
-line. Every line needs an `Item` reference — `QBO_WHOLESALE_DEFAULT_ITEM_ID`
-(default `"1"`) is used unless `line.qboItemId` is set.
+line. Every line needs an `Item` reference — the resolved **default item** is
+used unless `line.qboItemId` is set.
+
+> **Default item is find-or-created (no hardcoded id needed).** The fallback
+> `ItemRef` comes from `qbo.service.resolveDefaultItemId()`, not a hardcoded id:
+> `QBO_WHOLESALE_DEFAULT_ITEM_ID` (verbatim, if set) → an item named
+> `QBO_WHOLESALE_DEFAULT_ITEM_NAME` (default "Wholesale Sales") → **any existing
+> Service item** (adopts the company's seeded generic item, e.g. "Services"/id
+> 1) → **create** a "Wholesale Sales" Service item. So nothing has to be created
+> manually in QBO. `QBO_WHOLESALE_DEFAULT_ITEM_ID` is now OPTIONAL (no longer
+> defaults to the literal `"1"`); pin it only for determinism. The income
+> account for auto-created items derives from this resolved item, with a
+> cycle-safe fallback (`QBO_WHOLESALE_INCOME_ACCOUNT_ID` → first Income account)
+> used when the default item is itself being created.
 
 `DueDate` is computed in this app per **fixed, method-specific billing
 rules** (not a flat day-count), then sent explicitly to QBO. This makes
@@ -1289,15 +1336,20 @@ we omit `DueDate` from the request and QBO falls back to its own
 SalesTerm logic — last-resort safety so a missing date can't break
 invoice creation.
 
-`ShipAddr` is derived from the Shopify order using the same
-shipping → billing → customer-default fallback chain that the
-customer sync uses (`customer.utils.buildProfileFromShopifyOrder`),
-so the invoice still ships somewhere on pickup / digital orders that
-arrive without a `shipping_address`. The normalized address is
-projected to QBO's `PhysicalAddress` shape by `qbo.utils.toQboAddress`,
-which `BillAddr` on the customer payload also uses. If no address is
-on file at all, `ShipAddr` is omitted from the payload (QBO rejects
-empty address objects).
+**`BillAddr` AND `ShipAddr` are both set on the invoice from the Shopify
+order** — `createInvoiceForOrder` destructures both `billingAddress` +
+`shippingAddress` from `customer.utils.buildProfileFromShopifyOrder(order)`
+and passes them into `createInvoice`, which projects each via
+`qbo.utils.toQboAddress` onto the `/invoice` payload. Both use the same
+order-derived fallback chain the customer sync uses (billing →
+shipping → customer-default for bill-to; shipping → billing →
+customer-default for ship-to), so an invoice still has addresses on
+pickup / digital orders that arrive without one side. Setting `BillAddr`
+on the invoice (not just on the QBO customer record) means the invoice
+shows THIS order's billing address rather than silently falling back to
+the customer's stored default, which can be stale. Either side is omitted
+when the order has no usable address there (QBO rejects empty address
+objects).
 
 `ShipDate` is **omitted at invoice creation** — `orders/create` fires
 pre-fulfillment and there is no real ship timestamp yet. QBO leaves the
@@ -1352,17 +1404,35 @@ emitted as a product line. The order's `total_tax` (configured in
 `TxnTaxDetail.TotalTax`, which QBO renders in the invoice's summary
 "Tax" row (alongside Subtotal / Discount / Total) instead of in the
 Products section. It is **always sent** (even at `$0`) so the customer
-sees a tax figure on every invoice. By design **no QBO tax code
-(`TxnTaxCodeRef`) is applied** — tax authority lives in Shopify.
+sees a tax figure on every invoice.
 
-> **Rendering caveat.** Whether QBO actually shows the row in its
-> template can depend on a tax code being present on the transaction,
-> not on `TotalTax` alone: a **non-zero** Shopify tax renders fine, but a
-> **$0.00** row may be omitted by QBO. Forcing a $0 row would require a
-> company-specific tax code (AST `"NON"`, or a 0%/exempt `TaxCode` id),
-> which we deliberately do not wire in. US automated-sales-tax companies
-> may also recompute and ignore the override. The app's own Order Details
-> totals panels always show the tax line regardless of QBO's rendering.
+**Non-zero tax also carries a tax code (fixed 2026-07-17).** For an
+order that actually has tax, a bare `TotalTax` on non-taxable lines is
+**not enough** — a manual-sales-tax QBO company (`Preferences.TaxPrefs.
+UsingSalesTax: true` with a `TaxGroupCodeRef`, the default for Intuit US
+sandbox companies) **recomputes tax to `$0` and drops the amount** unless
+(a) at least one line is marked taxable and (b) the transaction carries a
+`TxnTaxCodeRef`. So `createInvoice` now marks product lines
+`TaxCodeRef: { value: "TAX" }` (shipping / discount / fee stay `"NON"`)
+and sets `TxnTaxDetail.TxnTaxCodeRef` to the company's default sales-tax
+code — resolved once from `Preferences.TaxPrefs.TaxGroupCodeRef`
+(cached; overridable via `QBO_WHOLESALE_TAX_CODE_ID`). QBO then **honors
+the passed `TotalTax` amount exactly** (verified against the sibling
+retail realm: passing `31` yields `TotalTax: 31`, not QBO's own
+rate-based figure), so the invoice total still equals Shopify's
+`total_price` and the payment fully settles. An explicit `TaxLine` is
+deliberately **not** sent — QBO ignores it and recomputes from the rate.
+A **$0-tax** order sends no line tax codes (unchanged behavior).
+
+> **Caveats.** A **$0.00** tax row may still be omitted by QBO's template
+> (a $0 order sends no tax code, so nothing forces the row) — the app's
+> own Order Details totals panels always show the tax line regardless. If
+> the company uses **Automated Sales Tax** (no `TaxGroupCodeRef`), the
+> code resolves no tax code and falls back to taxable lines + a bare
+> `TotalTax`; AST may compute its own amount from the ship-to address.
+> This was empirically confirmed on the **retail** realm (manual sales
+> tax); the wholesale realm is a sibling Intuit US sandbox and behaves the
+> same, but re-verify with a real taxed order after any QBO reconnect.
 
 > **Why only tax (and discount) reach the summary.** QBO renders the
 > customer invoice (emailed via `/invoice/{id}/send`, PDF via
@@ -1516,6 +1586,60 @@ absent the scheduler's ACH charge skips with a reason (existing
 `resolveInvoiceVault` behavior). The immutable order-time snapshot
 `customerPaymentPreference` is intentionally **not** rewritten — only the
 operational `paymentMethod`.
+
+### 7.3.2 QBO customer update on profile edit (account section)
+
+The QBO **Customer** entity is created find-or-create ONCE, from the order
+details, at a practitioner's first order (`qbo.service.findOrCreateCustomer`,
+via `ensureCustomerForOrder`) — and thereafter never refreshed by the order
+path (once `customer_maps.qboCustomerId` is set, intake short-circuits). So a
+practitioner who edits their profile after ordering would leave a **stale** QBO
+customer record.
+
+**Triggers.** Two edit surfaces, each best-effort + fire-and-forget so a QBO
+hiccup can never block/fail the originating operation:
+
+1. **Account-section edit** — `POST /api/update-profile` when contact/business
+   info or the billing address changed (`hasProfileUpdate || hasAddressUpdate`).
+   Profile built from the **post-update `WholesaleApplication` doc** via
+   `customer.service.syncQboCustomerFromApplication` (`businessName`→
+   `companyName`; single `billingAddress` mirrors to `shippingAddress`).
+2. **Admin-section edit** — an admin editing the customer in the **Shopify
+   admin** fires the `customers/update` webhook (`webhooks.customers.update.jsx`).
+   That edit does **not** touch the Mongo `WholesaleApplication` doc, so the
+   **Shopify webhook payload** is the source of truth (the just-edited state) —
+   profile built from `payload.first_name/last_name/email/phone` +
+   `normalizeAddress(payload.default_address)`.
+
+Both cases:
+
+- **Invoices are never rewritten.** Each invoice keeps the `BillAddr`/`ShipAddr`
+  captured on its originating Shopify order (invoices are generated from order
+  details, per requirement). Fee/due-date realignment on a *payment-method*
+  change is the separate §7.3.1 flow.
+- **No-op when there is no QBO customer yet (LAZY)** — the QBO customer is
+  created at order time, so a practitioner who has never ordered has no
+  `customer_maps.qboCustomerId`; the sync returns
+  `{ synced:false, reason:'no_qbo_customer' }` and their QBO customer is created
+  from order details on their first order (deliberate — no QBO records for
+  never-transacted registrants). For that first order to carry the latest
+  profile, the account-section edit (`/api/update-profile`) pushes name + phone
+  (`customerUpdatePersonalInfo`) AND the address (`customerUpdateDefaultAddress`)
+  to the Shopify customer, so the order details — and thus the created QBO
+  customer — reflect the edits. Email is intentionally not changed there.
+
+**Path.** Both triggers converge on
+`customer.service.syncQboCustomerProfile({ shop, email, profile })`, which
+resolves `customer_maps.qboCustomerId` (keyed by `shop`+`email`) →
+`qbo.service.updateCustomer({ qboCustomerId, profile })`.
+
+`updateCustomer` does a GET (`getCustomer`, for the current `SyncToken`) → a
+**sparse** `POST /customer` writing only the present fields (`GivenName`,
+`FamilyName`, `CompanyName`, `PrimaryEmailAddr`, `PrimaryPhone`, `BillAddr`,
+`ShipAddr` — addresses via `toQboAddress`). `DisplayName` is recomputed and
+included so the name tracks the profile; on a **6240 duplicate-name** collision
+it retries WITHOUT `DisplayName` so the contact/address changes still land
+(mirrors `createCustomer`'s adopt-on-6240 behavior). Added 2026-07-27.
 
 ### 7.4 Payment recording
 
@@ -2551,6 +2675,21 @@ payment-retry ticks. It only *notifies*; it never charges. Registered in
 Cadence is the daily cron in production, or a fast `REMINDER_INTERVAL`
 sweep in dev/test (currently every minute).
 
+**Delivery: SMTP with a dynamic per-stage template** (changed 2026-07-24 —
+was QuickBooks `/invoice/{id}/send`). QBO can't render a fully dynamic body,
+so each reminder is now built by `services/reminder/reminderEmail.service.buildReminderEmail({ stage, … })`
+(per-stage subject/heading/intro/CTA keyed off the stage) and sent **directly
+by the CRON** via the shared SMTP service (`email.service.sendEmail`) — so the
+`paymentReminders[]` sent/failed status reflects the real SMTP result, and a
+`failed` stage is retried on the next tick (a named stage is only skipped once
+recorded `sent`). The email carries full details:
+Practitioner Name, Order Number (from the linked `ShopifyOrder`), Invoice
+Number, Invoice Date, Payment Status, Due Date, Outstanding Amount, and a
+Product Summary (from the order's `rawPayload.line_items`). Recipient is the
+invoice's `customerEmail`; support address is `REMINDER_SUPPORT_EMAIL`
+(→ `PAYMENT_FAILURE_SUPPORT_EMAIL` → generic). Optional admin CC via
+`REMINDER_ADMIN_CC` (OFF by default — the recurring stage fires often).
+
 ```
 REMINDER_CRON=0 2 * * *        # default: 02:00 daily (scheduler timezone)
 REMINDER_INTERVAL=1 minute     # dev/test override (Agenda "every" expression)
@@ -2746,6 +2885,69 @@ heals it almost immediately.
 
 ---
 
+### 10.7 Async (durable) email delivery — `send-email` / `send-invoice-email`
+
+Every email the app sends is delivered by a **background Agenda job**, never
+inline on the request / order / CRON path. This guarantees the requirement:
+the primary operation (registration, order processing, payment, payout, an
+admin action) completes without waiting on SMTP or QBO, and a slow/unreachable
+mail server can never add latency or trip a gateway timeout.
+
+**SMTP path (`send-email`).** `services/email/emailQueue.service.enqueueEmail(message, { label })`
+is the front door. It persists a `send-email` Agenda job (via the existing
+`scheduleNow` helper) carrying the fully-rendered `sendEmail()` message object,
+then returns `{ success: true, queued: true }` after a fast Mongo insert. Every
+SMTP notification *definition* calls `enqueueEmail` instead of `sendEmail`:
+
+- `services/notifications/*` — application-lifecycle, account, NMI-alert,
+  QBO-alert, referral-code, fulfillment-sync
+- `services/payment/paymentFailureNotification.service.js`
+- `services/scheduler/batchSummaryNotification.service.js`
+
+Because the swap is at the definition layer, **every caller** (registration
+endpoints, admin endpoints, order/customer/payment services, the CRON jobs)
+becomes async automatically. The `isEmailNotificationsPaused()` guard on the two
+CRON emails still runs *before* the enqueue, so a paused notification is never
+queued.
+
+`enqueueEmail` never throws. If the queue itself is unreachable it falls back to
+an un-awaited inline `sendEmail` so an email is never silently dropped.
+
+**QBO invoice-email path (`send-invoice-email`).** The admin "Send invoice"
+button (`api/admin/send-invoice.js`) previously **awaited** QBO's
+`/invoice/<id>/send`, blocking the request. It now calls
+`enqueueInvoiceEmail({ shop, invoiceId, sendTo, triggerType, triggeredBy, source, remark })`
+and returns `202`. The `send-invoice-email` job reloads the live invoice, sends,
+advances the lifecycle-dispatcher baseline (`invoiceEmailSentAt` /
+`invoiceEmailedStatus` / `invoiceEmailedAmountPaid`), and writes the
+`emailEvents[]` audit ledger + admin remark itself — so the Order Details page
+still shows the outcome, just moments later. The order/CRON-path lifecycle sends
+(`dispatchInvoiceLifecycleEmails` on `created`/`payment`/`fulfillment`) are
+**unchanged** — they already run inside background webhook/CRON flows and rely on
+the emailEvents ledger + CRON self-heal.
+
+**Retry semantics.** The transport keeps its own 3 in-process attempts
+(§ email.service). On top of that, a failed job **reschedules itself on a
+2 / 5 / 15 / 60-minute backoff ladder** (5 attempts total, ~1h22m horizon) via
+`job.agenda.schedule('in N minutes', …)`. Because the job document is persisted
+in `agenda_jobs`, an in-flight retry **survives a deploy/restart** — the durable
+guarantee the previous in-process `.catch()` fire-and-forget could not provide.
+When the ladder is exhausted the failure is logged loudly (`send.exhausted` /
+`invoice_email.exhausted`); the primary operation already succeeded regardless.
+
+Both jobs are registered in `services/scheduler/jobs/index.js`
+(`JOB_NAMES.SEND_EMAIL` / `SEND_INVOICE_EMAIL`).
+
+**ns-retail** mirrors this: a `send-email` job + `enqueueEmail` (its own
+`cdo_agenda_jobs` collection), with payout + vendor-bill notifications rerouted;
+its admin "Send invoice" order action enqueues a `send-retail-invoice-email` job
+(re-invokes `sendRetailInvoiceForOrder` with the same backoff ladder; terminal
+reasons such as `no_invoice`/`no_email` are not retried). ns-retail's SMTP
+transport also gained the `connectionTimeout`/`greetingTimeout`/`socketTimeout`
+guards the wholesale transport already had.
+
+---
+
 ## 11. Payment retry mechanism
 
 `scheduler/jobs/processPendingPayments.job.server.js` runs **two passes** per tick.
@@ -2847,6 +3049,131 @@ admin click → POST /api/admin/orders/:id/charge-card
 `PaymentAttempt` ledger is strictly append-only. The `manual_paid`
 outcome distinguishes cheque receipts from NMI-driven attempts in the
 audit history.
+
+### 11.5 Failed-card auto-retry ladder (dedicated CRON)
+
+A **separate, frequent** CRON that recovers a failed CARD payment on a fixed
+2 / 4 / 7-day ladder (max 3 retries) so the customer isn't left waiting for the
+next twice-monthly PASS 1 tick. Card-only — ACH has its own settlement flow
+(§9.5.1); cheque/dropship never in scope.
+
+**Files:** `services/payment/paymentRetry.config.js` (offsets + cron/interval +
+the pure `buildInitialCardRetry` schedule builder), `services/payment/
+paymentRetry.service.js` (`processFailedCardRetries` sweep), `services/
+scheduler/jobs/processFailedCardRetries.job.js` (`process-failed-card-retries`,
+thin Agenda wrapper, `concurrency:1`, 15-min lock; scheduled in `ensureRecurring`
+above the retry dev-override early-return so it runs in dev too).
+
+**Trigger (schedule stored immediately on first failure).** Inside
+`chargeInvoice`, the first time a card charge doesn't succeed — a declined /
+gateway error, OR a skip because the customer's NMI vault is missing/invalid
+(the vault may be re-linked within the retry window, so it's still worth
+retrying) — `maybeInitCardRetry` sets `Invoice.cardRetry` from
+`buildInitialCardRetry(firstFailedAt)`, in the same `.save()` that records the
+attempt, so all three retry dates persist atomically. (The "already
+paid/cancelled/refunded", "awaiting ACH settlement", and "max attempts reached"
+skips do NOT start a ladder — nothing to retry.) Guarded: card-only, once-only
+(`firstFailedAt` set → no-op), never paid/cancelled.
+
+**`Invoice.cardRetry` = the complete audit record:** `active` (while true PASS 1
+excludes the invoice — `cardRetry.active: { $ne: true }` — so the two paths can't
+double-charge), `firstFailedAt`/`firstFailureReason`, `schedule[]` (per retry:
+`attemptNumber`, `scheduledAt`, `status` pending/succeeded/failed/skipped,
+`executedAt`, `outcome`, `gatewayResponseText`, `failureReason`,
+`invoiceStatusAfter`, `transactionId`), `retryCount`/`maxRetries` (= offset-list
+length), `nextRetryAt` (indexed with `active`), `processingAt` (claim lock),
+`finalStatus`/`completedAt`.
+
+**Sweep.** Query: `cardRetry.active: true` AND (`nextRetryAt <= now` OR the
+invoice is already paid/cancelled), excluding dropship + blocked practitioners.
+Per invoice: (1) **atomic claim** via `findOneAndUpdate` setting `processingAt`
+only if null/absent or older than the 15-min lock (stale-reclaim) → dedup +
+crash-resume; (2) **reconcile** — if already paid/cancelled (admin/checkout/a
+crashed-but-successful charge) close the ladder without charging; (3) **charge**
+the earliest due entry via `chargeInvoice` (loads `CustomerMap` by
+`customerMapRef`; bumps `maxAttempts` for headroom so chargeInvoice's own
+6-attempt→`failed` guard doesn't fire mid-ladder — the LADDER owns the terminal
+state); one retry per tick; (4) **record** outcome/gateway-response/timestamp on
+the entry, bump `retryCount`, advance `nextRetryAt`, append a `cron_failed_retry`
+remark; (5) **finalise** — on approval (or already-paid skip) → `finalStatus:
+'paid'`; after the last retry still unpaid → `paymentStatus: 'failed'` +
+`finalStatus: 'failed'`. A retry that can't charge (e.g. no vault) is recorded
+`skipped` and still consumes the attempt, so the ladder always terminates.
+
+**Crash-resume double-charge guard:** if a charge succeeded but the process died
+before recording, the invoice is already `paid`; the reconcile step (or
+`chargeInvoice`'s own "already paid" skip) closes the ladder instead of
+re-charging.
+
+**Config** (all optional): `PAYMENT_RETRY_FAILED_CRON` (prod cadence, default
+hourly `0 * * * *`), `PAYMENT_RETRY_FAILED_INTERVAL` (dev override),
+`PAYMENT_RETRY_FAILED_DAYS` (default `2,4,7`), `PAYMENT_RETRY_FAILED_MINUTES` +
+`PAYMENT_RETRY_FAILED_USE_MINUTES` (testing ladder in minutes). The retry count
+follows the offset-list length — no separate max-retries knob to drift.
+
+**Admin visibility.** The Order Details page ("Invoice & payment" section,
+`app.orders.$id.jsx`) renders a banner from `invoice.cardRetry` whenever a
+ladder exists: next scheduled retry date (while active), attempts used / max /
+remaining, the current payment status, the first-failure time+reason, and the
+full per-attempt schedule (scheduled date · status · execution time+outcome).
+Tone = info (pending) / success (finalised paid) / warning (finalised failed).
+
+### 11.6 Payment order hold (block new orders on an outstanding failed invoice)
+
+A practitioner with an outstanding **failed** invoice (`paymentStatus:'failed'`,
+non-drop-ship — the card-retry ladder exhausted, or `chargeInvoice` hit
+`maxAttempts`) is put on a **payment order hold** and blocked from placing new
+orders. Cleared automatically once no failed invoice remains. This is a separate
+concept from the admin `status:'blocked'` flow (a manual decision; neither
+touches the other).
+
+**Signal + reconciler.** `wholesale_applications.orderHold` is the flag,
+mirrored onto the app-owned customer metafield `$app:wholesale.order_hold`
+(value `"held"`). `orderHold.service.reconcilePractitionerOrderHold({shop,email})`
+is idempotent + self-healing: it recomputes the hold from live invoice state
+(`hasOutstandingFailedInvoice`) and syncs both the flag and the metafield. Hooked
+on ladder exhaustion (block) and `propagateSuccessfulPayment` (unblock).
+
+**Two enforcement layers — both required:**
+
+1. **Checkout Function (hard block)** —
+   `extensions/cart-checkout-validation/` (`cart.validations.generate.run`) reads
+   the customer metafield and, when held, returns a cart validation error with
+   the support message. This is the un-bypassable server-side block on **order
+   completion** — it covers even a direct `/checkout` URL visit. But by design it
+   **cannot** prevent navigating to `/checkout` or show anything on the cart page.
+
+2. **Storefront cart gate (UX layer)** — app-embed theme block
+   `extensions/theme-extension/blocks/checkout_hold_gate.liquid` (`target:body`,
+   enabled once under Theme editor → App embeds). For a logged-in customer it
+   fetches `GET /apps/<proxy>/api/storefront/order-hold` (App Proxy →
+   `app/api/storefront/order-hold.js`, `logged_in_customer_id` → live hold
+   recompute; **fails open**), and when held it **disables every checkout
+   trigger**, installs capturing click/submit guards (so it wins even if theme JS
+   binds the same button), and shows the message banner on the cart. A
+   `MutationObserver` + `cart:*` listeners re-apply after ajax-cart / drawer
+   re-renders. This is what actually prevents reaching checkout + shows the
+   message — the requirement the Function alone can't meet.
+
+**Block email notification.** The moment the hold is newly applied on card-retry
+exhaustion, the practitioner is emailed (admin CC'd) via
+`services/order/orderBlockNotification.service.notifyOrderBlocked`, enqueued on
+the durable SMTP queue (`enqueueEmail` → `send-email` job). Triggered from
+`paymentRetry.service.js` right after `reconcilePractitionerOrderHold`, gated on
+`changed && held` (fires only on the transition into blocked, never re-spams an
+already-blocked practitioner). The email explains new orders are temporarily
+blocked, that the account auto-unblocks once the invoice is paid, includes a
+support line, and lists: Invoice Number, Order Number, Outstanding Amount,
+Invoice Due Date (if available), Last Failed Payment Date, and Retry Attempts.
+Config: `ORDER_BLOCK_SUPPORT_EMAIL` (→ `PAYMENT_FAILURE_SUPPORT_EMAIL` → generic),
+admin CC via `CRON_ADMIN_EMAIL`. Best-effort — never throws into the retry CRON.
+Currently wired to the card path only (the ACH-failure block trigger is still a
+known gap).
+
+**Admin override.** `POST /api/admin/customers/:id/clear-order-hold` +
+a control on the customer detail page. **Backfill sweep:**
+`npm run reconcile:order-holds`. **Deploy:** `shopify app deploy`, then enable
+the "Checkout Hold Gate" app embed in the theme editor.
 
 ---
 
@@ -3258,7 +3585,8 @@ required values throw immediately.
 | `QBO_WHOLESALE_REFRESH_TOKEN` | _required first run_ | Seed refresh token (from OAuth Playground) |
 | `QBO_ENVIRONMENT` | `sandbox` | `sandbox` or `production` |
 | `QBO_MINOR_VERSION` | `73` | API minor version |
-| `QBO_WHOLESALE_DEFAULT_ITEM_ID` | `1` | QBO Item Id for invoice lines |
+| `QBO_WHOLESALE_DEFAULT_ITEM_ID` | _(optional)_ | Fallback QBO Item Id for invoice lines. When unset, `resolveDefaultItemId()` adopts an existing Service item or creates `QBO_WHOLESALE_DEFAULT_ITEM_NAME` — no id need pre-exist. |
+| `QBO_WHOLESALE_DEFAULT_ITEM_NAME` | `Wholesale Sales` | Name of the auto-created fallback item (only used when the id is unset and no Service item exists to adopt). |
 | `QBO_API_BASE_URL` | _auto_ | Override API host |
 | `QBO_OAUTH_TOKEN_URL` | _auto_ | Override OAuth endpoint |
 | **NMI** | | |

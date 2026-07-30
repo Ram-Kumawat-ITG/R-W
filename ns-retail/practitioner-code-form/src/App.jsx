@@ -18,8 +18,6 @@ import ApiService from './services/ApiService.js'
 //        c. Shopify's tag-based automatic-discount rule then auto-applies
 //           the discount at checkout (existing behaviour).
 
-const CODE_PATTERN = /^[a-z]+_[a-f0-9]{8}$/i
-
 // UI copy — hardcoded here on purpose. The theme block exposes ZERO
 // merchant-facing settings; edit these strings in source and rebuild.
 const UI = {
@@ -57,7 +55,16 @@ function readConfig() {
     shopDomain: String(cfg.shopDomain || ''),
     initialCode: String(cfg.initialCode || ''),
     initialPractitionerName: String(cfg.initialPractitionerName || ''),
+    initialDiscountPercent: String(cfg.initialDiscountPercent || ''),
   }
+}
+
+// discountPercent is stored everywhere (DB, cart attribute) as a FRACTION
+// (0.15 = 15%), matching cdo_settings.defaultCommissionRate's convention.
+// Always convert to a whole-number percent before showing it to the buyer.
+function formatPct(fraction) {
+  if (fraction == null || !Number.isFinite(fraction)) return ''
+  return `${Math.round(fraction * 100 * 100) / 100}%`
 }
 
 async function saveCartAttributes(attributes) {
@@ -74,6 +81,12 @@ async function saveCartAttributes(attributes) {
 // already applied in this session. Used before the auto-apply redirect
 // to avoid a pointless page reload when the customer already has the
 // discount active from an earlier visit.
+//
+// IMPORTANT: Shopify's `discount_codes` array can list a code that was
+// SUBMITTED but isn't actually taking effect (`applicable: false`) — e.g.
+// when a non-combinable code is added while a different one is still
+// active on the cart. Matching on code name alone would falsely report
+// "already applied" for a code that isn't really discounting anything.
 async function isDiscountAlreadyOnCart(code) {
   try {
     const res = await fetch('/cart.json', {
@@ -91,15 +104,37 @@ async function isDiscountAlreadyOnCart(code) {
       : []
     const needle = code.toLowerCase()
     const hitFlat = flat.some(
-      (dc) => String(dc?.code || '').toLowerCase() === needle,
+      (dc) =>
+        String(dc?.code || '').toLowerCase() === needle &&
+        dc?.applicable !== false,
     )
     const hitLvl = lvl.some(
       (dc) =>
-        String(dc?.code || dc?.title || '').toLowerCase() === needle,
+        String(dc?.code || dc?.title || '').toLowerCase() === needle &&
+        dc?.applicable !== false,
     )
     return hitFlat || hitLvl
   } catch {
     return false
+  }
+}
+
+// Clear any discount code currently active on the cart's checkout session.
+// Shopify's discount codes act like a list under the hood — applying a new
+// non-combinable code via `/discount/<code>` does NOT automatically detach
+// a previously-applied one, it just gets added alongside it as inapplicable.
+// We must explicitly clear the old code first so the new one actually takes
+// effect. `/cart/update.js` accepts a `discount` field for exactly this.
+async function clearCartDiscount() {
+  try {
+    await fetch('/cart/update.js', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ discount: '' }),
+    })
+  } catch {
+    // Best-effort — if this fails, the subsequent /discount/<code> redirect
+    // still runs and Shopify may still swap correctly on its own.
   }
 }
 
@@ -121,7 +156,44 @@ async function isDiscountAlreadyOnCart(code) {
 //   (b) after the redirect the cart page auto-reloads and the discount
 //       becomes visible in the cart totals immediately, so the buyer
 //       sees the discount BEFORE moving to checkout.
-function applyDiscountToSession(code) {
+//
+// Clears any existing discount FIRST (see clearCartDiscount) — swapping
+// between two non-combinable practitioner codes otherwise leaves the OLD
+// one as the applicable discount, since Shopify keeps both codes on the
+// cart and only one non-combinable code can be applicable at a time.
+// sessionStorage key marking that we've ALREADY attempted the /discount/<code>
+// redirect for this code in this tab. The redirect reloads /cart, so without a
+// once-per-session guard the auto-apply effect can loop forever whenever the
+// code never comes back "applicable" — e.g. the practitioner-discount Function
+// declines it (buyer locked to a different assigned code, or a stale
+// tag↔metafield mismatch), or the theme's /cart.json just doesn't surface a
+// Function-based discount. Keyed per code so a genuine reassignment to a
+// NEW code still gets its one attempt.
+function applyGuardKey(code) {
+  return `cdo_apply_attempted:${String(code || '').toLowerCase()}`
+}
+function hasAttemptedApply(code) {
+  try {
+    return sessionStorage.getItem(applyGuardKey(code)) === '1'
+  } catch {
+    return false
+  }
+}
+function markApplyAttempted(code) {
+  try {
+    sessionStorage.setItem(applyGuardKey(code), '1')
+  } catch {
+    // sessionStorage unavailable (private mode / blocked) — the redirect still
+    // runs; worst case the guard can't persist, but the manual paths are
+    // user-initiated so this only affects the auto-apply loop protection.
+  }
+}
+
+async function applyDiscountToSession(code) {
+  // Mark BEFORE navigating so the post-redirect reload sees the guard even if
+  // the discount ends up non-applicable — this is what breaks the loop.
+  markApplyAttempted(code)
+  await clearCartDiscount()
   const encoded = encodeURIComponent(code)
   // ?redirect=/cart keeps the buyer on the cart page (Shopify's default
   // is /checkout). The browser hits /discount/<code>, Shopify sets the
@@ -199,8 +271,9 @@ export default function App() {
           // cart attributes; the buyer typed them earlier this session.
           authCode = config.initialCode
           authName = config.initialPractitionerName
-          // Discount% is stored on the cart as a string; parse loosely.
-          const parsed = Number(config.initialPractitionerName)
+          // Discount% is stored on the cart as a string fraction (e.g.
+          // "0.15"); parse loosely.
+          const parsed = Number(config.initialDiscountPercent)
           authPct = Number.isFinite(parsed) ? parsed : null
         }
 
@@ -224,7 +297,7 @@ export default function App() {
         }
 
         // ── 3. Update UI + cart attrs to match the authoritative code
-        const suffixPct = authPct != null ? `${authPct}%` : ''
+        const suffixPct = formatPct(authPct)
         const suffix = suffixPct ? `${suffixPct} discount` : 'discount'
         const nameLabel = authName || 'your practitioner'
 
@@ -253,8 +326,22 @@ export default function App() {
           return
         }
 
-        // Not on session yet — activate via /discount/<code> and reload.
-        // Ye tab hoga:
+        // Already tried the /discount/<code> redirect once this session but the
+        // code still isn't reporting as applied — do NOT redirect again (that
+        // is the infinite-reload loop). The discount may still be honored at
+        // checkout (Function-based ORDER discounts aren't always reflected in
+        // /cart.json), or it was declined because the buyer is locked to a
+        // different assigned code. Either way, stop looping and leave the code
+        // saved on the cart attributes for checkout.
+        if (hasAttemptedApply(authCode)) {
+          setStatus({
+            tone: 'success',
+            message: `✓ ${nameLabel}'s ${suffix} — applied at checkout.`,
+          })
+          return
+        }
+
+        // Not on session yet — activate via /discount/<code> ONCE.
         //   • Logged-in returning patient's first visit this session
         //   • Session cookie expired but cart attribute persisted
         //   • Buyer manually cleared discount from cart summary
@@ -284,13 +371,6 @@ export default function App() {
     const trimmed = (code || '').trim()
     if (!trimmed) {
       setStatus({ tone: 'error', message: 'Please enter a practitioner code.' })
-      return
-    }
-    if (!CODE_PATTERN.test(trimmed)) {
-      setStatus({
-        tone: 'error',
-        message: 'Code format looks off — try again.',
-      })
       return
     }
 
@@ -356,10 +436,7 @@ export default function App() {
       //    Show the "success" message BEFORE the redirect so it flashes
       //    briefly (the redirect back to /cart is near-instant).
       const name = validation.practitionerName || 'your practitioner'
-      const pct =
-        validation.discountPercent != null
-          ? `${validation.discountPercent}%`
-          : ''
+      const pct = formatPct(validation.discountPercent)
       const suffix = pct ? `${pct} discount` : 'discount'
       setStatus({
         tone: 'success',

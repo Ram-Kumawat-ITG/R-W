@@ -4,7 +4,10 @@
 
 import CustomerMap from '../../models/customerMap.server'
 import WholesaleApplication from '../../models/wholesaleApplication.server'
-import { findOrCreateCustomer as findOrCreateQboCustomer } from '../qbo/qbo.service'
+import {
+  findOrCreateCustomer as findOrCreateQboCustomer,
+  updateCustomer as updateQboCustomer,
+} from '../qbo/qbo.service'
 import { validateCustomerVault } from '../nmi/nmi.service'
 import {
   buildProfileFromShopifyOrder,
@@ -13,6 +16,7 @@ import {
   normalizePaymentMethod,
 } from './customer.utils'
 import { createLogger } from '../../utils/logger.utils'
+import { notifyQboCustomerSyncFailed } from '../notifications/qboAlertNotification.service'
 
 const log = createLogger('customer.service')
 
@@ -88,7 +92,19 @@ export async function ensureCustomerForOrder({ shop, order }) {
 
   // QBO side
   if (!mapping.qboCustomerId) {
-    const { customer } = await findOrCreateQboCustomer(profile)
+    let customer
+    try {
+      ;({ customer } = await findOrCreateQboCustomer(profile))
+    } catch (err) {
+      await notifyQboCustomerSyncFailed({
+        shop,
+        email: profile.email,
+        businessName: profile.companyName,
+        shopifyOrderId: order?.id,
+        error: err,
+      }).catch((e) => log.error('qbo_sync_alert.failed', { err: e?.message || e }))
+      throw err
+    }
     mapping.qboCustomerId = customer.Id
     log.info('qbo.linked', { email: profile.email, qboCustomerId: customer.Id })
   } else {
@@ -109,7 +125,7 @@ export async function ensureCustomerForOrder({ shop, order }) {
   // history. The cheque → card admin fallback mutates
   // `Invoice.paymentMethod`, never this customer-level value.
   const app = await WholesaleApplication.findOne({ shop, email: profile.email })
-    .select('payment.method payment.card payment.ach nmiCustomerVaultId')
+    .select('payment.method payment.card payment.ach nmiCustomerVaultId cardFeeOverridePercent')
     .lean()
 
   {
@@ -131,6 +147,21 @@ export async function ensureCustomerForOrder({ shop, order }) {
       mapping.paymentMethod = resolved
     } else {
       console.log(`[customers] payment-method preference unchanged ("${resolved}")`)
+    }
+  }
+
+  // Mirror the per-practitioner CARD-fee override onto the customer map so the
+  // fee compute sites (invoice creation, chargeInvoice) can read it without a
+  // separate lookup. Source of truth is wholesale_applications; null = default
+  // card rate. Normalized to a finite >= 0 number or null.
+  {
+    const raw = app?.cardFeeOverridePercent
+    const resolvedOverride =
+      raw === null || raw === undefined || !Number.isFinite(Number(raw)) || Number(raw) < 0
+        ? null
+        : Number(raw)
+    if (mapping.cardFeeOverridePercent !== resolvedOverride) {
+      mapping.cardFeeOverridePercent = resolvedOverride
     }
   }
 
@@ -208,6 +239,59 @@ export async function ensureCustomerForOrder({ shop, order }) {
   return mapping
 }
 
+// Push an edited customer profile to their QBO Customer record.
+//
+// The QBO CUSTOMER entity is the only thing updated here — invoices are
+// generated from order details and are never rewritten, so past invoices keep
+// the address they were created with (by design).
+//
+// Resolution: the QBO customer id lives on customer_maps (mirrored at order
+// intake), keyed by (shop, email). If the practitioner has never placed an
+// order there is no QBO customer yet — nothing to update; one is created from
+// the order details on their first order. Best-effort: returns a status object
+// and lets the caller ignore failures rather than throwing.
+//
+// @param {object} args
+// @param {string} args.shop
+// @param {string} args.email
+// @param {object} args.profile  normalized profile
+//   ({ firstName, lastName, companyName, email, phone, billingAddress, shippingAddress })
+export async function syncQboCustomerProfile({ shop, email, profile }) {
+  const normEmail = String(email || profile?.email || '').toLowerCase()
+  if (!normEmail) return { synced: false, reason: 'no_email' }
+
+  const mapping = await CustomerMap.findOne({ shop, email: normEmail })
+    .select('qboCustomerId')
+    .lean()
+  const qboCustomerId = mapping?.qboCustomerId
+  if (!qboCustomerId) {
+    log.info('qbo.customer_update.skip_no_qbo_link', { shop, email: normEmail })
+    return { synced: false, reason: 'no_qbo_customer' }
+  }
+
+  const updated = await updateQboCustomer({ qboCustomerId, profile: { ...profile, email: normEmail } })
+  log.info('qbo.customer_update.done', { shop, email: normEmail, qboCustomerId })
+  return { synced: true, qboCustomerId: updated?.Id || qboCustomerId }
+}
+
+// Account-section variant: build the QBO profile from the (post-update)
+// WholesaleApplication doc, then delegate to syncQboCustomerProfile. Used by
+// POST /api/update-profile. `application` stores companyName as `businessName`
+// and a single `billingAddress`.
+export async function syncQboCustomerFromApplication({ shop, email, application }) {
+  const app = typeof application?.toObject === 'function' ? application.toObject() : application || {}
+  const profile = {
+    firstName: app.firstName || '',
+    lastName: app.lastName || '',
+    companyName: app.businessName || '',
+    email: String(email || app.email || '').toLowerCase(),
+    phone: app.phone || '',
+    billingAddress: app.billingAddress || null,
+    shippingAddress: app.shippingAddress || app.billingAddress || null,
+  }
+  return syncQboCustomerProfile({ shop, email, profile })
+}
+
 // Ensure the synthetic retail drop-ship customer
 // (DROPSHIP_RETAIL_CUSTOMER_EMAIL) is mapped to a QBO customer, WITHOUT the
 // wholesale NMI-vault / billing-address requirements.
@@ -256,7 +340,19 @@ export async function ensureDropshipCustomerMap({ shop, order }) {
   )
 
   if (!mapping.qboCustomerId) {
-    const { customer } = await findOrCreateQboCustomer(profile)
+    let customer
+    try {
+      ;({ customer } = await findOrCreateQboCustomer(profile))
+    } catch (err) {
+      await notifyQboCustomerSyncFailed({
+        shop,
+        email: profile.email,
+        businessName: profile.companyName,
+        shopifyOrderId: order?.id,
+        error: err,
+      }).catch((e) => log.error('qbo_sync_alert.failed', { err: e?.message || e }))
+      throw err
+    }
     mapping.qboCustomerId = customer.Id
     log.info('dropship.qbo.linked', { email: profile.email, qboCustomerId: customer.Id })
     console.log(`[customers] drop-ship QBO customer linked Id=${customer.Id}`)
@@ -364,6 +460,53 @@ export async function resolveCustomerAchBillingId({ shop, email, customerMap }) 
     {
       $setOnInsert: { shop, email: normalizedEmail },
       $set: { nmiAchBillingId: sourceBillingId, lastSyncedAt: new Date() },
+    },
+    { upsert: true },
+  )
+  return sourceBillingId
+}
+
+// Resolve the NMI CARD billing id for a customer at a specific shop.
+// Sibling of `resolveCustomerAchBillingId`, consulting
+// `wholesale_applications.payment.card.nmi_billing_id`. The card billing id
+// is normally mirrored onto `customer_maps.nmiCardBillingId` at order intake
+// (ensureCustomerForOrder), but a practitioner who updates or ADDS a card via
+// the portal (profile.service) after their last order was processed leaves the
+// cache stale/null. chargeInvoice targets `customerMap.nmiCardBillingId` for
+// card charges, so a stale cache makes a retry hit the vault's default
+// (priority-1) billing instead of the card the practitioner just set — the
+// exact gap this closes on the manual-retry path.
+//
+// Cache-then-source fallback identical to the vault/ACH resolvers:
+//   1. customer_maps.nmiCardBillingId (fast path)
+//   2. wholesale_applications.payment.card.nmi_billing_id (source of truth)
+//   3. lazy sync on miss
+export async function resolveCustomerCardBillingId({ shop, email, customerMap }) {
+  if (!shop || !email) return null
+  const normalizedEmail = String(email).toLowerCase()
+
+  const cached = customerMap?.nmiCardBillingId || null
+  if (cached) return cached
+
+  const app = await WholesaleApplication.findOne({
+    shop,
+    email: normalizedEmail,
+  })
+    .select('payment.card')
+    .lean()
+  const sourceBillingId = app?.payment?.card?.nmi_billing_id || null
+  if (!sourceBillingId) return null
+
+  console.log(
+    `[customers] lazy card billing sync — copying nmi_billing_id=${sourceBillingId} ` +
+      `from wholesale_applications.payment.card → customer_maps for ${normalizedEmail}`,
+  )
+  log.info('vault.card_billing.lazy_sync', { shop, email: normalizedEmail, nmiBillingId: sourceBillingId })
+  await CustomerMap.updateOne(
+    { shop, email: normalizedEmail },
+    {
+      $setOnInsert: { shop, email: normalizedEmail },
+      $set: { nmiCardBillingId: sourceBillingId, lastSyncedAt: new Date() },
     },
     { upsert: true },
   )

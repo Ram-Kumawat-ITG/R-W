@@ -490,7 +490,7 @@ export default function OrdersList() {
   };
 
   return (
-    <s-page inlineSize="large" heading="Orders">
+    <s-page inlineSize="large" heading="Practitioner Orders">
       <OrdersTabBar active="orders" />
 
       <s-section heading="Filters">

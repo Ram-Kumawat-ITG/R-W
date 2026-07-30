@@ -33,7 +33,12 @@ export async function syncCustomerCodeTag(shop, customerGid, newCode, practition
     throw new Error("shop, customerGid, and newCode are required");
   }
 
-  const newCodeTag = `code:${newCode}`;
+  // Lowercase the code so the `code:<code>` tag matches the lowercase
+  // `cdo.active_code` metafield + the discount's lowercase `config.code` (the
+  // Function + auto-apply compare case-insensitively, but keeping the stored
+  // tag lowercase removes any tag↔metafield case divergence and honors this
+  // module's own convention — see resolveCustomerCodeFromTag's comment).
+  const newCodeTag = `code:${String(newCode).toLowerCase().trim()}`;
   const emailTag = practitionerEmail
     ? String(practitionerEmail).toLowerCase().trim()
     : null;

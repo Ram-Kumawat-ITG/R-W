@@ -7,12 +7,36 @@
 import Agenda from 'agenda'
 import { schedulerConfig } from './scheduler.config'
 import { achSyncConfig } from '../payment/achStatusSync.config'
+import { paymentRetryConfig } from '../payment/paymentRetry.config'
 import { createLogger } from '../../utils/logger.utils'
 import { registerJobs, JOB_NAMES } from './jobs'
 
 const log = createLogger('scheduler.service')
 
 const MONGODB_URI = process.env.MONGODB_URI
+
+// Agenda opens its OWN Mongo connection from a connection string and has no
+// dbName option — the database must live in the address URI. Resolve it the
+// SAME way the session store + Mongoose do (DATABASE_NAME → URI path →
+// default) and bake it into the address, so `agenda_jobs` can't land in the
+// driver-default `test` database when MONGODB_URI has no path.
+function resolveAgendaAddress() {
+  try {
+    const url = new URL(MONGODB_URI)
+    const fromPath = url.pathname.substring(1)
+    // Adding a db to the URI path changes MongoDB's default authSource (which
+    // derives from the path). A URI with no path authenticates against `admin`
+    // — pin that explicitly BEFORE we add the path, or auth breaks for a user
+    // created in `admin` (e.g. `root`).
+    if (!url.searchParams.get('authSource')) {
+      url.searchParams.set('authSource', fromPath || 'admin')
+    }
+    url.pathname = '/' + (process.env.DATABASE_NAME || fromPath || 'natural-solutions')
+    return url.toString()
+  } catch {
+    return MONGODB_URI
+  }
+}
 
 let agendaInstance = null
 let startPromise = null
@@ -23,7 +47,7 @@ function buildAgenda() {
   // intervals we tune down to reduce DB chatter.
   const processEvery = schedulerConfig.retryIntervalOverride ? '5 seconds' : '1 minute'
   const agenda = new Agenda({
-    db: { address: MONGODB_URI, collection: 'agenda_jobs' },
+    db: { address: resolveAgendaAddress(), collection: 'agenda_jobs' },
     processEvery,
     maxConcurrency: 5,
     defaultConcurrency: 2,
@@ -102,6 +126,36 @@ async function ensureRecurring(agenda) {
   log.info('scheduler.ach_sync_registered', {
     mode: achSyncConfig.intervalOverride ? 'dev-interval' : 'cron',
     schedule: achSyncConfig.intervalOverride || achSyncConfig.cron,
+  })
+
+  // ── Failed-card auto-retry job ───────────────────────────────────
+  // Independent of the twice-monthly payment-retry ticks: when a card charge
+  // fails, this re-attempts on a 2/4/7-day ladder (max 3) so recovery doesn't
+  // wait for the next regular cycle. Registered here (before the retry
+  // dev-override early-return below) so it runs in dev too.
+  // PAYMENT_RETRY_FAILED_INTERVAL gives a fast testing cadence; otherwise the
+  // cron from config (production default: hourly).
+  if (paymentRetryConfig.intervalOverride) {
+    await agenda.cancel({ name: JOB_NAMES.PROCESS_FAILED_CARD_RETRIES })
+    await agenda.every(
+      paymentRetryConfig.intervalOverride,
+      JOB_NAMES.PROCESS_FAILED_CARD_RETRIES,
+      { tick: 'dev' },
+    )
+    console.log(
+      `\n[scheduler] DEV MODE — process-failed-card-retries running every ${paymentRetryConfig.intervalOverride}\n`,
+    )
+  } else {
+    await agenda.every(
+      paymentRetryConfig.cron,
+      JOB_NAMES.PROCESS_FAILED_CARD_RETRIES,
+      { tick: 'scheduled' },
+      { timezone: paymentRetryConfig.timezone },
+    )
+  }
+  log.info('scheduler.failed_card_retry_registered', {
+    mode: paymentRetryConfig.intervalOverride ? 'dev-interval' : 'cron',
+    schedule: paymentRetryConfig.intervalOverride || paymentRetryConfig.cron,
   })
 
   // ── Drop-ship payment job (REMOVED — replaced by batch payment UI) ──

@@ -21,6 +21,12 @@ export default [
   route("/api/registration-form", "api/registration-form.js"),
   route("/api/auth/check-email", "api/auth/check-email.js"),
   route("/api/update-profile",   "api/update-profile.js"),
+  // Storefront cart gate — reports the logged-in practitioner's PAYMENT
+  // order-hold status so the theme app-embed block (checkout_hold_gate)
+  // can disable the checkout button + show the message BEFORE the buyer
+  // reaches checkout. The checkout-validation Function is the hard block;
+  // this is the UX layer that prevents navigating to /checkout at all.
+  route("/api/storefront/order-hold", "api/storefront/order-hold.js"),
   // Practitioner Portal moved to the ns-retail app (extension + /api/portal/*
   // backend now live there — it owns the cdo_* collections). See ns-retail.
   //
@@ -38,6 +44,7 @@ export default [
   route("/api/portal/summary", "api/portal/summary.js"),
   route("/api/portal/revenue", "api/portal/revenue.js"),
   route("/api/portal/customers", "api/portal/customers.js"),
+  route("/api/portal/patient-code", "api/portal/patient-code.js"),
   route("/api/portal/commissions", "api/portal/commissions.js"),
   route("/api/portal/payouts", "api/portal/payouts.js"),
   route("/api/portal/referrals", "api/portal/referrals.js"),
@@ -59,6 +66,8 @@ export default [
   route("/api/admin/customers/:id/decline", "api/admin/decline.js"),
   route("/api/admin/customers/:id/block", "api/admin/block.js"),
   route("/api/admin/customers/:id/payment-method", "api/admin/payment-method.js"),
+  route("/api/admin/customers/:id/card-fee-override", "api/admin/card-fee-override.js"),
+  route("/api/admin/customers/:id/clear-order-hold", "api/admin/clear-order-hold.js"),
   route("/api/admin/orders/:id/retry-payment", "api/admin/retry-payment.js"),
   route("/api/admin/orders/:id/sync-ach-status", "api/admin/sync-ach-status.js"),
   route("/api/admin/orders/:id/mark-cheque-paid", "api/admin/mark-cheque-paid.js"),
@@ -71,6 +80,11 @@ export default [
   route("/api/admin/orders/:id/resume-auto-charge", "api/admin/resume-auto-charge.js"),
   route("/api/admin/orders/:id/pause-reminders", "api/admin/pause-reminders.js"),
   route("/api/admin/orders/:id/resume-reminders", "api/admin/resume-reminders.js"),
+  // Global (not per-invoice) — pause/resume the process-pending-payments
+  // CRON's two email notifications (customer "Payment Failed" + admin
+  // "Batch Processing Summary"). Charge processing is unaffected.
+  route("/api/admin/cron-notifications/pause", "api/admin/pause-cron-notifications.js"),
+  route("/api/admin/cron-notifications/resume", "api/admin/resume-cron-notifications.js"),
   route("/api/admin/admin-order-batch", "api/admin/admin-order-batch.js"),
   route("/api/sync/retail-order", "api/sync/retail-order.js"),
   route("/api/sync/retail-inventory-update", "api/sync/retail-inventory-update.js"),

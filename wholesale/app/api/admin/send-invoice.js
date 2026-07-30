@@ -4,8 +4,7 @@ import connectDB from '../../services/APIService/mongo.service'
 import ShopifyOrder from '../../models/order.server'
 import Invoice from '../../models/invoice.server'
 import CustomerMap from '../../models/customerMap.server'
-import { sendInvoiceEmail } from '../../services/qbo/qbo.service'
-import { appendInvoiceRemark, recordEmailEvent } from '../../services/invoice/invoice.service'
+import { enqueueInvoiceEmail } from '../../services/email/emailQueue.service'
 import { sendResponse } from '../../services/APIService/api.service'
 
 // POST /api/admin/orders/:id/send-invoice
@@ -89,55 +88,29 @@ export async function action({ request, params }) {
       `invoice=${invoice._id} qboInvoice=${invoice.qboInvoiceId} sendTo=${sendTo} by=${initiatedBy}`,
   )
 
-  try {
-    await sendInvoiceEmail({ qboInvoiceId: invoice.qboInvoiceId, sendTo })
-  } catch (err) {
-    const msg = `QBO invoice send failed: ${err?.message || 'unknown error'}`
-    console.error(`[admin/send-invoice] ${msg}`)
-    // Persist the failure so it surfaces on the Order Details page —
-    // both as the headline lastEmailError and as a row in the
-    // emailEvents[] audit ledger so admins can see exactly when /
-    // who attempted it.
-    invoice.lastEmailError = msg
-    recordEmailEvent(invoice, {
-      triggerType: 'manual',
-      triggeredBy: initiatedBy,
-      source: 'manual_resend',
-      recipient: sendTo,
-      status: 'failed',
-      errorMessage: err?.message || 'unknown error',
-    })
-    await invoice.save()
-    return sendResponse(502, 'error', msg, null)
-  }
-
-  // Advance the baseline to the current state so the lifecycle
-  // dispatcher's amount-grew / status-change re-send rule doesn't
-  // immediately fire a duplicate on the next payment event.
-  const now = new Date()
-  if (!invoice.invoiceEmailSentAt) invoice.invoiceEmailSentAt = now
-  invoice.invoiceEmailLastSentAt = now
-  invoice.invoiceEmailedStatus = invoice.paymentStatus
-  invoice.invoiceEmailedAmountPaid = Number((invoice.amountPaid || 0).toFixed(2))
-  invoice.lastEmailError = undefined
-  recordEmailEvent(invoice, {
+  // Hand the QBO send off to the durable background job instead of blocking
+  // this request on the QBO round-trip. The job reloads the invoice, sends,
+  // advances the lifecycle-dispatcher baseline, and writes the emailEvents[]
+  // audit ledger (success OR failure) — so the Order Details page still
+  // surfaces the outcome, just moments later. Delivery is retried across
+  // process restarts.
+  const queued = await enqueueInvoiceEmail({
+    shop: session.shop,
+    invoiceId: invoice._id,
+    sendTo,
     triggerType: 'manual',
     triggeredBy: initiatedBy,
     source: 'manual_resend',
-    recipient: sendTo,
-    status: 'sent',
-  })
-  await invoice.save()
-
-  await appendInvoiceRemark(invoice._id, {
-    kind: 'admin_action',
-    message: `Admin sent invoice email to ${sendTo} by ${initiatedBy}`,
-    source: 'admin',
+    remark: `Admin sent invoice email to ${sendTo} by ${initiatedBy}`,
   })
 
-  return sendResponse(200, 'success', `Invoice emailed to ${sendTo}`, {
+  if (!queued.success) {
+    return sendResponse(502, 'error', 'Could not queue the invoice email — please try again', null)
+  }
+
+  return sendResponse(202, 'success', `Invoice email queued for ${sendTo}`, {
     sentTo: sendTo,
     qboInvoiceId: invoice.qboInvoiceId,
-    sentAt: now.toISOString(),
+    queued: true,
   })
 }

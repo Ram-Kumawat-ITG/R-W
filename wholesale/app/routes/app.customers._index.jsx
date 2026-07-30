@@ -10,6 +10,7 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import connectDB from "../services/APIService/mongo.service";
 import WholesaleApplication from "../models/wholesaleApplication.server";
+import { getNotificationSettings } from "../services/scheduler/cronNotificationSettings.service";
 
 export const loader = async ({ request }) => {
   await authenticate.admin(request);
@@ -22,7 +23,14 @@ export const loader = async ({ request }) => {
     )
     .lean();
 
+  const emailPause = await getNotificationSettings();
+
   return {
+    emailPause: {
+      paused: emailPause.emailNotificationsPaused === true,
+      pausedAt: emailPause.pausedAt ? new Date(emailPause.pausedAt).toISOString() : null,
+      pausedBy: emailPause.pausedBy || null,
+    },
     rows: rows.map((r) => ({
       id: r._id.toString(),
       firstName: r.firstName || "",
@@ -51,7 +59,7 @@ const STATUS_FILTERS = [
 const PAGE_SIZE = 15;
 
 export default function CustomersList() {
-  const { rows } = useLoaderData();
+  const { rows, emailPause } = useLoaderData();
   const navigate = useNavigate();
   const navigation = useNavigation();
   const shopify = useAppBridge();
@@ -65,12 +73,41 @@ export default function CustomersList() {
   const [decliningId, setDecliningId] = useState(null);
   const [pendingDeclineRow, setPendingDeclineRow] = useState(null);
   const declineFetcher = useFetcher();
-  const syncFetcher = useFetcher();
-  const invFetcher = useFetcher();
-  const tagFetcher = useFetcher();
-  const handledSyncRef = useRef(null);
-  const handledInvRef = useRef(null);
-  const handledTagRef = useRef(null);
+  const emailPauseFetcher = useFetcher();
+
+  // Global email kill switch. Optimistically reflect the in-flight toggle so
+  // the banner flips immediately; the loader revalidates on completion.
+  const emailBusy = emailPauseFetcher.state !== "idle";
+  const emailPaused =
+    emailPauseFetcher.data?.result?.emailNotificationsPaused ??
+    emailPause?.paused ??
+    false;
+
+  useEffect(() => {
+    if (emailPauseFetcher.state === "idle" && emailPauseFetcher.data) {
+      const paused = emailPauseFetcher.data?.result?.emailNotificationsPaused;
+      shopify.toast.show(
+        paused
+          ? "All email notifications are now PAUSED"
+          : "Email notifications resumed",
+      );
+      revalidator.revalidate();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [emailPauseFetcher.state, emailPauseFetcher.data]);
+
+  const toggleEmailPause = () => {
+    emailPauseFetcher.submit(
+      {},
+      {
+        method: "post",
+        action: emailPaused
+          ? "/api/admin/cron-notifications/resume"
+          : "/api/admin/cron-notifications/pause",
+        encType: "application/json",
+      },
+    );
+  };
   const declineModalRef = useRef(null);
   const loadedToastShown = useRef(false);
   // Track which response payload we've already handled so React-Router's
@@ -169,79 +206,6 @@ export default function CustomersList() {
     }
   }, [declineFetcher.data, declineFetcher.state, shopify]);
 
-  useEffect(() => {
-    if (!syncFetcher.data) return;
-    if (syncFetcher.state !== "idle") return;
-    if (handledSyncRef.current === syncFetcher.data) return;
-    handledSyncRef.current = syncFetcher.data;
-
-    if (syncFetcher.data.status === "success") {
-      const r = syncFetcher.data.result || {};
-      shopify?.toast?.show(
-        `Sync done: ${r.synced ?? 0} synced, ${r.failed ?? 0} failed`,
-      );
-    } else {
-      shopify?.toast?.show(syncFetcher.data.message || "Sync failed.", {
-        isError: true,
-      });
-    }
-  }, [syncFetcher.data, syncFetcher.state, shopify]);
-
-  useEffect(() => {
-    if (!invFetcher.data) return;
-    if (invFetcher.state !== "idle") return;
-    if (handledInvRef.current === invFetcher.data) return;
-    handledInvRef.current = invFetcher.data;
-    if (invFetcher.data.status === "success") {
-      const r = invFetcher.data.result || {};
-      shopify?.toast?.show(
-        `Inventory snapshot done: ${r.updated ?? 0} items updated`,
-      );
-    } else {
-      shopify?.toast?.show(
-        invFetcher.data.message || "Inventory snapshot failed.",
-        { isError: true },
-      );
-    }
-  }, [invFetcher.data, invFetcher.state, shopify]);
-
-  const runSyncBackfill = () =>
-    syncFetcher.submit(null, {
-      method: "POST",
-      action: "/api/admin/sync/backfill",
-    });
-
-  const runInventorySnapshot = () =>
-    invFetcher.submit(null, {
-      method: "POST",
-      action: "/api/admin/sync/inventory-snapshot",
-    });
-
-  const runTagBackfill = () =>
-    tagFetcher.submit(null, {
-      method: "POST",
-      action: "/api/admin/backfill-customer-tags",
-    });
-
-  useEffect(() => {
-    if (!tagFetcher.data) return;
-    if (tagFetcher.state !== "idle") return;
-    if (handledTagRef.current === tagFetcher.data) return;
-    handledTagRef.current = tagFetcher.data;
-    if (tagFetcher.data.status === "success") {
-      const r = tagFetcher.data.result || {};
-      shopify?.toast?.show(
-        `Tagged ${r.tagged ?? 0} / ${r.totalScanned ?? 0} customers ` +
-          `(already tagged: ${r.alreadyTagged ?? 0}, failed: ${r.failed ?? 0})`,
-      );
-    } else {
-      shopify?.toast?.show(
-        tagFetcher.data.message || "Customer tag backfill failed.",
-        { isError: true },
-      );
-    }
-  }, [tagFetcher.data, tagFetcher.state, shopify]);
-
   const openDeclineModal = (row) => {
     if (!row?.id) return;
     setPendingDeclineRow(row);
@@ -260,39 +224,53 @@ export default function CustomersList() {
     setPendingDeclineRow(null);
   };
 
-  const syncBusy =
-    syncFetcher.state === "submitting" || syncFetcher.state === "loading";
-  const invBusy =
-    invFetcher.state === "submitting" || invFetcher.state === "loading";
-  const tagBusy =
-    tagFetcher.state === "submitting" || tagFetcher.state === "loading";
-
   return (
     <s-page inlineSize="large" heading="Wholesale applications">
-      <s-button
-        slot="primary-action"
-        variant="secondary"
-        onClick={runInventorySnapshot}
-        {...(invBusy ? { loading: true } : {})}
-      >
-        {invBusy ? "Snapshotting…" : "Snapshot inventory"}
-      </s-button>
-      <s-button
-        slot="secondary-actions"
-        variant="secondary"
-        onClick={runSyncBackfill}
-        {...(syncBusy ? { loading: true } : {})}
-      >
-        {syncBusy ? "Syncing…" : "Sync products to retail"}
-      </s-button>
-      <s-button
-        slot="secondary-actions"
-        variant="secondary"
-        onClick={runTagBackfill}
-        {...(tagBusy ? { loading: true } : {})}
-      >
-        {tagBusy ? "Backfilling…" : "Backfill customer tags"}
-      </s-button>
+      {/* Global email kill switch — silences ALL outbound email (SMTP
+          notifications, QuickBooks invoice emails, Shopify invites) from a
+          single control. Does not affect charge processing, invoicing, or
+          data sync — only email delivery. */}
+      <s-section padding="none">
+        <s-banner
+          tone={emailPaused ? "critical" : "info"}
+          heading={
+            emailPaused
+              ? "All email notifications are PAUSED"
+              : "Email notifications are active"
+          }
+        >
+          <s-stack direction="block" gap="small-200">
+            <s-text>
+              {emailPaused
+                ? "No emails are being sent from any source — SMTP notifications, QuickBooks invoice emails, and Shopify invites are all suppressed. Charging, invoicing, and data sync are unaffected."
+                : "Use this to stop ALL outbound customer + admin email from every source (SMTP, QuickBooks invoices, Shopify invites) in one click — e.g. while working with migrated/real customer data."}
+            </s-text>
+            {emailPaused && emailPause?.pausedBy ? (
+              <s-text tone="subdued">
+                Paused by {emailPause.pausedBy}
+                {emailPause.pausedAt
+                  ? ` on ${new Date(emailPause.pausedAt).toLocaleString()}`
+                  : ""}
+              </s-text>
+            ) : null}
+            <s-box>
+              <s-button
+                variant={emailPaused ? "secondary" : "primary"}
+                tone={emailPaused ? undefined : "critical"}
+                onClick={toggleEmailPause}
+                {...(emailBusy ? { loading: true } : {})}
+              >
+                {emailBusy
+                  ? "Working…"
+                  : emailPaused
+                    ? "Resume email notifications"
+                    : "Stop all email notifications"}
+              </s-button>
+            </s-box>
+          </s-stack>
+        </s-banner>
+      </s-section>
+
       <s-section padding="none">
         <s-box padding="base">
           <s-stack direction="block" gap="base">

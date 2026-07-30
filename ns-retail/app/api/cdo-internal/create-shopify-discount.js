@@ -23,9 +23,15 @@ import { createShopifyDiscount } from "../../services/cdo/cdo.discount.service";
 //   {
 //     code             string  — practitioner code, e.g. "john_a3f1c8e2"
 //     discountPercent  number  — fraction, e.g. 0.10 for 10%
+//     practitionerId   string  — owning practitioner's id (REQUIRED — written to
+//                                the discount's config metafield so the
+//                                practitioner-discount Function can gate on it)
 //     practitionerName string  — for the discount title (admin-readable)
 //     shop             string  — retail Shopify shop domain (xxx.myshopify.com)
 //   }
+//
+// NOTE: the wholesale-side caller (`generatePractitionerCode()`) must be
+// updated to send `practitionerId` in its request body — this field is new.
 //
 // Returns:
 //   { status: 'success', result: { shopifyDiscountId, shopifyDiscountUrl } }
@@ -63,6 +69,7 @@ export async function action({ request }) {
 
   const code = String(body?.code || "").trim();
   const discountPercent = Number(body?.discountPercent || 0);
+  const practitionerId = String(body?.practitionerId || "").trim();
   const practitionerName = String(body?.practitionerName || "").trim();
   const shop = String(body?.shop || "").trim();
 
@@ -71,6 +78,9 @@ export async function action({ request }) {
   }
   if (!shop) {
     return json(400, { status: "error", message: "shop required" });
+  }
+  if (!practitionerId) {
+    return json(400, { status: "error", message: "practitionerId required" });
   }
   if (
     !Number.isFinite(discountPercent) ||
@@ -89,6 +99,7 @@ export async function action({ request }) {
     shop,
     code,
     discountPercent,
+    practitionerId,
     practitionerName,
   });
 

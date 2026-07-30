@@ -132,6 +132,34 @@ export function deriveDeliveryStatus(fulfillments) {
   return lowestKey
 }
 
+// Roll fulfillments[] up into an order-level FULFILLMENT (shipping) status,
+// self-healing a stale/missing order-level value. Trusts an explicit
+// Shopify-reported terminal value (fulfilled / partial / restocked / returned
+// / cancelled) and otherwise infers 'fulfilled' when any active shipment has
+// actually shipped — so an order that carries tracking can never display as
+// 'Unfulfilled' (the reported list/detail bug where the Fulfillment badge and
+// the Delivery-status badge disagreed). Mirrors the ns-retail intake
+// self-heal. Pure + isomorphic — safe from a loader or a render path.
+export function deriveFulfillmentStatus(rawStatus, fulfillments) {
+  const raw = String(rawStatus || '').toLowerCase()
+  if (raw === 'fulfilled') return 'fulfilled'
+  if (raw === 'partial' || raw === 'partially_fulfilled') return 'partially_fulfilled'
+  if (raw === 'restocked') return 'restocked'
+  if (raw === 'returned') return 'returned'
+  if (raw === 'cancelled') return 'cancelled'
+  // Order-level field absent/unfulfilled → self-heal from the shipments.
+  const active = (Array.isArray(fulfillments) ? fulfillments : []).filter(
+    (f) => String(f?.status || '').toLowerCase() !== 'cancelled',
+  )
+  const anyShipped = active.some(
+    (f) =>
+      String(f?.shipmentStatus || '').trim() ||
+      ['success', 'open'].includes(String(f?.status || '').toLowerCase()),
+  )
+  if (anyShipped) return 'fulfilled'
+  return raw || 'unfulfilled'
+}
+
 // Resolve the customer-facing tracking link:
 //   1. A carrier deep-link from the template map (base ∪ extraTemplates),
 //      with the tracking number pre-filled.

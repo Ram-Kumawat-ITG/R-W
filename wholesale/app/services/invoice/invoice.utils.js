@@ -159,9 +159,13 @@ export function shopifyLinesToQboLines(order) {
       quantity: qty,
       unitPrice,
       amount,
-      // Carried for per-product QBO Item resolution (SKU column). The QBO
-      // service resolves `sku` → a QBO Item (carrying that SKU) and sets the
-      // line's qboItemId; lines without a sku stay on the default item.
+      // Carried for per-product QBO Item resolution. The QBO service resolves
+      // each line to its QBO Inventory Item via the durable Shopify↔QBO product
+      // mapping (qbo_product_maps, keyed by variant id — the proactive product
+      // sync), falling back to a SKU lookup, then the default item. `sku` also
+      // drives QBO's SKU column (Item.Sku). Lines with neither a variant id nor
+      // a sku stay on the default item.
+      variantId: item.variant_id != null ? String(item.variant_id) : undefined,
       sku: item.sku ? String(item.sku).trim() : undefined,
       name: item.name || item.title || undefined,
     })
@@ -233,6 +237,23 @@ export function computeProcessingFee({ baseAmount, method, rates }) {
   return { amount, rate, method, label: processingFeeLabel(method) }
 }
 
+// Apply a per-practitioner CARD-fee override to the base per-method rate map.
+// The override replaces ONLY the `card` rate — `ach` and `check` are left at
+// their configured defaults, so a practitioner who pays by ACH always gets the
+// standard ACH rate regardless of any card override. Pass the result as the
+// `rates` argument to computeProcessingFee.
+//
+// `cardFeeOverridePercent` is a fraction (0 = 0%, 0.015 = 1.5%); `null`/
+// undefined (or an invalid/negative value) means "no override — use the
+// defaults". NOTE 0 is a valid, distinct override (explicit "no card fee") and
+// is preserved here; only null/undefined falls through to the default.
+export function effectiveFeeRates(baseRates, cardFeeOverridePercent) {
+  if (cardFeeOverridePercent === null || cardFeeOverridePercent === undefined) return baseRates
+  const n = Number(cardFeeOverridePercent)
+  if (!Number.isFinite(n) || n < 0) return baseRates
+  return { ...baseRates, card: n }
+}
+
 // Build a processing-fee invoice line. Used to append the line to a QBO
 // invoice at settlement. The description encodes the method label, the rate
 // as a percentage, AND the calculation basis when known, so the line is
@@ -283,8 +304,13 @@ export function computeInvoiceCalculation({ totals, fee, grandTotalOverride }) {
   const shipping = Number(totals.shipping ?? 0)
   const tax = Number(totals.tax ?? 0)
   const feeAmount = fee ? Number(fee.amount ?? 0) : 0
+  // When Shopify prices are tax-INCLUSIVE, the (adjusted) subtotal already
+  // contains the tax, so adding `tax` again would double-count it in the
+  // computed grand total. The tax row is still shown for information (the
+  // render labels it "included"); it just isn't summed a second time.
+  const taxForTotal = totals.taxesIncluded ? 0 : tax
   const computedGrand = Number(
-    (adjustedSubtotal + shipping + tax + feeAmount).toFixed(2),
+    (adjustedSubtotal + shipping + taxForTotal + feeAmount).toFixed(2),
   )
   const grandTotal = Number.isFinite(grandTotalOverride)
     ? Number(grandTotalOverride.toFixed(2))

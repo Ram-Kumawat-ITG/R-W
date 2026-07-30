@@ -20,6 +20,7 @@ import CdoPractitionerCode from "../../models/cdoPractitionerCode.server";
 import {
   resolvePractitionerReferral,
   checkPatientBinding,
+  resolvePatientPractitioner,
 } from "../../services/cdo/cdo.service";
 import { syncCustomerCodeTag, lookupCustomerByEmail } from "../../utils/customerTags";
 
@@ -146,6 +147,27 @@ export async function action({ request }) {
             reason: "bound_other",
           },
         });
+      }
+
+      // Already attributed to THIS practitioner → locked to the assigned code;
+      // a different code can't be self-applied (only the practitioner can
+      // reassign via the portal). Mirrors the validate endpoint + the Function.
+      if (!verdict.firstTime) {
+        const binding = await resolvePatientPractitioner({ email, customerId });
+        const assigned = binding?.code
+          ? String(binding.code).toLowerCase().trim()
+          : null;
+        if (assigned && assigned !== String(referral.code).toLowerCase().trim()) {
+          return json(200, {
+            status: "success",
+            message: "This isn't your assigned discount code",
+            result: {
+              ok: false,
+              tagged: false,
+              reason: "locked_code",
+            },
+          });
+        }
       }
     }
 

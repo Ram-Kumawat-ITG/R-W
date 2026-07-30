@@ -98,7 +98,12 @@ export function toCustomerPayload(profile) {
 //     on the invoice so the QBO total matches Shopify's post-discount total.
 //   - everything else      → a SalesItemLineDetail (products, shipping, tax,
 //     processing fee).
-export function toInvoiceLine(item, defaultItemId) {
+// `taxCode` (optional) — a QBO TaxCode id ("TAX" / "NON" / a group id) set on
+// the SalesItemLineDetail. Supplied only when the order carries tax; marking
+// the line taxable is what makes QBO honor the TotalTax override (see
+// qbo.service.createInvoice). Omitted → QBO applies the customer/company
+// default (unchanged behavior for tax-free orders). No effect on discount lines.
+export function toInvoiceLine(item, defaultItemId, taxCode) {
   const amount = Number(item.amount)
   if (!Number.isFinite(amount)) {
     throw new Error(`Invoice line amount is not numeric: ${item.amount}`)
@@ -119,6 +124,7 @@ export function toInvoiceLine(item, defaultItemId) {
       ItemRef: { value: item.qboItemId || defaultItemId },
       Qty: item.quantity ?? 1,
       UnitPrice: item.unitPrice ?? amount,
+      ...(taxCode ? { TaxCodeRef: { value: taxCode } } : {}),
     },
   }
 }

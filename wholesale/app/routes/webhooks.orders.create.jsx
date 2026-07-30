@@ -15,19 +15,7 @@ import { authenticate } from '../shopify.server'
 import connectDB from '../services/APIService/mongo.service'
 import { scheduleNow, JOB_NAMES } from '../services/scheduler/scheduler.service'
 import { processShopifyOrder } from '../services/order/order.service'
-import { isSyncEnabled, deductRetailInventoryForOrder } from '../services/sync/index'
 import { createLogger } from '../utils/logger.utils'
-
-// Module-level dedup for retail deduction — guards against Shopify's
-// at-least-once webhook delivery firing deductRetailInventoryForOrder twice
-// for the same order. Each entry auto-expires after 5 minutes.
-const _dedupedWebhookIds = new Set()
-function claimWebhookForSync(id) {
-  if (!id || _dedupedWebhookIds.has(id)) return false
-  _dedupedWebhookIds.add(id)
-  setTimeout(() => _dedupedWebhookIds.delete(id), 5 * 60 * 1000)
-  return true
-}
 
 const log = createLogger('webhook.orders_create')
 
@@ -134,14 +122,13 @@ export const action = async ({ request }) => {
     return new Response('Enqueue failed', { status: 500 })
   }
 
-  // Cross-store sync: deduct retail inventory for the same quantities.
-  // Fire-and-forget — sync failure must never affect the 200 response.
-  // claimWebhookForSync prevents double-deduction when Shopify retries the
-  // same webhook (at-least-once delivery).
-  if (isSyncEnabled() && claimWebhookForSync(webhookId)) {
-    deductRetailInventoryForOrder(payload)
-      .catch((err) => log.error('retail_inventory_deduct.failed', { shop, orderId: payload.id, err }))
-  }
+  // NOTE: retail inventory is intentionally NOT deducted here. The order
+  // deducts wholesale stock natively (wholesale is the single source of
+  // truth); Shopify then fires inventory_levels/update, and
+  // webhooks.inventory_levels.update.jsx mirrors the new wholesale quantity to
+  // BOTH the retail store and QBO. Deducting retail here as well is what
+  // previously double-deducted the retail store — see the deprecated
+  // deductRetailInventoryForOrder in services/sync/inventory.sync.js.
 
   return new Response(null, { status: 200 })
 }

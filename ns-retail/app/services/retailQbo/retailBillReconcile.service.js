@@ -38,6 +38,7 @@ import {
   billPaymentWebUrl,
 } from "./retailQbo.service";
 import { createLogger } from "../../utils/logger.utils";
+import { notifyVendorBillFailed } from "../notifications/vendorBillNotification.service";
 
 const log = createLogger("retail.bill_reconcile");
 
@@ -291,6 +292,18 @@ export async function reconcileRetailVendorBillForOrder({ shop, shopifyOrderId, 
       },
     );
     log.error("bill.reconcile_failed", { shopifyOrderId, billId, err });
+    notifyVendorBillFailed({
+      stage: "reconciliation",
+      shopifyOrderId,
+      orderName: order.orderName,
+      billId,
+      billDocNumber: order.retailQbo?.qboBillDocNumber,
+      totalAmount: order.retailQbo?.qboBillTotal,
+      currency: order.currency,
+      reason: msg,
+      errorDetail: err?.stack,
+      failedAt: new Date(),
+    }).catch((e) => log.error("bill.reconcile_notification_failed", { err: e?.message || e }));
     return { ok: false, reason: "error", error: msg };
   }
 }

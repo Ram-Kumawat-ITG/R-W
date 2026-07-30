@@ -13,6 +13,7 @@ export const CDO_TABS = [
   { label: "Referrals", path: `${CDO_BASE}/referrals` },
   { label: "Transactions", path: `${CDO_BASE}/transactions` },
   { label: "Reports", path: `${CDO_BASE}/reports` },
+  { label: "Migration", path: `${CDO_BASE}/migration` },
   { label: "Settings", path: `${CDO_BASE}/settings` },
 ];
 

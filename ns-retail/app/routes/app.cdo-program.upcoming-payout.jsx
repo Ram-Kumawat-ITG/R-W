@@ -147,7 +147,11 @@ export default function UpcomingPayoutBatch() {
             label="Commission Liability"
             value={formatCurrency(details.totalAmount)}
             tone="critical"
-            sublabel={`${formatNumber(details.commissionCount)} pending commission(s)`}
+            sublabel={
+              details.deferredByCeilingCount > 0
+                ? `Capped at ${formatCurrency(details.maxTransferAmount)} transfer ceiling`
+                : `${formatNumber(details.commissionCount)} pending commission(s)`
+            }
           />
           <MetricCard
             label="Payout Date"
@@ -179,6 +183,20 @@ export default function UpcomingPayoutBatch() {
           </s-stack>
         )}
       </s-section>
+
+      {/* Batch transfer ceiling notice */}
+      {details.deferredByCeilingCount > 0 && (
+        <s-section heading="Transfer Ceiling Reached">
+          <s-box padding="base" background="bg-surface-secondary" border-radius="base">
+            <s-text tone="subdued">
+              This run is capped at the {formatCurrency(details.maxTransferAmount)} transfer
+              ceiling (CDO_PAYOUT_MAX_TRANSFER_AMOUNT). {formatNumber(details.deferredByCeilingCount)}{" "}
+              commission(s) totalling {formatCurrency(details.deferredByCeilingTotal)} exceed the
+              ceiling and will carry forward automatically to the next payout run.
+            </s-text>
+          </s-box>
+        </s-section>
+      )}
 
       {/* Below-minimum notice */}
       {details.belowMinimumCount > 0 && (

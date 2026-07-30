@@ -3,6 +3,7 @@ import { authenticate } from "../shopify.server";
 import { listOrders } from "../services/cdo/cdo.service";
 import DataTable from "../components/cdo/DataTable";
 import StatusBadge from "../components/cdo/StatusBadge";
+import { MigratedBadge, MIGRATED_FILTER } from "../components/cdo/MigratedBadge";
 import { formatCurrency, formatDate } from "../utils/format";
 
 export const loader = async ({ request }) => {
@@ -25,7 +26,16 @@ const COLUMNS = [
     header: "Commission",
     render: (r) => formatCurrency(r.commissionAmount, r.currency),
   },
-  { key: "status", header: "Status", render: (r) => <StatusBadge status={r.status} /> },
+  {
+    key: "status",
+    header: "Status",
+    render: (r) => (
+      <s-stack direction="inline" gap="small-200" alignItems="center">
+        <StatusBadge status={r.status} />
+        <MigratedBadge migrated={r.migrated} />
+      </s-stack>
+    ),
+  },
   { key: "placedAt", header: "Date", render: (r) => formatDate(r.placedAt) },
 ];
 
@@ -35,6 +45,7 @@ export default function CdoOrders() {
     <DataTable
       columns={COLUMNS}
       rows={rows}
+      filters={[MIGRATED_FILTER]}
       searchKeys={["orderName", "practitionerName", "customerName", "status"]}
       searchPlaceholder="Search by order, practitioner, or customer"
       description="Shopify orders attributed to CDO practitioners through referral tracking."

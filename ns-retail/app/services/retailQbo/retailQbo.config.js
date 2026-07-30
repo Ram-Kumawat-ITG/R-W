@@ -49,6 +49,40 @@ export const retailQboConfig = {
   salesItemName: readEnv("QBO_RETAIL_ITEM_NAME", { fallback: "Retail Sales" }),
   incomeAccountId: readEnv("QBO_RETAIL_INCOME_ACCOUNT_ID"),
 
+  // Sales-tax code applied at the transaction level (TxnTaxDetail.TxnTaxCodeRef)
+  // so the tax the customer paid in Shopify renders as QBO's summary "Tax" row.
+  // For a manual-sales-tax QBO company this must be a taxable TaxCode id (e.g. a
+  // tax group). When unset, the service auto-resolves the company's default from
+  // Preferences.TaxPrefs.TaxGroupCodeRef. Only used when the order carries tax.
+  taxCodeId: readEnv("QBO_RETAIL_TAX_CODE_ID"),
+
+  // ── Proactive Shopify → Retail-QBO product (Products & Services) sync ──
+  // When ON, the retail store's products/create + products/update webhooks
+  // create/update a QBO Item per variant in the RETAIL realm and maintain the
+  // retail_qbo_product_maps mapping. Only ever syncs the RETAIL Shopify store.
+  // Kill-switch: QBO_RETAIL_PRODUCT_SYNC_ENABLED=false. Defaults ON. NEVER
+  // deletes/deactivates QBO items (retention).
+  productSyncEnabled: readBool("QBO_RETAIL_PRODUCT_SYNC_ENABLED", true),
+  // Create the QBO Items as `Inventory` type (TrackQtyOnHand + QtyOnHand +
+  // InvStartDate) instead of `Service`, so QBO tracks stock. Requires QBO
+  // Plus/Advanced + an Inventory-Asset account + a COGS account. Both accounts
+  // auto-resolve from the retail realm's Chart of Accounts when the ids are
+  // unset. If tracking is on but the accounts can't be resolved (or the plan
+  // tier is too low), item creation GRACEFULLY falls back to Service type so
+  // invoicing/sync never breaks.
+  inventoryTrackingEnabled: readBool("QBO_RETAIL_INVENTORY_TRACKING_ENABLED", true),
+  inventoryAssetAccountId: readEnv("QBO_RETAIL_INVENTORY_ASSET_ACCOUNT_ID", { fallback: null }),
+  inventoryCogsAccountId: readEnv("QBO_RETAIL_INVENTORY_COGS_ACCOUNT_ID", { fallback: null }),
+  // QBO requires an Inventory item's income account to be Detail Type
+  // 'Sales of Product Income' (a generic Service-fee income account is
+  // rejected). Auto-resolved from the Chart of Accounts when unset.
+  productIncomeAccountId: readEnv("QBO_RETAIL_PRODUCT_INCOME_ACCOUNT_ID", { fallback: null }),
+  // Offset account for InventoryAdjustment posts (used to reconcile QtyOnHand
+  // after an item is created — QBO can't PATCH QtyOnHand on a plain item
+  // update). Auto-resolved when unset (prefers an "Inventory Shrinkage" /
+  // adjustment account, else the COGS account).
+  inventoryAdjustmentAccountId: readEnv("QBO_RETAIL_INVENTORY_ADJUSTMENT_ACCOUNT_ID", { fallback: null }),
+
   // Customer-facing email behavior — QBO is the delivery channel. Both default
   // ON per the retail spec; set the env to "false"/"0" to disable.
   //   sendInvoiceOnCreate — email the invoice to the customer right after it's
@@ -73,10 +107,12 @@ export const retailQboConfig = {
   //    the same order. Default ON; set QBO_RETAIL_CREATE_VENDOR_BILL=false to
   //    disable without touching the invoice flow.
   createVendorBill: readBool("QBO_RETAIL_CREATE_VENDOR_BILL", true),
-  // The QBO Vendor the dropship bills post to. Prefer an explicit id; the
-  // existing QBO_RETAIL_ADMIN_VENDOR alias ("all patient bills are recorded as
-  // bills from this vendor") is accepted as a fallback. When NO id is set, the
-  // service find-or-creates the vendor by name/email below.
+  // The QBO Vendor the dropship bills post to. OPTIONAL — when set it's an
+  // authoritative override (backward compatible; the legacy QBO_RETAIL_ADMIN_VENDOR
+  // alias is still accepted). When NO id is set (the intended default now), the
+  // service find-or-creates the vendor by name/email below and PERSISTS the
+  // resolved id in the `retail_qbo_dropship_vendor` mapping for reuse — so no
+  // hardcoded id is required in production. See resolveDropshipVendorId().
   dropshipVendorId:
     readEnv("QBO_RETAIL_DROPSHIP_VENDOR_ID") || readEnv("QBO_RETAIL_ADMIN_VENDOR"),
   dropshipVendorName: readEnv("QBO_RETAIL_DROPSHIP_VENDOR_NAME", {

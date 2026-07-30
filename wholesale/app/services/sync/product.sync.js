@@ -1,6 +1,11 @@
 import IdMap from "./idMap.model";
 import { retailClient } from "./retailApi";
 import { resolveRetailLocationId } from "./sync.utils";
+import {
+  fetchVariantRetailPricingBySku,
+  resolveVariantPricing,
+} from "./retailPricing";
+import { fetchAllCustomMetafieldsForProduct } from "./productMetafields";
 import { createLogger } from "../../utils/logger.utils";
 
 const log = createLogger("sync.product");
@@ -8,11 +13,66 @@ const log = createLogger("sync.product");
 // Build the payload for a retail product create/update from the
 // wholesale webhook payload (Shopify REST format).
 //
-// `includePrice` defaults to FALSE — wholesale and retail have different
-// pricing tiers (retail = ~2× wholesale), so prices should NOT be synced
-// from wholesale to retail. Callers can opt-in with `{ includePrice: true }`
-// for the rare case where prices ARE intentionally mirrored.
-function buildRetailPayload(p, { includePrice = false } = {}) {
+// Pricing sources (checked in order per variant):
+//   1. `pricingBySku` — Map<sku, {price, compareAtPrice}> from the wholesale
+//      variant-level metafields (`custom.retail_price` +
+//      `custom.retail_compare_at_price`, both `money` type). Fetched by
+//      `fetchVariantRetailPricingBySku`. This is the primary + intended
+//      source of retail prices, replaced the old product-level JSON
+//      metafield on 2026-07-17.
+//   2. `includePrice: true` — legacy escape hatch that copies wholesale
+//      prices to retail directly. Only used when explicitly requested;
+//      wholesale ≠ retail pricing tiers, so this is rarely correct.
+//   3. Neither → variant is created WITHOUT a price (Shopify defaults it to
+//      $0). Non-breaking: this matches the pre-metafield behavior.
+//
+// Variant-matching for the update path:
+//   Pass `retailVariantsBySku` = a Map<sku, retailVariantObject> keyed by
+//   SKU. Each wholesale variant is looked up by SKU and the corresponding
+//   retail variant's `id` is injected into the payload so Shopify's PUT
+//   updates the correct row in place. Wholesale variants without a matching
+//   retail SKU are SKIPPED from the payload with a warn log — the retail
+//   variant stays untouched. When `retailVariantsBySku` is null (create
+//   path), all wholesale variants are included and Shopify creates fresh
+//   retail variants.
+//
+// Metafield mirroring (2026-07-28):
+//   Pass `metafieldsData = { productMetafields, variantMetafieldsBySku }`
+//   from `fetchAllCustomMetafieldsForProduct`. Every `custom.*` metafield
+//   present on the wholesale product (product-level) or wholesale variant
+//   (variant-level, matched by SKU) is included in the retail payload's
+//   `metafields[]` — Shopify's REST products endpoint upserts them by
+//   (namespace, key) on create AND update. Values + types pass through
+//   verbatim so text/money/number_decimal/json/list.* all work uniformly.
+//   Definitions (Settings → Custom data) are NOT synced — merchants must
+//   create those on retail separately if they want the field to appear
+//   as a structured admin form input. Values remain readable via API
+//   regardless, which is all that downstream consumers (e.g. the
+//   shipping algorithm reading `custom.pack_category`) require.
+function buildRetailPayload(
+  p,
+  {
+    includePrice = false,
+    pricingBySku = null,
+    retailVariantsBySku = null,
+    metafieldsData = null,
+  } = {},
+) {
+  const productMetafields = metafieldsData?.productMetafields || [];
+  const variantMetafieldsBySku =
+    metafieldsData?.variantMetafieldsBySku || new Map();
+
+  const variants = (p.variants || [])
+    .map((v) =>
+      buildRetailVariant(v, {
+        includePrice,
+        pricingBySku,
+        retailVariantsBySku,
+        variantMetafieldsBySku,
+      }),
+    )
+    .filter(Boolean);
+
   return {
     product: {
       title: p.title,
@@ -22,25 +82,110 @@ function buildRetailPayload(p, { includePrice = false } = {}) {
       tags: p.tags,
       status: p.status,
       options: p.options?.map((o) => ({ name: o.name, values: o.values })),
-      variants: p.variants?.map((v) => ({
-        option1: v.option1,
-        option2: v.option2,
-        option3: v.option3,
-        ...(includePrice && {
-          price: v.price,
-          compare_at_price: v.compare_at_price,
-        }),
-        sku: v.sku,
-        taxable: v.taxable,
-        barcode: v.barcode,
-        inventory_management: "shopify",
-        inventory_policy: v.inventory_policy,
-      })),
+      variants,
       images: p.images
         ?.filter((i) => i.src)
         .map((i) => ({ src: i.src, alt: i.alt || null })),
+      // Product-level `custom.*` metafields — omit the field entirely
+      // when empty (Shopify accepts either, but omission keeps the
+      // payload minimal + avoids a spurious "no changes" write).
+      ...(productMetafields.length > 0 && { metafields: productMetafields }),
     },
   };
+}
+
+// Build one variant entry for the retail payload. Returns null if the
+// variant should be skipped (update path only — no SKU at all on the
+// wholesale variant, so we can't pair with the retail side).
+//
+// New-variant behaviour (2026-07-22 fix): when the wholesale variant has
+// a SKU but no matching retail variant exists yet, we DO include it in
+// the payload — just without an `id` field. Shopify's PUT `/products/{id}`
+// treats variants-without-id as new variants to create on that product.
+// This unlocks the "merchant added a fresh variant to an existing product"
+// flow, which previously silently dropped the new variant.
+function buildRetailVariant(
+  v,
+  {
+    includePrice,
+    pricingBySku,
+    retailVariantsBySku,
+    variantMetafieldsBySku = null,
+  },
+) {
+  const wholesaleSku = String(v?.sku || "").trim();
+
+  // Update path — try to pair with an existing retail variant by SKU.
+  let retailVariantId = null;
+  if (retailVariantsBySku) {
+    if (!wholesaleSku) {
+      log.warn("variant.skip_no_sku", { wholesaleVariantId: v?.id });
+      return null;
+    }
+    const retailVariant = retailVariantsBySku.get(wholesaleSku);
+    if (retailVariant) {
+      // Existing retail variant → update in place with its id.
+      retailVariantId = retailVariant.id;
+    } else {
+      // Fresh wholesale variant with no retail counterpart yet — include
+      // in the payload without `id` so Shopify creates it on the retail
+      // product. Log at info (not warn) — this is expected behaviour.
+      log.info("variant.new_variant_will_create_in_retail", {
+        wholesaleVariantId: v?.id,
+        sku: wholesaleSku,
+      });
+    }
+  }
+
+  const base = {
+    // `id` — critical on the update path so Shopify updates the correct
+    // retail variant in place instead of matching by option combinations.
+    ...(retailVariantId != null && { id: retailVariantId }),
+    option1: v.option1,
+    option2: v.option2,
+    option3: v.option3,
+    sku: v.sku,
+    taxable: v.taxable,
+    barcode: v.barcode,
+    inventory_management: "shopify",
+    inventory_policy: v.inventory_policy,
+    // Physical + shipping fields added 2026-07-14 so retail carrier-service
+    // callback (rates.js) can compute correct package weight + dimensions.
+    // Passed through verbatim from the wholesale variant — Shopify accepts
+    // either `grams` (canonical) or `weight` + `weight_unit` and normalizes.
+    ...(v.grams != null && { grams: v.grams }),
+    ...(v.weight != null && { weight: v.weight }),
+    ...(v.weight_unit && { weight_unit: v.weight_unit }),
+    ...(v.requires_shipping != null && { requires_shipping: v.requires_shipping }),
+    ...(v.position != null && { position: v.position }),
+  };
+
+  const metafieldPricing = resolveVariantPricing(v, pricingBySku);
+  if (metafieldPricing) {
+    base.price = metafieldPricing.price;
+    if (metafieldPricing.compareAtPrice) {
+      base.compare_at_price = metafieldPricing.compareAtPrice;
+    }
+  } else if (includePrice) {
+    base.price = v.price;
+    base.compare_at_price = v.compare_at_price;
+  }
+
+  // Variant-level `custom.*` metafield mirror (2026-07-28): the wholesale
+  // variant may carry arbitrary merchant-owned metafields (color, material,
+  // internal codes, etc.). Include them verbatim so the retail variant
+  // gets the same values. Shopify's REST products endpoint upserts by
+  // (namespace, key) — no separate call needed. Omit the array entirely
+  // when this variant has no custom metafields (Shopify accepts either;
+  // omission keeps the payload minimal).
+  if (variantMetafieldsBySku && wholesaleSku) {
+    const variantMetafields = variantMetafieldsBySku.get(wholesaleSku);
+    if (Array.isArray(variantMetafields) && variantMetafields.length > 0) {
+      base.metafields = variantMetafields;
+    }
+  }
+
+  return base;
 }
 
 // Pair wholesale + retail variant arrays by SKU. Both stores share SKUs
@@ -160,34 +305,105 @@ async function upsertVariantMappings(wholesaleVariants, retailVariants) {
   }
 }
 
-export async function syncProductCreate(wholesaleProduct) {
+// Sentinel retailId stored on the claim row while a retail product create
+// is in flight. Lets a concurrent duplicate webhook (Shopify at-least-once
+// delivery, or the products/update Shopify fires right after create) detect
+// the in-progress create and back off instead of POSTing a second retail
+// product or PUTing against a nonexistent id.
+export const PENDING_RETAIL_ID = "__pending__";
+
+export async function syncProductCreate(wholesaleProduct, { shop } = {}) {
   const wholesaleId = String(wholesaleProduct.id);
 
   const existing = await IdMap.findOne({ entityType: "product", wholesaleId });
   if (existing) {
+    if (existing.retailId === PENDING_RETAIL_ID) {
+      log.warn("product_create.create_in_flight", { wholesaleId });
+      return;
+    }
     log.info("product_create.already_mapped", {
       wholesaleId,
       retailId: existing.retailId,
     });
-    return syncProductUpdate(wholesaleProduct);
+    return syncProductUpdate(wholesaleProduct, { shop });
   }
 
-  const data = await retailClient.post(
-    "products.json",
-    buildRetailPayload(wholesaleProduct),
-  );
-  const retailProduct = data?.product;
-  if (!retailProduct?.id) {
-    throw new Error(
-      `syncProductCreate: no retail product id returned for wholesale ${wholesaleId}`,
-    );
+  // ── Claim-first (2026-07-15) ─────────────────────────────────────────
+  // Insert the mapping row BEFORE the retail POST so the unique
+  // (entityType, wholesaleId) index — not the findOne above — is the real
+  // duplicate guard. Two racing creates (duplicate webhook delivery, or a
+  // restart replay) both pass the findOne when neither has inserted yet;
+  // without this claim both would POST products.json and the loser's
+  // retail product would be a permanent unmapped orphan.
+  try {
+    await IdMap.create({
+      entityType: "product",
+      wholesaleId,
+      retailId: PENDING_RETAIL_ID,
+    });
+  } catch (err) {
+    if (err?.code === 11000) {
+      log.warn("product_create.lost_claim_race", { wholesaleId });
+      return;
+    }
+    throw err;
   }
 
-  await IdMap.create({
-    entityType: "product",
+  // Fetch variant-level retail-pricing metafields from the wholesale
+  // product. Best-effort — missing/malformed metafields yield an empty
+  // Map and we sync without prices (pre-metafield behavior, non-breaking).
+  // `shop` is optional so any legacy/test caller that doesn't pass it
+  // still works.
+  const pricingBySku = shop
+    ? await fetchVariantRetailPricingBySku({ shop, productId: wholesaleId })
+    : new Map();
+  log.info("product_create.retail_pricing", {
     wholesaleId,
-    retailId: String(retailProduct.id),
+    variantsWithPricing: pricingBySku.size,
   });
+
+  // Fetch every `custom.*` metafield on the wholesale product + variants so
+  // they can be mirrored verbatim into the retail record on create.
+  // Best-effort (2026-07-28) — a fetch failure returns an empty result
+  // and the sync proceeds without metafields.
+  const metafieldsData = shop
+    ? await fetchAllCustomMetafieldsForProduct({ shop, productId: wholesaleId })
+    : { productMetafields: [], variantMetafieldsBySku: new Map() };
+  log.info("product_create.custom_metafields", {
+    wholesaleId,
+    productMetafieldCount: metafieldsData.productMetafields.length,
+    variantsWithMetafields: metafieldsData.variantMetafieldsBySku.size,
+  });
+
+  let retailProduct;
+  try {
+    const data = await retailClient.post(
+      "products.json",
+      buildRetailPayload(wholesaleProduct, { pricingBySku, metafieldsData }),
+    );
+    retailProduct = data?.product;
+    if (!retailProduct?.id) {
+      throw new Error(
+        `syncProductCreate: no retail product id returned for wholesale ${wholesaleId}`,
+      );
+    }
+  } catch (err) {
+    // Release the claim so a later retry (webhook redelivery, manual
+    // backfill) can attempt the create again instead of hitting the
+    // "create in flight" guard forever.
+    await IdMap.deleteOne({
+      entityType: "product",
+      wholesaleId,
+      retailId: PENDING_RETAIL_ID,
+    }).catch(() => {});
+    throw err;
+  }
+
+  // Finalize the claim with the real retail id.
+  await IdMap.updateOne(
+    { entityType: "product", wholesaleId },
+    { $set: { retailId: String(retailProduct.id) } },
+  );
   await upsertVariantMappings(
     wholesaleProduct.variants || [],
     retailProduct.variants || [],
@@ -205,7 +421,7 @@ export async function syncProductCreate(wholesaleProduct) {
   return retailProduct;
 }
 
-export async function syncProductUpdate(wholesaleProduct) {
+export async function syncProductUpdate(wholesaleProduct, { shop } = {}) {
   const wholesaleId = String(wholesaleProduct.id);
 
   const mapping = await IdMap.findOne({ entityType: "product", wholesaleId });
@@ -213,11 +429,82 @@ export async function syncProductUpdate(wholesaleProduct) {
     log.warn("product_update.no_mapping", { wholesaleId });
     return;
   }
+  if (mapping.retailId === PENDING_RETAIL_ID) {
+    // A create is still in flight (Shopify fires products/update almost
+    // immediately after products/create) — the create path will push the
+    // full current payload, so skipping here loses nothing.
+    log.warn("product_update.create_in_flight", { wholesaleId });
+    return;
+  }
+
+  // Re-fetch variant retail-pricing metafields on every update — the
+  // merchant may have edited them. Empty Map → sync without prices.
+  const pricingBySku = shop
+    ? await fetchVariantRetailPricingBySku({ shop, productId: wholesaleId })
+    : new Map();
+  log.info("product_update.retail_pricing", {
+    wholesaleId,
+    variantsWithPricing: pricingBySku.size,
+  });
+
+  // Re-fetch every `custom.*` metafield on the wholesale product + variants
+  // on every update — the merchant may have added, edited, or created new
+  // ones. Empty result → sync without metafield changes (no deletion).
+  const metafieldsData = shop
+    ? await fetchAllCustomMetafieldsForProduct({ shop, productId: wholesaleId })
+    : { productMetafields: [], variantMetafieldsBySku: new Map() };
+  log.info("product_update.custom_metafields", {
+    wholesaleId,
+    productMetafieldCount: metafieldsData.productMetafields.length,
+    variantsWithMetafields: metafieldsData.variantMetafieldsBySku.size,
+  });
 
   const retailId = mapping.retailId;
+
+  // ── Pre-fetch retail product to pair variants by SKU (2026-07-14) ───
+  //
+  // Shopify PUT `/products/{id}.json` needs each variant's `id` in the
+  // payload to update the correct variant in place. Without variant IDs,
+  // Shopify falls back to matching by option combinations — which silently
+  // fails to apply price / weight / etc. updates when the option keys
+  // don't line up perfectly (empty SKUs, renamed options, etc.). This was
+  // the root cause of "metafield edit didn't push to retail" bug fixed
+  // 2026-07-14. Fetch retail's current variants, build a SKU → variant
+  // map, and hand it to `buildRetailPayload`; wholesale variants without
+  // a matching retail SKU are skipped (warn logged) so retail is never
+  // silently mangled.
+  const retailVariantsBySku = new Map();
+  try {
+    const preFetch = await retailClient.get(`products/${retailId}.json`);
+    const currentRetailVariants = preFetch?.product?.variants || [];
+    for (const rv of currentRetailVariants) {
+      const sku = String(rv?.sku || "").trim();
+      if (sku) retailVariantsBySku.set(sku, rv);
+    }
+    log.info("product_update.retail_prefetch_ok", {
+      wholesaleId,
+      retailId,
+      retailVariantCount: currentRetailVariants.length,
+      retailSkuCount: retailVariantsBySku.size,
+    });
+  } catch (err) {
+    log.warn("product_update.retail_prefetch_failed", {
+      wholesaleId,
+      retailId,
+      err: err?.message || String(err),
+    });
+    // Fall through — proceed without retail IDs. Existing behavior (Shopify
+    // matches by option combinations) is preserved as the fallback.
+  }
+
   await retailClient.put(
     `products/${retailId}.json`,
-    buildRetailPayload(wholesaleProduct, { includePrice: false }),
+    buildRetailPayload(wholesaleProduct, {
+      pricingBySku,
+      metafieldsData,
+      retailVariantsBySku:
+        retailVariantsBySku.size > 0 ? retailVariantsBySku : null,
+    }),
   );
 
   // Re-fetch to get current retail variant IDs (variants may be added/removed)
@@ -225,6 +512,22 @@ export async function syncProductUpdate(wholesaleProduct) {
   await upsertVariantMappings(
     wholesaleProduct.variants || [],
     retailData?.product?.variants || [],
+  );
+
+  // ── Mirror inventory to retail (2026-07-22 fix) ─────────────────────
+  //
+  // Shopify's Spring '26 variant edit page fires ONLY products/update when
+  // inventory is edited from there — no separate inventory_levels/update
+  // is emitted (unlike the product list's Available column, which fires
+  // both). Without this mirror step, variant-page inventory edits never
+  // propagated to retail. Idempotent when the wholesale inventory-levels
+  // webhook already ran the same set (Shopify accepts identical writes
+  // without side effects), and safe under the double-webhook case because
+  // both paths end up calling `inventory_levels/set` with the same value.
+  await setRetailInventoryForProduct(
+    wholesaleProduct.variants || [],
+    retailData?.product?.variants || [],
+    wholesaleProduct.location_id ?? null,
   );
 
   log.info("product_update.done", { wholesaleId, retailId });
@@ -236,6 +539,14 @@ export async function syncProductDelete(wholesaleProductId) {
   const mapping = await IdMap.findOne({ entityType: "product", wholesaleId });
   if (!mapping) {
     log.warn("product_delete.no_mapping", { wholesaleId });
+    return;
+  }
+  if (mapping.retailId === PENDING_RETAIL_ID) {
+    // Create still in flight — just drop the claim; there is no retail
+    // product to delete yet (and if the racing create does land one, the
+    // next products/delete redelivery or reconciliation pass cleans it up).
+    await IdMap.deleteOne({ entityType: "product", wholesaleId });
+    log.warn("product_delete.pending_claim_dropped", { wholesaleId });
     return;
   }
 

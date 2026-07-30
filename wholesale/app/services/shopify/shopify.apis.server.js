@@ -48,6 +48,30 @@ export async function executeGraphQL(admin, operation, variables) {
     throw new TransientError(`Shopify Admin GraphQL threw: ${err.message}`, { cause: err })
   }
   const json = await res.json()
+
+  // Rate limiting: Shopify GraphQL does NOT return HTTP 429 — it returns a
+  // 200 with `{ errors: [{ extensions: { code: 'THROTTLED' } }], data: null }`.
+  // Left unhandled this surfaces as a confusing downstream failure (e.g.
+  // createCustomer's `data.customer` is undefined → "returned no customer"),
+  // which is exactly what sank the bulk practitioner migration. Classify it
+  // as TransientError so retry wrappers back off and let the cost bucket
+  // refill. MAX_COST_EXCEEDED (single query too expensive) is treated the
+  // same — a smaller/paced retry can still succeed.
+  const topLevelErrors = Array.isArray(json?.errors) ? json.errors : []
+  if (topLevelErrors.length) {
+    const throttled = topLevelErrors.some((e) => {
+      const code = e?.extensions?.code
+      return code === 'THROTTLED' || code === 'MAX_COST_EXCEEDED'
+    })
+    if (throttled) {
+      log.warn('graphql.throttled', { errors: topLevelErrors })
+      throw new TransientError(
+        `Shopify GraphQL throttled: ${topLevelErrors.map((e) => e.message).join('; ')}`,
+        { body: topLevelErrors },
+      )
+    }
+  }
+
   return json
 }
 

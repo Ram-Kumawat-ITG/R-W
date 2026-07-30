@@ -16,7 +16,6 @@ import { authenticate } from "../shopify.server";
 import connectDB from "../services/APIService/mongo.service";
 import WholesaleApplication from "../models/wholesaleApplication.server";
 import { sendResponse } from "../services/APIService/api.service";
-import { syncPractitionerToRetail } from "../services/retailSync/practitioner.service";
 import { createLogger } from "../utils/logger.utils";
 
 const log = createLogger("webhook.customers_delete");

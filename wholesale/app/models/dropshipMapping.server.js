@@ -37,10 +37,11 @@ const dropshipMappingSchema = new mongoose.Schema(
     // ── Amounts (locked at creation, for traceability) ────────────────
     // Sum of retail BASE prices × qty (before patient discount/shipping/tax)
     retailBaseSubtotal: { type: Number, default: 0 },
-    // Sum of the WHOLESALE product prices × qty (sync_id_maps.wholesalePrice;
-    // falls back to ½ of retail when a variant's snapshot isn't populated) —
-    // what wholesale invoices retail for. Informational/audit only; the
-    // invoiced amount is the QBO invoice total built from the order lines.
+    // Sum of the WHOLESALE product prices × qty (resolved BY SKU from
+    // sync_product_maps, then live wholesale Shopify; falls back to ½ of retail
+    // when a SKU resolves nowhere) — what wholesale invoices retail for.
+    // Informational/audit only; the invoiced amount is the QBO invoice total
+    // built from the order lines.
     wholesaleSubtotal: { type: Number, default: 0 },
     currency: { type: String, default: 'USD' },
 

@@ -7,9 +7,9 @@ import {
   ensureRetailInvoiceForOrder,
   ensureRetailPaymentForOrder,
   resyncInvoiceShippingForOrder,
-  sendRetailInvoiceForOrder,
   getRetailInvoicePdf,
 } from "../services/retailQbo/retailOrderInvoice.service";
+import { enqueueRetailInvoiceEmail } from "../services/email/emailQueue.service";
 import { ensureRetailVendorBillForOrder } from "../services/retailQbo/retailVendorBill.service";
 import { reconcileRetailVendorBillForOrder } from "../services/retailQbo/retailBillReconcile.service";
 import StatusBadge from "../components/cdo/StatusBadge";
@@ -141,15 +141,12 @@ export const action = async ({ request }) => {
       return { status: "error", message: r.error || "Nothing to sync yet." };
     }
     if (op === "send-invoice") {
-      const r = await sendRetailInvoiceForOrder({ shop, shopifyOrderId });
-      if (r.ok) return { status: "success", message: `Invoice emailed to ${r.email}.` };
-      if (r.reason === "no_invoice") {
-        return { status: "error", message: "Create the QBO invoice first, then send it." };
-      }
-      if (r.reason === "no_email") {
-        return { status: "error", message: "This order has no customer email to send the invoice to." };
-      }
-      return { status: "error", message: r.error || "Could not send the invoice." };
+      // Hand the QBO send off to the durable background job so this admin
+      // request returns immediately instead of blocking on the QBO round-trip.
+      // The job retries across restarts; failures land in the retailQbo syncLog.
+      const r = await enqueueRetailInvoiceEmail({ shop, shopifyOrderId });
+      if (r.success) return { status: "success", message: "Invoice email queued for sending." };
+      return { status: "error", message: r.error || "Could not queue the invoice email." };
     }
     if (op === "invoice-pdf") {
       const r = await getRetailInvoicePdf({ shop, shopifyOrderId });
@@ -344,7 +341,10 @@ export default function OrderDetail() {
         <s-grid gap="base" gridTemplateColumns="repeat(3, minmax(0, 1fr))">
           <Row label="Order number" value={order.orderNumber || order.orderName} />
           <Row label="Order date" value={formatDateTime(order.placedAt)} />
-          <Row label="Order status" value={order.status} />
+          {/* `order.status` is the CDO commission-workflow status
+              (pending/approved/paid/cancelled), NOT Shopify's order lifecycle —
+              labelled accordingly so it isn't confused with fulfillment state. */}
+          <Row label="CDO status" value={order.status} />
           <Row label="Financial status" value={order.financialStatus} />
           <s-stack direction="block" gap="none">
             <s-text tone="subdued">Shipping status</s-text>
@@ -402,7 +402,7 @@ export default function OrderDetail() {
           <s-grid gap="base" gridTemplateColumns="repeat(4, minmax(0, 1fr))">
             <Row label="Referral code" value={order.referralCode} />
             <Row
-              label="Commission rate"
+              label="Referral configured rate"
               value={order.referral?.commissionRate != null ? formatPercent(order.referral.commissionRate) : "—"}
             />
             <Row label="Practitioner" value={order.practitioner?.name || order.practitioner?.email} />
@@ -456,7 +456,9 @@ export default function OrderDetail() {
       {/* ── Pricing / tax / discount ── */}
       <CollapsibleSection heading="Pricing & discounts" storageKey="r-ord-pricing">
         <s-grid gap="base" gridTemplateColumns="repeat(5, minmax(0, 1fr))">
-          <Row label="Subtotal" value={formatCurrency(p.subtotal, cur)} />
+          {/* Shopify `subtotal_price` is net of line/order discounts — label it
+              so it isn't read as pre-discount alongside the "Discounts" row. */}
+          <Row label="Subtotal (after discounts)" value={formatCurrency(p.subtotal, cur)} />
           <Row label="Shipping" value={formatCurrency(p.totalShipping, cur)} />
           <Row label="Discounts" value={formatCurrency(p.totalDiscounts, cur)} />
           <Row label="Tax" value={formatCurrency(p.totalTax, cur)} />
@@ -581,6 +583,14 @@ export default function OrderDetail() {
             </s-banner>
           ) : null}
 
+          {q && q.qboInvoiceId ? (
+            <s-paragraph tone="subdued" size="small">
+              Reflects the last QBO sync (see “Last sync”). Values may differ if
+              the invoice or bill was edited, paid, or voided directly in
+              QuickBooks.
+            </s-paragraph>
+          ) : null}
+
           {!q || !q.qboInvoiceId ? (
             <s-paragraph tone="subdued">
               No QBO invoice yet. New retail orders are invoiced automatically on placement; for this order use
@@ -601,7 +611,11 @@ export default function OrderDetail() {
               </s-stack>
               <Row label="Invoice number" value={q.qboInvoiceDocNumber} />
               <s-stack direction="block" gap="none">
-                <s-text tone="subdued">Invoice status</s-text>
+                {/* This badge is the QBO SYNC-pipeline state
+                    (pending/creating/created/shipping_synced/error), not the
+                    invoice's open/paid settlement — that's "Invoice payment"
+                    below. Labelled to avoid the two reading as contradictory. */}
+                <s-text tone="subdued">QBO sync status</s-text>
                 <QboStatusBadge status={q?.qboSyncStatus} />
               </s-stack>
               <Row label="Invoice created" value={q.qboCreatedAt ? formatDateTime(q.qboCreatedAt) : "—"} />

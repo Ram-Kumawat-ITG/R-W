@@ -55,6 +55,19 @@ export function mapAddress(a) {
   };
 }
 
+// True when an address carries at least one meaningful street/locality field.
+// Our migration stores a billingAddress OBJECT with empty strings even when
+// no address was provided (needsContactInfo), so a plain truthiness check
+// isn't enough — Shopify rejects an all-empty MailingAddressInput.
+export function hasUsableAddress(a) {
+  if (!a) return false;
+  return Boolean(
+    (a.line1 && String(a.line1).trim()) ||
+      (a.city && String(a.city).trim()) ||
+      (a.zip && String(a.zip).trim()),
+  );
+}
+
 // Build a Shopify order GraphQL id (gid://) from either a numeric id or
 // an already-formatted gid. Idempotent.
 export function toOrderGid(orderId) {

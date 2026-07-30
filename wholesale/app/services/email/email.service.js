@@ -9,6 +9,7 @@ import nodemailer from 'nodemailer'
 import { emailConfig, assertEmailConfigured } from './email.config'
 import { createLogger } from '../../utils/logger.utils'
 import { PermanentError, TransientError, retry } from '../../utils/retry.utils'
+import { isEmailNotificationsPaused } from '../scheduler/cronNotificationSettings.service'
 
 const log = createLogger('email.service')
 
@@ -22,6 +23,15 @@ function getTransporter() {
     port: emailConfig.port,
     secure: emailConfig.secure,
     auth: { user: emailConfig.user, pass: emailConfig.password },
+    // Hard SMTP timeouts so a slow/unreachable mail server can never hang the
+    // caller for the OS-default TCP timeout (minutes). Without these, an
+    // awaited send in a request path (e.g. registration) could block long
+    // enough to trip the Shopify App Proxy / platform gateway timeout. A send
+    // that exceeds these fails fast as a TransientError (retried, then the
+    // caller gets { success:false }).
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 15_000,
   })
   return transporter
 }
@@ -50,6 +60,22 @@ export async function sendEmail({ to, cc, bcc, subject, html, text, attachments,
   if (!subject) return failure('sendEmail: "subject" is required', context)
   if (!html && !text) return failure('sendEmail: one of "html" or "text" is required', context)
 
+  // GLOBAL EMAIL KILL SWITCH — every SMTP email in the app funnels through
+  // here (all notifications, reminders, admin alerts), so this is the single
+  // choke point that silences ALL SMTP mail when an admin flips the global
+  // pause. Returns success:true + skipped so the durable send-email job marks
+  // the message DONE (dropped, not retried) rather than piling up a backlog
+  // that would flood customers on resume. Fails OPEN on a read error so a
+  // transient DB blip can't silently swallow mail during normal operation.
+  try {
+    if (await isEmailNotificationsPaused()) {
+      log.warn('send.skipped_paused', context)
+      return { success: true, skipped: true, reason: 'notifications_paused' }
+    }
+  } catch (err) {
+    log.error('send.pause_check_failed', { ...context, err: err?.message || String(err) })
+  }
+
   try {
     const client = getTransporter()
 
@@ -73,8 +99,13 @@ export async function sendEmail({ to, cc, bcc, subject, html, text, attachments,
         log.warn('send.retry', { ...context, attempt, err, nextDelayMs }),
     })
 
-    log.info('send.success', { ...context, messageId: info.messageId })
-    return { success: true, messageId: info.messageId }
+    // On a test transport (Ethereal) nodemailer returns a preview URL where the
+    // captured message can be viewed — no real delivery happens. Logging it lets
+    // staging verify that a notification actually fired + see its content.
+    // Returns undefined on a real SMTP provider, so this is a no-op in prod.
+    const previewUrl = nodemailer.getTestMessageUrl(info) || null
+    log.info('send.success', { ...context, messageId: info.messageId, previewUrl })
+    return { success: true, messageId: info.messageId, previewUrl }
   } catch (err) {
     log.error('send.failed', { ...context, err })
     return { success: false, error: err.message || 'Failed to send email' }

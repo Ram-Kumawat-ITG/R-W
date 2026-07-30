@@ -92,7 +92,9 @@ export const action = async ({ request }) => {
                 ? "An open payout already exists for this practitioner — approve or mark it paid first."
                 : skip?.reason === "below_minimum"
                   ? `Below minimum payout amount ($${(skip.minAmount || 0).toFixed(2)}).`
-                  : "No eligible commissions to batch.",
+                  : skip?.reason === "batch_ceiling_deferred"
+                    ? `Exceeds the transfer ceiling ($${(skip.ceiling || 0).toFixed(2)}) — reduce the selected commissions or raise CDO_PAYOUT_MAX_TRANSFER_AMOUNT.`
+                    : "No eligible commissions to batch.",
           };
         }
         const newPayout = result.created[0];

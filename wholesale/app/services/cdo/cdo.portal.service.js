@@ -34,6 +34,12 @@ import CdoCommission from "../../models/cdoCommission.server";
 import CdoPayout from "../../models/cdoPayout.server";
 import CdoReferral from "../../models/cdoReferral.server";
 import { createRetailDiscount, setRetailDiscountActive } from "./cdo.service";
+import { syncConfig, isFulfillmentSyncEnabled } from "../sync/sync.config";
+import {
+  notifyReferralCodeCreated,
+  notifyReferralCodePaused,
+  notifyReferralCodeResumed,
+} from "../notifications/referralCodeNotification.service";
 
 // Revenue expression shared by aggregations: prefer pricing.total, fall
 // back to the flat `amount`, then 0. ns-retail writes both on most docs.
@@ -587,10 +593,44 @@ export async function getReferredCustomers(
       },
     },
     {
-      // cdo_applications is not mirrored in wholesale (out of scope for the
-      // portal migration — it isn't read anywhere else here), so the current
-      // referral code falls back to the newest cdo_referrals record below.
-      $addFields: { currentCode: null },
+      // The AUTHORITATIVE current/active code lives on cdo_applications.referral
+      // (this is what the practitioner reassigns via "Assign discount code", and
+      // what order attribution + the discount Function honor). It is NOT written
+      // back to cdo_referrals, so we must read it here or the tab shows the stale
+      // first-touch code. cdo_applications isn't mirrored as a model in wholesale,
+      // but a $lookup addresses the collection by name (same as the cdo_orders
+      // lookup above) — no model needed. Matched by email (case-insensitive).
+      $lookup: {
+        from: "cdo_applications",
+        let: { email: "$referredEmail" },
+        pipeline: [
+          {
+            $match: {
+              $expr: {
+                $eq: [
+                  { $toLower: { $ifNull: ["$email", ""] } },
+                  { $toLower: { $ifNull: ["$$email", ""] } },
+                ],
+              },
+            },
+          },
+          {
+            $project: {
+              _id: 0,
+              code: "$referral.code",
+              history: { $ifNull: ["$referralHistory", []] },
+            },
+          },
+          { $limit: 1 },
+        ],
+        as: "appAgg",
+      },
+    },
+    {
+      $addFields: {
+        currentCode: { $ifNull: [{ $arrayElemAt: ["$appAgg.code", 0] }, null] },
+        appHistory: { $ifNull: [{ $arrayElemAt: ["$appAgg.history", 0] }, []] },
+      },
     },
     {
       $facet: {
@@ -607,6 +647,7 @@ export async function getReferredCustomers(
               lifetimeValue: 1,
               codes: 1,
               currentCode: 1,
+              appHistory: 1,
             },
           },
         ],
@@ -620,18 +661,23 @@ export async function getReferredCustomers(
     rows: (result?.rows || []).map((r) => {
       const seen = new Set();
       const codes = [];
-      for (const c of r.codes || []) {
-        if (!c?.code) continue;
-        const key = normalizeReferralCode(c.code) || String(c.code).toLowerCase();
-        if (seen.has(key)) continue;
+      const pushCode = (code, status, usedAt) => {
+        if (!code) return;
+        const key = normalizeReferralCode(code) || String(code).toLowerCase();
+        if (seen.has(key)) return;
         seen.add(key);
-        codes.push({
-          code: c.code,
-          status: c.status || null,
-          usedAt: c.usedAt || null,
-        });
-      }
-      const currentCode = r.currentCode || codes[0]?.code || null;
+        codes.push({ code, status: status || null, usedAt: usedAt || null });
+      };
+      // The assigned/active code (cdo_applications.referral.code) is the source
+      // of truth; fall back to the newest cdo_referrals row when a patient was
+      // attributed at checkout without an application. It ALWAYS goes first so
+      // the "Latest" row + the Code column reflect what the practitioner
+      // assigned — even when that code has no conversion row in cdo_referrals.
+      const currentCode = r.currentCode || (r.codes || [])[0]?.code || null;
+      pushCode(currentCode, "active", null);
+      // Then codes seen on actual conversions, then prior codes from history.
+      for (const c of r.codes || []) pushCode(c.code, c.status, c.usedAt);
+      for (const h of r.appHistory || []) pushCode(h.code, "replaced", h.replacedAt);
       return {
         id: String(r.refId),
         name: r.referredName || null,
@@ -877,6 +923,7 @@ export async function createReferralCode(
   const disc = await createRetailDiscount({
     code: raw,
     discountPercent: fraction,
+    practitionerId,
     practitionerName: fullName,
   });
 
@@ -927,6 +974,16 @@ export async function createReferralCode(
 
   const row = shapeCodeRow(created);
   row.otherActiveCodes = otherActive.map((c) => shapeCodeRow(c));
+
+  // Best-effort — never blocks the already-created code on an SMTP hiccup.
+  await notifyReferralCodeCreated({
+    email: application?.email,
+    practitionerName: fullName,
+    code: raw,
+    discountPercent: fraction,
+    referralUrl: row.referralUrl,
+  }).catch((e) => log.error("create_referral.notification_failed", { err: e?.message || e }));
+
   return row;
 }
 
@@ -1001,5 +1058,98 @@ export async function setReferralCodeStatus(practitionerId, { codeId, status } =
   doc.updatedBy = "portal-self-service";
   await doc.save();
   log.info("set_status.ok", { practitionerId, codeId: String(doc._id), status });
+
+  // Best-effort — never blocks the already-applied status change.
+  const notify = status === "active" ? notifyReferralCodeResumed : notifyReferralCodePaused;
+  await notify({
+    email: doc.practitionerEmail,
+    practitionerName: doc.practitionerName,
+    code: doc.code,
+    discountPercent: doc.discountPercent,
+  }).catch((e) => log.error("set_status.notification_failed", { err: e?.message || e }));
+
   return shapeCodeRow(doc);
+}
+
+/**
+ * Assign/reassign the ACTIVE discount code for one of the practitioner's
+ * patients (Patients tab → "Change code"). The authoritative write lives in
+ * ns-retail (it owns cdo_applications + the retail Shopify customer), so this
+ * only validates + orchestrates: it re-checks the code is one of THIS
+ * practitioner's active codes (defense in depth), then POSTs to the ns-retail
+ * internal endpoint, which reassigns cdo_applications.referral, sets the
+ * customer `cdo.active_code` metafield the discount Function enforces, and
+ * syncs the `code:` tag. The patient must already be attributed to this
+ * practitioner (ns-retail rejects otherwise) — this never attributes a new
+ * patient or steals another practitioner's.
+ *
+ * @param {string} practitionerId  trusted tenant key (from the guard)
+ * @param {{ referredEmail: string, codeId: string }} input
+ * @param {{ application: object }} ctx
+ * @returns {Promise<{ email: string, code: string, previousCode: string|null }>}
+ * @throws {Error & { code: 'INVALID'|'CONFLICT'|'DISCOUNT_FAILED' }}
+ */
+export async function assignPatientCode(
+  practitionerId,
+  { referredEmail, codeId } = {},
+  { application } = {},
+) {
+  const email = String(referredEmail || "").trim().toLowerCase();
+  if (!email) throw portalError("INVALID", "Patient email is required.");
+  if (!codeId) throw portalError("INVALID", "Select a discount code to assign.");
+
+  // Defense in depth: the code must be one of THIS practitioner's ACTIVE codes.
+  // (ns-retail re-validates authoritatively, but fail fast with a clear message.)
+  const codeDoc = await CdoPractitionerCode.findOne({ _id: codeId, practitionerId })
+    .lean()
+    .catch(() => null);
+  if (!codeDoc) throw portalError("INVALID", "That discount code isn't one of yours.");
+  if (codeDoc.status !== "active") {
+    throw portalError("CONFLICT", `"${codeDoc.code}" isn't active — resume it or pick another code.`);
+  }
+
+  if (!isFulfillmentSyncEnabled()) {
+    throw portalError(
+      "DISCOUNT_FAILED",
+      "Code assignment is temporarily unavailable — the retail link is not configured.",
+    );
+  }
+
+  const url = `${syncConfig.nsRetailApiBase.replace(/\/+$/, "")}/api/cdo-internal/assign-patient-code`;
+  let res;
+  let data;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-sync-secret": syncConfig.syncSecret,
+      },
+      body: JSON.stringify({
+        practitionerId: String(practitionerId),
+        referredEmail: email,
+        codeId: String(codeId),
+        shop: syncConfig.retailShop,
+        actor: application?.email || "practitioner",
+      }),
+      signal: AbortSignal.timeout(syncConfig.fulfillmentSyncTimeoutMs),
+    });
+    data = await res.json().catch(() => ({}));
+  } catch (e) {
+    log.error("assign_patient_code.network", { practitionerId, email, err: e?.message || e });
+    throw portalError("DISCOUNT_FAILED", "Could not reach the assignment service. Please try again.");
+  }
+
+  if (!res.ok || data?.status !== "success") {
+    const msg = data?.message || "Could not assign the discount code.";
+    if (res.status === 409) throw portalError("CONFLICT", msg);
+    if (res.status === 400) throw portalError("INVALID", msg);
+    throw portalError("DISCOUNT_FAILED", msg);
+  }
+
+  return {
+    email,
+    code: data?.result?.code || codeDoc.code,
+    previousCode: data?.result?.oldCode || null,
+  };
 }

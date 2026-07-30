@@ -10,6 +10,7 @@ import {
   propagateSuccessfulPayment,
 } from '../../payment/payment.service'
 import { notifyPaymentFailure } from '../../payment/paymentFailureNotification.service'
+import { sendBatchSummaryEmail } from '../batchSummaryNotification.service'
 import { createLogger } from '../../../utils/logger.utils'
 
 // Cap on the per-run `errors[]` detail list persisted to CronBatchRun —
@@ -73,12 +74,25 @@ export function registerProcessPendingPaymentsJob(agenda) {
       // rows where the field is absent.) Their `paymentMethod: 'dropship'`
       // already falls outside the card/ach filter; the flag is the explicit,
       // method-independent guard applied across all three passes below.
+      const blockedApps = await WholesaleApplication.find({ status: 'blocked' })
+        .select('email')
+        .lean()
+      const blockedEmails = blockedApps
+        .map((app) => String(app.email || '').toLowerCase())
+        .filter(Boolean)
+
       const pendingCursor = Invoice.find({
         paymentStatus: 'pending',
         paymentMethod: { $in: ['card', 'ach'] },
         isDropship: { $ne: true },
         autoChargePaused: { $ne: true },
+        // While a failed-card retry ladder owns this invoice (process-failed-
+        // card-retries), skip it here so the two paths can't double-charge.
+        // Once the ladder finalises it's terminal (paid/failed) and wouldn't
+        // match `paymentStatus: 'pending'` anyway.
+        'cardRetry.active': { $ne: true },
         $expr: { $lt: ['$attemptCount', '$maxAttempts'] },
+        ...(blockedEmails.length ? { customerEmail: { $nin: blockedEmails } } : {}),
       }).cursor()
 
       let processed = 0
@@ -206,6 +220,16 @@ export function registerProcessPendingPaymentsJob(agenda) {
             }
           }
 
+          // Order lookup — used both by the payment-failure email below
+          // (order label + date) and the batch-history breakdown row
+          // further down, so it's fetched once and shared.
+          const orderDoc = await ShopifyOrder.findById(invoice.orderRef)
+            .select('shopifyOrderName shopifyOrderNumber receivedAt')
+            .lean()
+          const orderLabel =
+            orderDoc?.shopifyOrderName ||
+            (orderDoc?.shopifyOrderNumber ? `#${orderDoc.shopifyOrderNumber}` : invoice.shopifyOrderId)
+
           // Customer-facing "Payment Failed" notification — best-effort,
           // isolated in its own try/catch so an email/SMTP problem can
           // never interrupt the batch or affect the payment outcome
@@ -219,6 +243,8 @@ export function registerProcessPendingPaymentsJob(agenda) {
                 invoice,
                 reason: result.responseText || result.error || result.reason || null,
                 customerName: await resolvePractitionerName(invoice.customerEmail),
+                orderLabel,
+                orderDate: orderDoc?.receivedAt || null,
               })
             } catch (notifyErr) {
               // notifyPaymentFailure already catches internally and never
@@ -235,12 +261,6 @@ export function registerProcessPendingPaymentsJob(agenda) {
               : result.outcome === 'declined'
                 ? 'declined'
                 : 'errored'
-          const orderDoc = await ShopifyOrder.findById(invoice.orderRef)
-            .select('shopifyOrderName shopifyOrderNumber receivedAt')
-            .lean()
-          const orderLabel =
-            orderDoc?.shopifyOrderName ||
-            (orderDoc?.shopifyOrderNumber ? `#${orderDoc.shopifyOrderNumber}` : invoice.shopifyOrderId)
           batchItems.push({
             shopifyOrderId: invoice.shopifyOrderId,
             orderLabel,
@@ -296,7 +316,7 @@ export function registerProcessPendingPaymentsJob(agenda) {
       // CHEQUE REMINDERS DO NOT LIVE HERE. Customer-facing payment
       // reminders for unpaid cheque invoices are owned exclusively by the
       // dedicated reminder CRON (`process-check-reminders` /
-      // services/reminder), which sends QBO emails on the Day 9 / 11 / 13
+      // services/reminder), which sends SMTP emails on the Day 9 / 11 / 13
       // ladder + recurring phase. This payment CRON is responsible only
       // for charging, status updates, and payment/audit logs — keeping
       // the two concerns separate avoids duplicate reminders. The legacy
@@ -460,26 +480,57 @@ export function registerProcessPendingPaymentsJob(agenda) {
         sweepProcessed, sweepOk, sweepFailed,
       })
 
-      // Persist a batch-history record for the Orders page's "CRON Batch"
-      // section. `errored`/`sweepFailed` are technical failures (NMI
-      // threw, QBO/Shopify sync threw); a card `declined` is a normal
-      // business outcome, not a batch failure, so it counts as
-      // "completed work" for the success/partial/failed rollup below.
-      // Best-effort: a history-write failure must never affect payment
-      // processing, which has already fully completed by this point.
-      try {
-        const hasTechnicalFailures = errored > 0 || sweepFailed > 0
-        const hasCompletedWork = approved > 0 || declined > 0 || sweepOk > 0
-        const status = !hasTechnicalFailures
-          ? 'success'
-          : hasCompletedWork
-            ? 'partial'
-            : 'failed'
-        const summaryParts = []
-        if (declined > 0) summaryParts.push(`${declined} declined`)
-        if (errored > 0) summaryParts.push(`${errored} errored`)
-        if (sweepFailed > 0) summaryParts.push(`${sweepFailed} sync-retry failed`)
+      // `errored`/`sweepFailed` are technical failures (NMI threw,
+      // QBO/Shopify sync threw); a card `declined` is a normal business
+      // outcome, not a batch failure, so it counts as "completed work"
+      // for the success/partial/failed rollup below. Computed once here
+      // so both the CronBatchRun history write and the admin summary
+      // email (independent of each other — see below) agree on it.
+      const hasTechnicalFailures = errored > 0 || sweepFailed > 0
+      const hasCompletedWork = approved > 0 || declined > 0 || sweepOk > 0
+      const tickStatus = !hasTechnicalFailures ? 'success' : hasCompletedWork ? 'partial' : 'failed'
+      const summaryParts = []
+      if (declined > 0) summaryParts.push(`${declined} declined`)
+      if (errored > 0) summaryParts.push(`${errored} errored`)
+      if (sweepFailed > 0) summaryParts.push(`${sweepFailed} sync-retry failed`)
 
+      // Admin-facing "Batch Processing Summary" email — one per tick,
+      // regardless of outcome. Best-effort and independent of the
+      // CronBatchRun persistence below (a DB write failure shouldn't
+      // suppress the email, and vice versa).
+      try {
+        await sendBatchSummaryEmail({
+          jobName: PROCESS_PENDING_PAYMENTS_JOB,
+          tick,
+          tickId,
+          status: tickStatus,
+          startedAt,
+          finishedAt: Date.now(),
+          durationMs: elapsedMs,
+          processed,
+          approved,
+          declined,
+          errored,
+          skipped,
+          followupsLogged,
+          sweepProcessed,
+          sweepOk,
+          sweepFailed,
+          totalInvoiceAmount: Number(batchInvoiceAmount.toFixed(2)),
+          totalPractitioners: batchPractitioners.size,
+          errorDetails: batchErrors,
+        })
+      } catch (err) {
+        // sendBatchSummaryEmail already catches internally and never
+        // throws — this is belt-and-suspenders only.
+        log.error('batch_summary_email.unexpected', { tick, tickId, err })
+      }
+
+      // Persist a batch-history record for the Orders page's "CRON Batch"
+      // section. Best-effort: a history-write failure must never affect
+      // payment processing, which has already fully completed by this
+      // point.
+      try {
         const batchRun = await CronBatchRun.create({
           shop: batchShop || undefined,
           jobName: PROCESS_PENDING_PAYMENTS_JOB,
@@ -488,7 +539,7 @@ export function registerProcessPendingPaymentsJob(agenda) {
           startedAt: new Date(startedAt),
           finishedAt: new Date(),
           durationMs: elapsedMs,
-          status,
+          status: tickStatus,
           totalInvoicesProcessed: processed,
           totalApproved: approved,
           totalDeclined: declined,

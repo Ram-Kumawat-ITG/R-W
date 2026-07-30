@@ -20,8 +20,29 @@ import {
 } from '../nmi/nmi.service'
 import { propagateSuccessfulPayment } from '../invoice/invoice.service'
 import { invoiceConfig } from '../invoice/invoice.config'
-import { computeProcessingFee, applyDerivedPaymentStatus } from '../invoice/invoice.utils'
+import { computeProcessingFee, effectiveFeeRates, applyDerivedPaymentStatus } from '../invoice/invoice.utils'
 import { createLogger } from '../../utils/logger.utils'
+import { notifyNmiVaultInvalid, notifyNmiDuplicateTransaction } from '../notifications/nmiAlertNotification.service'
+import { resolveCustomerCardBillingId, resolveCustomerAchBillingId } from '../customer/customer.service'
+import { buildInitialCardRetry } from './paymentRetry.config'
+
+// On the FIRST failed CARD charge, initialise the retry ladder on the invoice
+// (schedule 2/4/7-days-later retries) so the dedicated process-failed-card-
+// retries CRON picks it up without waiting for the twice-monthly cycle. Pure
+// in-memory mutation — chargeInvoice persists it in its own failure save.
+// Best-effort (guarded). Card-only; once-only (guarded on firstFailedAt); never
+// for a settled invoice.
+function maybeInitCardRetry(invoice, { anchor, reason, responseText }) {
+  try {
+    if (invoice.paymentMethod !== 'card') return
+    if (invoice.cardRetry && invoice.cardRetry.firstFailedAt) return
+    if (invoice.paymentStatus === 'paid' || invoice.paymentStatus === 'cancelled') return
+    invoice.cardRetry = buildInitialCardRetry(anchor || new Date(), { reason, responseText })
+    invoice.markModified('cardRetry')
+  } catch (err) {
+    log.warn('card_retry.init_failed', { invoiceId: invoice._id?.toString(), err: err?.message || err })
+  }
+}
 
 const log = createLogger('payment.service')
 
@@ -107,6 +128,45 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
     return { skipped: true, reason: 'max attempts reached' }
   }
 
+  // The NMI billing_id (card or ACH) is mirrored onto CustomerMap only at
+  // ORDER INTAKE, so a practitioner who updated/ADDED their card or bank
+  // details via the portal AFTER their last order leaves the cache stale/empty.
+  // Re-resolve from the source of truth on a cache MISS (only) so the
+  // scheduler/CRON auto-retry — which loads CustomerMap fresh and never
+  // re-mirrors — targets what the practitioner just set, matching what the
+  // manual retry endpoints already do. Runs BEFORE resolveInvoiceVault so the
+  // resolved ACH billing id also satisfies that helper's missing-billing gate
+  // (for ACH the billing id is required; without this a legit ACH invoice would
+  // be skipped — and eventually auto-failed — purely because the cache was
+  // stale). No extra DB read once mirrored (cache hit → skipped). Best-effort:
+  // a lookup failure leaves the id as-is and the normal gate/behaviour below
+  // applies, so it can never corrupt an otherwise-valid charge.
+  if (customerMap && customerMap.shop && customerMap.email) {
+    try {
+      if (invoice.paymentMethod === 'ach' && !customerMap.nmiAchBillingId) {
+        const resolved = await resolveCustomerAchBillingId({
+          shop: customerMap.shop,
+          email: customerMap.email,
+          customerMap,
+        })
+        if (resolved) customerMap.nmiAchBillingId = resolved
+      } else if (invoice.paymentMethod === 'card' && !customerMap.nmiCardBillingId) {
+        const resolved = await resolveCustomerCardBillingId({
+          shop: customerMap.shop,
+          email: customerMap.email,
+          customerMap,
+        })
+        if (resolved) customerMap.nmiCardBillingId = resolved
+      }
+    } catch (err) {
+      log.warn('charge.billing_resolve_failed', {
+        invoiceId: invoice._id?.toString(),
+        method: invoice.paymentMethod,
+        err: err?.message || String(err),
+      })
+    }
+  }
+
   const { vaultId, billingId, methodLabel, missingReason } = resolveInvoiceVault(invoice, customerMap)
   if (missingReason) {
     const attemptNumber = invoice.attemptCount + 1
@@ -124,6 +184,11 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
     invoice.lastAttemptError = missingReason
     if (invoice.attemptCount >= invoice.maxAttempts) invoice.paymentStatus = 'failed'
     else applyDerivedPaymentStatus(invoice)
+    // A card charge blocked by a missing/invalid vault is still a failed card
+    // payment — start the retry ladder so it re-attempts on the 2/4/7-day
+    // schedule (the vault may be fixed within that window). Card-only + once-
+    // only (guarded inside).
+    maybeInitCardRetry(invoice, { anchor: invoice.lastAttemptAt, reason: missingReason, responseText: missingReason })
     await invoice.save()
     return { skipped: true, reason: missingReason }
   }
@@ -156,6 +221,10 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
     invoice.lastAttemptError = reason
     if (invoice.attemptCount >= invoice.maxAttempts) invoice.paymentStatus = 'failed'
     else applyDerivedPaymentStatus(invoice)
+    // Vault-invalid is still a failed card payment — start the retry ladder
+    // (the vault may be re-linked within the retry window). Card-only + once-
+    // only (guarded inside maybeInitCardRetry).
+    maybeInitCardRetry(invoice, { anchor: invoice.lastAttemptAt, reason, responseText: reason })
     await invoice.save()
     log.warn('charge.skipped.vault_invalid', {
       invoiceId: invoice._id.toString(),
@@ -163,6 +232,16 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
       methodLabel,
       reason: vaultCheck.reason,
     })
+    // Fires on both CRON auto-charge and admin retry — this is the only
+    // signal an admin gets that a customer's charge is silently not
+    // happening (it will keep skipping every future attempt too).
+    await notifyNmiVaultInvalid({
+      invoiceId: invoice._id.toString(),
+      shopifyOrderId: invoice.shopifyOrderId,
+      vaultId,
+      methodLabel,
+      reason: vaultCheck.reason,
+    }).catch((e) => log.error('vault_invalid_alert.failed', { err: e?.message || e }))
     return { skipped: true, reason }
   }
 
@@ -203,12 +282,13 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
   // Processing fee is sized off the FULL remaining outstanding (it's a
   // per-invoice fee, not per-charge). It's only staged the first time —
   // subsequent partial charges of the same invoice don't re-stage.
+  // Per-practitioner CARD-fee override (card-only; ACH/cheque unaffected).
   const feePreview =
     !invoice.processingFeeAppliedAt &&
     computeProcessingFee({
       baseAmount: remainingOutstanding,
       method: invoice.paymentMethod,
-      rates: invoiceConfig.processingFeeRates,
+      rates: effectiveFeeRates(invoiceConfig.processingFeeRates, customerMap?.cardFeeOverridePercent),
     })
   // The fee only rides along on the charge that actually settles the
   // invoice. Partial charges send just the base portion; the final
@@ -267,6 +347,7 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
     invoice.lastAttemptError = err.message
     if (invoice.attemptCount >= invoice.maxAttempts) invoice.paymentStatus = 'failed'
     else applyDerivedPaymentStatus(invoice)
+    maybeInitCardRetry(invoice, { anchor: invoice.lastAttemptAt, reason: err.message, responseText: err.message })
     await invoice.save()
     return { skipped: false, outcome: 'error', error: err.message }
   }
@@ -286,6 +367,21 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
     nmiCvvResponse: result.cvvResponse,
     rawResponse: result.raw,
   })
+
+  // NMI's gateway-level duplicate-transaction check rejecting a charge is
+  // a processor-config issue, not a routine decline — see the 2026-06-22
+  // incident in CLAUDE.md. Flag it distinctly so an admin checks the NMI
+  // control panel instead of assuming it's a normal card decline.
+  if (result.outcome !== 'approved' && /duplicate transaction/i.test(result.responseText || '')) {
+    await notifyNmiDuplicateTransaction({
+      invoiceId: invoice._id.toString(),
+      shopifyOrderId: invoice.shopifyOrderId,
+      vaultId: customerMap.nmiCustomerVaultId,
+      amount,
+      responseText: result.responseText,
+      transactionId: result.transactionId,
+    }).catch((e) => log.error('duplicate_txn_alert.failed', { err: e?.message || e }))
+  }
 
   invoice.attemptCount = attemptNumber
   invoice.lastAttemptAt = new Date()
@@ -340,6 +436,11 @@ export async function chargeInvoice({ invoice, customerMap, requestedAmount }) {
   } else {
     if (invoice.attemptCount >= invoice.maxAttempts) invoice.paymentStatus = 'failed'
     else applyDerivedPaymentStatus(invoice)
+    maybeInitCardRetry(invoice, {
+      anchor: invoice.lastAttemptAt,
+      reason: result.responseText,
+      responseText: result.responseText,
+    })
   }
   await invoice.save()
 

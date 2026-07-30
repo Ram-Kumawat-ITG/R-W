@@ -18,13 +18,14 @@ import { toYmd, applyDerivedPaymentStatus } from '../invoice/invoice.utils'
 import { chargeInvoice } from '../payment/payment.service'
 import { validateShopifyOrder } from './order.validator'
 import { paymentConfig } from '../payment/payment.config'
-import { customerHasApprovedTag, getOrderFulfillments } from '../shopify/shopify.service'
+import { customerHasApprovedTag, customerHasBlockedTag, getOrderFulfillments } from '../shopify/shopify.service'
 import { voidInvoice as voidQboInvoice, setInvoiceShipping } from '../qbo/qbo.service'
 import {
   normalizeCarrier,
   carrierDisplayName,
   shipmentStatusLabel,
   resolveCarrierTrackingUrl,
+  deriveFulfillmentStatus,
 } from '../../utils/shipping.constants'
 import { trackingConfig } from './tracking.config'
 import { isRetailCustomerEmail } from '../dropship/dropship.config'
@@ -230,7 +231,23 @@ export async function processShopifyOrder({ shop, order, webhookId }) {
   }
 
   console.log(`[orders] approval gate — fetching tags for customer ${shopifyCustomerId}`)
-  const approved = await customerHasApprovedTag({ shop, customerId: shopifyCustomerId })
+  const [approved, blocked] = await Promise.all([
+    customerHasApprovedTag({ shop, customerId: shopifyCustomerId }),
+    customerHasBlockedTag({ shop, customerId: shopifyCustomerId }),
+  ])
+
+  if (blocked) {
+    console.log(
+      `[orders] HOLD — customer ${shopifyCustomerId} is blocked; ` +
+        `skipping QBO + NMI until unblocked. Will resume when the Blocked tag is removed.`,
+    )
+    log.info('hold.blocked', { shopifyOrderId, shopifyCustomerId })
+    local.processingStatus = 'pending_approval'
+    local.processingError = 'Customer is blocked'
+    await local.save()
+    return local
+  }
+
   if (!approved) {
     console.log(
       `[orders] HOLD — customer ${shopifyCustomerId} is not approved; ` +
@@ -1077,6 +1094,20 @@ export async function handleFulfillmentUpdate({ shop, fulfillment, webhookId, ev
   )
   recomputeShipDate(localOrder)
   recomputeDeliveredAt(localOrder)
+  // Self-heal the order-level fulfillment status: recording a shipped
+  // fulfillment must never leave the order reading "unfulfilled" (the webhook
+  // captures tracking + shipmentStatus but Shopify's order-level
+  // displayFulfillmentStatus only reaches us via the page-load live-pull,
+  // which can lag or read UNFULFILLED for a drop-ship order). Only UPGRADE
+  // from an empty/unfulfilled value — never clobber a Shopify-reported
+  // partial/restocked/returned. Mirrors the ns-retail intake self-heal.
+  {
+    const curFf = String(localOrder.fulfillmentStatus || '').toLowerCase()
+    if (!['fulfilled', 'partial', 'partially_fulfilled', 'restocked', 'returned'].includes(curFf)) {
+      const healed = deriveFulfillmentStatus(localOrder.fulfillmentStatus, localOrder.fulfillments)
+      if (healed !== curFf) localOrder.fulfillmentStatus = healed
+    }
+  }
   if (!changed) console.log(`[orders] fulfillment ${fulfillmentId} unchanged — no history row`)
 
   if (webhookId) {
@@ -1166,9 +1197,28 @@ export async function syncFulfillmentsFromShopify({ shop, shopifyOrderId, admin 
   }
   // Mirror the order-level fulfillment status (FULFILLED / PARTIALLY_FULFILLED
   // / UNFULFILLED → lower-case) so the page can show "Fulfillment status".
+  //
+  // MONOTONIC GUARD: never let a live re-read regress a fulfilled/delivered
+  // order back to unfulfilled/partially_fulfilled. Shopify can transiently
+  // report a lower displayFulfillmentStatus (order edit in flight, a drop-ship
+  // order whose real shipment is tracked on the linked retail order, a stale
+  // read), which previously wiped the delivered state the customer already saw
+  // — the reported "reverts to Unfulfilled after Delivered" bug. `deliveredAt`
+  // is stamped first-detection-wins and the fulfillments[] rows persist, so
+  // together they are the durable "this order shipped/was delivered" signal.
+  // Genuine reversals (restocked / returned) are still honored.
   if (data.displayFulfillmentStatus) {
     const fs = String(data.displayFulfillmentStatus).toLowerCase()
-    if (localOrder.fulfillmentStatus !== fs) {
+    const RANK = { unfulfilled: 0, partial: 1, partially_fulfilled: 1, fulfilled: 2 }
+    const activeFf = (localOrder.fulfillments || []).filter(
+      (f) => String(f.status || '').toLowerCase() !== 'cancelled',
+    )
+    const hasShipped = Boolean(localOrder.deliveredAt) || activeFf.length > 0
+    const curRank = RANK[String(localOrder.fulfillmentStatus || '').toLowerCase()] ?? -1
+    const nextRank = RANK[fs] ?? -1
+    const isReversal = fs === 'restocked' || fs === 'returned'
+    const wouldRegress = hasShipped && nextRank >= 0 && nextRank < curRank
+    if (localOrder.fulfillmentStatus !== fs && (isReversal || !wouldRegress)) {
       localOrder.fulfillmentStatus = fs
       anyChanged = true
     }

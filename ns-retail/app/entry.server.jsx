@@ -21,7 +21,6 @@ if (process.env.NODE_ENV !== "test" && !schedulerConfig.disabled) {
   (async () => {
     try {
       await connectDB();
-      console.log("[boot] MongoDB connected");
       await getAgenda();
       console.log(
         `[boot] CDO payout scheduler started (${

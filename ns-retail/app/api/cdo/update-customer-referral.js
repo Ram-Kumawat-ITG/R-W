@@ -11,7 +11,8 @@
 
 import { authenticate } from "../../shopify.server";
 import { updateApplicationReferral } from "../../services/cdo/cdo.service";
-import { syncCustomerCodeTag, lookupCustomerByEmail } from "../../utils/customerTags";
+import { lookupCustomerByEmail } from "../../utils/customerTags";
+import { syncPatientCode } from "../../utils/patientCode";
 import connectDB from "../../db/mongo.server";
 
 export async function action({ request }) {
@@ -61,20 +62,21 @@ export async function action({ request }) {
       }
     }
 
-    if (targetShopifyCustomerId) {
-      try {
-        await syncCustomerCodeTag(
-          shop || session?.shop,
-          targetShopifyCustomerId,
-          updated.referral?.code,
-          updated.referral?.practitionerEmail,
-        );
-      } catch (err) {
+    if (targetShopifyCustomerId && updated.referral?.code) {
+      // Write BOTH the code: tag AND the cdo.active_code metafield together
+      // (this endpoint previously set only the tag, which left the Function's
+      // enforcement metafield stale → the code would be declined at checkout).
+      const sync = await syncPatientCode(
+        shop || session?.shop,
+        targetShopifyCustomerId,
+        updated.referral.code,
+        { practitionerEmail: updated.referral?.practitionerEmail },
+      );
+      if (!sync.ok) {
         console.error(
-          `[api/cdo/update-customer-referral] tag sync for ${targetShopifyCustomerId} failed:`,
-          err?.message || err,
+          `[api/cdo/update-customer-referral] Shopify code sync for ${targetShopifyCustomerId} incomplete (${sync.reason}) — tag/metafield may be out of sync.`,
         );
-        // Non-blocking: tag sync failure doesn't fail the referral update
+        // Non-blocking: sync failure doesn't fail the referral update.
       }
     }
 

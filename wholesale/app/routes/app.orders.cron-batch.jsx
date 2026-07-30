@@ -1,11 +1,13 @@
-import { useEffect, useState } from "react";
-import { useLoaderData, useNavigate, useRevalidator } from "react-router";
+import { useEffect, useRef, useState } from "react";
+import { useFetcher, useLoaderData, useNavigate, useRevalidator } from "react-router";
+import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import connectDB from "../services/APIService/mongo.service";
 import {
   getUpcomingBatch,
   getBatchHistory,
 } from "../services/scheduler/cronBatch.service";
+import { getNotificationSettings } from "../services/scheduler/cronNotificationSettings.service";
 import {
   OrdersTabBar,
   CollapsibleSection,
@@ -77,14 +79,15 @@ export const loader = async ({ request }) => {
     if (v) batchFilters[key] = v;
   }
 
-  const [upcomingBatch, batchHistory] = await Promise.all([
+  const [upcomingBatch, batchHistory, notificationSettings] = await Promise.all([
     safe("upcoming CRON batch", () => getUpcomingBatch()),
     safe("CRON batch history", () =>
       getBatchHistory({ page: batchPage, pageSize: BATCH_HISTORY_PAGE_SIZE, ...batchFilters }),
     ),
+    safe("CRON notification settings", () => getNotificationSettings()),
   ]);
 
-  return { upcomingBatch, batchHistory, batchPage, batchFilters };
+  return { upcomingBatch, batchHistory, batchPage, batchFilters, notificationSettings };
 };
 
 const UPCOMING_STATUS_TONE = {
@@ -330,14 +333,82 @@ function BatchHistoryCard({ batch: b, defaultOpen }) {
 }
 
 export default function OrdersCronBatch() {
-  const { upcomingBatch, batchHistory, batchPage, batchFilters } = useLoaderData();
+  const { upcomingBatch, batchHistory, batchPage, batchFilters, notificationSettings } = useLoaderData();
   const navigate = useNavigate();
   const revalidator = useRevalidator();
+  const shopify = useAppBridge();
 
   const historyTotal = batchHistory?.total ?? 0;
   const historyPageSize = batchHistory?.pageSize || BATCH_HISTORY_PAGE_SIZE;
   const historyTotalPages = Math.max(1, Math.ceil(historyTotal / historyPageSize));
   const hasHistoryFilter = HISTORY_FILTER_KEYS.some((k) => batchFilters?.[k]);
+
+  // Global pause/resume for the CRON's two email notifications (customer
+  // "Payment Failed" + admin "Batch Processing Summary"). Charge
+  // processing is unaffected — see cronNotificationSettings.service.js.
+  const notificationsPaused = notificationSettings?.emailNotificationsPaused === true;
+  const pauseNotificationsFetcher = useFetcher();
+  const resumeNotificationsFetcher = useFetcher();
+  const pauseNotificationsModalRef = useRef(null);
+  const resumeNotificationsModalRef = useRef(null);
+  const [pauseNotificationsNote, setPauseNotificationsNote] = useState("");
+  const handledPauseNotificationsRef = useRef(null);
+  const handledResumeNotificationsRef = useRef(null);
+
+  const onConfirmPauseNotifications = () => {
+    pauseNotificationsModalRef.current?.hideOverlay?.();
+    const body = {};
+    const trimmed = pauseNotificationsNote.trim();
+    if (trimmed) body.note = trimmed;
+    pauseNotificationsFetcher.submit(body, {
+      method: "POST",
+      action: "/api/admin/cron-notifications/pause",
+      encType: "application/json",
+    });
+  };
+
+  const onConfirmResumeNotifications = () => {
+    resumeNotificationsModalRef.current?.hideOverlay?.();
+    resumeNotificationsFetcher.submit(
+      {},
+      {
+        method: "POST",
+        action: "/api/admin/cron-notifications/resume",
+        encType: "application/json",
+      },
+    );
+  };
+
+  useEffect(() => {
+    if (!pauseNotificationsFetcher.data) return;
+    if (pauseNotificationsFetcher.state !== "idle") return;
+    if (handledPauseNotificationsRef.current === pauseNotificationsFetcher.data) return;
+    handledPauseNotificationsRef.current = pauseNotificationsFetcher.data;
+
+    const data = pauseNotificationsFetcher.data;
+    if (data.status === "success") {
+      setPauseNotificationsNote("");
+      shopify?.toast?.show("CRON email notifications paused");
+      revalidator.revalidate();
+    } else {
+      shopify?.toast?.show(data.message || "Could not pause notifications", { isError: true });
+    }
+  }, [pauseNotificationsFetcher.data, pauseNotificationsFetcher.state, shopify, revalidator]);
+
+  useEffect(() => {
+    if (!resumeNotificationsFetcher.data) return;
+    if (resumeNotificationsFetcher.state !== "idle") return;
+    if (handledResumeNotificationsRef.current === resumeNotificationsFetcher.data) return;
+    handledResumeNotificationsRef.current = resumeNotificationsFetcher.data;
+
+    const data = resumeNotificationsFetcher.data;
+    if (data.status === "success") {
+      shopify?.toast?.show("CRON email notifications resumed");
+      revalidator.revalidate();
+    } else {
+      shopify?.toast?.show(data.message || "Could not resume notifications", { isError: true });
+    }
+  }, [resumeNotificationsFetcher.data, resumeNotificationsFetcher.state, shopify, revalidator]);
 
   // Pagination preserves whatever filters are currently active — only
   // `batchPage` changes. Filter changes (via AdvancedFilters) reset to
@@ -425,6 +496,114 @@ export default function OrdersCronBatch() {
           )}
         </s-stack>
       </s-section>
+
+      <s-section heading="Email notifications">
+        <s-stack direction="block" gap="base">
+          <s-stack direction="inline" gap="base" alignItems="center" justifyContent="space-between" wrap>
+            <s-stack direction="block" gap="none">
+              <s-text tone="subdued">
+                The customer &quot;Payment Failed&quot; email + the admin batch-summary
+                email sent by this CRON. Pausing does NOT affect charge processing —
+                only these two emails are silenced.
+              </s-text>
+              {notificationsPaused && (
+                <s-text tone="critical">
+                  Paused
+                  {notificationSettings?.pausedAt
+                    ? ` ${new Date(notificationSettings.pausedAt).toLocaleString()}`
+                    : ""}
+                  {notificationSettings?.pausedBy ? ` by ${notificationSettings.pausedBy}` : ""}
+                  {notificationSettings?.pauseNote ? ` — "${notificationSettings.pauseNote}"` : ""}
+                </s-text>
+              )}
+            </s-stack>
+            <s-stack direction="inline" gap="base" alignItems="center">
+              <s-badge tone={notificationsPaused ? "warning" : "success"}>
+                {notificationsPaused ? "Paused" : "Active"}
+              </s-badge>
+              {!notificationsPaused ? (
+                <s-button
+                  onClick={() => pauseNotificationsModalRef.current?.showOverlay?.()}
+                  {...(pauseNotificationsFetcher.state !== "idle" ? { loading: true } : {})}
+                >
+                  Pause email notifications
+                </s-button>
+              ) : (
+                <s-button
+                  onClick={() => resumeNotificationsModalRef.current?.showOverlay?.()}
+                  {...(resumeNotificationsFetcher.state !== "idle" ? { loading: true } : {})}
+                >
+                  Resume email notifications
+                </s-button>
+              )}
+            </s-stack>
+          </s-stack>
+        </s-stack>
+      </s-section>
+
+      <s-modal
+        ref={pauseNotificationsModalRef}
+        id="pause-cron-notifications-modal"
+        heading="Pause CRON email notifications?"
+        accessibilityLabel="Pause CRON email notifications confirmation"
+      >
+        <s-stack direction="block" gap="base">
+          <s-paragraph>
+            The customer &quot;Payment Failed&quot; email and the admin batch-summary
+            email will stop sending on every future process-pending-payments tick
+            until you resume. Charge processing, invoice status, and the batch
+            history log are all unaffected.
+          </s-paragraph>
+          <s-text-area
+            label="Note (optional)"
+            placeholder="Reason for pausing"
+            value={pauseNotificationsNote}
+            rows={3}
+            onChange={(e) => setPauseNotificationsNote(e.currentTarget.value)}
+            maxLength={500}
+          />
+        </s-stack>
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          onClick={onConfirmPauseNotifications}
+          {...(pauseNotificationsFetcher.state !== "idle" ? { loading: true } : {})}
+        >
+          Pause email notifications
+        </s-button>
+        <s-button
+          slot="secondary-actions"
+          onClick={() => pauseNotificationsModalRef.current?.hideOverlay?.()}
+        >
+          Cancel
+        </s-button>
+      </s-modal>
+
+      <s-modal
+        ref={resumeNotificationsModalRef}
+        id="resume-cron-notifications-modal"
+        heading="Resume CRON email notifications?"
+        accessibilityLabel="Resume CRON email notifications confirmation"
+      >
+        <s-paragraph>
+          The customer &quot;Payment Failed&quot; email and the admin batch-summary
+          email will resume sending on the next process-pending-payments tick.
+        </s-paragraph>
+        <s-button
+          slot="primary-action"
+          variant="primary"
+          onClick={onConfirmResumeNotifications}
+          {...(resumeNotificationsFetcher.state !== "idle" ? { loading: true } : {})}
+        >
+          Resume email notifications
+        </s-button>
+        <s-button
+          slot="secondary-actions"
+          onClick={() => resumeNotificationsModalRef.current?.hideOverlay?.()}
+        >
+          Cancel
+        </s-button>
+      </s-modal>
 
       <AdvancedFilters
         heading="Filter batch history"

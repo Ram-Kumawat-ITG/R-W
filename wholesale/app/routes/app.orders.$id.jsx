@@ -25,6 +25,7 @@ import { syncFulfillmentsFromShopify } from "../services/order/order.service";
 import { invoiceConfig } from "../services/invoice/invoice.config";
 import {
   computeProcessingFee,
+  effectiveFeeRates,
   processingFeeLabel,
   computeInvoiceCalculation,
 } from "../services/invoice/invoice.utils";
@@ -388,11 +389,15 @@ export const loader = async ({ request, params }) => {
     businessName,
     breakdown,
     cardOnFile,
-    // Processing-fee rates by settlement method. Surfaced to the client
-    // so confirmation modals (charge-card, mark-cheque-paid) can show the
-    // fee breakdown + new total before the admin commits. Matches the
-    // values that propagateSuccessfulPayment will append to QBO.
-    processingFeeRates: { ...invoiceConfig.processingFeeRates },
+    // Processing-fee rates by settlement method, with this practitioner's
+    // per-practitioner CARD override applied (card-only). Surfaced to the
+    // client so confirmation modals (charge-card, mark-cheque-paid) show the
+    // same fee that will actually be charged. Matches the values that
+    // createInvoiceForOrder / chargeInvoice compute.
+    processingFeeRates: effectiveFeeRates(
+      { ...invoiceConfig.processingFeeRates },
+      application?.cardFeeOverridePercent ?? customerMap?.cardFeeOverridePercent,
+    ),
     qbo: {
       invoice: qboInvoice,
       error: qboInvoiceError,
@@ -1210,6 +1215,16 @@ export default function OrderDetail() {
     outstanding != null
       ? Number(((outstanding ?? 0) + (cardFeePreview?.amount ?? 0)).toFixed(2))
       : null;
+  // Retry modal previews the fee for the INVOICE's OWN method — an ACH invoice
+  // carries the 1% ACH rate, not the 3% card rate — so the quoted fee/label/
+  // total match what the ACH retry will actually apply. (The charge-card modal
+  // below keeps the card preview: it always flips the invoice to card.)
+  const retryFeeMethod = isAchInvoice ? "ach" : "card";
+  const retryFeePreview = previewFee(retryFeeMethod);
+  const retryFeeTotal =
+    outstanding != null
+      ? Number(((outstanding ?? 0) + (retryFeePreview?.amount ?? 0)).toFixed(2))
+      : null;
 
   // Full invoice-calculation breakdown for the totals box: Order Subtotal →
   // Discount → Adjusted Subtotal → Shipping → Tax → Payment Processing Fee →
@@ -1821,6 +1836,82 @@ export default function OrderDetail() {
                 </s-badge>
               )}
             </s-stack>
+
+            {/* Automatic payment-retry schedule (services/payment/paymentRetry)
+                — populated once a card charge fails; shows when the next retry
+                fires, how many attempts are used / remain, and the current
+                payment status. */}
+            {invoice.cardRetry && (
+              <s-banner
+                tone={
+                  invoice.cardRetry.active
+                    ? "info"
+                    : invoice.cardRetry.finalStatus === "paid"
+                      ? "success"
+                      : "warning"
+                }
+                heading={
+                  invoice.cardRetry.active
+                    ? "Automatic payment retry scheduled"
+                    : invoice.cardRetry.finalStatus === "paid"
+                      ? "Automatic retries succeeded"
+                      : "Automatic retries completed"
+                }
+              >
+                <s-stack direction="block" gap="base">
+                  {invoice.cardRetry.active && invoice.cardRetry.nextRetryAt && (
+                    <s-text>
+                      <strong>Next scheduled retry:</strong>{" "}
+                      {new Date(invoice.cardRetry.nextRetryAt).toLocaleString()}
+                    </s-text>
+                  )}
+                  <s-text>
+                    <strong>Retry attempts:</strong>{" "}
+                    {invoice.cardRetry.retryCount ?? 0} of{" "}
+                    {invoice.cardRetry.maxRetries ?? 0} used ·{" "}
+                    {Math.max(
+                      0,
+                      (invoice.cardRetry.maxRetries ?? 0) -
+                        (invoice.cardRetry.retryCount ?? 0),
+                    )}{" "}
+                    remaining
+                  </s-text>
+                  <s-text>
+                    <strong>Current payment status:</strong>{" "}
+                    {invoice.paymentStatus}
+                  </s-text>
+                  {invoice.cardRetry.firstFailedAt && (
+                    <s-text tone="subdued">
+                      First failed{" "}
+                      {new Date(invoice.cardRetry.firstFailedAt).toLocaleString()}
+                      {invoice.cardRetry.firstFailureReason
+                        ? ` — ${invoice.cardRetry.firstFailureReason}`
+                        : ""}
+                    </s-text>
+                  )}
+
+                  {invoice.cardRetry.schedule?.length > 0 && (
+                    <s-stack direction="block" gap="base">
+                      <s-text tone="subdued">
+                        <strong>Retry schedule</strong>
+                      </s-text>
+                      {invoice.cardRetry.schedule.map((e) => (
+                        <s-text key={e.attemptNumber} tone="subdued">
+                          Retry {e.attemptNumber} —{" "}
+                          {new Date(e.scheduledAt).toLocaleString()} ·{" "}
+                          {e.status}
+                          {e.executedAt
+                            ? ` (ran ${new Date(e.executedAt).toLocaleString()}${
+                                e.outcome ? `, ${e.outcome}` : ""
+                              })`
+                            : ""}
+                        </s-text>
+                      ))}
+                    </s-stack>
+                  )}
+                </s-stack>
+              </s-banner>
+            )}
 
             {/* Paused-state context banner — surfaces who paused it,
                 when, and the optional pause note so admins reviewing
@@ -2740,18 +2831,18 @@ export default function OrderDetail() {
           Invoice balance:{" "}
           <strong>{formatAmount(outstanding ?? 0, invoice?.currency)}</strong>
           <br />
-          {cardFeePreview ? (
+          {retryFeePreview ? (
             <>
-              {processingFeeLabel("card")} (
-              {+(cardFeePreview.rate * 100).toFixed(4)}
+              {processingFeeLabel(retryFeeMethod)} (
+              {+(retryFeePreview.rate * 100).toFixed(4)}
               %):{" "}
               <strong>
-                {formatAmount(cardFeePreview.amount, invoice?.currency)}
+                {formatAmount(retryFeePreview.amount, invoice?.currency)}
               </strong>
               <br />
               <strong>
                 Total to charge:{" "}
-                {formatAmount(cardFeeTotal ?? 0, invoice?.currency)}
+                {formatAmount(retryFeeTotal ?? 0, invoice?.currency)}
               </strong>
               <br />
               <s-text tone="subdued" size="small">

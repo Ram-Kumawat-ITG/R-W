@@ -1,8 +1,9 @@
 // CDO commission-payout scheduler configuration.
 //
-// Production runs on a monthly cron (default 00:30 on the 25th). Dev/test
-// uses a short interval override so the automated payout pipeline can be
-// exercised without waiting for the 25th.
+// Production runs on a weekly cron (default 00:30 every Monday — changed
+// 2026-07-09 from monthly-on-the-25th per the project owner). Dev/test uses a
+// short interval override so the automated payout pipeline can be exercised
+// without waiting for the next Monday.
 //
 // All env reads go through readEnv (no raw process.env outside config).
 
@@ -12,10 +13,10 @@ export const schedulerConfig = {
   // IANA timezone the production cron is evaluated in.
   scheduleTimezone: readEnv("CDO_PAYOUT_TZ", { fallback: "America/Los_Angeles" }),
 
-  // Production cron — default 00:30 on the 25th of every month. The payout
-  // date is env-configurable today; a settings-driven schedule is a future
+  // Production cron — default 00:30 every Monday. The payout schedule is
+  // env-configurable today; a settings-driven schedule is a future
   // enhancement (see docs/payout.md §7).
-  payoutCron: readEnv("CDO_PAYOUT_CRON", { fallback: "30 0 25 * *" }),
+  payoutCron: readEnv("CDO_PAYOUT_CRON", { fallback: "30 0 * * 1" }),
 
   // Dev-only override. When set, replaces the cron with an Agenda
   // "every <interval>" schedule, e.g.:

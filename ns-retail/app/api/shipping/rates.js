@@ -12,7 +12,7 @@
 // At checkout Shopify POSTs the cart's origin + destination + items here
 // and expects this exact response shape:
 //
-//   { rates: [{ service_name, service_code, total_price, currency, ... }] }
+//   { rates: [{ service_name, service_code, total_price, currency, ... }] }        
 //
 // Critical contract:
 //   • total_price is a STRING in MINOR UNITS (cents). "500" = $5.00.
@@ -22,24 +22,42 @@
 //     { rates: [] } so Shopify can fall back gracefully.
 //
 // What this endpoint does:
-//   1. Verifies the Shopify HMAC header (logs mismatch in dev; reject in prod).
-//   2. Reads items + origin + destination from the Shopify payload.
-//   3. Calls USPS + UPS direct-carrier APIs in parallel:
+//   1. Verifies the Shopify HMAC header (log-only; carrier-service
+//      callbacks aren't standard-signed — see history at the HMAC block).
+//   2. Reads items + origin + destination from the Shopify payload and
+//      filters out any "Processing Fee" cart lines added by the UI
+//      extension (defensive — fee is disabled today).
+//   3. Fetches the `custom.pack_category` metafield for every cart product
+//      via one bulk GraphQL call to Shopify Admin API (auth via
+//      unauthenticated.admin using RETAIL_SHOP_DOMAIN). If ANY product's
+//      metafield is missing OR set to REVIEW → returns empty rates
+//      (customer sees "no shipping available"). This is the back-pressure
+//      that forces the merchant to classify every product before it can
+//      ship.
+//   4. Classifies the cart into 12 packing categories (SS / S / M / L /
+//      LL / XL / G1 / G2 / G4 / FA / OTHER / REVIEW — per client sheet
+//      2026-07-23), selects the smallest box tier that fits via the 6-step
+//      selectBox() algorithm (OTHER routes to overflow), and computes the
+//      package weight = items + tare + packing buffer.
+//   5. Calls USPS + UPS direct-carrier APIs in parallel with the picked
+//      box's real dims + weight:
 //        • USPS Web Tools v3 (USPS_CLIENT_ID / USPS_CLIENT_SECRET)
 //        • UPS Rating v2403  (UPS_CLIENT_ID / UPS_CLIENT_SECRET / UPS_SHIPPER_NUMBER)
 //      Dedups by (carrier, service), applies the tiered handling markup
-//      (see `tieredMarkupCents`), sorts cheapest-first, returns to Shopify.
-//   4. If NEITHER carrier returns rates (credentials missing / API down):
-//      returns an EMPTY rates list. Shopify will show "no shipping
-//      available" at checkout — this is intentional so we never quote
-//      placeholder prices. Static fallback was REMOVED 2026-06-22 once
-//      real USPS credentials were configured in .env.
+//      (see `tieredMarkupCents`), zeroes both when free-shipping fires
+//      ($500+ NS-only cart), sorts cheapest-first, and returns rates
+//      with the picked box surfaced in service_name + description.
+//   6. If NEITHER carrier returns rates (credentials missing / API down):
+//      returns an EMPTY rates list — never quotes placeholder prices.
 //
 // SETUP — both carriers (one-time):
 //   USPS:   registration.usps.com → APIs → OAuth credentials
 //   UPS:    developer.ups.com → My Apps → OAuth 2.0
 //
-// Any carrier whose env vars aren't set is silently skipped — no errors.
+// Env vars required in addition to carrier creds:
+//   RETAIL_SHOP_DOMAIN — the retail Shopify shop this app is installed on
+//   (used by the Admin API tag-fetch call). Any carrier whose env vars
+//   aren't set is silently skipped — no errors.
 
 import crypto from "node:crypto";
 import { unauthenticated } from "../../shopify.server";
@@ -52,11 +70,6 @@ import { unauthenticated } from "../../shopify.server";
 // data; only these operational constants are declared here.
 // ═══════════════════════════════════════════════════════════════════════
 const CONFIG = {
-  // Processing fee — fraction of (subtotal + shipping + tax) charged
-  // as a payment-processing surcharge, bundled into every shipping
-  // rate returned to Shopify. Set to 0 to disable the fee entirely.
-  processingFeeRate: 0.03, // 3 %
-
   // Handling markup added to every non-free shipping option, tiered
   // by total cart quantity (values in CENTS on the wire).
   // The drop-ship reverse-calc in wholesale/app/services/dropship/*.js
@@ -74,23 +87,137 @@ const CONFIG = {
     thresholdUsd: 500,
   },
 
-  // Shopify tax API (draftOrderCalculate) tuning. Cache lets us
-  // reuse the same tax figure for a given cart+address combo without
-  // re-hitting the Admin API on every re-render. Timeout bounds the
-  // callback so a slow API doesn't stall the whole checkout — on
-  // timeout we fall through with 0 tax (fee based on subtotal +
-  // shipping only, no state guessing).
-  shopifyTax: {
-    cacheTtlMs: 5 * 60 * 1000, // 5 min
-    // Bumped 3 → 5 sec (2026-07-06) — Shopify's draftOrderCalculate
-    // occasionally takes 3-4 sec under load; 5 sec still leaves
-    // 5 sec buffer under Shopify's 10-sec carrier-callback budget.
-    timeoutMs: 5000, // 5 sec
-    // Hard cap on the in-process cache so unique cart+address combos
-    // don't grow the Map unbounded on long-running instances (memory
-    // safety). Oldest entry evicted on overflow (insertion-order LRU).
-    cacheMaxEntries: 1000,
+  // Retail no longer charges the 3% card surcharge and no longer fetches
+  // tax here — Shopify handles retail tax natively. Wholesale still has
+  // its own fee logic in wholesale/app/api/shipping/rates.js; keep both
+  // in sync when handling markup or free-shipping rules change.
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// PACKING config — box tiers, unit-cost table, packing-material buffer
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Everything the box-selection engine needs to size an order. Numbers
+// come from two sources:
+//   1. Stephanie's raw packing rules (converted to deterministic
+//      "unit-cost" math — see PROGRAM.md 2026-07-13 for derivation).
+//   2. Trace's July 2026 corrections after review (weight fix on 9x6x4,
+//      G4 fit correction, real-measured 18x14x8 tare, etc.).
+//
+// Naming aligned with client's 2026-07-23 product classification sheet
+// (Stephanie's 8-tier + XL + OTHER). Compared to earlier code:
+//   • SS (extra small)   was S      — Chromium, D3, tiny tablets
+//   • S  (small capsule) was S1     — Adrenal TLP, most NS capsules
+//   • XL (extra large)   NEW        — Body FX only
+//   • OTHER (own box)    NEW        — kits, cases, services (overflow)
+//   • REVIEW             NEW        — merchant-unmatched → empty rates
+const PACKING = {
+  // Unit-cost per category — how much "space" one of each takes in a
+  // box, expressed as a unit fraction. Derived from the 9x6x4 envelope
+  // baseline (capacity = 3 units):
+  //   - 3 × SS = 3 units → 1 SS = 0.75 (extra small: Chromium, D3)
+  //   - 3 × S  = 3 units → 1 S  = 1    (small capsule: Adrenal TLP, Body RGN)
+  //   - 1 × M + 1 × S = 3 units → 1 M = 2
+  //   - 1 × L alone = 3 units → 1 L = 3
+  //   - 1 × XL treated like L (client 2026-07-23) → 1 XL = 3
+  //   - 4 × G1 = 3 → 1 G1 = 0.75
+  //   - 3 × G2 = 3 → 1 G2 = 1
+  //   - 2 × G4 = 3 → 1 G4 = 1.5 (client corrected 2026-07-13; was 3)
+  //   - 60 × FA = 9 (fits 11x9x4) → 1 FA = 0.15
+  // LL uses the separate `liquids` capacity, not unitCost.
+  // OTHER and REVIEW never reach the unit-cost math — routed early in
+  // selectBox Step 0 (OTHER → overflow tier; REVIEW → empty rates).
+  unitCost: {
+    SS: 0.75,
+    S: 1,
+    M: 2,
+    L: 3,
+    XL: 3,
+    G1: 0.75,
+    G2: 1,
+    G4: 1.5,
+    FA: 0.15,
+    // LL — no entry; LL count checked against box.liquids separately
   },
+
+  // Packing-material weight added to every package (bubble wrap, paper,
+  // peanuts, tape). Trace explicitly asked for over-weight rather than
+  // under (cited a real $3.15 UPS bulge adjustment). Numbers are our
+  // estimates pending Stephanie's worst-case measurement — safe to raise
+  // if under-weight surfaces at billing time.
+  packingBufferOz: {
+    envelope: 2,
+    box: 5,
+  },
+
+  // Box tiers — ordered smallest to largest. `selectBox` iterates in this
+  // order and picks the FIRST tier where the cart fits. Client confirmed
+  // "smallest-that-fits" (Q8) because the approval gate catches any
+  // wrong pick.
+  //
+  // Field reference:
+  //   name       — human-readable identifier for logs
+  //   type       — "envelope" or "box" (drives packingBufferOz lookup)
+  //   L,W,H      — dimensions in inches (sent to USPS + UPS)
+  //   tareOz     — empty box/envelope weight in ounces
+  //   units      — non-liquid space capacity in unit-cost terms
+  //   liquids    — large-liquid (LL) capacity (0 for envelopes)
+  //   glassMax   — optional cap on total glass count for that tier
+  //   glassMin   — minimum glass count that TRIGGERS this tier (Enersync)
+  //   faMax      — optional cap on FA count
+  //   partitioned — true for Enersync boxes (glass safety)
+  //   glassSize  — Enersync-only, "1oz" or "2oz" (majority-size match)
+  //   fragilePreferred — true for UPS mini (glass-safety trigger)
+  //   tinyExtrasOnly — true for 18x13x3 (only S + FA allowed as extras)
+  //
+  // Tare-weight corrections logged 2026-07-13:
+  //   9x6x4 envelope: 2.7 → 0.7 oz (Trace's original sheet had a typo)
+  //   18x14x8 box:    ~14 → 17 oz  (Trace actually weighed = 1 lb 1 oz)
+  boxTiers: [
+    // ── Envelopes + UPS mini (small, ordered by capacity) ─────────────
+    { name: "9x6x4 envelope",   type: "envelope", L: 9,  W: 6,  H: 4,  tareOz: 0.7,  units: 3, liquids: 0, glassMax: 4 },
+    // 8x6x3 UPS mini — units:6 (bumped from 3, 2026-07-20): client's stated
+    // capacity is 6×G1 (4.5u), 5×G2 (5u), or 4×G4 (6u). The units:3 budget
+    // was silently rejecting these carts and routing them to 11x9x4 envelope
+    // instead — losing the intended glass-safety protection. Non-glass items
+    // are still gated out by Step 2's small-order guard (smallGlass>=3, no L,
+    // no M, no LL, totalItems<=5).
+    { name: "8x6x3 UPS mini",   type: "box",      L: 8,  W: 6,  H: 3,  tareOz: 2.7,  units: 6, liquids: 0, glassMax: 6, fragilePreferred: true },
+    { name: "11x9x4 envelope",  type: "envelope", L: 11, W: 9,  H: 4,  tareOz: 0.7,  units: 9, liquids: 0, faMax: 60 },
+    // ── Liquid boxes (ordered by liquid capacity) ─────────────────────
+    // "Extras" numbers per client's Q1: 3 for smallest, 4 for mid, 6-8 for big.
+    { name: "8x6x6 box",        type: "box",      L: 8,  W: 6,  H: 6,  tareOz: 3.9,  units: 3, liquids: 1 },
+    { name: "10x7x6 box",       type: "box",      L: 10, W: 7,  H: 6,  tareOz: 5.0,  units: 4, liquids: 2 },
+    { name: "11x4x12 box",      type: "box",      L: 11, W: 4,  H: 12, tareOz: 5.7,  units: 4, liquids: 3 },
+    { name: "16x11x3 box",      type: "box",      L: 16, W: 11, H: 3,  tareOz: 7.5,  units: 4, liquids: 4 },
+    { name: "12x12x5 box",      type: "box",      L: 12, W: 12, H: 5,  tareOz: 9.6,  units: 4, liquids: 4 },
+    // 18x13x3 — per client Q2: "no extra room when full liquids, only FA or
+    // very small bottle like Aquamax/Chromium might fit". `tinyExtrasOnly`
+    // flag makes selectBox reject any cart with S/M/L/XL/G* items.
+    { name: "18x13x3 box",      type: "box",      L: 18, W: 13, H: 3,  tareOz: 9.3,  units: 1, liquids: 6, tinyExtrasOnly: true },
+    // 15x12x10 — client confirmed on 2026-07-30 that the actual box is
+    // 15×12×10, not 15×12×9 (our previously-recorded dimensions were incorrect).
+    // Tare (11.5 oz) + capacity (units:6, liquids:12) unchanged per client;
+    // only the H digit corrected. Volume is now 1800 in³ (was 1620).
+    { name: "15x12x10 box",     type: "box",      L: 15, W: 12, H: 10, tareOz: 11.5, units: 6, liquids: 12 },
+    // 13x13x10 — Trace confirmed tare 13.6 oz on 2026-07-23. Capacity is a
+    // best-guess from volume comparison: 1690 in³ is close to 15x12x10's
+    // 1800 in³, so we mirror its capacity (12 liquids + 6 units). Ordered
+    // AFTER 15x12x10 because it's heavier — selectBox iterates smallest-tare
+    // -first for equivalent capacity. Client to confirm real capacity when
+    // the box is next in use; tune here on feedback.
+    { name: "13x13x10 box",     type: "box",      L: 13, W: 13, H: 10, tareOz: 13.6, units: 6, liquids: 12 },
+    // 18x14x8 — Trace measured 17 oz (1 lb 1 oz). Prior estimate was ~14.
+    { name: "18x14x8 box",      type: "box",      L: 18, W: 14, H: 8,  tareOz: 17.0, units: 8, liquids: 16 },
+    // ── Enersync (partitioned) — triggered by 12+ glass ───────────────
+    // Client Q5: NOT strictly glass-only. Example: 12×G1 + 3×Adrenal TLP
+    // fits in Enersync 1oz. So `units: 4` allows up to 4 unit-cost of
+    // extras alongside the glass partitions.
+    { name: "Enersync 1oz",     type: "box",      L: 10, W: 7,  H: 6,  tareOz: 7.0,  units: 4, liquids: 0, glassMin: 12, partitioned: true, glassSize: "1oz" },
+    { name: "Enersync 2oz",     type: "box",      L: 11, W: 7,  H: 8,  tareOz: 13.2, units: 4, liquids: 0, glassMin: 12, partitioned: true, glassSize: "2oz" },
+    // 13x13x10 was added on 2026-07-23 above (tare 13.6 oz per Trace).
+    // 16x12x10 was explicitly excluded per Q7 answer.
+  ],
 };
 
 // Handling-markup resolver — reads `CONFIG.handlingMarkupCents`. The
@@ -103,25 +230,56 @@ function tieredMarkupCents(qty) {
 
 // ── Discount detection from the carrier-service payload ──────────────
 //
-// Shopify's carrier-service callback DOES NOT reliably surface applied
-// discount codes / automatic discounts in a single canonical field —
-// different Shopify versions + themes populate different keys, and
-// sometimes NONE of them. Without accounting for the discount, the 3%
-// processing fee is calculated on the pre-discount subtotal and the
-// customer over-pays the fee (small but real — $0.45 on a $15 discount).
+// Used only for observability — the per-rate breakdown log shows the net
+// (post-discount) cart subtotal alongside the raw items sum so ops can
+// see at a glance whether a customer's discount landed in the payload.
+// Nothing in the returned rate depends on this value; free-shipping still
+// checks the pre-discount subtotal (Shopify's carrier-service payload
+// doesn't reliably expose post-discount totals across all themes).
 //
-// We probe the payload for every field we've seen actually populated,
-// in order of reliability. First non-zero win. Returns discount in
-// CENTS. Returns 0 when no discount info is available in the payload —
-// in that case the fee falls back to computing on the raw subtotal,
-// matching the previous (pre-discount-aware) behavior exactly.
-//
-// Returns { cents, source } so the per-rate log can show which field
-// was used, making it easy to diagnose payload shape drift over time.
+// Shopify populates the discount across multiple fields depending on
+// Shopify version + theme. We probe them in order of reliability and
+// return the first non-zero value in CENTS. Returns 0 on no match.
+// The { source } field records which field won so payload-shape drift
+// is diagnosable in production logs.
 function detectCartDiscountCents(rate, realItems) {
-  // Field 1: `rate.total_discounts` — integer cents, top-level. Newer
-  //          versions of the carrier-service payload set this. Most
-  //          reliable when present.
+  // Field 0a: `rate.order_totals.discount_amount` — integer CENTS.
+  //           Confirmed present in real 2026-07-07 production payload
+  //           dumps: Shopify carrier-service now sends an `order_totals`
+  //           block { subtotal_price, total_price, discount_amount }
+  //           on every callback. When any discount (line-level OR
+  //           order-level) is active, this field carries the total
+  //           applied discount in cents. Highest-confidence source.
+  const orderTotalDiscount = Number(rate?.order_totals?.discount_amount);
+  if (Number.isFinite(orderTotalDiscount) && orderTotalDiscount > 0) {
+    return {
+      cents: Math.round(orderTotalDiscount),
+      source: "order_totals.discount_amount",
+    };
+  }
+
+  // Field 0b: derived from `order_totals.subtotal_price` vs
+  //           `order_totals.total_price` — belt-and-braces in case
+  //           Shopify sometimes populates the totals but leaves
+  //           `discount_amount` at 0. Both values are cents already
+  //           (no dollars/cents heuristic needed for this block).
+  const otSubtotal = Number(rate?.order_totals?.subtotal_price);
+  const otTotal = Number(rate?.order_totals?.total_price);
+  if (
+    Number.isFinite(otSubtotal) &&
+    Number.isFinite(otTotal) &&
+    otSubtotal > otTotal &&
+    otSubtotal > 0
+  ) {
+    return {
+      cents: Math.round(otSubtotal - otTotal),
+      source: "order_totals (subtotal − total)",
+    };
+  }
+
+  // Field 1: `rate.total_discounts` — integer cents, top-level. Older
+  //          shape of the carrier-service payload set this. Kept as a
+  //          fallback for backward compatibility.
   const topLevel = Number(rate?.total_discounts);
   if (Number.isFinite(topLevel) && topLevel > 0) {
     return { cents: Math.round(topLevel), source: "rate.total_discounts" };
@@ -257,197 +415,442 @@ function gramsToLb(grams) {
   return Math.max(0.1, Math.round(((Number(grams) || 0) / 453.592) * 10) / 10);
 }
 
-// ── Processing fee (bundled into shipping rate) ────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+// PRODUCT CLASSIFICATION — metafield-based (2026-07-23)
+// ═══════════════════════════════════════════════════════════════════════
 //
-// Migrated 2026-07-06 from the Grow-plan-blocked checkout UI extension
-// (`extensions/processing-fee/`) into the carrier-service callback. The
-// fee is bundled into every returned shipping rate so it flows through
-// naturally at checkout without any Plus-only Shopify surface.
+// Each product in the retail Shopify store carries a `custom.pack_category`
+// metafield naming its shipping pack category. Twelve allowed values (client
+// classification sheet, 2026-07-23):
 //
-// Formula:
-//   shipping    = free-shipping ? 0 : (real carrier rate + handling markup)
-//   tax         = Shopify's live tax on this cart+destination (see
-//                 `calculateShopifyTax` — draftOrderCalculate mutation).
-//                 Fallback = 0 if the API is unreachable.
-//   feeBase     = subtotal + shipping + tax
-//   fee         = feeBase × CONFIG.processingFeeRate
-//   rate to Shopify = shipping + fee
+//   SS      Extra small tablets / tiny bottles (Chromium, D3, B12, Biotin)
+//   S       Small capsules                     (Adrenal TLP, Cardio Support)
+//   M       Medium capsules                    (B-Complex, Bone Health)
+//   L       Large non-liquid                   (Amino Complex, Enervimin Focus)
+//   LL      Large liquid                       (Liquid Life, Zavita, Biomega)
+//   XL      Extra large                        (Body FX only — 2 products)
+//   G1      1 oz glass                         (droppers, sprays, essential oils)
+//   G2      2 oz glass                         (2oz droppers, sprays)
+//   G4      4 oz glass                         (Organdrainex, Colloidal Silver)
+//   FA      Frequency App                      (flat patches)
+//   OTHER   Ships in its own retail box        (kits, cases, services)
+//   REVIEW  Merchant-unmatched                 (blocks checkout — see below)
 //
-// Free-shipping interaction: fee STILL applies when free-shipping fires
-// (shipping is $0 but the 3% processing fee is not — merchant still
-// collects the fee on NS-only $500+ carts). See CONFIG.freeShipping.
+// The merchant assigns these in Shopify admin → Product → Metafields →
+// "Pack category" (a text field with the allowed values above). Client's
+// classification sheet ships pre-filled with the correct value per SKU;
+// merchant CSV-imports it once. Superseded the `pack:XXX` tag system on
+// 2026-07-23 (see §21 changelog).
 //
-// Tax handling: Shopify's own `draftOrderCalculate` mutation is the sole
-// tax source — no more hardcoded state-rate tables. If the API fails /
-// times out the fee is calculated on (subtotal + shipping) only (no
-// static state guessing). Rely on Shopify's tax config for accuracy.
+// Runtime: on every carrier callback we do ONE bulk GraphQL query to
+// Shopify Admin API asking for the `custom.pack_category` metafield on all
+// product IDs in the cart. Missing metafield → treated as REVIEW → empty
+// rates.
+//
+// Missing / REVIEW policy:
+//   If ANY cart item's product has no valid `custom.pack_category`, or the
+//   metafield equals REVIEW, the whole rate response is EMPTY — customer
+//   sees "no shipping available." This is intentional back-pressure: it
+//   forces the merchant to classify every product before it can ship.
 
-// ── Shopify Tax API (draftOrderCalculate) ─────────────────────────────
-//
-// Live tax calculation using Shopify's own tax engine. This is more
-// accurate than the static US_STATE_TAX_RATES lookup because it honors:
-//   • City / county / special-district add-ons (not just state)
-//   • Product taxability rules (some categories tax-exempt)
-//   • Marketplace facilitator laws
-//   • Customer tax-exempt status (if configured on the customer record)
-//
-// Trade-off: adds a 200-500ms Shopify Admin GraphQL call per callback.
-// Mitigated by (a) an in-memory cache keyed on the tax-affecting inputs
-// (state, zip, product mix, subtotal) with a 5-min TTL, and (b) a 3-sec
-// timeout that falls back to the static lookup on slow / failed calls.
-//
-// Rate limit consideration: `draftOrderCalculate` costs ~10-20 points.
-// Shopify's GraphQL bucket is 50 points/sec, so we can safely handle up
-// to ~3 fresh checkouts per second before rate-limit risk. Cache hits
-// consume nothing.
+const PACK_METAFIELD_NAMESPACE = "custom";
+const PACK_METAFIELD_KEY = "pack_category";
+const ALLOWED_CATEGORIES = new Set([
+  "SS", "S", "M", "L", "LL", "XL", "G1", "G2", "G4", "FA", "OTHER", "REVIEW",
+]);
 
-// Shop domain — resolved per-request in the action handler (Shopify
-// sends `X-Shopify-Shop-Domain` header on the webhook, which is the
-// most reliable source; env vars are a fallback for local dev where
-// the header may be missing). Kept as a function rather than a module
-// constant so a multi-environment deploy correctly routes each request
-// to its own shop.
-function resolveShopDomain(request) {
-  const fromHeader = String(
-    request?.headers?.get?.("x-shopify-shop-domain") || "",
-  ).trim();
-  if (fromHeader) return fromHeader;
-  return (
-    // eslint-disable-next-line no-undef
-    process.env.RETAIL_SHOP_DOMAIN ||
-    // eslint-disable-next-line no-undef
-    process.env.SHOPIFY_SHOP ||
-    ""
-  );
+// Normalise a raw metafield value into a canonical PACK CATEGORY code, or
+// null if the value is missing / unrecognised. Case-tolerant on read so
+// "ss" and "Ss" both map to "SS".
+function normalizePackCategory(raw) {
+  if (raw == null) return null;
+  const trimmed = String(raw).trim();
+  if (!trimmed) return null;
+  const normalised = trimmed.toUpperCase();
+  if (ALLOWED_CATEGORIES.has(normalised)) return normalised;
+  return null;
 }
 
-const _shopifyTaxCache = new Map(); // key → { taxCents, cachedAt }
+// Bulk-fetch the `custom.pack_category` metafield for every product ID in
+// the cart via one Shopify Admin GraphQL call, using the app's stored OAuth
+// session for the retail shop (`unauthenticated.admin(shop)`). Returns
+// Map<productId string, packCategory string>. Never throws — on any
+// failure (missing session, network, GraphQL error) returns an empty Map
+// so the caller treats every item as "no category" and falls back to
+// empty rates.
+//
+// Shop resolution: the carrier-service callback doesn't include a shop
+// domain header, so we read RETAIL_SHOP_DOMAIN from env (falling back to
+// SHOPIFY_SHOP for parity with the rest of the file). This must match
+// the shop domain this app is installed on — the same one whose OAuth
+// session token was persisted at install time.
+async function fetchProductPackCategoriesFromShopify(productIds) {
+  if (!productIds || productIds.length === 0) return new Map();
 
-function buildTaxCacheKey({ destination, realItems, subtotalCents }) {
-  const state = String(destination?.province_code || destination?.province || "").toUpperCase();
-  const zip = String(destination?.postal_code || destination?.zip || "").slice(0, 5);
-  const country = String(destination?.country_code || destination?.country || "US").toUpperCase();
-  // Include item variant ids so tax varies with product mix (some
-  // products may be tax-exempt). Subtotal is already discount-adjusted
-  // by the caller, so a discount-applied cart naturally caches under
-  // a different key than the same items un-discounted.
-  const variants = (realItems || [])
-    .map((it) => `${it.variant_id || it.product_id}:${it.quantity}`)
-    .sort()
-    .join(",");
-  return `${country}|${state}|${zip}|${subtotalCents}|${variants}`;
-}
+  const rawShop =
+    process.env.RETAIL_SHOP_DOMAIN || process.env.SHOPIFY_SHOP || "";
+  const shop = String(rawShop || "")
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/, "");
+  if (!shop) {
+    console.warn(
+      "[shipping.rates] RETAIL_SHOP_DOMAIN env var not set — cannot fetch pack_category metafield. Every quote will be empty until it's configured.",
+    );
+    return new Map();
+  }
 
-const MUTATION_DRAFT_ORDER_CALCULATE = `#graphql
-  mutation DraftOrderCalculateForTax($input: DraftOrderInput!) {
-    draftOrderCalculate(input: $input) {
-      calculatedDraftOrder {
-        totalTaxSet {
-          shopMoney {
-            amount
-            currencyCode
-          }
-        }
-        taxLines {
-          title
-          rate
-          ratePercentage
-          priceSet {
-            shopMoney { amount }
+  let admin;
+  try {
+    const authed = await unauthenticated.admin(shop);
+    admin = authed.admin;
+  } catch (err) {
+    console.warn(
+      "[shipping.rates] pack_category session lookup failed:",
+      err?.message || String(err),
+    );
+    return new Map();
+  }
+
+  const gids = productIds.map((id) => `gid://shopify/Product/${id}`);
+  const query = `#graphql
+    query CartProductPackCategories($ids: [ID!]!, $namespace: String!, $key: String!) {
+      nodes(ids: $ids) {
+        ... on Product {
+          id
+          packCategory: metafield(namespace: $namespace, key: $key) {
+            value
           }
         }
       }
-      userErrors { field message }
     }
-  }
-`;
+  `;
 
-// Calculate the exact Shopify tax for the given cart + destination.
-// Returns { taxCents, source } on success or null on failure — caller
-// falls back to the static state-lookup rate.
-async function calculateShopifyTax({ shop, destination, realItems, subtotalCents }) {
-  if (!shop) return null;
-  if (!realItems?.length) return null;
-
-  // Cache hit — return instantly (no Shopify call).
-  const cacheKey = buildTaxCacheKey({ destination, realItems, subtotalCents });
-  const cached = _shopifyTaxCache.get(cacheKey);
-  if (cached && Date.now() - cached.cachedAt < CONFIG.shopifyTax.cacheTtlMs) {
-    return { taxCents: cached.taxCents, source: "shopify_cached" };
-  }
-
-  // Build the input — Shopify draftOrderCalculate needs variantId in
-  // GID form; carrier-service payload sends numeric variant_id.
-  const lineItems = realItems
-    .filter((it) => it?.variant_id)
-    .map((it) => ({
-      variantId: `gid://shopify/ProductVariant/${it.variant_id}`,
-      quantity: Number(it.quantity) || 1,
-    }));
-  if (!lineItems.length) return null;
-
-  const input = {
-    shippingAddress: {
-      address1: destination?.address1 || "",
-      city: destination?.city || "",
-      provinceCode:
-        destination?.province_code || destination?.province || undefined,
-      countryCode:
-        destination?.country_code || destination?.country || "US",
-      zip: destination?.postal_code || destination?.zip || "",
-    },
-    lineItems,
-  };
-  // Drop empty provinceCode — Shopify rejects "" for that field.
-  if (!input.shippingAddress.provinceCode) {
-    delete input.shippingAddress.provinceCode;
-  }
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), CONFIG.shopifyTax.timeoutMs);
+  const startedAt = Date.now();
+  let body;
   try {
-    const { admin } = await unauthenticated.admin(shop);
-    const res = await admin.graphql(MUTATION_DRAFT_ORDER_CALCULATE, {
-      variables: { input },
-      signal: controller.signal,
+    const res = await admin.graphql(query, {
+      variables: {
+        ids: gids,
+        namespace: PACK_METAFIELD_NAMESPACE,
+        key: PACK_METAFIELD_KEY,
+      },
     });
-    const body = await res.json();
-    clearTimeout(timer);
-
-    const userErrors = body?.data?.draftOrderCalculate?.userErrors || [];
-    if (userErrors.length) {
-      console.warn(
-        "[shipping.rates] draftOrderCalculate userErrors:",
-        JSON.stringify(userErrors),
-      );
-      return null;
-    }
-    const taxAmountUsd = Number(
-      body?.data?.draftOrderCalculate?.calculatedDraftOrder?.totalTaxSet
-        ?.shopMoney?.amount,
-    );
-    if (!Number.isFinite(taxAmountUsd)) return null;
-    const taxCents = Math.round(taxAmountUsd * 100);
-
-    // Cache for CONFIG.shopifyTax.cacheTtlMs. Bounded to
-    // `cacheMaxEntries` — on overflow we drop the OLDEST entry
-    // (Map preserves insertion order, so the first key is the
-    // oldest by insertion time — approximates LRU cheaply).
-    if (_shopifyTaxCache.size >= CONFIG.shopifyTax.cacheMaxEntries) {
-      const oldestKey = _shopifyTaxCache.keys().next().value;
-      if (oldestKey !== undefined) _shopifyTaxCache.delete(oldestKey);
-    }
-    _shopifyTaxCache.set(cacheKey, { taxCents, cachedAt: Date.now() });
-
-    return { taxCents, source: "shopify_live" };
+    body = await res.json();
   } catch (err) {
-    clearTimeout(timer);
     console.warn(
-      "[shipping.rates] Shopify tax API failed — falling back to state lookup:",
-      err?.message || err,
+      "[shipping.rates] pack_category GraphQL call failed:",
+      err?.message || String(err),
+      `· elapsed=${Date.now() - startedAt}ms`,
     );
-    return null;
+    return new Map();
   }
+
+  if (Array.isArray(body?.errors) && body.errors.length) {
+    console.warn(
+      "[shipping.rates] pack_category GraphQL errors:",
+      JSON.stringify(body.errors).slice(0, 400),
+    );
+    return new Map();
+  }
+
+  const result = new Map();
+  for (const node of body?.data?.nodes || []) {
+    if (!node?.id) continue;
+    const idStr = String(node.id).replace("gid://shopify/Product/", "");
+    const rawValue = node.packCategory?.value ?? null;
+    result.set(idStr, rawValue); // may be null; classifier handles it
+  }
+  console.log(
+    `[shipping.rates] pack_category fetched · ${result.size}/${productIds.length} product(s) resolved · elapsed=${Date.now() - startedAt}ms`,
+  );
+  return result;
+}
+
+// Aggregate cart-level classification. Given the cart's line items and a
+// pre-fetched Map<productId, rawMetafieldValue>, produce per-line categories,
+// the bucketed counts, and a `missing` list of items whose product has no
+// valid `custom.pack_category` metafield (or has the value REVIEW).
+// Callers should refuse to quote rates if `missing.length > 0`.
+function classifyCart(items, categoriesByProductId) {
+  const counts = {
+    SS: 0, S: 0, M: 0, L: 0, LL: 0, XL: 0,
+    G1: 0, G2: 0, G4: 0, FA: 0, OTHER: 0, REVIEW: 0,
+  };
+  const perLine = [];
+  const missing = [];
+
+  for (const it of items || []) {
+    const productId = String(it?.product_id || "");
+    const rawValue = categoriesByProductId.get(productId);
+    const category = normalizePackCategory(rawValue);
+    const qty = Number(it?.quantity) || 1;
+
+    // REVIEW is a valid metafield value that still blocks checkout —
+    // treat it like a missing classification so the front-end shows the
+    // same "no shipping available" back-pressure.
+    if (!category || category === "REVIEW") {
+      missing.push({
+        productId,
+        variantId: it?.variant_id ?? null,
+        sku: it?.sku || null,
+        name: it?.name || "",
+        rawValue: rawValue ?? null,
+        reason: category === "REVIEW" ? "review_pending" : "no_metafield",
+      });
+      perLine.push({
+        variantId: it?.variant_id ?? null,
+        sku: it?.sku || null,
+        name: it?.name || "",
+        grams: Number(it?.grams) || 0,
+        quantity: qty,
+        category: category || null,
+      });
+      // Still count REVIEW so ops sees it in the summary log.
+      if (category === "REVIEW") counts.REVIEW += qty;
+      continue;
+    }
+
+    counts[category] += qty;
+    perLine.push({
+      variantId: it?.variant_id ?? null,
+      sku: it?.sku || null,
+      name: it?.name || "",
+      grams: Number(it?.grams) || 0,
+      quantity: qty,
+      category,
+    });
+  }
+
+  return { counts, perLine, missing };
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// BOX SELECTION — cart classification counts → picked box tier
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The core algorithm. Given a cart's per-category counts (from
+// classifyCart), pick the smallest box in PACKING.boxTiers that fits.
+// Client-confirmed priority (see PROGRAM.md 2026-07-13 approvals):
+//
+//   STEP 1: totalGlass >= 12 → Enersync (1oz or 2oz by majority)
+//           Extras allowed up to Enersync.units (Q5 answer).
+//   STEP 2: (G1 + G2) >= 3 AND totalItems <= 5 AND no L AND no LL
+//           → 8x6x3 UPS mini (glass-safety trigger, Q6 answer)
+//   STEP 3: any LL > 0 → smallest liquid box that fits
+//           iterate ordered liquid tiers; first where liquids AND units OK
+//           18x13x3 tinyExtrasOnly enforced — only S + FA allowed
+//   STEP 4: any FA > 0 (no LL) → 11x9x4 envelope if fits
+//   STEP 5: bottles/glass only, no LL:
+//             unitDemand <= 3 → 9x6x4 envelope
+//             unitDemand <= 9 → 11x9x4 envelope
+//             larger        → next tier that fits
+//   STEP 6: nothing fits → largest tier + overflow flag (approval gate
+//           handles it manually)
+//
+// Returns { box, overflow }. Box is a PACKING.boxTiers entry (with
+// `name`, `L`, `W`, `H`, `tareOz`, `type`). Overflow=true means no
+// tier's capacity satisfied — merchant should manually pick.
+function selectBox(cartCounts) {
+  const c = cartCounts || {};
+  const totalGlass = (c.G1 || 0) + (c.G2 || 0) + (c.G4 || 0);
+  const totalItems =
+    (c.SS || 0) + (c.S || 0) + (c.M || 0) + (c.L || 0) + (c.XL || 0) +
+    (c.LL || 0) + (c.G1 || 0) + (c.G2 || 0) + (c.G4 || 0) + (c.FA || 0) +
+    (c.OTHER || 0);
+  // Non-liquid, non-FA unit demand (LL uses `liquids`, FA uses `faMax`).
+  // XL is treated like L per client 2026-07-23 (unit-cost 3) — routes
+  // through the standard non-liquid path.
+  const unitDemand =
+    (c.SS || 0) * PACKING.unitCost.SS +
+    (c.S || 0) * PACKING.unitCost.S +
+    (c.M || 0) * PACKING.unitCost.M +
+    (c.L || 0) * PACKING.unitCost.L +
+    (c.XL || 0) * PACKING.unitCost.XL +
+    (c.G1 || 0) * PACKING.unitCost.G1 +
+    (c.G2 || 0) * PACKING.unitCost.G2 +
+    (c.G4 || 0) * PACKING.unitCost.G4;
+  // FA can share space with other items (they're flat cards). Treat FA
+  // demand separately via `faMax` on the envelope tier (60 in 11x9x4).
+  const faDemand = c.FA || 0;
+  const llDemand = c.LL || 0;
+
+  // Non-tiny categories used to check `tinyExtrasOnly` (18x13x3). SS is
+  // the only extra-small category that qualifies as a "tiny extra" alongside
+  // FA. Everything else — S (small capsules) up through XL — is non-tiny.
+  const hasNonTinyExtras =
+    (c.S || 0) > 0 || (c.M || 0) > 0 || (c.L || 0) > 0 || (c.XL || 0) > 0 ||
+    (c.G1 || 0) > 0 || (c.G2 || 0) > 0 || (c.G4 || 0) > 0;
+
+  // ── STEP 0: OTHER (own-box) present in cart → overflow ─────────────
+  //
+  // Client's OTHER category (kits, cases, services, EnerSync 24-count boxes)
+  // ships in its own retail box. No engine tier can size it correctly, so we
+  // route the whole cart to the largest tier with overflow=true and warn.
+  // Merchant approval gate reviews and fixes the label at fulfillment time.
+  //
+  // REVIEW is already blocked earlier in the action handler (empty rates),
+  // so it never reaches this function.
+  if ((c.OTHER || 0) > 0) {
+    const largest = resolveLargestOverflowBox();
+    console.warn(
+      `[shipping.rates] cart contains pack:OTHER(${c.OTHER}) — routes in own retail box; falling back to ${largest.name} + overflow`,
+    );
+    return { box: largest, overflow: true };
+  }
+
+  // ── STEP 1: 12+ glass → Enersync ────────────────────────────────────
+  if (totalGlass >= 12 && llDemand === 0) {
+    // Majority size decides which Enersync (Q5). Ties → 2oz (bigger box,
+    // conservative for mixed carts).
+    const majoritySize =
+      (c.G1 || 0) > ((c.G2 || 0) + (c.G4 || 0)) ? "1oz" : "2oz";
+    const enersync = PACKING.boxTiers.find(
+      (b) => b.partitioned && b.glassSize === majoritySize,
+    );
+    // Verify the non-glass extras fit within Enersync's units budget.
+    // (Client Q5: 12×G1 + 3×Adrenal TLP fits — 3 S = 3 units, budget 4.)
+    const nonGlassUnits =
+      (c.SS || 0) * PACKING.unitCost.SS +
+      (c.S || 0) * PACKING.unitCost.S +
+      (c.M || 0) * PACKING.unitCost.M +
+      (c.L || 0) * PACKING.unitCost.L +
+      (c.XL || 0) * PACKING.unitCost.XL;
+    if (enersync && nonGlassUnits <= enersync.units) {
+      return { box: enersync, overflow: false };
+    }
+    // Otherwise fall through — extras too big, hit the regular box path.
+  }
+
+  // ── STEP 2: Small order with 3+ small glass → UPS mini ─────────────
+  // Client Q6 (broad interpretation, 2026-07-20): "small order" = ≤ 5 total
+  // items, no LL, no L, AND no M ("no larger bottles"). This keeps UPS mini
+  // strictly for concentrated small-glass loads + tiny SS/S/FA extras. A
+  // medium+glass cart falls through to the 11×9×4 envelope path via Step 5.
+  const smallGlassCount = (c.G1 || 0) + (c.G2 || 0);
+  if (
+    smallGlassCount >= 3 &&
+    llDemand === 0 &&
+    (c.L || 0) === 0 &&
+    (c.M || 0) === 0 &&
+    (c.XL || 0) === 0 &&
+    totalItems <= 5
+  ) {
+    const upsMini = PACKING.boxTiers.find((b) => b.fragilePreferred);
+    if (upsMini && unitDemand <= upsMini.units && totalGlass <= (upsMini.glassMax || 999)) {
+      return { box: upsMini, overflow: false };
+    }
+  }
+
+  // ── STEP 3: Any large liquid → smallest liquid box ─────────────────
+  //
+  // The `tinyExtrasOnly` flag (currently only on 18x13x3) is stricter than
+  // a simple non-tiny-extras rejection. Per Trace (via PM 2026-07-17, still
+  // aligned with client sheet 2026-07-23):
+  //   (a) Cart has any S/M/L/XL/G* items → reject outright (hasNonTinyExtras).
+  //   (b) Box at MAX liquid capacity + cart has any SS bottles → skip to
+  //       next tier. Only Frequency Apps (flat cards) may sit alongside
+  //       6 large liquids. Whether a single SS bottle can squeeze in is
+  //       still under review; conservative default is SS-blocked when full.
+  //   (c) Box has leftover liquid room → SS + FA both fit (guarded by
+  //       normal unit-budget check below).
+  if (llDemand > 0) {
+    const liquidBoxes = PACKING.boxTiers.filter((b) => b.liquids > 0);
+    for (const box of liquidBoxes) {
+      if (box.tinyExtrasOnly) {
+        if (hasNonTinyExtras) continue;
+        const liquidRoomLeft = box.liquids - llDemand;
+        if (liquidRoomLeft <= 0 && (c.SS || 0) > 0) continue;
+      }
+      if (box.liquids >= llDemand && box.units >= unitDemand) {
+        return { box, overflow: false };
+      }
+    }
+    // No liquid box fits — overflow to largest tier
+    const largest = resolveLargestOverflowBox();
+    return { box: largest, overflow: true };
+  }
+
+  // ── STEP 4: FA + small items (no LL) → 11x9x4 envelope ────────────
+  if (faDemand > 0) {
+    const largeEnv = PACKING.boxTiers.find((b) => b.name === "11x9x4 envelope");
+    if (
+      largeEnv &&
+      faDemand <= (largeEnv.faMax || 60) &&
+      unitDemand <= largeEnv.units
+    ) {
+      return { box: largeEnv, overflow: false };
+    }
+  }
+
+  // ── STEP 5: Only bottles/glass, no LL — pick by unit demand ───────
+  // Iterate non-liquid boxes smallest to largest. Skip UPS mini + Enersync
+  // (special-purpose only) and skip tinyExtrasOnly boxes.
+  const nonLiquidBoxes = PACKING.boxTiers.filter(
+    (b) =>
+      b.liquids === 0 && !b.fragilePreferred && !b.partitioned && !b.tinyExtrasOnly,
+  );
+  for (const box of nonLiquidBoxes) {
+    if (box.units >= unitDemand + faDemand * PACKING.unitCost.FA) {
+      // Glass max check (envelope has glassMax:4 for 9x6x4)
+      if (box.glassMax !== undefined && totalGlass > box.glassMax) continue;
+      return { box, overflow: false };
+    }
+  }
+
+  // Iterate all remaining boxes (including liquid ones as last resort)
+  // in case the cart is huge — but flag as overflow so merchant knows.
+  const largest = resolveLargestOverflowBox();
+  return { box: largest, overflow: true };
+}
+
+// Helper — resolve the "largest overflow" box, used by Steps 0/3/5 fallback.
+// Bug fix 2026-07-30 (was `PACKING.boxTiers[length - 1]`):
+// `boxTiers` is ordered smallest→largest for MAINLINE boxes then appends
+// the two Enersync (partitioned, glass-only) specialty tiers at the end,
+// so `length - 1` was returning **Enersync 2oz** — a small 11×7×8
+// partitioned box (tare 13.2 oz, liquids:0). Every OTHER cart, every
+// oversized LL cart, and every non-liquid overflow was being quoted at
+// those wrong dims — merchant ate the DIM-weight difference on real
+// shipments in 18×14×8. Explicit name lookup for the real largest box,
+// with a defensive fallback so the algorithm never returns undefined.
+function resolveLargestOverflowBox() {
+  return (
+    PACKING.boxTiers.find((b) => b.name === "18x14x8 box") ||
+    // If 18x14x8 is ever renamed/removed, pick the largest non-partitioned
+    // tier by name convention — still better than the specialty Enersync.
+    PACKING.boxTiers.filter((b) => !b.partitioned).slice(-1)[0] ||
+    PACKING.boxTiers[PACKING.boxTiers.length - 1]
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// PACKAGE WEIGHT COMPUTATION
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Total package weight = sum of item weights + empty box tare + packing
+// material buffer. Sent to USPS + UPS for accurate rate quotes.
+function computePackageWeight(items, box) {
+  const itemsGrams = (items || []).reduce(
+    (sum, it) => sum + (Number(it?.grams) || 0) * (Number(it?.quantity) || 1),
+    0,
+  );
+  const itemsOz = itemsGrams / 28.3495;
+  const tareOz = box?.tareOz || 0;
+  const bufferOz = box?.type
+    ? PACKING.packingBufferOz[box.type] || 0
+    : PACKING.packingBufferOz.box;
+
+  const totalOz = itemsOz + tareOz + bufferOz;
+  const totalLbs = Math.max(0.1, Math.round((totalOz / 16) * 10) / 10);
+
+  return {
+    itemsOz: Math.round(itemsOz * 10) / 10,
+    tareOz,
+    bufferOz,
+    totalOz: Math.round(totalOz * 10) / 10,
+    totalLbs,
+  };
 }
 
 // In-memory OAuth token cache keyed by carrier. Most direct-carrier APIs
@@ -496,7 +899,7 @@ function setCachedToken(key, token, ttlSeconds) {
 //   USPS_CLIENT_ID
 //   USPS_CLIENT_SECRET
 //   (Optional override) USPS_API_BASE = https://apis.usps.com
-async function fetchUSPSRates({ origin, destination, items }) {
+async function fetchUSPSRates({ origin, destination, items, selectedBox, packageWeight }) {
   const clientId = process.env.USPS_CLIENT_ID;
   const clientSecret = process.env.USPS_CLIENT_SECRET;
   if (!clientId || !clientSecret) return [];
@@ -542,20 +945,31 @@ async function fetchUSPSRates({ origin, destination, items }) {
   //
   // `MACHINABLE` + `SP` (single piece) + `NONE` (no facility entry) are
   // the right defaults for a small parcel handed to a retail PO.
+  // Legacy weight from raw item grams (kept as fallback if selectBox
+  // didn't run for some reason — should never happen in normal flow).
   const totalGrams = (items || []).reduce(
     (s, it) => s + (Number(it?.grams) || 0) * (Number(it?.quantity) || 0),
     0,
   );
+
+  // Dimensions + weight come from the box-selection engine
+  // (`selectedBox` + `packageWeight`). Fallback to legacy 10×8×4 +
+  // summed grams is defensive resilience only — real requests always
+  // pass both.
+  const weightLbs = packageWeight?.totalLbs ?? gramsToLb(totalGrams);
+  const lengthIn = selectedBox?.L ?? 10;
+  const widthIn = selectedBox?.W ?? 8;
+  const heightIn = selectedBox?.H ?? 4;
 
   // Common to every USPS call. Per-mail-class overrides (below) replace
   // rateIndicator + processingCategory when a tier needs them.
   const baseBody = {
     originZIPCode: origin?.postal_code || "",
     destinationZIPCode: destination?.postal_code || "",
-    weight: gramsToLb(totalGrams),
-    length: 10,
-    width: 8,
-    height: 4,
+    weight: weightLbs,
+    length: lengthIn,
+    width: widthIn,
+    height: heightIn,
     destinationEntryFacilityType: "NONE",
     priceType: "COMMERCIAL",
     mailingDate: new Date().toISOString().slice(0, 10),
@@ -682,7 +1096,7 @@ async function fetchUSPSRates({ origin, destination, items }) {
 //
 // Rates: POST {base}/api/rating/v2403/Shop returns rates for ALL available
 // services in one call (vs `/Rate` which targets a single service code).
-async function fetchUPSRates({ origin, destination, items }) {
+async function fetchUPSRates({ origin, destination, items, selectedBox, packageWeight }) {
   const clientId = process.env.UPS_CLIENT_ID;
   const clientSecret = process.env.UPS_CLIENT_SECRET;
   const shipperNumber = process.env.UPS_SHIPPER_NUMBER;
@@ -720,11 +1134,19 @@ async function fetchUPSRates({ origin, destination, items }) {
   }
 
   // ── Step 2: Build rate request ──────────────────────────────────
+  //
+  // Dimensions + weight come from the box-selection engine
+  // (`selectedBox` + `packageWeight`). UPS requires all numeric values
+  // as STRINGS. Fallback to legacy 10×8×4 + summed grams is defensive
+  // resilience only — real requests always pass both.
   const totalGrams = (items || []).reduce(
     (s, it) => s + (Number(it?.grams) || 0) * (Number(it?.quantity) || 0),
     0,
   );
-  const weightLb = gramsToLb(totalGrams);
+  const weightLb = packageWeight?.totalLbs ?? gramsToLb(totalGrams);
+  const boxL = String(selectedBox?.L ?? 10);
+  const boxW = String(selectedBox?.W ?? 8);
+  const boxH = String(selectedBox?.H ?? 4);
 
   const addr = (a) => ({
     AddressLine: [a?.address1 || "", a?.address2 || ""].filter(Boolean),
@@ -752,9 +1174,9 @@ async function fetchUPSRates({ origin, destination, items }) {
           PackagingType: { Code: "02", Description: "Customer Supplied" },
           Dimensions: {
             UnitOfMeasurement: { Code: "IN", Description: "Inches" },
-            Length: "10",
-            Width: "8",
-            Height: "4",
+            Length: boxL,
+            Width: boxW,
+            Height: boxH,
           },
           PackageWeight: {
             UnitOfMeasurement: { Code: "LBS", Description: "Pounds" },
@@ -855,11 +1277,18 @@ async function fetchUPSRates({ origin, destination, items }) {
 }
 
 // ── Dispatcher: USPS + UPS in parallel ─────────────────────────────────
-async function fetchDirectCarrierRates(rate) {
+//
+// Extra params (2026-07-15): `selectedBox` + `packageWeight` are threaded
+// through to the carrier fetchers so both USPS and UPS quote using the
+// REAL picked box (dims + total weight incl. tare + buffer) instead of
+// the hardcoded 10×8×4 placeholder they used before.
+async function fetchDirectCarrierRates(rate, { selectedBox, packageWeight }) {
   const input = {
     origin: rate.origin,
     destination: rate.destination,
     items: rate.items,
+    selectedBox,
+    packageWeight,
   };
   const results = await Promise.all([
     fetchUSPSRates(input).catch((e) => {
@@ -941,22 +1370,28 @@ export async function action({ request }) {
 
   // ── 1. Aggregate cart ────────────────────────────────────────────────
   //
-  // Strip the Processing Fee cart line out of EVERY downstream calculation
-  // (markup tier, carrier weight). See `isProcessingFeeItem` for detection
-  // rules. `realItems` is the items array we treat as the customer's
-  // actual merchandise; `rate.items` is the raw Shopify payload we keep
-  // around only for logging.
+  // `realItems` = the physical merchandise the carrier will actually ship.
+  // Two categories are excluded here BEFORE classification / weight math:
+  //   1. Processing-fee cart lines (see `isProcessingFeeItem`) — legacy
+  //      UI-extension mechanism that inflates quantity + weight if left in.
+  //   2. Items with `requires_shipping: false` — digital products, gift
+  //      cards, service SKUs. Shopify still includes these in the carrier
+  //      callback payload, but they have no packaging cost and no `pack:`
+  //      tag. Without this filter, a mixed cart (1 physical + 1 digital)
+  //      would fail the tag-classification guard and return empty rates
+  //      for the whole cart. Fixed 2026-07-20.
   const realItems = (rate.items || []).filter(
-    (it) => !isProcessingFeeItem(it),
+    (it) => !isProcessingFeeItem(it) && it?.requires_shipping !== false,
   );
-  const feeLinesExcluded = rate.items.length - realItems.length;
+  const nonShippingLinesExcluded = rate.items.length - realItems.length;
 
   const totalQty = sumQuantity(realItems);
   if (totalQty === 0) return ratesResponse([]);
 
   console.log(
-    `[shipping.rates] inbound: ${rate.items.length} line(s) (${feeLinesExcluded} processing-fee excluded), realQty=${totalQty}, dest=${rate.destination?.country}/${rate.destination?.province}/${rate.destination?.postal_code}`,
+    `[shipping.rates] inbound: ${rate.items.length} line(s) (${nonShippingLinesExcluded} fee/digital excluded), realQty=${totalQty}, dest=${rate.destination?.country}/${rate.destination?.province}/${rate.destination?.postal_code}`,
   );
+
 
   // ── 1a. Free-shipping rule (retail store) ─────────────────────────
   //
@@ -1005,11 +1440,9 @@ export async function action({ request }) {
   // Added on top of every real carrier quote.
   const baseCents = tieredMarkupCents(totalQty);
 
-  // Cart subtotal in CENTS. First compute the raw items-sum, then
-  // subtract any applied discount so the 3% processing fee is charged
-  // on what the CUSTOMER actually owes for the merchandise — not the
-  // pre-discount list total (which would over-charge the fee by
-  // 3% × discountAmount).
+  // Cart subtotal in CENTS — raw items-sum and its discount-adjusted
+  // counterpart. Neither is used for rate math today (fee is removed);
+  // both are surfaced in the per-rate breakdown log for observability.
   const rawItemsSumCents = realItems.reduce(
     (sum, it) => sum + (Number(it?.price) || 0) * (Number(it?.quantity) || 0),
     0,
@@ -1024,48 +1457,98 @@ export async function action({ request }) {
     );
   } else {
     console.log(
-      `[shipping.rates] no cart discount detected in payload (source=${cartDiscount.source}); fee will use raw subtotal=$${(cartSubtotalCents / 100).toFixed(2)}`,
+      `[shipping.rates] no cart discount detected in payload (source=${cartDiscount.source}); net subtotal=$${(cartSubtotalCents / 100).toFixed(2)}`,
     );
   }
 
-  // Tax resolution — Shopify's live tax API is the ONLY source. We
-  // call `draftOrderCalculate` with the cart + destination and use the
-  // returned totalTax as our tax number (city/county/product rules all
-  // honored). Result is cached per (cart, address) for 5 min.
+  // ── Product classification (metafield-based — 2026-07-23) ────────────
   //
-  // On failure / timeout / non-US → tax = 0, fee is calculated on
-  // (subtotal + shipping) only. No static state-rate guessing — the
-  // operator should fix the Shopify API integration if fallback is
-  // used too often (visible as `taxSource=api_unavailable` in logs).
-  const shopifyTaxResult = await calculateShopifyTax({
-    shop: resolveShopDomain(request),
-    destination: rate.destination,
-    realItems,
-    subtotalCents: cartSubtotalCents,
-  });
+  // Each cart line's packing category is read from the `custom.pack_category`
+  // metafield on the Shopify product (assigned by the merchant in admin
+  // from the client's classification sheet). We fetch those metafields in
+  // one bulk GraphQL call using the product IDs from the carrier-service
+  // payload, then classify the cart. If ANY item's metafield is missing OR
+  // set to REVIEW we refuse to quote rates — the customer sees "no shipping
+  // available" until the merchant classifies the product.
+  //
+  // Rationale: the carrier-service payload does NOT include product
+  // metafields, so we have to fetch. Empty rates is the deliberate
+  // back-pressure signal to force merchant to classify every product
+  // before shipping quotes will render.
+  const uniqueProductIds = Array.from(
+    new Set(
+      (realItems || [])
+        .map((it) => (it?.product_id != null ? String(it.product_id) : null))
+        .filter(Boolean),
+    ),
+  );
+  const categoriesByProductId =
+    await fetchProductPackCategoriesFromShopify(uniqueProductIds);
+  const classification = classifyCart(realItems, categoriesByProductId);
 
-  let baseTaxCents = 0;
-  let taxRate = 0;
-  let taxSource = "api_unavailable";
-  if (shopifyTaxResult && shopifyTaxResult.taxCents >= 0) {
-    // Shopify tax API succeeded — use its exact figure for the
-    // subtotal portion + derive a rate for scaling to shipping tax.
-    baseTaxCents = shopifyTaxResult.taxCents;
-    taxRate = cartSubtotalCents > 0 ? baseTaxCents / cartSubtotalCents : 0;
-    taxSource = shopifyTaxResult.source; // shopify_live | shopify_cached
+  if (classification.missing.length > 0) {
+    console.warn(
+      `[shipping.rates] ABORT — ${classification.missing.length} cart item(s) missing/REVIEW pack_category; returning empty rates. Missing:`,
+      classification.missing
+        .map(
+          (m) =>
+            `productId=${m.productId} "${m.name}"${m.sku ? ` [${m.sku}]` : ""} reason=${m.reason} raw=${JSON.stringify(m.rawValue)}`,
+        )
+        .join(" | "),
+    );
+    return ratesResponse([]);
   }
+
+  const categorySummary = Object.entries(classification.counts)
+    .filter(([, v]) => v > 0)
+    .map(([k, v]) => `${k}:${v}`)
+    .join(" ");
   console.log(
-    `[shipping.rates] processing-fee inputs: subtotal=$${(cartSubtotalCents / 100).toFixed(2)} · taxRate=${(taxRate * 100).toFixed(2)}% · state=${rate.destination?.province || rate.destination?.province_code || "?"} · taxSource=${taxSource}`,
+    `[shipping.rates] cart classified → ${categorySummary || "(empty)"}`,
+  );
+  console.log(
+    `[shipping.rates.classification] per-line:`,
+    classification.perLine
+      .map(
+        (l) =>
+          `${l.category}${l.quantity > 1 ? `×${l.quantity}` : ""} — ${l.name}${l.sku ? ` [${l.sku}]` : ""} (${l.grams}g)`,
+      )
+      .join(" | "),
+  );
+
+  // ── Box selection + package weight ───────────────────────────────────
+  //
+  // Pick the smallest box tier that fits the cart's classified contents
+  // (see selectBox() docs for the exact priority order). If overflow
+  // (nothing fits), we still return a box — the largest tier — flagged
+  // so the merchant approval gate can catch it.
+  //
+  // Package weight = items grams + box tare + packing-material buffer.
+  // Sent verbatim to USPS + UPS in the fetch below.
+  const { box: selectedBox, overflow: boxOverflow } = selectBox(
+    classification.counts,
+  );
+  const packageWeight = computePackageWeight(realItems, selectedBox);
+  console.log(
+    `[shipping.rates] box selected: ${selectedBox.name}` +
+      ` (${selectedBox.L}×${selectedBox.W}×${selectedBox.H} in, tare ${selectedBox.tareOz}oz)` +
+      ` · weight items=${packageWeight.itemsOz}oz + tare=${packageWeight.tareOz}oz` +
+      ` + buffer=${packageWeight.bufferOz}oz = ${packageWeight.totalOz}oz` +
+      ` (${packageWeight.totalLbs} lbs)` +
+      (boxOverflow ? " · OVERFLOW — approval gate should catch this" : ""),
   );
 
   // Carrier APIs (USPS/UPS) read items[] to compute package weight + box
   // dims. Pass `realItems` so the Processing Fee line — which should be
   // weight=0 but may be misconfigured in Shopify Admin — never inflates
   // the quote. We clone `rate` rather than mutate the original payload.
-  const directRates = await fetchDirectCarrierRates({
-    ...rate,
-    items: realItems,
-  });
+  const directRates = await fetchDirectCarrierRates(
+    {
+      ...rate,
+      items: realItems,
+    },
+    { selectedBox, packageWeight },
+  );
   if (directRates && directRates.length) {
     // Dedup by (carrier, service) — pick cheapest variant per service.
     const dedup = new Map();
@@ -1080,65 +1563,58 @@ export async function action({ request }) {
     }
 
     const rates = Array.from(dedup.values()).map((r) => {
-      // Free-shipping rule zeros shipping cost + handling markup, but the
-      // 3% processing fee is INDEPENDENT — it still applies on FREE-ship
-      // NS-only carts because it's a payment-processing surcharge, not a
-      // shipping charge. Customer still sees per-service labels
-      // (Ground/Priority/Express) so delivery-speed choice is meaningful.
+      // Free-shipping zeros both the raw carrier rate AND the handling
+      // markup. Otherwise: shipping = carrier rate + tiered markup.
       const shippingCents = isFreeShipping ? 0 : r.rateCents + baseCents;
 
-      // Fee base = subtotal + shipping + tax.
-      //   • baseTaxCents is the exact tax on the SUBTOTAL (from Shopify
-      //     API or state fallback — already computed above).
-      //   • Extra shipping-tax is added at the derived rate — many US
-      //     states tax shipping, so this component is not zero.
-      const shippingTaxCents = Math.round(shippingCents * taxRate);
-      const totalTaxCents = baseTaxCents + shippingTaxCents;
-      const feeBaseCents = cartSubtotalCents + shippingCents + totalTaxCents;
-      const processingFeeCents = Math.round(
-        feeBaseCents * CONFIG.processingFeeRate,
-      );
-
-      // Final rate = shipping (possibly $0) + processing fee.
-      const finalCents = shippingCents + processingFeeCents;
+      // Final rate to Shopify = shipping only (carrier rate + handling
+      // markup, or $0 when free-shipping fires). Tax is applied by
+      // Shopify's own settings on the checkout summary line.
+      const finalCents = shippingCents;
 
       const baseName = `${r.carrier} ${r.service}`.trim();
-      const feeUsd = (processingFeeCents / 100).toFixed(2);
-      const taxUsd = (totalTaxCents / 100).toFixed(2);
 
       // ── Detailed per-rate log ──────────────────────────────────────
-      // Prints the full calculation breakdown for THIS shipping option
-      // so operators can pinpoint exactly why the total came out to
-      // what it did. Renders as a compact single-line block in Render
-      // logs — search for `shipping.rates.breakdown` to filter.
+      // Compact breakdown of the calculation for THIS shipping option.
+      // Search Render logs for `shipping.rates.breakdown` to filter.
       // eslint-disable-next-line no-console
       console.log(
         `[shipping.rates.breakdown] ${baseName}
+    ├─ Box selected:         ${selectedBox.name} (${selectedBox.L}×${selectedBox.W}×${selectedBox.H} in)${boxOverflow ? " · OVERFLOW" : ""}
+    ├─ Package weight:       ${packageWeight.totalOz} oz (${packageWeight.totalLbs} lbs)
+    ├─   items:              ${packageWeight.itemsOz} oz
+    ├─   box tare:           ${packageWeight.tareOz} oz
+    ├─   packing buffer:     ${packageWeight.bufferOz} oz
     ├─ Raw carrier rate:     $${(r.rateCents / 100).toFixed(2)}
     ├─ Handling markup:      $${(baseCents / 100).toFixed(2)} (tier: ${totalQty <= 2 ? "1-2 items" : totalQty === 3 ? "3 items" : "4+ items"})
     ├─ Free-shipping active: ${isFreeShipping ? "YES → shipping zeroed" : "no"}
-    ├─ Shipping (final):     $${(shippingCents / 100).toFixed(2)} ${isFreeShipping ? "(free)" : "(raw + handling)"}
     ├─ Raw items sum:        $${(rawItemsSumCents / 100).toFixed(2)}
     ├─ Cart discount:        ${discountCents > 0 ? `−$${(discountCents / 100).toFixed(2)} (source: ${cartDiscount.source})` : "$0.00 (none)"}
     ├─ Cart subtotal (net):  $${(cartSubtotalCents / 100).toFixed(2)}
-    ├─ Base tax on subtotal: $${(baseTaxCents / 100).toFixed(2)} (source: ${taxSource})
-    ├─ Shipping tax:         $${(shippingTaxCents / 100).toFixed(2)} (rate ${(taxRate * 100).toFixed(3)}% × shipping)
-    ├─ Total tax:            $${taxUsd}
-    ├─ Fee base:             $${(feeBaseCents / 100).toFixed(2)} (net subtotal + shipping + tax)
-    ├─ Processing fee (3%):  $${feeUsd}
-    └─ Final rate to Shopify: $${(finalCents / 100).toFixed(2)}`,
+    └─ Final rate to Shopify: $${(finalCents / 100).toFixed(2)}${isFreeShipping ? " (free)" : " (raw + handling)"}`,
       );
+
+      // Box info surfaced in checkout: service_name gets a compact
+      // dimension suffix so the customer sees the package they'll
+      // receive; description gets the full box label (Enersync 1oz,
+      // UPS mini, etc.). Helps merchant + customer verify the tag-based
+      // classifier picked the right box (see `pack:XXX` tags on the
+      // product page).
+      const boxDims = `${selectedBox.L}×${selectedBox.W}×${selectedBox.H} in`;
+      const boxLabel = selectedBox.name
+        ? `${selectedBox.name} (${boxDims})`
+        : boxDims;
 
       return {
         service_name: isFreeShipping
-          ? `${baseName} (Free shipping + 3% processing fee)`
-          : `${baseName} (incl. handling + 3% processing fee)`,
+          ? `${baseName} (Free shipping · Box ${boxDims})`
+          : `${baseName} (incl. handling · Box ${boxDims})`,
         service_code: r.code,
         total_price: String(finalCents), // STRING in cents
         currency: r.currency || "USD",
         description: isFreeShipping
-          ? `Complimentary shipping on ${CONFIG.freeShipping.vendor} orders over $${CONFIG.freeShipping.thresholdUsd} · 3% processing fee $${feeUsd} (calculated on subtotal + tax $${taxUsd})`
-          : `${r.carrier} ${r.service} (includes handling + 3% processing fee $${feeUsd}, calculated on subtotal + shipping + tax $${taxUsd})`,
+          ? `Complimentary shipping on ${CONFIG.freeShipping.vendor} orders over $${CONFIG.freeShipping.thresholdUsd} · Package: ${boxLabel}`
+          : `${r.carrier} ${r.service} (includes handling markup) · Package: ${boxLabel}`,
         ...(r.deliveryDateMin ? { min_delivery_date: r.deliveryDateMin } : {}),
         ...(r.deliveryDateMax ? { max_delivery_date: r.deliveryDateMax } : {}),
       };
@@ -1152,8 +1628,8 @@ export async function action({ request }) {
 
     console.log(
       isFreeShipping
-        ? `[shipping.rates] Direct carriers OK: ${rates.length} rate(s) FREE-ship (+3% fee) on $${cartSubtotalUsd.toFixed(2)} NS-only cart`
-        : `[shipping.rates] Direct carriers OK: ${rates.length} real rate(s), tiered markup=$${baseCents / 100} on ${totalQty} item(s) + 3% processing fee`,
+        ? `[shipping.rates] Direct carriers OK: ${rates.length} rate(s) FREE-ship on $${cartSubtotalUsd.toFixed(2)} NS-only cart`
+        : `[shipping.rates] Direct carriers OK: ${rates.length} real rate(s), tiered markup=$${baseCents / 100} on ${totalQty} item(s)`,
     );
     return ratesResponse(rates);
   }

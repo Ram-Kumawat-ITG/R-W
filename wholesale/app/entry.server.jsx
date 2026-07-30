@@ -13,6 +13,7 @@ import { nmiConfig } from "./services/nmi/nmi.config";
 import { paymentConfig } from "./services/payment/payment.config";
 import { invoiceConfig } from "./services/invoice/invoice.config";
 import { schedulerConfig } from "./services/scheduler/scheduler.config";
+import { paymentRetryConfig, activeRetryOffsets } from "./services/payment/paymentRetry.config";
 import { shopifyConfig } from "./services/shopify/shopify.config";
 import { createLogger } from "./utils/logger.utils";
 
@@ -40,7 +41,7 @@ function printBootBanner() {
   console.log(`  QBO_CLIENT_SECRET         : ${mask(qboConfig.clientSecret)}`);
   console.log(`  QBO_WHOLESALE_REALM_ID    : ${qboConfig.realmId || "MISSING"}`);
   console.log(`  QBO_WHOLESALE_REFRESH_TOKEN (seed): ${mask(qboConfig.bootstrapRefreshToken)}`);
-  console.log(`  QBO_WHOLESALE_DEFAULT_ITEM_ID    : ${qboConfig.defaultItemId}`);
+  console.log(`  QBO_WHOLESALE_DEFAULT_ITEM_ID    : ${qboConfig.defaultItemId || "(auto: find-or-create '" + qboConfig.defaultItemName + "')"}`);
   console.log("  --- NMI ---");
   console.log(`  NMI_ENVIRONMENT           : ${nmiConfig.environment}`);
   console.log(`  NMI_API_URL               : ${nmiConfig.apiUrl}`);
@@ -65,6 +66,12 @@ function printBootBanner() {
   console.log(`  PAYMENT_RETRY_CRON_PRIMARY: ${schedulerConfig.retryCronPrimary}`);
   console.log(`  PAYMENT_RETRY_CRON_SECONDARY: ${schedulerConfig.retryCronSecondary}`);
   console.log(`  PAYMENT_SCHEDULE_TZ       : ${schedulerConfig.scheduleTimezone}`);
+  console.log("  --- Failed-card auto-retry ---");
+  console.log(
+    `  FAILED-CARD RETRY OFFSETS : ${activeRetryOffsets().join("/")} ${paymentRetryConfig.useMinutes ? "min" : "day"} (max ${activeRetryOffsets().length} retries)`,
+  );
+  console.log(`  PAYMENT_RETRY_FAILED_INTERVAL: ${paymentRetryConfig.intervalOverride || "(unset — using cron)"}`);
+  console.log(`  PAYMENT_RETRY_FAILED_CRON : ${paymentRetryConfig.cron}`);
   console.log("  --- Logging ---");
   console.log(`  LOG_PRETTY                : ${process.env.LOG_PRETTY === "true"}`);
   console.log(`  LOG_LEVEL                 : ${process.env.LOG_LEVEL || "info"}`);
@@ -79,7 +86,6 @@ printBootBanner();
 (async () => {
   try {
     await connectDB();
-    console.log("[boot] MongoDB connected");
     await verifyCriticalIndexes();
     // Idempotent: only writes rows missing the snapshot field. After
     // the first boot it's a no-op until a new row needs backfill.
@@ -87,9 +93,14 @@ printBootBanner();
       console.warn("[boot] customerPaymentPreference backfill failed:", err?.message || err);
       bootLog.warn("backfill.customer_payment_preference.failed", { err });
     });
-    await getAgenda();
-    console.log("[boot] Agenda scheduler started");
-    bootLog.info("scheduler.ready");
+    if (schedulerConfig.disabled) {
+      console.log("[boot] Agenda scheduler NOT started (SCHEDULER_DISABLED=true)");
+      bootLog.warn("scheduler.disabled_by_env");
+    } else {
+      await getAgenda();
+      console.log("[boot] Agenda scheduler started");
+      bootLog.info("scheduler.ready");
+    }
   } catch (err) {
     console.error("[boot] FAILED:", err.stack || err);
     bootLog.error("scheduler.boot_failed", { err });

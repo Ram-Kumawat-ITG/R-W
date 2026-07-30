@@ -18,8 +18,7 @@ if (!process.env.MONGODB_URI) {
 }
 
 const mongoUrl = new URL(process.env.MONGODB_URI);
-const dbName =
-  decodeURIComponent(mongoUrl.pathname.replace(/^\//, "")) || "ns-retail";
+const dbName = process.env.DATABASE_NAME || mongoUrl.pathname.substring(1) || "natural-solutions";
 
 const shopify = shopifyApp({
   apiKey: process.env.SHOPIFY_API_KEY,
