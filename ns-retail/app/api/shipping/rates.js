@@ -195,13 +195,17 @@ const PACKING = {
     // very small bottle like Aquamax/Chromium might fit". `tinyExtrasOnly`
     // flag makes selectBox reject any cart with S/M/L/XL/G* items.
     { name: "18x13x3 box",      type: "box",      L: 18, W: 13, H: 3,  tareOz: 9.3,  units: 1, liquids: 6, tinyExtrasOnly: true },
-    { name: "15x12x9 box",      type: "box",      L: 15, W: 12, H: 9,  tareOz: 11.5, units: 6, liquids: 12 },
+    // 15x12x10 — client confirmed on 2026-07-30 that the actual box is
+    // 15×12×10, not 15×12×9 (our previously-recorded dimensions were incorrect).
+    // Tare (11.5 oz) + capacity (units:6, liquids:12) unchanged per client;
+    // only the H digit corrected. Volume is now 1800 in³ (was 1620).
+    { name: "15x12x10 box",     type: "box",      L: 15, W: 12, H: 10, tareOz: 11.5, units: 6, liquids: 12 },
     // 13x13x10 — Trace confirmed tare 13.6 oz on 2026-07-23. Capacity is a
-    // best-guess from volume comparison: 1690 in³ is ~ 15x12x9's 1620 in³,
-    // so we mirror 15x12x9's capacity (12 liquids + 6 units). Ordered
-    // AFTER 15x12x9 because it's slightly heavier — selectBox iterates
-    // smallest-tare-first for equivalent capacity. Client to confirm real
-    // capacity when the box is next in use; tune here on feedback.
+    // best-guess from volume comparison: 1690 in³ is close to 15x12x10's
+    // 1800 in³, so we mirror its capacity (12 liquids + 6 units). Ordered
+    // AFTER 15x12x10 because it's heavier — selectBox iterates smallest-tare
+    // -first for equivalent capacity. Client to confirm real capacity when
+    // the box is next in use; tune here on feedback.
     { name: "13x13x10 box",     type: "box",      L: 13, W: 13, H: 10, tareOz: 13.6, units: 6, liquids: 12 },
     // 18x14x8 — Trace measured 17 oz (1 lb 1 oz). Prior estimate was ~14.
     { name: "18x14x8 box",      type: "box",      L: 18, W: 14, H: 8,  tareOz: 17.0, units: 8, liquids: 16 },
@@ -688,7 +692,7 @@ function selectBox(cartCounts) {
   // REVIEW is already blocked earlier in the action handler (empty rates),
   // so it never reaches this function.
   if ((c.OTHER || 0) > 0) {
-    const largest = PACKING.boxTiers[PACKING.boxTiers.length - 1];
+    const largest = resolveLargestOverflowBox();
     console.warn(
       `[shipping.rates] cart contains pack:OTHER(${c.OTHER}) — routes in own retail box; falling back to ${largest.name} + overflow`,
     );
@@ -763,7 +767,7 @@ function selectBox(cartCounts) {
       }
     }
     // No liquid box fits — overflow to largest tier
-    const largest = PACKING.boxTiers[PACKING.boxTiers.length - 1];
+    const largest = resolveLargestOverflowBox();
     return { box: largest, overflow: true };
   }
 
@@ -796,8 +800,28 @@ function selectBox(cartCounts) {
 
   // Iterate all remaining boxes (including liquid ones as last resort)
   // in case the cart is huge — but flag as overflow so merchant knows.
-  const largest = PACKING.boxTiers[PACKING.boxTiers.length - 1];
+  const largest = resolveLargestOverflowBox();
   return { box: largest, overflow: true };
+}
+
+// Helper — resolve the "largest overflow" box, used by Steps 0/3/5 fallback.
+// Bug fix 2026-07-30 (was `PACKING.boxTiers[length - 1]`):
+// `boxTiers` is ordered smallest→largest for MAINLINE boxes then appends
+// the two Enersync (partitioned, glass-only) specialty tiers at the end,
+// so `length - 1` was returning **Enersync 2oz** — a small 11×7×8
+// partitioned box (tare 13.2 oz, liquids:0). Every OTHER cart, every
+// oversized LL cart, and every non-liquid overflow was being quoted at
+// those wrong dims — merchant ate the DIM-weight difference on real
+// shipments in 18×14×8. Explicit name lookup for the real largest box,
+// with a defensive fallback so the algorithm never returns undefined.
+function resolveLargestOverflowBox() {
+  return (
+    PACKING.boxTiers.find((b) => b.name === "18x14x8 box") ||
+    // If 18x14x8 is ever renamed/removed, pick the largest non-partitioned
+    // tier by name convention — still better than the specialty Enersync.
+    PACKING.boxTiers.filter((b) => !b.partitioned).slice(-1)[0] ||
+    PACKING.boxTiers[PACKING.boxTiers.length - 1]
+  );
 }
 
 // ═══════════════════════════════════════════════════════════════════════

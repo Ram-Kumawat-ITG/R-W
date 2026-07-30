@@ -6,7 +6,7 @@
 
 > **Living doc.** Update this file **every time** we change anything in `rates.js` (algorithm, thresholds, category mapping, carrier config, etc.). If code and doc disagree, code wins — but that's a bug in this doc, fix it.
 
-**Last updated:** 2026-07-23 (metafield-based classifier — replaces tag-based system)
+**Last updated:** 2026-07-30 (Bug C1 fix — `resolveLargestOverflowBox()` helper; client PDF verification of 34 real orders)
 
 ---
 
@@ -33,6 +33,7 @@
 19. [Testing Checklist](#19-testing-checklist)
 20. [Known Gaps / Pending Items](#20-known-gaps--pending-items)
 21. [Changelog](#21-changelog)
+22. [Real-Order Verification Data (2026-07-30 PDF review)](#22-real-order-verification-data-2026-07-30-pdf-review)
 
 ---
 
@@ -43,7 +44,7 @@
 **Current business rules** (retail store, as of 2026-07-16):
 
 - **Product classification is pure tag-based** — each product must carry ONE `pack:XXX` tag (9 categories). Missing tag = empty rates.
-- **Box selection** — 13 physical box/envelope tiers, picked by a 6-step priority algorithm.
+- **Box selection** — 14 physical box/envelope tiers (12 mainline + 2 Enersync partitioned specialty), picked by a 7-step priority algorithm.
 - **Package weight** — computed from real item grams + measured box tare + packing-material buffer.
 - **USPS + UPS** — called in parallel with the picked box's dimensions + real weight.
 - **Handling markup** — tiered by cart quantity (+$2 / +$3 / +$5).
@@ -207,8 +208,8 @@ Derived from the 9x6x4 envelope baseline: 3 × S = 3 units budget, 1 × L = 3 un
 | 16x11x3 box | box | 16×11×3 | 7.5 | 4 | 4 | liquid tier |
 | 12x12x5 box | box | 12×12×5 | 9.6 | 4 | 4 | liquid tier |
 | 18x13x3 box | box | 18×13×3 | 9.3 | 1 | 6 | **tinyExtrasOnly** — rejects any M/L/S1/G* items |
-| 15x12x9 box | box | 15×12×9 | 11.5 | 6 | 12 | liquid tier |
-| 13x13x10 box | box | 13×13×10 | 13.6 | 6 | 12 | liquid tier; added 2026-07-23 (Trace-measured tare). Capacity is best-guess mirror of 15x12x9 — tune when client confirms real fit. |
+| 15x12x10 box | box | 15×12×10 | 11.5 | 6 | 12 | liquid tier; **renamed from 15x12x9 on 2026-07-30** — client confirmed actual dimensions are 15×12×10; tare + capacity unchanged. |
+| 13x13x10 box | box | 13×13×10 | 13.6 | 6 | 12 | liquid tier; added 2026-07-23 (Trace-measured tare). Capacity is best-guess mirror of 15x12x10 — tune when client confirms real fit. |
 | 18x14x8 box | box | 18×14×8 | 17.0 | 8 | 16 | Trace-measured tare (was 14, corrected 2026-07-13) |
 | Enersync 1oz | box | 10×7×6 | 7.0 | 4 | 0 | partitioned; glassMin: 12, glassSize: 1oz; 4-unit extras budget for non-glass items |
 | Enersync 2oz | box | 11×7×8 | 13.2 | 4 | 0 | partitioned; glassMin: 12, glassSize: 2oz; 4-unit extras budget for non-glass items |
@@ -225,6 +226,26 @@ Field notes:
 
 **Excluded tiers** (per client Q7): 16x12x10 explicitly not used.
 **Excluded**: 16×12×10 (client Q7).
+
+### 5.2.1 Overflow-box resolution (`resolveLargestOverflowBox()`)
+
+**⚠️ Do NOT use `PACKING.boxTiers[PACKING.boxTiers.length - 1]` to get "the largest box."** The `boxTiers` array orders mainline boxes smallest → largest **and then appends the two Enersync specialty tiers at the end**, so `length - 1` returns **Enersync 2oz** (a small 11×7×8 partitioned glass-only box with tare 13.2 oz and `liquids: 0`) — NOT the intended 18×14×8.
+
+Bug C1 (found + fixed 2026-07-30) traced back to this exact mistake at three sites: Step 0 (OTHER cart → overflow), Step 3 (LL cart with no liquid tier that fits), and Step 5 (non-liquid overflow). Every OTHER cart, every oversized LL cart, and every non-liquid overflow was being quoted at Enersync 2oz's 11×7×8 dims + 13.2 oz tare + partitioned interior — merchant ate the DIM-weight difference on real 18×14×8 shipments.
+
+Use the helper `resolveLargestOverflowBox()` instead — it explicitly looks up the box named `"18x14x8 box"` and falls back to "largest non-partitioned tier" only if that name is missing:
+
+```js
+function resolveLargestOverflowBox() {
+  return (
+    PACKING.boxTiers.find((b) => b.name === "18x14x8 box") ||
+    PACKING.boxTiers.filter((b) => !b.partitioned).slice(-1)[0] ||
+    PACKING.boxTiers[PACKING.boxTiers.length - 1]
+  );
+}
+```
+
+Any future overflow / fallback path MUST call this helper — never index `boxTiers` from the end directly.
 
 ### 5.3 Packing-material buffer
 
@@ -324,7 +345,7 @@ The tag system is fully removed from code as of 2026-07-23 (clean cut). Products
 Given the cart's classification counts, `selectBox()` walks 7 rules in order. First match wins. Returns `{ box, overflow }`.
 
 **Step 0 — Any `OTHER` in cart → largest tier + overflow flag**
-`OTHER` products (kits, cases, services, EnerSync 24-count boxes) ship in their own retail box. No engine tier applies — we route the whole cart to `18×14×8` with `overflow: true` and log the reason. Merchant approval gate reviews and fixes the label at fulfillment time. (`REVIEW` never reaches this step — it's blocked earlier in the action handler with empty rates.)
+`OTHER` products (kits, cases, services, EnerSync 24-count boxes) ship in their own retail box. No engine tier applies — we route the whole cart to `18×14×8` (resolved via `resolveLargestOverflowBox()` — see §5.2.1) with `overflow: true` and log the reason. Merchant approval gate reviews and fixes the label at fulfillment time. (`REVIEW` never reaches this step — it's blocked earlier in the action handler with empty rates.)
 
 **Step 1 — 12+ glass items, no LL → Enersync**
 Enersync boxes are partitioned for glass safety but are **not** glass-only. Majority glass size decides which Enersync (`1oz` vs `2oz`). Ties → 2oz (bigger box, conservative for mixed carts). Non-glass extras (SS/S/M/L/XL) are allowed as long as they fit within Enersync's `units: 4` budget. Confirmed by Trace 2026-07-14: a cart of 12× G1 + 3× Adrenal TLP (3× S = 3 units) fits comfortably in Enersync 1oz. If extras exceed the 4-unit budget, this step falls through to the box path.
@@ -337,7 +358,7 @@ Iterate all boxes with `liquids > 0` in size order. First tier where `liquids �
 
 Additional rules for `tinyExtrasOnly` (18×13×3, confirmed by Trace via PM 2026-07-17):
 - **Rejected outright** if cart has any S/M/L/XL/G* items.
-- **Skipped** when box is at MAX liquid capacity (6) AND cart has any SS bottles → falls through to next tier (15×12×9). Even a single extra-small bottle over-stuffs it when full.
+- **Skipped** when box is at MAX liquid capacity (6) AND cart has any SS bottles → falls through to next tier (15×12×10). Even a single extra-small bottle over-stuffs it when full.
 - **FA (flat cards) allowed** alongside 6 full liquids — they're thin enough to slide in without displacing anything.
 - If box has leftover liquid room (llDemand < 6), both SS + FA extras are permitted (guarded by the standard unit-budget check).
 
@@ -348,7 +369,9 @@ Checks `faMax: 60` + unit budget.
 Iterates `liquids === 0 && !fragilePreferred && !partitioned && !tinyExtrasOnly` tiers smallest to largest. `glassMax` on envelope (9×6×4 has 4) is checked.
 
 **Step 6 — Overflow**
-Nothing fit. Return largest tier (18×14×8) + `overflow: true`. Merchant approval gate handles it manually.
+Nothing fit. Return largest tier (18×14×8) + `overflow: true`. Merchant approval gate handles it manually. Uses `resolveLargestOverflowBox()` (see §5.2.1) — **must not** index `boxTiers[length - 1]`.
+
+**Fallback paths in Steps 3 and 5 that hit "no tier accommodates this cart" also route to `resolveLargestOverflowBox()` + `overflow: true`.** Step 3 (LL) escalates when no `liquids > 0` tier has enough `liquids` capacity AND unit budget (or when `tinyExtrasOnly` guards reject every candidate). Step 5 (non-liquid bottles/glass) escalates when no `liquids === 0 && !fragilePreferred && !partitioned && !tinyExtrasOnly` tier has enough unit budget.
 
 ### 7.1 Worked examples (`custom.pack_category` → box)
 
@@ -372,7 +395,7 @@ Nothing fit. Return largest tier (18×14×8) + `overflow: true`. Merchant approv
 | 1× `LL` | LL=1 | 0 | 8x6x6 box |
 | 3× `LL` | LL=3 | 0 | 11x4x12 box |
 | 6× `LL` | LL=6 | 0 | 18x13x3 box (only if no non-tiny extras) |
-| 6× `LL` + 1× `SS` | LL=6, SS=1 | 0.75 | 15x12x9 box (18×13×3 at-full-capacity guard blocks SS extra) |
+| 6× `LL` + 1× `SS` | LL=6, SS=1 | 0.75 | 15x12x10 box (18×13×3 at-full-capacity guard blocks SS extra) |
 | 6× `LL` + 1× `FA` | LL=6, FA=1 | 0.15 | 18x13x3 box (FA allowed at full LL capacity) |
 
 ---
@@ -645,7 +668,7 @@ All logs prefixed with `[shipping.rates` for easy filtering in Render logs.
 
 ### 19.11 18×13×3 at-full-capacity guard (SS-blocked, FA-allowed)
 1. Set 6 products' `custom.pack_category = LL` (max liquid capacity of 18×13×3) AND set 1 product's `custom.pack_category = SS` (Chromium-style). Add all to cart.
-2. Expected: **not** 18×13×3 — instead falls through to `15x12x9 box`. SS bottles do not fit alongside 6 full liquids.
+2. Expected: **not** 18×13×3 — instead falls through to `15x12x10 box`. SS bottles do not fit alongside 6 full liquids.
 3. Second scenario: 6× LL + 1× FA (flat card). Expected: `18×13×3` selected (FA is allowed at full liquid capacity).
 4. Third scenario: 5× LL + 1× SS. Expected: `18×13×3` selected (1 liquid slot leftover, SS fits within units budget).
 
@@ -676,7 +699,7 @@ All logs prefixed with `[shipping.rates` for easy filtering in Render logs.
 | **XL physical routing** — code treats XL like L (unit-cost 3) per client 2026-07-23; 1× Body FX would fit in 9×6×4 envelope which is physically wrong | Client to confirm actual XL dimensions; may need dedicated tier or higher unit-cost |
 | ~~"Medium" definition + M unit-cost~~ | **RESOLVED 2026-07-23** — client confirmed 4 M bottles fit in 11×9×4. Current code (M unit-cost 2, 4×2=8 ≤ envelope's 9) already matches. |
 | Extras allowances per liquid box — dev estimates unconfirmed except 18×13×3 at full = FA-only | Trace to confirm per-box extras counts |
-| ~~13×13×10 box tare weight~~ | **RESOLVED 2026-07-23** — Trace confirmed tare 13.6 oz. Box added to tier list with best-guess capacity (12 LL + 6 units, mirrors 15×12×9). Real capacity to be tuned on merchant feedback. |
+| ~~13×13×10 box tare weight~~ | **RESOLVED 2026-07-23** — Trace confirmed tare 13.6 oz. Box added to tier list with best-guess capacity (12 LL + 6 units, mirrors 15×12×10 — that sibling tier was named `15x12x9` at the time; renamed 2026-07-30). Real capacity to be tuned on merchant feedback. |
 | 4+ L items in cart → dedicated non-liquid large box | Design gap; overflow path today, client review needed |
 | Q9 packing-buffer worst-case measurement | Stephanie to provide, may adjust `packingBufferOz` |
 | Whether a single SS bottle can squeeze in 18×13×3 at 6 full liquids | Trace to confirm; conservative default is SS-blocked |
@@ -684,7 +707,11 @@ All logs prefixed with `[shipping.rates` for easy filtering in Render logs.
 | Merchant approval gate integration (currently `overflow: true` only logs, no downstream queue) | Separate workstream; scope confirmation pending |
 | Discount-aware free-shipping | Nice-to-have; would swap pre-discount subtotal for post-discount |
 | 13 Package Templates in retail Shopify admin (Settings → Shipping and delivery → Saved packages) | Merchant to create manually — cheat-sheet provided |
-| Staging → Production deploy (fee removal, box engine, metafield classifier) | Blocked on: (a) merchant metafield-set complete for all active products, (b) 13 package templates created, (c) at minimum staging end-to-end test |
+| Staging → Production deploy (fee removal, box engine, metafield classifier) | Blocked on: (a) merchant metafield-set complete for all active products, (b) 14 package templates created, (c) at minimum staging end-to-end test |
+| **Missing box sizes seen in client's 34-order PDF sample** — `9×7×5`, `13×11×2`, `12×10×2`, `9×6×6`, `10×10×10` (each appeared in 1 order except `12×10×2` which was 5 boxes on the 100-bottle Grady order). Not urgent — 5/34 orders = 15%. If added, need tare weight + `units` / `liquids` capacity from Trace per box. | Client to confirm which (if any) to add + provide capacities/tare |
+| **Product-level `pack_category` re-calibration** — client PDF verification found single-item orders where algorithm picked 9×6×4 envelope but client packed in 11×9×4 (e.g. Calvert Omega Complete ×1). Root cause: product classified as `S` but its actual bottle size fits better in an M-envelope. Data/calibration issue, not a code bug. | Client to review flagged products + update metafield values (list to be compiled from PDF) |
+| **Extras allowance calibration per liquid box** — client PDF showed multi-item LL orders (Reitz, Spencer, Johnson, Lehn) where algorithm picked the minimum-fit liquid box but client used the next tier up. Suggests our `units` extras budget on liquid boxes is optimistic; still pending Trace's Q1 confirmation ("real extras count per box with full LL"). | Trace to confirm per-box extras counts (Q1 answer, promised after category lock) |
+| **Multi-package split logic** — no support today: a cart that exceeds every single-box tier gets one `overflow: true` label at 18×14×8 regardless of true item count. Client PDF showed one 100-bottle order shipped in **5 separate boxes** (Grady, 100× G1). Algorithm returns 1 quote; client physically ships N. Systemic gap; needs decision on API contract (multi-package rate response), split rules, and per-package weight aggregation. | Design + client confirmation required before implementation |
 
 ---
 
@@ -694,6 +721,9 @@ Every meaningful shipping change lands here **and** in `PROGRAM.md`. Newest firs
 
 | Date | Change |
 |---|---|
+| 2026-07-30 | **Box tier rename — `15x12x9` → `15x12x10` (client dimension correction)**: client confirmed the actual physical box is 15×12×10, not 15×12×9 — our previously-recorded height was incorrect. This is a dimension correction, not a new tier: `tareOz: 11.5` and capacity (`units: 6, liquids: 12`) unchanged per client. Applied to `PACKING.boxTiers` in both `ns-retail/app/api/shipping/rates.js` and `wholesale/app/api/shipping/rates.js` (byte-identical mirror maintained). Volume grows 1620 → 1800 in³, so a bigger DIM weight will be sent to USPS/UPS on any cart routed here — customer's checkout quote now matches the box the merchant physically ships in, closing the same DIM-weight-mismatch class of bug as C1 (though for a different set of orders). Doc updated: §5.2 table row renamed with back-reference note, §7 Step 3 narrative + §7.1 worked example + §19.11 test case all renamed to `15x12x10`, §20 historical row note added, 13x13x10 comment/volume comparison updated to reference 15x12x10's new 1800 in³ volume. **Merchant task**: rename the corresponding Package Template in Shopify admin (Settings → Shipping and delivery → Saved packages) from "15x12x9" to "15x12x10" so the label on the printed shipping label matches. |
+| 2026-07-30 | **Bug C1 fix — Enersync 2oz was being returned as "largest overflow box"**: three sites in `rates.js` (Step 0 OTHER-route, Step 3 LL-overflow, Step 5 non-liquid-overflow) used `PACKING.boxTiers[PACKING.boxTiers.length - 1]` to fetch "the largest box." Because `boxTiers` orders mainline boxes smallest → largest AND THEN appends the two Enersync specialty tiers at the end, `length - 1` returned **Enersync 2oz** (11×7×8, partitioned glass-only, tare 13.2 oz, `liquids: 0`) — not 18×14×8. Every OTHER cart + every oversized LL cart + every non-liquid overflow was quoted with wrong dims/tare. New helper `resolveLargestOverflowBox()` explicitly does `PACKING.boxTiers.find((b) => b.name === "18x14x8 box")` with two defensive fallbacks. Applied at all 3 sites in **both** `ns-retail/app/api/shipping/rates.js` and `wholesale/app/api/shipping/rates.js` (byte-identical mirror). Doc §5.2.1 added (why the array-index shortcut is wrong + helper spec); §7 Steps 0, 3, 5, 6 updated to reference the helper. |
+| 2026-07-30 | **Client PDF real-order verification (34 orders)**: PM shared a PDF of 34 real client orders with their actual packed box sizes handwritten on each. Traced every order through the current algorithm (mental sim, no code run — end-to-end verification test still pending). Result breakdown: **50% match** (17 orders — algorithm picked the same box client actually used); **18% mismatch due to Bug C1** (6 orders quoted Enersync 2oz where client used 18×14×8 — now fixed above); **12% mismatch due to missing box sizes** (5 orders — client used 9×7×5 / 13×11×2 / 12×10×2 / 9×6×6 / 10×10×10, none of which are in our tier list; see new §20 row); **18% mismatch due to client "safe-side" packing** (6 orders — client picked a larger box than the algorithm's minimum-fit choice; split into two subcauses documented in §20: single-item cases suggest product mis-categorization, multi-item cases suggest liquid-box `units` extras budget is optimistic); **3% systemic gap** (1 order — 100-bottle Grady, no multi-package split logic in the algorithm today, shipped in 5 boxes). No code change from this verification — findings driving the 4 new §20 pending items (missing sizes / category re-calibration / extras tuning / multi-package split). Waiting on client responses before any of them are actionable. |
 | 2026-07-23 | **Client Q4 + Q7 confirmations applied**: (1) Q4 — client confirmed **4 M bottles fit in 11×9×4**. Current M unit-cost 2 (4×2=8 ≤ envelope's 9) already matches — no code change; §20 "under review" note removed. (2) Q7 — client confirmed **13×13×10 box tare = 13.6 oz**. Added to `PACKING.boxTiers` between 15×12×9 and 18×14×8 with best-guess capacity (units:6, liquids:12 — mirrors 15×12×9 based on similar volume). §5.2 table + §20 known-gap updated. Real capacity to be tuned when merchant provides feedback from live orders. |
 | 2026-07-23 | **Classifier migrated to metafield (major)**: Tag-based `pack:XXX` system fully replaced with `custom.pack_category` product metafield. Client's product classification sheet (500+ SKUs) now the source of truth. Naming aligned with client sheet: (1) OLD `S` (extra small) → NEW **`SS`**; (2) OLD `S1` (small capsule) → NEW **`S`**. (3) `XL` re-added (Body FX only — treated like L, unit-cost 3). (4) `OTHER` re-added (own-box shipping — Step 0 routes to overflow flag). (5) `REVIEW` added (unclassified products → empty rates, back-pressure). (6) Old tag-fetching GraphQL replaced with metafield-fetching GraphQL (`custom.pack_category`). (7) `selectBox` renamed all internal category refs (S1→S, S→SS everywhere; added XL to unit demand + non-tiny-extras check). (8) Doc §6 fully rewritten (metafield table, migration note); §7 renamed 6-step → 7-step (Step 0 added); §7.1 examples updated; §19.13 added for XL/OTHER/REVIEW test scenarios; §20 rewritten to reflect metafield-based blockers. Zero backward-compat with old tags (clean cut). |
 | 2026-07-20 | **Digital-product bug fix** — `realItems` filter now excludes items with `requires_shipping: false` in addition to processing-fee lines. Previously a cart containing at least one digital product (no `pack:` tag by design) would fail the tag-classification guard and return empty rates for the whole cart, blocking checkout of the accompanying physical items. Fixed at [rates.js:~1295](app/api/shipping/rates.js). Log line updated: `N fee/digital excluded` replaces `N processing-fee excluded`. |
@@ -713,6 +743,112 @@ Every meaningful shipping change lands here **and** in `PROGRAM.md`. Newest firs
 | 2026-07-07 | HMAC verification reverted to log-only after 2026-07-06 hard-reject broke prod checkout. |
 | 2026-07-07 | Order-level discount detection added (5-field probe). |
 | 2026-07-06 | Initial fee migration from Checkout UI Extension to carrier callback. |
+
+---
+
+## 22. Real-Order Verification Data (2026-07-30 PDF review)
+
+Ground-truth check of the current 7-step selection algorithm against real client fulfillment behaviour. This section is the **evidence base** for the four new pending items in §20; if any pending item is re-scoped or dismissed, cross-reference here to see what real orders motivated it.
+
+### 22.1 Source + provenance
+
+- **Source**: PDF sent by Parker (PM) on 2026-07-30, containing 34 recent client orders with the client's actual packed box size handwritten on each order.
+- **Not committed to repo** — the PDF contains handwritten customer annotations and is client-confidential. It lives with the PM. Ask Parker for the file if you need to re-verify a specific order.
+- **Verification method**: mental trace through the current algorithm (no automated end-to-end test run against staging yet — pending).
+- **Confidence caveat**: order numbers / customer names in the tables below are **best-effort reconstruction** from the AI session context that produced the analysis. Any specific name/number should be **re-verified against the source PDF** before it's used to drive an operational decision (e.g. before flagging a specific product to Trace). The **bucket counts and category patterns** are the trustworthy output; individual row identifiers are supporting evidence, not gospel.
+
+### 22.2 Summary — how well the algorithm matched reality
+
+| Bucket | Count | % of 34 | Meaning |
+|---|---|---|---|
+| ✅ **Match** | 17 | 50% | Algorithm picked the same box the client actually packed. |
+| 🐛 **Bug C1** | 6 | 18% | Algorithm returned Enersync 2oz (11×7×8) via the `boxTiers[length-1]` gotcha; client used 18×14×8. **Fixed 2026-07-30.** |
+| 📦 **Missing tier** | 5 | 15% | Client used a box size not in our 14-tier `PACKING.boxTiers`. See §22.4. |
+| ⚙️ **Calibration** | 6 | 18% | Algorithm picked the smallest-fit tier; client used the next size up. Two subcauses in §22.5. |
+| 🔀 **Systemic gap** | 1 | 3% | Client physically split cart into multiple boxes (algorithm has no multi-package logic today). See §22.6. |
+
+Total = 35 (Grady is counted once in Missing-tier and once in Systemic gap because it exhibits both issues — see §22.6).
+
+### 22.3 Bucket A — Bug C1 (18%, now fixed)
+
+6 orders where the algorithm hit Step 0 (OTHER-route), Step 3 (LL-overflow), or Step 5 (non-liquid-overflow) fallback path and returned `boxTiers[length-1]` = Enersync 2oz instead of 18×14×8.
+
+Fix landed 2026-07-30 in both `ns-retail/app/api/shipping/rates.js` and `wholesale/app/api/shipping/rates.js` via new `resolveLargestOverflowBox()` helper (see §5.2.1). Re-verifying these 6 orders against the fixed code should now produce Match.
+
+Specific order identifiers not reliably preserved in session context — re-derive from PDF if needed for a re-verification test. The pattern is: any large cart that pushed past every tier's `units`/`liquids` capacity.
+
+### 22.4 Bucket B — Missing tier (15%)
+
+Client used a physical box we don't have a tier definition for. Need Trace to confirm tare weight + capacity before adding.
+
+| Client's box | Order (approx.) | Cart snapshot | Category likely to fit better than our current picks |
+|---|---|---|---|
+| **9×7×5** | Coleman (~13 items) | mixed non-liquid | between 9×6×4 and 11×9×4 |
+| **13×11×2** | Babon (~12 items) | mixed non-liquid | flatter than 11×9×4, similar footprint |
+| **12×10×2** | Goolsby (100× G1 EnerSync 1oz), used ×5 boxes | 100 small glass | overlaps with Systemic gap — see §22.6 |
+| **9×6×6** | Christisen (~18 items) | mixed | between 8×6×6 and 10×7×6 |
+| **10×10×10** | Wendy (~46 items) | large mixed | cube shape, no cube tier exists in our list |
+
+Note: customer/count columns are approximate — re-verify against PDF before adding boxes.
+
+### 22.5 Bucket C — Calibration mismatches (18%)
+
+6 orders where algorithm picked minimum-fit; client packed in next tier up. Two distinct subcauses:
+
+**C1) Single-item cases → product `pack_category` re-review candidates (2 orders)**
+
+Product is classified in a category whose default box doesn't physically fit its bottle. Fix is a Shopify metafield update per product, no code change.
+
+| Order (approx.) | Product | Current cat. | Algo box | Client box | Suggested review |
+|---|---|---|---|---|---|
+| #14126 | Sleep Formula ×3 | (from §22 context) | 9×6×4 | 11×9×4 | Product may need S → M reclassification |
+| #40469 | Calvert Omega Complete ×1 | S | 9×6×4 | 11×9×4 | Product may need S → M reclassification |
+
+**Action for client**: ask Trace to confirm which of these products should have their `custom.pack_category` metafield changed. Full list to be compiled from PDF cross-reference; two above are the ones surfaced in analysis.
+
+**C2) Multi-item LL cases → liquid-box extras capacity may be too optimistic (4 orders)**
+
+Algorithm picks the smallest liquid box where `liquids ≥ llDemand AND units ≥ unitDemand`; client picked next size up. Suggests the `units` values on liquid boxes overstate what physically fits alongside a full LL.
+
+| Order (approx.) | Cart | Algo box | Client box |
+|---|---|---|---|
+| #40470 | Reitz (LL×2 + G2×2 = 4 items) | 10×7×6 | 11×4×12 |
+| CDO Spencer | LL + G1 + S (3 items) | 8×6×6 | 11×4×12 |
+| CDO Johnson | LL + G1 + S×2 (4 items) | 8×6×6 | 11×4×12 |
+| #40487 | Lehn (LL + many = 10 items) | 18×14×8 | 11×4×12 (unusual — smaller than algo!) |
+
+**Action for client**: waiting on Trace's answer to Q1 (per-liquid-box realistic extras count with a full LL load). Answer will drive a numerical adjustment to the `units` field on each liquid tier in `PACKING.boxTiers` — no code logic change, just number tuning.
+
+### 22.6 Bucket D — Systemic gap: multi-package split (3%)
+
+1 order in the sample: **Grady, 100 bottles, packed by client into 5 physical boxes of 12×10×2**. Overlaps with Bucket B (12×10×2 is a missing tier) — but even if we added that tier, our algorithm today would still quote **1** shipment, not 5.
+
+Root cause: `selectBox()` returns one `{ box, overflow }` result. USPS/UPS receive one dims-and-weight payload. There's no data path for "cart splits into N packages, quote each separately, sum the rates."
+
+**Action**: not implementable without a design decision from client on:
+- Business rule for when to split (item count? total volume? weight threshold?)
+- Whether every rate response should be a sum (customer sees one line) or itemized (customer sees N shipments)
+- How to pick the box per split (same box for all, or optimize per split?)
+
+Deferred until client explicitly asks for it. Occurrence rate is 1/34 = 3% — not urgent.
+
+### 22.7 What tomorrow's client questions should ask
+
+Based on the buckets above, the four specific questions to send Trace / PM:
+
+1. **Missing sizes** (§22.4): "Aap ne 9×7×5, 13×11×2, 12×10×2, 9×6×6, 10×10×10 use kiye. Kya inko humari tier list mein add karna hai? Agar haan, har box ka **tare weight** aur **capacity** (kitne SS/S/M/L/LL/G items fit hote hain) chahiye."
+2. **Product re-review** (§22.5 C1): "Ye 2 products (Sleep Formula, Calvert Omega Complete) aap bade envelope mein pack karti ho — kya inki category badalni chahiye (S → M)? Aur koi products bhi hain iss list mein?" — full PDF cross-reference needed to compile complete list before sending.
+3. **Extras allowance** (§22.5 C2): "Har liquid box mein — 6 full LL bottles ke saath — realistic extras count kya hai (SS / S / M / G1 / G2 / G4 counts)?" — this is Trace's still-open Q1 from July.
+4. **Multi-package rule** (§22.6): "100-bottle order aapne 5 boxes mein pack kiya. Kis point pe cart split karna chahiye (item count? weight?)? Aur checkout par customer ko ek quote dikhana hai ya per-box breakdown?"
+
+### 22.8 How to use this section
+
+- **Adding a new box tier** (from client answer to Q1): update §5.2 table + §PACKING.boxTiers + add a test case in §19.
+- **Re-categorizing a product** (from client answer to Q2): no code change — merchant updates the Shopify metafield. Log the change here in §22.5 C1 table for audit.
+- **Tuning extras allowances** (from client answer to Q3): update `units` field on the relevant liquid tier in `PACKING.boxTiers` + refresh §5.2 table.
+- **Implementing multi-package** (from client answer to Q4): major work — new §23 will be needed; §7 selection algorithm gets a new post-step; §9 carrier integrations get a fan-out layer.
+
+Cross-reference: each of the 4 §20 pending items points back to the relevant §22 subsection.
 
 ---
 
