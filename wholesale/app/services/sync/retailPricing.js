@@ -154,7 +154,9 @@ export async function fetchVariantRetailPricingBySku({ shop, productId }) {
 // Shopify stores `money` metafields as a JSON blob: {"amount":"25.99","currency_code":"USD"}
 // We keep only `amount` because the retail sync writes to Shopify REST which
 // infers currency from the destination shop settings.
-function parseMoneyMetafield(mf, ctx) {
+// Exported so product.sync.js can reuse it when reading metafields directly
+// from the webhook payload (avoids a second round-trip + the race condition).
+export function parseMoneyMetafield(mf, ctx) {
   if (!mf || !mf.value) return null
   const raw = String(mf.value).trim()
   if (!raw) return null

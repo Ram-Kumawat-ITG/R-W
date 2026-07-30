@@ -1,14 +1,23 @@
 import IdMap from "./idMap.model";
+import ProductMap from "./productMap.model";
 import { retailClient } from "./retailApi";
 import { resolveRetailLocationId } from "./sync.utils";
 import {
   fetchVariantRetailPricingBySku,
   resolveVariantPricing,
+  parseMoneyMetafield,
 } from "./retailPricing";
 import { fetchAllCustomMetafieldsForProduct } from "./productMetafields";
 import { createLogger } from "../../utils/logger.utils";
 
 const log = createLogger("sync.product");
+
+// Variant metafield keys that are consumed to set the retail `price` /
+// `compare_at_price` fields directly. They must NOT also be written as
+// metafields onto the retail variant — `retail_price` on a retail variant
+// has no meaning (it IS the retail variant; the field only makes sense on
+// wholesale to express what the retail price should be).
+const VARIANT_PRICING_MF_KEYS = new Set(["retail_price", "retail_compare_at_price"]);
 
 // Build the payload for a retail product create/update from the
 // wholesale webhook payload (Shopify REST format).
@@ -56,6 +65,12 @@ function buildRetailPayload(
     pricingBySku = null,
     retailVariantsBySku = null,
     metafieldsData = null,
+    // includeImages: true on CREATE (initial copy from wholesale CDN).
+    // false on UPDATE — after the first upload Shopify re-hosts images under
+    // the retail store's own CDN URL. Re-sending the wholesale src on every
+    // products/update would cause Shopify to upload a duplicate image each
+    // time, accumulating stale copies on the retail product.
+    includeImages = true,
   } = {},
 ) {
   const productMetafields = metafieldsData?.productMetafields || [];
@@ -83,9 +98,13 @@ function buildRetailPayload(
       status: p.status,
       options: p.options?.map((o) => ({ name: o.name, values: o.values })),
       variants,
-      images: p.images
-        ?.filter((i) => i.src)
-        .map((i) => ({ src: i.src, alt: i.alt || null })),
+      // Omitted entirely on update — Shopify leaves existing retail images
+      // untouched when the key is absent, preventing duplicate uploads.
+      ...(includeImages && {
+        images: p.images
+          ?.filter((i) => i.src)
+          .map((i) => ({ src: i.src, alt: i.alt || null })),
+      }),
       // Product-level `custom.*` metafields — omit the field entirely
       // when empty (Shopify accepts either, but omission keeps the
       // payload minimal + avoids a spurious "no changes" write).
@@ -163,9 +182,10 @@ function buildRetailVariant(
   const metafieldPricing = resolveVariantPricing(v, pricingBySku);
   if (metafieldPricing) {
     base.price = metafieldPricing.price;
-    if (metafieldPricing.compareAtPrice) {
-      base.compare_at_price = metafieldPricing.compareAtPrice;
-    }
+    // Always set compare_at_price — null explicitly clears the strike-through
+    // on retail when the merchant removes the metafield. Omitting the key
+    // entirely would leave the old value in place permanently.
+    base.compare_at_price = metafieldPricing.compareAtPrice ?? null;
   } else if (includePrice) {
     base.price = v.price;
     base.compare_at_price = v.compare_at_price;
@@ -305,6 +325,126 @@ async function upsertVariantMappings(wholesaleVariants, retailVariants) {
   }
 }
 
+// ── Payload-metafield extraction helpers (2026-07-30) ───────────────────────
+//
+// When the webhook subscription includes `metafield_namespaces: ["custom"]`
+// (set in shopify.app.toml), Shopify embeds the full metafield values directly
+// inside the webhook payload — both at the product level and on each variant.
+// Reading from the payload eliminates the race condition where the webhook fires
+// slightly before Shopify's GraphQL read replicas have committed the new value,
+// which caused "metafield-only edits to retail_price didn't sync until the next
+// unrelated product save" (observed 2026-07-30).
+//
+// Detection: when metafield_namespaces is active, Shopify always includes a
+// `metafields` key on the product object (may be an empty array). When the
+// subscription does NOT include it, the key is absent (undefined). We use
+// `'metafields' in wholesaleProduct` as the presence signal and fall back to
+// the GraphQL fetch for any webhook delivered under the old subscription
+// (e.g. during the redeploy transition window).
+
+// Extract retail variant pricing from the payload's variant metafields.
+// Returns Map<sku, { price, compareAtPrice }> — identical shape to
+// fetchVariantRetailPricingBySku so both paths are interchangeable downstream.
+function extractPricingFromPayload(wholesaleProduct) {
+  const result = new Map();
+  for (const v of wholesaleProduct.variants || []) {
+    const sku = String(v?.sku || "").trim();
+    if (!sku) continue;
+    const mfs = Array.isArray(v.metafields) ? v.metafields : [];
+    const priceMf = mfs.find(
+      (m) => m.namespace === "custom" && m.key === "retail_price",
+    );
+    if (!priceMf) continue;
+    const price = parseMoneyMetafield(priceMf, {
+      productId: wholesaleProduct.id,
+      sku,
+      key: "retail_price",
+    });
+    if (!price) continue;
+    const compareAtMf = mfs.find(
+      (m) => m.namespace === "custom" && m.key === "retail_compare_at_price",
+    );
+    const compareAtPrice = compareAtMf
+      ? parseMoneyMetafield(compareAtMf, {
+          productId: wholesaleProduct.id,
+          sku,
+          key: "retail_compare_at_price",
+        })
+      : null;
+    result.set(sku, { price, compareAtPrice: compareAtPrice ?? null });
+  }
+  return result;
+}
+
+// Extract all custom-namespace metafields from the payload (product-level +
+// per-variant). Returns { productMetafields, variantMetafieldsBySku } —
+// identical shape to fetchAllCustomMetafieldsForProduct.
+function extractMetafieldsFromPayload(wholesaleProduct) {
+  const productMetafields = (
+    Array.isArray(wholesaleProduct.metafields) ? wholesaleProduct.metafields : []
+  )
+    .filter((m) => m.namespace === "custom")
+    .map((m) => ({ namespace: m.namespace, key: m.key, value: m.value, type: m.type }));
+
+  const variantMetafieldsBySku = new Map();
+  for (const v of wholesaleProduct.variants || []) {
+    const sku = String(v?.sku || "").trim();
+    if (!sku) continue;
+    const rows = (Array.isArray(v.metafields) ? v.metafields : [])
+      .filter((m) => m.namespace === "custom" && !VARIANT_PRICING_MF_KEYS.has(m.key))
+      .map((m) => ({ namespace: m.namespace, key: m.key, value: m.value, type: m.type }));
+    if (rows.length > 0) variantMetafieldsBySku.set(sku, rows);
+  }
+
+  return { productMetafields, variantMetafieldsBySku };
+}
+
+// Resolve pricing + metafields for a sync operation.
+// Prefers the webhook payload when metafields are embedded (no race condition).
+// Falls back to separate GraphQL fetches for webhooks delivered before the
+// subscription was updated to include metafield_namespaces.
+async function resolveMetafieldData(wholesaleProduct, { shop } = {}) {
+  const payloadHasMetafields = "metafields" in wholesaleProduct;
+
+  if (payloadHasMetafields) {
+    const pricingBySku = extractPricingFromPayload(wholesaleProduct);
+    const metafieldsData = extractMetafieldsFromPayload(wholesaleProduct);
+    log.info("metafields.from_payload", {
+      productId: wholesaleProduct.id,
+      variantsWithPricing: pricingBySku.size,
+      productMetafieldCount: metafieldsData.productMetafields.length,
+      variantsWithMetafields: metafieldsData.variantMetafieldsBySku.size,
+    });
+    return { pricingBySku, metafieldsData };
+  }
+
+  // Legacy path — webhook delivered before metafield_namespaces was added.
+  const pricingBySku = shop
+    ? await fetchVariantRetailPricingBySku({ shop, productId: String(wholesaleProduct.id) })
+    : new Map();
+  const rawMetafieldsData = shop
+    ? await fetchAllCustomMetafieldsForProduct({ shop, productId: String(wholesaleProduct.id) })
+    : { productMetafields: [], variantMetafieldsBySku: new Map() };
+
+  // Strip pricing keys — identical filter to the payload path so both paths
+  // behave the same regardless of which subscription state is active.
+  const filteredVariantMfBySku = new Map();
+  for (const [sku, mfs] of rawMetafieldsData.variantMetafieldsBySku) {
+    const filtered = mfs.filter((m) => !VARIANT_PRICING_MF_KEYS.has(m.key));
+    if (filtered.length > 0) filteredVariantMfBySku.set(sku, filtered);
+  }
+  const metafieldsData = {
+    productMetafields: rawMetafieldsData.productMetafields,
+    variantMetafieldsBySku: filteredVariantMfBySku,
+  };
+
+  log.info("metafields.from_graphql_fallback", {
+    productId: wholesaleProduct.id,
+    variantsWithPricing: pricingBySku.size,
+  });
+  return { pricingBySku, metafieldsData };
+}
+
 // Sentinel retailId stored on the claim row while a retail product create
 // is in flight. Lets a concurrent duplicate webhook (Shopify at-least-once
 // delivery, or the products/update Shopify fires right after create) detect
@@ -349,31 +489,12 @@ export async function syncProductCreate(wholesaleProduct, { shop } = {}) {
     throw err;
   }
 
-  // Fetch variant-level retail-pricing metafields from the wholesale
-  // product. Best-effort — missing/malformed metafields yield an empty
-  // Map and we sync without prices (pre-metafield behavior, non-breaking).
-  // `shop` is optional so any legacy/test caller that doesn't pass it
-  // still works.
-  const pricingBySku = shop
-    ? await fetchVariantRetailPricingBySku({ shop, productId: wholesaleId })
-    : new Map();
-  log.info("product_create.retail_pricing", {
-    wholesaleId,
-    variantsWithPricing: pricingBySku.size,
-  });
-
-  // Fetch every `custom.*` metafield on the wholesale product + variants so
-  // they can be mirrored verbatim into the retail record on create.
-  // Best-effort (2026-07-28) — a fetch failure returns an empty result
-  // and the sync proceeds without metafields.
-  const metafieldsData = shop
-    ? await fetchAllCustomMetafieldsForProduct({ shop, productId: wholesaleId })
-    : { productMetafields: [], variantMetafieldsBySku: new Map() };
-  log.info("product_create.custom_metafields", {
-    wholesaleId,
-    productMetafieldCount: metafieldsData.productMetafields.length,
-    variantsWithMetafields: metafieldsData.variantMetafieldsBySku.size,
-  });
+  // Resolve pricing + all custom metafields from the payload when available
+  // (no race condition), or fall back to GraphQL fetches for older webhooks.
+  const { pricingBySku, metafieldsData } = await resolveMetafieldData(
+    wholesaleProduct,
+    { shop },
+  );
 
   let retailProduct;
   try {
@@ -437,27 +558,12 @@ export async function syncProductUpdate(wholesaleProduct, { shop } = {}) {
     return;
   }
 
-  // Re-fetch variant retail-pricing metafields on every update — the
-  // merchant may have edited them. Empty Map → sync without prices.
-  const pricingBySku = shop
-    ? await fetchVariantRetailPricingBySku({ shop, productId: wholesaleId })
-    : new Map();
-  log.info("product_update.retail_pricing", {
-    wholesaleId,
-    variantsWithPricing: pricingBySku.size,
-  });
-
-  // Re-fetch every `custom.*` metafield on the wholesale product + variants
-  // on every update — the merchant may have added, edited, or created new
-  // ones. Empty result → sync without metafield changes (no deletion).
-  const metafieldsData = shop
-    ? await fetchAllCustomMetafieldsForProduct({ shop, productId: wholesaleId })
-    : { productMetafields: [], variantMetafieldsBySku: new Map() };
-  log.info("product_update.custom_metafields", {
-    wholesaleId,
-    productMetafieldCount: metafieldsData.productMetafields.length,
-    variantsWithMetafields: metafieldsData.variantMetafieldsBySku.size,
-  });
+  // Resolve pricing + all custom metafields from the payload when available
+  // (no race condition), or fall back to GraphQL fetches for older webhooks.
+  const { pricingBySku, metafieldsData } = await resolveMetafieldData(
+    wholesaleProduct,
+    { shop },
+  );
 
   const retailId = mapping.retailId;
 
@@ -474,17 +580,21 @@ export async function syncProductUpdate(wholesaleProduct, { shop } = {}) {
   // a matching retail SKU are skipped (warn logged) so retail is never
   // silently mangled.
   const retailVariantsBySku = new Map();
+  // Capture the pre-PUT retail variant IDs so we can diff against the
+  // post-PUT set and clean up IdMap rows for any variants the merchant deleted.
+  let oldRetailVariantIds = new Set();
   try {
     const preFetch = await retailClient.get(`products/${retailId}.json`);
-    const currentRetailVariants = preFetch?.product?.variants || [];
-    for (const rv of currentRetailVariants) {
+    const prefetchedVariants = preFetch?.product?.variants || [];
+    for (const rv of prefetchedVariants) {
       const sku = String(rv?.sku || "").trim();
       if (sku) retailVariantsBySku.set(sku, rv);
+      if (rv?.id) oldRetailVariantIds.add(String(rv.id));
     }
     log.info("product_update.retail_prefetch_ok", {
       wholesaleId,
       retailId,
-      retailVariantCount: currentRetailVariants.length,
+      retailVariantCount: prefetchedVariants.length,
       retailSkuCount: retailVariantsBySku.size,
     });
   } catch (err) {
@@ -504,15 +614,58 @@ export async function syncProductUpdate(wholesaleProduct, { shop } = {}) {
       metafieldsData,
       retailVariantsBySku:
         retailVariantsBySku.size > 0 ? retailVariantsBySku : null,
+      // Never re-upload images on update — retail already hosts them under its
+      // own CDN URL after initial creation; re-sending the wholesale src on
+      // every update causes Shopify to upload a duplicate image each time.
+      includeImages: false,
     }),
   );
 
-  // Re-fetch to get current retail variant IDs (variants may be added/removed)
+  // Re-fetch to get current retail variant IDs (variants may be added/removed).
   const retailData = await retailClient.get(`products/${retailId}.json`);
-  await upsertVariantMappings(
-    wholesaleProduct.variants || [],
-    retailData?.product?.variants || [],
-  );
+  const currentRetailVariants = retailData?.product?.variants || [];
+
+  await upsertVariantMappings(wholesaleProduct.variants || [], currentRetailVariants);
+
+  // ── Orphaned IdMap cleanup (productVariant + inventoryItem rows) ─────
+  //
+  // When a wholesale merchant deletes a variant, Shopify's PUT removes it
+  // from the retail product too (replace-variants semantics). Without cleanup
+  // the old productVariant and inventoryItem rows in sync_id_maps become
+  // permanent orphans that pollute inventory-delta logic and audit queries.
+  // Diff pre-PUT vs post-PUT retail variant IDs — anything missing was deleted.
+  if (oldRetailVariantIds.size > 0) {
+    const currentRetailVariantIds = new Set(
+      currentRetailVariants.map((rv) => String(rv.id)),
+    );
+    const deletedRetailVariantIds = [...oldRetailVariantIds].filter(
+      (id) => !currentRetailVariantIds.has(id),
+    );
+    if (deletedRetailVariantIds.length > 0) {
+      const orphanRows = await IdMap.find({
+        entityType: "productVariant",
+        retailId: { $in: deletedRetailVariantIds },
+      }).lean();
+      const orphanInvItemIds = orphanRows
+        .map((r) => r.wholesaleInventoryItemId)
+        .filter(Boolean);
+      await IdMap.deleteMany({
+        entityType: "productVariant",
+        retailId: { $in: deletedRetailVariantIds },
+      });
+      if (orphanInvItemIds.length > 0) {
+        await IdMap.deleteMany({
+          entityType: "inventoryItem",
+          wholesaleId: { $in: orphanInvItemIds },
+        });
+      }
+      log.info("product_update.orphaned_variants_cleaned", {
+        wholesaleId,
+        deletedVariantCount: deletedRetailVariantIds.length,
+        deletedInventoryItemCount: orphanInvItemIds.length,
+      });
+    }
+  }
 
   // ── Mirror inventory to retail (2026-07-22 fix) ─────────────────────
   //
@@ -526,7 +679,7 @@ export async function syncProductUpdate(wholesaleProduct, { shop } = {}) {
   // both paths end up calling `inventory_levels/set` with the same value.
   await setRetailInventoryForProduct(
     wholesaleProduct.variants || [],
-    retailData?.product?.variants || [],
+    currentRetailVariants,
     wholesaleProduct.location_id ?? null,
   );
 
@@ -550,6 +703,14 @@ export async function syncProductDelete(wholesaleProductId) {
     return;
   }
 
+  // Collect wholesale variant IDs BEFORE touching anything.
+  // ProductMap still exists at this point — deleteProductMap is chained
+  // AFTER syncProductDelete in the webhook handler, so the document is live.
+  const productMap = await ProductMap.findOne({ wholesaleProductId: wholesaleId }).lean();
+  const wholesaleVariantIds = (productMap?.variants || [])
+    .map((v) => v.wholesaleVariantId)
+    .filter(Boolean);
+
   try {
     await retailClient.delete(`products/${mapping.retailId}.json`);
   } catch (err) {
@@ -560,6 +721,38 @@ export async function syncProductDelete(wholesaleProductId) {
     });
   }
 
+  // ── Clean up ALL sync_id_maps rows for this product ──────────────────
+  // Without this, productVariant and inventoryItem rows accumulate as
+  // permanent orphans that pollute inventory-delta logic and audit queries.
   await IdMap.deleteOne({ entityType: "product", wholesaleId });
+
+  if (wholesaleVariantIds.length > 0) {
+    // Find variant rows first to extract their wholesaleInventoryItemIds
+    // before the rows are deleted.
+    const variantRows = await IdMap.find({
+      entityType: "productVariant",
+      wholesaleId: { $in: wholesaleVariantIds },
+    }).lean();
+    const wholesaleInvItemIds = variantRows
+      .map((r) => r.wholesaleInventoryItemId)
+      .filter(Boolean);
+
+    await IdMap.deleteMany({
+      entityType: "productVariant",
+      wholesaleId: { $in: wholesaleVariantIds },
+    });
+    if (wholesaleInvItemIds.length > 0) {
+      await IdMap.deleteMany({
+        entityType: "inventoryItem",
+        wholesaleId: { $in: wholesaleInvItemIds },
+      });
+    }
+    log.info("product_delete.mappings_cleaned", {
+      wholesaleId,
+      variantCount: variantRows.length,
+      inventoryItemCount: wholesaleInvItemIds.length,
+    });
+  }
+
   log.info("product_delete.done", { wholesaleId, retailId: mapping.retailId });
 }

@@ -19,14 +19,16 @@ api_version = "2026-07"
   [[webhooks.subscriptions]]
   topics = [ "products/create" ]
   uri = "/webhooks/products/create"
- 
+  metafield_namespaces = [ "custom" ]
+
   [[webhooks.subscriptions]]
   topics = [ "customers/create" ]
   uri = "/webhooks/customers/create"
- 
+
   [[webhooks.subscriptions]]
   topics = [ "products/update" ]
   uri = "/webhooks/products/update"
+  metafield_namespaces = [ "custom" ]
  
   [[webhooks.subscriptions]]
   topics = [ "orders/create" ]
