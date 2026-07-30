@@ -34,6 +34,42 @@ import { createLogger } from "../../utils/logger.utils";
 
 const log = createLogger("cdo.discount.service");
 
+// Shopify's GraphQL rate limiter does NOT return HTTP 429 — it returns a 200
+// carrying { errors: [{ extensions: { code: "THROTTLED" } }] }. Treating that as
+// a normal error is what made the wholesale bulk migration lose 1,093 of 1,094
+// records, so every write here backs off and retries instead. One-at-a-time
+// callers (the portal) effectively never hit this; bulk callers depend on it.
+const THROTTLE_ATTEMPTS = 8;
+const THROTTLE_BASE_MS = 1500;
+const THROTTLE_MAX_MS = 30000;
+
+function isThrottleResponse(json) {
+  return (Array.isArray(json?.errors) ? json.errors : []).some((e) => {
+    const c = e?.extensions?.code;
+    return c === "THROTTLED" || c === "MAX_COST_EXCEEDED";
+  });
+}
+
+// Returns { data, throttled }. `throttled:true` means the retries were exhausted
+// against a sustained limit — a "retry me later", not a rejection.
+async function graphqlWithThrottleRetry(admin, query, variables, { label } = {}) {
+  let delay = THROTTLE_BASE_MS;
+  for (let attempt = 1; attempt <= THROTTLE_ATTEMPTS; attempt++) {
+    const res = await admin.graphql(query, { variables });
+    const json = await res.json();
+    if (!isThrottleResponse(json)) return { data: json, throttled: false };
+    if (attempt === THROTTLE_ATTEMPTS) {
+      log.warn("graphql.throttled_gave_up", { label, attempts: attempt });
+      return { data: json, throttled: true };
+    }
+    const jittered = Math.round(delay * (0.75 + Math.random() * 0.5));
+    log.info("graphql.throttled_retrying", { label, attempt, waitMs: jittered });
+    await new Promise((r) => setTimeout(r, jittered));
+    delay = Math.min(THROTTLE_MAX_MS, delay * 2);
+  }
+  return { data: null, throttled: true };
+}
+
 const CONFIG_METAFIELD_NAMESPACE = "cdo";
 const CONFIG_METAFIELD_KEY = "config";
 
@@ -211,16 +247,25 @@ export async function createShopifyDiscount({
   };
 
   try {
-    const res = await admin.graphql(MUTATION_DISCOUNT_CREATE, {
-      variables: { codeAppDiscount: input },
-    });
-    const data = await res.json();
+    const { data, throttled } = await graphqlWithThrottleRetry(
+      admin,
+      MUTATION_DISCOUNT_CREATE,
+      { codeAppDiscount: input },
+      { label: `discount:${code}` },
+    );
+    if (throttled) {
+      // Retries exhausted against a sustained rate limit. Reported distinctly so
+      // a bulk caller can tell "slow down and retry me" apart from a real
+      // rejection — the whole reason the wholesale bulk migration lost 1,093 of
+      // 1,094 records was a throttle being recorded as a permanent failure.
+      return { ok: false, throttled: true, error: "Shopify rate limit — retry this code later" };
+    }
     if (data?.errors?.length) {
       log.error("create.graphql_errors", {
         code,
         errors: JSON.stringify(data.errors).slice(0, 300),
       });
-      return { ok: false, error: "Discount creation failed" };
+      return { ok: false, error: `Discount creation failed: ${data.errors.map((e) => e.message).join("; ")}` };
     }
     const userErrors = data?.data?.discountCodeAppCreate?.userErrors || [];
     if (userErrors.length) {

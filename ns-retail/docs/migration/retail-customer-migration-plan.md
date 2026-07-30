@@ -139,3 +139,72 @@ store's notification settings (or run against test addresses).
 - **Audit:** one `cdo_migration_runs` doc per commit (`report.migrationType =
   'retail_customer'`); dry runs write nothing. Re-running the same file is
   idempotent (adopt/update, never duplicate).
+
+## Run it from the terminal, not the admin page (2026-07-29)
+
+**Use the CLI for this workbook.** The admin page is fine for a few hundred rows
+and is kept for spot fixes, but it runs the whole import inside one HTTP action
+at roughly one row per second, so 4,836 rows cannot finish before the request is
+cut off.
+
+```sh
+npm run migrate:retail-customers                 # dry run — shows exactly what remains
+npm run migrate:retail-customers:apply           # migrate; safe to re-run any time
+npm run migrate:retail-customers:apply -- --only-failed=docs/migration/logs/<failures>.csv
+```
+
+Script: [`scripts/migrate-retail-customers.js`](../../scripts/migrate-retail-customers.js).
+It does not reimplement the import — it drives the same
+`runCustomerMigrationImport()` in checkpointed chunks, so there is no second
+copy of the business logic to drift.
+
+| Flag | Meaning |
+|---|---|
+| `--apply` | actually write (**dry run by default**) |
+| `--file=<path>` | workbook (default `docs/migration/Retail_Customer_Migration_FILLED.xlsx`) |
+| `--chunk=<n>` | rows per checkpoint (default 25) |
+| `--pacing=<ms>` | delay between rows (default 200) |
+| `--limit=<n>` | only the first n outstanding rows — good for a smoke test |
+| `--only-failed=<csv>` | re-run just the emails in a failures CSV |
+| `--retry-passes=<n>` | extra passes over failed rows (default 1) |
+| `--no-resume` | re-verify every row instead of skipping linked ones |
+| `--verify-shopify` | confirm each linked customer still exists before trusting it |
+
+**Resume is derived from the database, not a checkpoint file** — any email
+already in `cdo_applications` with a `customerId` is skipped without spending a
+Shopify call. That is correct even after a hard kill, and it is what makes
+re-running a finished 4,836-row file take seconds. Ctrl-C stops at the next row
+boundary, flushes the logs, and the next run continues from there.
+
+Failures go to `docs/migration/logs/retail-customers-failed-<ts>.csv` (git-ignored
+— it holds real customer emails) with the row id, email, source, pass and reason,
+plus a `…-events-<ts>.jsonl` per-row trace. Previously-failed rows are retried
+automatically once before the run ends. The audit doc is rewritten after **every
+chunk**, so progress survives a kill.
+
+### What was actually wrong (root cause, 2026-07-29)
+
+The first three attempts left 3,549 of 4,836 rows migrated with no record of why:
+
+1. **The killed-request bug.** The route wrote its report only *after* the loop,
+   so all three `cdo_migration_runs` docs contained nothing but
+   `{ migrationType }` — no progress, no error, no failed-row list. The customers
+   already created persisted, which is why each retry silently started over and
+   got further (1,259 → 2,290 docs). Of the 1,287 rows left, **1,179 were one
+   contiguous block at the tail** — the signature of a timeout, not bad data.
+   *Fixed:* the CLI has no request timeout, and the route now checkpoints
+   `report.progress` every 50 rows and marks `complete: true/false`, so a killed
+   run leaves a readable record.
+2. **`Phone has already been taken`** — the other 109 failures, scattered
+   through the sheet. **Shopify enforces phone uniqueness across customers**, so
+   the second real person sharing a number (spouses, a household, a
+   practitioner's number reused on patient records) failed `customerCreate`
+   outright. The service already had this fallback shape for addresses but not
+   for phones, so the row was lost. *Fixed:* a phone user-error now strips the
+   phone and retries — customer created, phone still kept on the
+   `cdo_applications` doc, warning raised. This is why those rows were invisible:
+   the error existed but the report carrying it was never saved.
+
+Not a cause: duplicates. 3,549 applications resolved to 3,549 **distinct**
+Shopify customer ids, and a `--no-resume` re-run over already-migrated rows
+reports `created 0 / adopted 3` with the store count unchanged — adoption works.

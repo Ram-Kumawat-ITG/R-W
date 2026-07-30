@@ -1,0 +1,4 @@
+# Regenerable caches written by 1-lookup-practitioners.cjs.
+# They hold practitioner emails + application ids — keep them local.
+apps.json
+existing.json

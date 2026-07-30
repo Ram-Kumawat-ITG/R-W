@@ -199,6 +199,17 @@ function isAddressUserError(userErrors) {
     return /address|province|country|zip/i.test(f) || /province|country|zip/i.test(e.message || "");
   });
 }
+// Shopify enforces phone uniqueness ACROSS customers, so a number shared by two
+// real people (spouses, a household, a practitioner's number reused on patient
+// records) fails the second create with "Phone has already been taken". The
+// phone is incidental data on a migration — losing the customer over it is not
+// acceptable, so it is dropped from the Shopify payload and kept in our own DB.
+function isPhoneUserError(userErrors) {
+  return userErrors.some((e) => {
+    const f = Array.isArray(e.field) ? e.field.join(".") : String(e.field || "");
+    return /phone/i.test(f) || /phone/i.test(e.message || "");
+  });
+}
 
 // ── Report scaffolding ─────────────────────────────────────────────────────
 
@@ -226,7 +237,24 @@ function pushWarning(section, rowId, message) {
 
 // commit=false → full validation + Shopify READ lookups, but no writes.
 // commit=true  → same walk + actual Shopify creates/updates + Mongo upserts.
-export async function runCustomerMigrationImport({ parsed, admin, shop, actor, commit, migrationRunId = null }) {
+//
+// `pacingMs`   — override ROW_PACING_MS (the CLI driver tunes this).
+// `onProgress` — called after every row with { index, total, rowId, email,
+//                outcome } so a long run can report progress and checkpoint as
+//                it goes, instead of only revealing anything once the whole walk
+//                finishes. Resume is the CALLER's job: scripts/migrate-retail-
+//                customers.js filters already-linked rows out of `parsed` before
+//                calling, so it can also size its chunks and ETA correctly.
+export async function runCustomerMigrationImport({
+  parsed,
+  admin,
+  shop,
+  actor,
+  commit,
+  migrationRunId = null,
+  pacingMs = ROW_PACING_MS,
+  onProgress = null,
+}) {
   await connectDB();
   const section = newSection();
   const report = { dryRun: !commit, migrationType: "retail_customer", actor: actor || null, customers: section };
@@ -239,8 +267,10 @@ export async function runCustomerMigrationImport({ parsed, admin, shop, actor, c
 
   const seenEmails = new Map(); // email → first row_id (in-sheet dedupe)
 
+  let index = 0;
   for (const row of rows) {
     section.total += 1;
+    index += 1;
     const rowId = s(row.row_id) || String(row._sheetRowNumber || section.total);
 
     // ── Validate ──
@@ -261,6 +291,7 @@ export async function runCustomerMigrationImport({ parsed, admin, shop, actor, c
     if (rowErrors.length) {
       pushError(section, rowId, rowErrors.join("; "));
       section.skipped += 1;
+      onProgress?.({ index, total: rows.length, rowId, email, outcome: "invalid" });
       continue;
     }
     if (!firstName || !lastName) {
@@ -269,6 +300,7 @@ export async function runCustomerMigrationImport({ parsed, admin, shop, actor, c
     if (seenEmails.has(email)) {
       pushError(section, rowId, `duplicate email in sheet (first seen at row ${seenEmails.get(email)}) — keep one row per email`);
       section.skipped += 1;
+      onProgress?.({ index, total: rows.length, rowId, email, outcome: "duplicate_in_sheet" });
       continue;
     }
     seenEmails.set(email, rowId);
@@ -301,6 +333,7 @@ export async function runCustomerMigrationImport({ parsed, admin, shop, actor, c
     const explicitExistingGid = normalizeCustomerGid(row.existing_shopify_customer_id);
     const notes = s(row.notes);
 
+    let outcome = "failed";
     try {
       // ── Resolve the target Shopify customer ──
       let existing = null;
@@ -344,10 +377,24 @@ export async function runCustomerMigrationImport({ parsed, admin, shop, actor, c
           let res = await retailGraphql(admin, MUTATION_CUSTOMER_CREATE, { input });
           let ue = res?.data?.customerCreate?.userErrors || [];
 
-          // Address rejected → retry without addresses (customer still created).
-          if (ue.length && addresses.length && isAddressUserError(ue)) {
-            pushWarning(section, rowId, `Shopify rejected the address (${ue.map((e) => e.message).join("; ")}) — customer created without it; address kept in our DB`);
-            delete input.addresses;
+          // Remediate the two optional fields Shopify can reject, one at a time,
+          // rather than losing the customer over incidental data. Each stripped
+          // field is still persisted on our own cdo_applications doc. The guard
+          // bounds this at one attempt per field so a genuinely broken row falls
+          // through to the error path instead of looping.
+          const stripped = new Set();
+          for (let guard = 0; ue.length && guard < 2; guard++) {
+            if (input.addresses && !stripped.has("addresses") && isAddressUserError(ue)) {
+              pushWarning(section, rowId, `Shopify rejected the address (${ue.map((e) => e.message).join("; ")}) — customer created without it; address kept in our DB`);
+              delete input.addresses;
+              stripped.add("addresses");
+            } else if (input.phone && !stripped.has("phone") && isPhoneUserError(ue)) {
+              pushWarning(section, rowId, `Shopify rejected the phone "${phone}" (${ue.map((e) => e.message).join("; ")}) — Shopify requires phone numbers to be unique across customers, so the customer was created without it; phone kept in our DB`);
+              delete input.phone;
+              stripped.add("phone");
+            } else {
+              break;
+            }
             res = await retailGraphql(admin, MUTATION_CUSTOMER_CREATE, { input });
             ue = res?.data?.customerCreate?.userErrors || [];
           }
@@ -413,13 +460,17 @@ export async function runCustomerMigrationImport({ parsed, admin, shop, actor, c
         else section.created += 1;
         void shopifyCustomerGid;
       }
+      outcome = "ok";
     } catch (err) {
       pushError(section, rowId, err?.message || String(err));
       section.skipped += 1;
+      outcome = "failed";
       log.error("row.failed", { rowId, email, err: err?.message || String(err) });
     }
 
-    if (commit && ROW_PACING_MS) await new Promise((r) => setTimeout(r, ROW_PACING_MS));
+    onProgress?.({ index, total: rows.length, rowId, email, outcome });
+
+    if (commit && pacingMs) await new Promise((r) => setTimeout(r, pacingMs));
   }
 
   return report;
