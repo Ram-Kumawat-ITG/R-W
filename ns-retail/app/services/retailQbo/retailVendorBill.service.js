@@ -19,7 +19,7 @@
 
 import connectDB from "../../db/mongo.server";
 import CdoOrder from "../../models/cdoOrder.server";
-import SyncIdMap from "../../models/syncIdMap.server";
+import SyncProductMap from "../../models/syncProductMap.server";
 import { isRetailQboConfigured, retailQboConfig } from "./retailQbo.config";
 import {
   resolveDropshipVendorId,
@@ -38,35 +38,64 @@ function errMsg(err) {
 }
 
 // Build a Map(retailVariantId → wholesale unit price) for an order's lines by
-// reading the wholesale product sync's `sync_id_maps` snapshot. This is the
-// SAME source the wholesale dropship invoice prices from, so the bill (A/P)
-// matches the wholesale invoice (A/R). Single batched query; best-effort — a
-// lookup failure or a missing/zero snapshot just leaves that variant out of
-// the map, and createBillForOrder falls back to retail × wholesalePriceFactor.
+// resolving each line's SKU against the wholesale product mirror
+// (`sync_product_maps`). This is the SAME collection and the SAME key the
+// wholesale dropship invoice prices from, so the bill (A/P) matches the
+// wholesale invoice (A/R) by construction.
+//
+// Keyed on SKU, NOT on the retail variant id: retail Shopify ids are reassigned
+// when the catalog is deleted + reimported, which silently orphaned the previous
+// `sync_id_maps.retailId` lookup. SKU is the stable business key.
+//
+// The returned map is still keyed by retail `variantId` so createBillForOrder is
+// unchanged. Single batched query; best-effort — an unresolvable SKU just leaves
+// that variant out, and createBillForOrder falls back to
+// retail × wholesalePriceFactor exactly as before.
 async function buildWholesalePriceMap(lineItems) {
   const map = new Map();
-  const ids = [
+  const lines = (lineItems || []).filter(
+    (li) => li?.variantId != null && li.variantId !== "",
+  );
+  const skus = [
     ...new Set(
-      (lineItems || [])
-        .map((li) => li?.variantId)
-        .filter((v) => v != null && v !== "")
-        .map(String),
+      lines
+        .map((li) => String(li?.sku ?? "").trim())
+        .filter((s) => s.length > 0),
     ),
   ];
-  if (ids.length === 0) return map;
+  if (skus.length === 0) return map;
+
   try {
-    const rows = await SyncIdMap.find({
-      entityType: "productVariant",
-      retailId: { $in: ids },
-    })
-      .select("retailId wholesalePrice")
+    const docs = await SyncProductMap.find({ "variants.sku": { $in: skus } })
+      .select("variants.sku variants.price")
       .lean();
-    for (const r of rows) {
-      const wp = Number(r.wholesalePrice);
-      if (Number.isFinite(wp) && wp > 0) {
-        map.set(String(r.retailId), Math.round(wp * 100) / 100);
+
+    // sku → wholesale price
+    const priceBySku = new Map();
+    for (const doc of docs) {
+      for (const v of doc.variants || []) {
+        const sku = String(v?.sku ?? "").trim();
+        if (!sku || priceBySku.has(sku)) continue;
+        const wp = Number(v?.price);
+        if (Number.isFinite(wp) && wp > 0) {
+          priceBySku.set(sku, Math.round(wp * 100) / 100);
+        }
       }
     }
+
+    // Re-key onto the retail variantId the caller expects.
+    for (const li of lines) {
+      const sku = String(li?.sku ?? "").trim();
+      if (!sku) continue;
+      const wp = priceBySku.get(sku);
+      if (wp != null) map.set(String(li.variantId), wp);
+    }
+
+    log.info("wholesale_price_map.done", {
+      lines: lines.length,
+      skus: skus.length,
+      priced: map.size,
+    });
   } catch (err) {
     log.warn("wholesale_price_map_failed", { err: err?.message || err });
   }
@@ -154,10 +183,12 @@ export async function ensureRetailVendorBillForOrder({ shop, shopifyOrderId, for
     const vendorId = await resolveDropshipVendorId();
     const expenseAccountId = await resolveDropshipExpenseAccountId();
 
-    // Resolve each line's actual WHOLESALE product price from sync_id_maps
-    // (written by the wholesale product sync) so the vendor bill matches the
-    // wholesale dropship invoice for the same order. Lines with no mapping
-    // fall back to retail × wholesalePriceFactor inside createBillForOrder.
+    // Resolve each line's actual WHOLESALE product price BY SKU from
+    // sync_product_maps (written by the wholesale product sync) so the vendor
+    // bill matches the wholesale dropship invoice for the same order — both
+    // sides resolve from the same collection by the same key. Lines whose SKU
+    // resolves nowhere fall back to retail × wholesalePriceFactor inside
+    // createBillForOrder.
     const wholesalePriceByVariantId = await buildWholesalePriceMap(order.lineItems);
 
     // QBO caps requestid at 50 chars; key off the short numeric tail of the GID.

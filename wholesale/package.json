@@ -24,6 +24,7 @@
     "retry:shopify-customers": "vite-node --config scripts/vite-node.config.js scripts/retry-failed-shopify-customers.js",
     "delete:wholesale-products": "vite-node --config scripts/vite-node.config.js scripts/delete-all-wholesale-products.js",
     "delete:retail-products": "vite-node --config scripts/vite-node.config.js scripts/delete-all-retail-products.js",
+    "diagnose:sync-maps": "vite-node --config scripts/vite-node.config.js scripts/diagnose-sync-id-maps.js",
     "lint": "eslint --ignore-path .gitignore --cache --cache-location ./node_modules/.cache/eslint .",
     "shopify": "shopify",
     "prisma": "prisma",

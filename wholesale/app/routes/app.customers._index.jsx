@@ -73,9 +73,6 @@ export default function CustomersList() {
   const [decliningId, setDecliningId] = useState(null);
   const [pendingDeclineRow, setPendingDeclineRow] = useState(null);
   const declineFetcher = useFetcher();
-  const syncFetcher = useFetcher();
-  const invFetcher = useFetcher();
-  const tagFetcher = useFetcher();
   const emailPauseFetcher = useFetcher();
 
   // Global email kill switch. Optimistically reflect the in-flight toggle so
@@ -111,9 +108,6 @@ export default function CustomersList() {
       },
     );
   };
-  const handledSyncRef = useRef(null);
-  const handledInvRef = useRef(null);
-  const handledTagRef = useRef(null);
   const declineModalRef = useRef(null);
   const loadedToastShown = useRef(false);
   // Track which response payload we've already handled so React-Router's
@@ -212,79 +206,6 @@ export default function CustomersList() {
     }
   }, [declineFetcher.data, declineFetcher.state, shopify]);
 
-  useEffect(() => {
-    if (!syncFetcher.data) return;
-    if (syncFetcher.state !== "idle") return;
-    if (handledSyncRef.current === syncFetcher.data) return;
-    handledSyncRef.current = syncFetcher.data;
-
-    if (syncFetcher.data.status === "success") {
-      const r = syncFetcher.data.result || {};
-      shopify?.toast?.show(
-        `Sync done: ${r.synced ?? 0} synced, ${r.failed ?? 0} failed`,
-      );
-    } else {
-      shopify?.toast?.show(syncFetcher.data.message || "Sync failed.", {
-        isError: true,
-      });
-    }
-  }, [syncFetcher.data, syncFetcher.state, shopify]);
-
-  useEffect(() => {
-    if (!invFetcher.data) return;
-    if (invFetcher.state !== "idle") return;
-    if (handledInvRef.current === invFetcher.data) return;
-    handledInvRef.current = invFetcher.data;
-    if (invFetcher.data.status === "success") {
-      const r = invFetcher.data.result || {};
-      shopify?.toast?.show(
-        `Inventory snapshot done: ${r.updated ?? 0} items updated`,
-      );
-    } else {
-      shopify?.toast?.show(
-        invFetcher.data.message || "Inventory snapshot failed.",
-        { isError: true },
-      );
-    }
-  }, [invFetcher.data, invFetcher.state, shopify]);
-
-  const runSyncBackfill = () =>
-    syncFetcher.submit(null, {
-      method: "POST",
-      action: "/api/admin/sync/backfill",
-    });
-
-  const runInventorySnapshot = () =>
-    invFetcher.submit(null, {
-      method: "POST",
-      action: "/api/admin/sync/inventory-snapshot",
-    });
-
-  const runTagBackfill = () =>
-    tagFetcher.submit(null, {
-      method: "POST",
-      action: "/api/admin/backfill-customer-tags",
-    });
-
-  useEffect(() => {
-    if (!tagFetcher.data) return;
-    if (tagFetcher.state !== "idle") return;
-    if (handledTagRef.current === tagFetcher.data) return;
-    handledTagRef.current = tagFetcher.data;
-    if (tagFetcher.data.status === "success") {
-      const r = tagFetcher.data.result || {};
-      shopify?.toast?.show(
-        `Tagged ${r.tagged ?? 0} / ${r.totalScanned ?? 0} customers ` +
-          `(already tagged: ${r.alreadyTagged ?? 0}, failed: ${r.failed ?? 0})`,
-      );
-    } else {
-      shopify?.toast?.show(
-        tagFetcher.data.message || "Customer tag backfill failed.",
-        { isError: true },
-      );
-    }
-  }, [tagFetcher.data, tagFetcher.state, shopify]);
-
   const openDeclineModal = (row) => {
     if (!row?.id) return;
     setPendingDeclineRow(row);
@@ -303,40 +224,8 @@ export default function CustomersList() {
     setPendingDeclineRow(null);
   };
 
-  const syncBusy =
-    syncFetcher.state === "submitting" || syncFetcher.state === "loading";
-  const invBusy =
-    invFetcher.state === "submitting" || invFetcher.state === "loading";
-  const tagBusy =
-    tagFetcher.state === "submitting" || tagFetcher.state === "loading";
-
   return (
     <s-page inlineSize="large" heading="Wholesale applications">
-      <s-button
-        slot="primary-action"
-        variant="secondary"
-        onClick={runInventorySnapshot}
-        {...(invBusy ? { loading: true } : {})}
-      >
-        {invBusy ? "Snapshotting…" : "Snapshot inventory"}
-      </s-button>
-      <s-button
-        slot="secondary-actions"
-        variant="secondary"
-        onClick={runSyncBackfill}
-        {...(syncBusy ? { loading: true } : {})}
-      >
-        {syncBusy ? "Syncing…" : "Sync products to retail"}
-      </s-button>
-      <s-button
-        slot="secondary-actions"
-        variant="secondary"
-        onClick={runTagBackfill}
-        {...(tagBusy ? { loading: true } : {})}
-      >
-        {tagBusy ? "Backfilling…" : "Backfill customer tags"}
-      </s-button>
-
       {/* Global email kill switch — silences ALL outbound email (SMTP
           notifications, QuickBooks invoice emails, Shopify invites) from a
           single control. Does not affect charge processing, invoicing, or

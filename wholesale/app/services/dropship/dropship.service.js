@@ -11,12 +11,12 @@
 // foundation: identifying / creating the "Natural Solutions Retail"
 // customer on the wholesale store. Phase B adds the actual Draft Order
 // creation; line items are priced at the WHOLESALE product price
-// (sync_id_maps.wholesalePrice — see resolveWholesaleLines).
+// (resolved by SKU — see resolveWholesaleLines).
 
 import { unauthenticated } from '../../shopify.server'
 import { createLogger } from '../../utils/logger.utils'
 import DropshipMapping from '../../models/dropshipMapping.server'
-import SyncIdMap from '../sync/idMap.model'
+import SyncProductMap from '../sync/productMap.model'
 import { dropshipConfig } from './dropship.config'
 
 const log = createLogger('dropship.service')
@@ -186,10 +186,10 @@ export async function processRetailOrderForDropShip({
   // 1. Compute the amounts — locked at order receipt so any later
   //    price changes on the catalog don't retroactively shift this
   //    drop-ship order's wholesale invoice. wholesaleSubtotal is sourced
-  //    from the actual wholesale product prices (sync_id_maps), not a
+  //    from the actual wholesale product prices (resolved by SKU), not a
   //    ½-of-retail estimate.
   const { retailBaseSubtotal, wholesaleSubtotal, currency } =
-    await computeDropshipAmounts(order)
+    await computeDropshipAmounts(order, { shop: wholesaleShop })
 
   // 2. Upsert the mapping doc (idempotent on (shop, retailOrderId)).
   //    If a row already exists and is past 'received' we ALREADY started
@@ -345,11 +345,11 @@ async function createDropshipWholesaleOrder({
 }) {
   const { admin } = await unauthenticated.admin(shop)
 
-  // 1. Build line items — variant mapping + ½ base price.
-  const lineItems = await buildDropshipLineItems(order)
+  // 1. Build line items — wholesale variant + wholesale price, resolved by SKU.
+  const lineItems = await buildDropshipLineItems(order, { shop })
   if (lineItems.length === 0) {
     throw new Error(
-      'No mappable line items — every variant_id is missing from sync_id_maps',
+      'No mappable line items — no retail line SKU matched a wholesale variant',
     )
   }
 
@@ -446,89 +446,221 @@ async function runDraftOrderCreate(admin, draftInput) {
 }
 
 // Fallback factor for the rare case where a variant's wholesale price
-// snapshot isn't populated in sync_id_maps yet — preserves the legacy
-// ½-of-retail behavior so an un-synced product never blocks invoicing.
-// Mirrors the retail Vendor Bill's QBO_RETAIL_WHOLESALE_PRICE_FACTOR (0.5)
-// so the two sides stay in sync even on this fallback path.
+// can't be resolved at all — preserves the legacy ½-of-retail behavior so an
+// un-synced product never blocks invoicing. Mirrors the retail Vendor Bill's
+// QBO_RETAIL_WHOLESALE_PRICE_FACTOR (0.5) so the two sides stay in sync even
+// on this fallback path.
 const WHOLESALE_PRICE_FALLBACK_FACTOR = 0.5
+
+// Look up wholesale variants by SKU directly on the wholesale Shopify store.
+// The authoritative, never-stale source — used as the self-healing fallback
+// when a SKU has no `sync_product_maps` row (product predates the mirror, or
+// the mirror write failed).
+const QUERY_WHOLESALE_VARIANTS_BY_SKU = `#graphql
+  query WholesaleVariantsBySku($q: String!, $first: Int!) {
+    productVariants(first: $first, query: $q) {
+      edges {
+        node {
+          id
+          sku
+          price
+        }
+      }
+    }
+  }
+`
+
+// Normalize a SKU for map keys. Trimmed (a trailing space on one store must
+// not break pairing) but case-PRESERVING — Shopify SKUs are case-sensitive
+// and two variants may legitimately differ only by case.
+function skuKey(raw) {
+  const s = String(raw ?? '').trim()
+  return s.length > 0 ? s : null
+}
+
+function gidToNumericId(gid) {
+  const m = String(gid || '').match(/(\d+)\s*$/)
+  return m ? m[1] : null
+}
+
+/**
+ * Batch-resolve SKU → { wholesaleVariantId, wholesalePrice } for a set of SKUs.
+ *
+ * Tier 1: `sync_product_maps` — the comprehensive WHOLESALE product mirror,
+ *   indexed on `variants.sku`. Maintained by products/create|update|delete +
+ *   the admin backfill, and critically refreshed even when the retail mirror
+ *   FAILS (the webhooks chain upsertProductMap after the sync settles, success
+ *   or failure), so it stays accurate independent of retail-side health.
+ *
+ * Tier 2: live wholesale Shopify lookup by SKU — authoritative and always
+ *   current. Covers any SKU the mirror hasn't captured yet.
+ *
+ * Deliberately keyed on SKU, never on a retail id: Shopify ids are reassigned
+ * when a catalog is deleted and reimported, whereas the SKU is the stable
+ * business key that survives it.
+ */
+async function resolveWholesalePricingBySku(skus, { shop } = {}) {
+  const wanted = [...new Set(skus.filter(Boolean))]
+  const bySku = new Map()
+  if (wanted.length === 0) return bySku
+
+  // ── Tier 1 — sync_product_maps (one indexed query) ──────────────────
+  try {
+    const docs = await SyncProductMap.find({ 'variants.sku': { $in: wanted } })
+      .select('variants.sku variants.wholesaleVariantId variants.price')
+      .lean()
+    for (const doc of docs) {
+      for (const v of doc.variants || []) {
+        const key = skuKey(v?.sku)
+        if (!key || !wanted.includes(key) || bySku.has(key)) continue
+        if (!v?.wholesaleVariantId) continue
+        const price = Number(v.price)
+        bySku.set(key, {
+          wholesaleVariantId: String(v.wholesaleVariantId),
+          wholesalePrice:
+            Number.isFinite(price) && price > 0
+              ? Math.round(price * 100) / 100
+              : null,
+          source: 'sync_product_maps',
+        })
+      }
+    }
+  } catch (err) {
+    // Non-fatal — tier 2 still has a chance to resolve everything.
+    log.warn('sku_resolve.product_map_failed', { err: err?.message || err })
+  }
+
+  // ── Tier 2 — live wholesale Shopify, for whatever tier 1 missed ──────
+  const missing = wanted.filter((s) => !bySku.has(s))
+  if (missing.length > 0 && shop) {
+    try {
+      const { admin } = await unauthenticated.admin(shop)
+      // Shopify's variant search supports OR'd sku: terms. Chunk so a very
+      // large order can't build an over-long query string.
+      const CHUNK = 25
+      for (let i = 0; i < missing.length; i += CHUNK) {
+        const chunk = missing.slice(i, i + CHUNK)
+        const q = chunk.map((s) => `sku:"${s.replace(/"/g, '\\"')}"`).join(' OR ')
+        const res = await admin.graphql(QUERY_WHOLESALE_VARIANTS_BY_SKU, {
+          variables: { q, first: 100 },
+        })
+        const json = await res.json()
+        for (const edge of json?.data?.productVariants?.edges || []) {
+          const node = edge?.node
+          const key = skuKey(node?.sku)
+          if (!key || bySku.has(key)) continue
+          const numericId = gidToNumericId(node?.id)
+          if (!numericId) continue
+          const price = Number(node?.price)
+          bySku.set(key, {
+            wholesaleVariantId: numericId,
+            wholesalePrice:
+              Number.isFinite(price) && price > 0
+                ? Math.round(price * 100) / 100
+                : null,
+            source: 'wholesale_shopify_live',
+          })
+        }
+      }
+    } catch (err) {
+      // Non-fatal — unresolved SKUs fall through to the ½-retail fallback,
+      // exactly as before. Never let a Shopify hiccup break order intake.
+      log.warn('sku_resolve.live_lookup_failed', {
+        missing: missing.length,
+        err: err?.message || err,
+      })
+    }
+  }
+
+  log.info('sku_resolve.done', {
+    requested: wanted.length,
+    resolved: bySku.size,
+    unresolved: wanted.filter((s) => !bySku.has(s)),
+  })
+  return bySku
+}
 
 /**
  * Resolve each retail order line to its matching wholesale variant + the
- * wholesale UNIT price to charge. Pricing precedence (per the "Admin Order
- * invoices must use the wholesale product price" requirement):
+ * wholesale UNIT price to charge, keyed on SKU (see
+ * resolveWholesalePricingBySku for why SKU and not retail id).
  *
- *   1. sync_id_maps.wholesalePrice — the actual wholesale Shopify variant
- *      price captured by the product sync. AUTHORITATIVE. The retail QBO
- *      Vendor Bill reads the SAME field, so the wholesale invoice (A/R) and
- *      the retail vendor bill (A/P) stay numerically in sync by construction.
+ * Pricing precedence (per the "Admin Order invoices must use the wholesale
+ * product price" requirement):
+ *
+ *   1. The wholesale variant's own price, resolved by SKU. AUTHORITATIVE.
+ *      ns-retail's QBO Vendor Bill resolves by the SAME key from the SAME
+ *      collection, so the wholesale invoice (A/R) and the retail vendor bill
+ *      (A/P) stay numerically in sync by construction.
  *   2. retail base price × WHOLESALE_PRICE_FALLBACK_FACTOR — graceful
- *      fallback when the snapshot isn't populated yet (legacy ½ behavior).
+ *      fallback when the SKU resolves to a variant with no usable price.
  *
- * Lines with no variant_id, or no sync_id_maps row, come back with
+ * Lines with no SKU, or a SKU that resolves nowhere, come back with
  * wholesaleVariantId=null so the caller can skip + warn (we never silently
  * drop a product onto the wholesale order). Used by BOTH buildDropshipLineItems
  * (the order/invoice) and computeDropshipAmounts (the mapping audit subtotal)
  * so the two always agree.
  */
-async function resolveWholesaleLines(order) {
+async function resolveWholesaleLines(order, { shop } = {}) {
   const lines = Array.isArray(order?.line_items) ? order.line_items : []
+  if (lines.length === 0) return []
+
+  const pricing = await resolveWholesalePricingBySku(
+    lines.map((l) => skuKey(l?.sku)),
+    { shop },
+  )
+
   const out = []
   for (const line of lines) {
     const retailVariantId = String(line?.variant_id || '')
+    const sku = skuKey(line?.sku)
     const qty = parseInt(line?.quantity || '1', 10) || 1
     const retailUnit = parseFloat(line?.price || '0') || 0
     const fallbackUnit =
       Math.round(retailUnit * WHOLESALE_PRICE_FALLBACK_FACTOR * 100) / 100
 
-    if (!retailVariantId) {
-      out.push({
-        line,
-        qty,
-        retailVariantId: '',
-        retailUnit,
-        wholesaleVariantId: null,
-        wholesaleUnitPrice: fallbackUnit,
-        priceSource: 'fallback_no_variant',
-        reason: 'no variant_id in retail line',
-      })
-      continue
-    }
-
-    const idMap = await SyncIdMap.findOne({
-      entityType: 'productVariant',
-      retailId: retailVariantId,
-    })
-      .select('wholesaleId wholesalePrice')
-      .lean()
-
-    if (!idMap?.wholesaleId) {
+    if (!sku) {
       out.push({
         line,
         qty,
         retailVariantId,
+        sku: null,
         retailUnit,
         wholesaleVariantId: null,
         wholesaleUnitPrice: fallbackUnit,
-        priceSource: 'fallback_no_mapping',
-        reason: 'no sync_id_maps row for this retail variant',
+        priceSource: 'fallback_no_sku',
+        reason: 'retail line has no SKU — cannot resolve a wholesale variant',
       })
       continue
     }
 
-    const snapshot = Number(idMap.wholesalePrice)
-    const hasSnapshot = Number.isFinite(snapshot) && snapshot > 0
+    const hit = pricing.get(sku)
+    if (!hit?.wholesaleVariantId) {
+      out.push({
+        line,
+        qty,
+        retailVariantId,
+        sku,
+        retailUnit,
+        wholesaleVariantId: null,
+        wholesaleUnitPrice: fallbackUnit,
+        priceSource: 'fallback_no_match',
+        reason: `SKU "${sku}" matched no wholesale variant (checked sync_product_maps + live Shopify)`,
+      })
+      continue
+    }
+
     out.push({
       line,
       qty,
       retailVariantId,
+      sku,
       retailUnit,
-      wholesaleVariantId: idMap.wholesaleId,
-      wholesaleUnitPrice: hasSnapshot
-        ? Math.round(snapshot * 100) / 100
-        : fallbackUnit,
-      priceSource: hasSnapshot
-        ? 'sync_id_maps.wholesalePrice'
-        : 'fallback_no_snapshot',
+      wholesaleVariantId: hit.wholesaleVariantId,
+      wholesaleUnitPrice:
+        hit.wholesalePrice != null ? hit.wholesalePrice : fallbackUnit,
+      priceSource:
+        hit.wholesalePrice != null ? hit.source : 'fallback_no_price',
     })
   }
   return out
@@ -541,8 +673,8 @@ async function resolveWholesaleLines(order) {
  * Throws if ANY variant is unmappable (we'd rather hard-fail than silently
  * drop products from the wholesale order).
  */
-async function buildDropshipLineItems(order) {
-  const resolved = await resolveWholesaleLines(order)
+async function buildDropshipLineItems(order, { shop } = {}) {
+  const resolved = await resolveWholesaleLines(order, { shop })
   const out = []
   const unmapped = []
 
@@ -551,6 +683,7 @@ async function buildDropshipLineItems(order) {
       unmapped.push({
         line_id: r.line?.id,
         retailVariantId: r.retailVariantId,
+        sku: r.sku,
         reason: r.reason,
       })
       continue
@@ -582,6 +715,7 @@ async function buildDropshipLineItems(order) {
     lines: resolved
       .filter((r) => r.wholesaleVariantId)
       .map((r) => ({
+        sku: r.sku,
         wholesaleVariantId: r.wholesaleVariantId,
         qty: r.qty,
         retailUnit: r.retailUnit,
@@ -661,8 +795,8 @@ function buildShippingLine(order) {
  * order receipt so later catalog price changes don't retroactively shift the
  * recorded amounts.
  */
-async function computeDropshipAmounts(order) {
-  const resolved = await resolveWholesaleLines(order)
+async function computeDropshipAmounts(order, { shop } = {}) {
+  const resolved = await resolveWholesaleLines(order, { shop })
   let retailBaseSubtotal = 0
   let wholesaleSubtotal = 0
   for (const r of resolved) {

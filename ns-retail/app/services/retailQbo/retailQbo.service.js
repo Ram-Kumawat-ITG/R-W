@@ -1204,10 +1204,11 @@ async function resolvePurchasableBillItem({ variantId, sku, name }, cache) {
 //
 // Per-line unit pricing precedence (keeps the bill in sync with the wholesale
 // invoice, which prices from the same source):
-//   1. wholesalePriceByVariantId — the actual wholesale Shopify variant price
-//      (sync_id_maps.wholesalePrice), keyed by the line's retail variant id.
-//   2. retail BASE unit price × priceFactor — graceful fallback when a
-//      variant's wholesale price snapshot isn't populated (legacy ½ behavior).
+//   1. wholesalePriceByVariantId — the actual wholesale Shopify variant price,
+//      resolved BY SKU from sync_product_maps then re-keyed onto the line's
+//      retail variant id by buildWholesalePriceMap (see retailVendorBill.service).
+//   2. retail BASE unit price × priceFactor — graceful fallback when a line's
+//      SKU resolves to no wholesale price (legacy ½ behavior).
 // Discounts are ignored in both cases (matching the wholesale base formula).
 export async function createBillForOrder({
   order,
