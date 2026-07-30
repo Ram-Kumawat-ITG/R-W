@@ -59,10 +59,30 @@ export const action = async ({ request }) => {
       migrationRunId = run._id;
     }
 
-    const report = await runCustomerMigrationImport({ parsed, admin, shop, actor, commit, migrationRunId });
+    // Checkpoint progress into the audit doc DURING the walk, not only after it.
+    // A big file cannot finish inside one HTTP request (~0.9s/row), and when the
+    // request is killed the final write never runs — which is how three earlier
+    // runs left an audit doc containing nothing but { migrationType }, hiding
+    // both the progress made and the rows that failed. Now a killed run still
+    // leaves a readable record, and `complete: false` marks it as partial.
+    let checkpointAt = 0;
+    const onProgress = commit && migrationRunId
+      ? ({ index, total }) => {
+        if (index - checkpointAt < 50 && index !== total) return;
+        checkpointAt = index;
+        // Fire-and-forget: a checkpoint must never slow down or fail a row.
+        CdoMigrationRun.findByIdAndUpdate(migrationRunId, {
+          "report.migrationType": "retail_customer",
+          "report.complete": false,
+          "report.progress": { processed: index, total, updatedAt: new Date().toISOString() },
+        }).catch(() => {});
+      }
+      : null;
+
+    const report = await runCustomerMigrationImport({ parsed, admin, shop, actor, commit, migrationRunId, onProgress });
 
     if (commit && migrationRunId) {
-      await CdoMigrationRun.findByIdAndUpdate(migrationRunId, { report });
+      await CdoMigrationRun.findByIdAndUpdate(migrationRunId, { report: { ...report, complete: true } });
     }
     return { status: "success", op, report };
   } catch (err) {
@@ -168,6 +188,21 @@ export default function CustomerMigration() {
             no writes), then Commit. Re-running the same file is safe: existing
             customers are adopted/updated, not duplicated.
           </s-paragraph>
+
+          <s-banner tone="warning">
+            <s-paragraph>
+              Use the terminal for anything over ~500 rows. This page does the
+              whole import inside one HTTP request at roughly one row per second,
+              so a few thousand rows cannot finish before the request is cut off —
+              customers already created stay created, but the run is left partial.
+              The CLI has no request timeout, resumes where it stopped, and logs
+              failed rows to their own file:
+            </s-paragraph>
+            <s-paragraph>
+              <s-text>npm run migrate:retail-customers</s-text> (dry run) then{" "}
+              <s-text>npm run migrate:retail-customers:apply</s-text>
+            </s-paragraph>
+          </s-banner>
 
           <input
             ref={fileInputRef}

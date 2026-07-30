@@ -4,9 +4,16 @@
 // shorter interval so you can see the orchestrator pick up an invoice
 // without waiting two weeks.
 
-import { readEnv } from '../../utils/env.utils'
+import { readEnv, readBool } from '../../utils/env.utils'
 
 export const schedulerConfig = {
+  // Hard kill switch — when true the scheduler never boots (entry.server skips
+  // getAgenda(), so ensureRecurring() never re-registers the cron jobs either).
+  // Mirrors ns-retail's CDO_SCHEDULER_DISABLED. Needed because pausing the job
+  // documents in Mongo is undone by the next process restart: boot calls
+  // agenda.every(), which re-creates and re-enables them.
+  disabled: readBool('SCHEDULER_DISABLED', false),
+
   scheduleTimezone: readEnv('PAYMENT_SCHEDULE_TZ', { fallback: 'America/Los_Angeles' }),
   // Production cron expressions. Defaults are 00:30 on the 15th and 00:30
   // on the last day of the month.

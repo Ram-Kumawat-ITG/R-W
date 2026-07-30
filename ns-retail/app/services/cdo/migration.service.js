@@ -38,6 +38,14 @@ import { createLogger } from "../../utils/logger.utils";
 
 const log = createLogger("migration.service");
 
+// How far apart two same-numbered orders may be placed and still be treated as
+// the SAME order by the cross-source duplicate guard below. Wide enough to
+// absorb timezone/date-only skew between a storefront export and GoAffPro's
+// ledger; far narrower than the year-plus gap seen when a staging store's order
+// counter merely reuses a production order number.
+const DUP_WINDOW_DAYS = 3;
+const DUP_WINDOW_MS = DUP_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+
 const SHEET_NAMES = {
   practitioners: "Practitioners",
   referralCodes: "Referral_Codes",
@@ -369,11 +377,44 @@ export async function runMigrationImport({ parsed, actor, commit, migrationRunId
       continue;
     }
     try {
-      const admin = await unauthenticated.admin(shop);
-      const res = await admin.graphql(URL_REDIRECT_CREATE, {
-        variables: { redirect: { path: fromPath, target: toTarget } },
-      });
-      const body = await res.json();
+      // `unauthenticated.admin()` resolves to { admin, session } — it is NOT the
+      // admin client itself. Assigning the whole object made every
+      // urlRedirectCreate fail with "admin.graphql is not a function". The dry
+      // run returns before this line, so the bug was invisible until a real
+      // commit. Every other call site in the app destructures the same way.
+      const { admin } = await unauthenticated.admin(shop);
+      // Same throttle reality as the discount writes: Shopify answers a rate
+      // limit with a 200 + errors[].extensions.code === "THROTTLED", never a 429.
+      // A bulk run creates hundreds of redirects, so this must back off rather
+      // than record a rate limit as a failed row.
+      let body = null;
+      let redirectThrottled = false;
+      let delay = 1500;
+      for (let attempt = 1; attempt <= 8; attempt++) {
+        const res = await admin.graphql(URL_REDIRECT_CREATE, {
+          variables: { redirect: { path: fromPath, target: toTarget } },
+        });
+        body = await res.json();
+        const throttled = (Array.isArray(body?.errors) ? body.errors : []).some((e) => {
+          const c = e?.extensions?.code;
+          return c === "THROTTLED" || c === "MAX_COST_EXCEEDED";
+        });
+        if (!throttled) break;
+        if (attempt === 8) {
+          redirectThrottled = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, Math.round(delay * (0.75 + Math.random() * 0.5))));
+        delay = Math.min(30000, delay * 2);
+      }
+      if (redirectThrottled) {
+        pushError(report.referralUrlMapping, row.row_id, "Shopify rate limit — redirect not created; re-run to retry this row");
+        continue;
+      }
+      if (body?.errors?.length) {
+        pushError(report.referralUrlMapping, row.row_id, `Shopify GraphQL error: ${body.errors.map((e) => e.message).join("; ")}`);
+        continue;
+      }
       const userErrors = body?.data?.urlRedirectCreate?.userErrors || [];
       if (userErrors.length) {
         if (userErrors.some((e) => /already exists|has already been taken/i.test(e.message || ""))) {
@@ -478,6 +519,43 @@ export async function runMigrationImport({ parsed, actor, commit, migrationRunId
 
     const syntheticOrderId = `legacy:goaffpro:${shop || "unknown"}:${orderRef}`;
     try {
+      // Cross-source duplicate guard.
+      //
+      // The synthetic id below only recognises rows THIS importer created. The
+      // same real order can already exist under a different `shopifyOrderId` —
+      // most commonly ingested live as `gid://shopify/Order/…`, or migrated from
+      // a storefront export. `cdo_orders` is unique on (shop, shopifyOrderId) so
+      // that passes the index, and `cdo_commissions` is unique per orderId, so
+      // the practitioner would be PAID TWICE for one order.
+      //
+      // `orderName` is the only identifier every source shares, so match on it —
+      // but a name match alone is not proof: a staging store's own order counter
+      // can drift into the same numeric range as the production store's history.
+      // Require the dates to agree too, and skip only then.
+      const placedAtForDupCheck = dateOrNull(row.order_placed_at);
+      if (placedAtForDupCheck) {
+        const nameMatch = await CdoOrder.findOne({
+          shop,
+          orderName: orderRef,
+          shopifyOrderId: { $ne: syntheticOrderId },
+          placedAt: {
+            $gte: new Date(placedAtForDupCheck.getTime() - DUP_WINDOW_MS),
+            $lte: new Date(placedAtForDupCheck.getTime() + DUP_WINDOW_MS),
+          },
+        })
+          .select("_id shopifyOrderId commissionAmount")
+          .lean();
+        if (nameMatch) {
+          report.historicalOrders.alreadyExists += 1;
+          pushError(
+            report.historicalOrders,
+            row.row_id,
+            `Order "${orderRef}" already exists as ${nameMatch.shopifyOrderId} (commission ${nameMatch.commissionAmount}) placed within ${DUP_WINDOW_DAYS} days of this row — skipped to avoid paying the same order twice. If they are genuinely different orders, give this row a distinct order reference.`,
+          );
+          continue;
+        }
+      }
+
       const existingOrder = await CdoOrder.findOne({ shop, shopifyOrderId: syntheticOrderId }).lean();
       if (existingOrder) {
         report.historicalOrders.alreadyExists += 1;

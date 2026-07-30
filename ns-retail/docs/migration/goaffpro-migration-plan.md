@@ -1,9 +1,16 @@
 # GoAffPro → CDO Program Migration — Analysis & Plan
 
-Status: **Admin Import Interface built (CDO Program → Migration tab).**
-Fill in [GoAffPro_Migration_Template.xlsx](GoAffPro_Migration_Template.xlsx),
-upload it there, run **Validate (dry run)** first, review the per-sheet
-report, then **Commit Import**.
+Status: **Production data loaded and dry-run verified (2026-07-29) — 3 blockers
+outstanding before commit.**
+Upload [GoAffPro_Migration_PRODUCTION_FILLED.xlsx](../../../docs/Goaffpro/GoAffPro_Migration_PRODUCTION_FILLED.xlsx)
+to CDO Program → Migration, run **Validate (dry run)** first, review the
+per-sheet report, then **Commit Import**. Read that workbook's *READ ME FIRST*
+sheet before committing: the CDO program's orders export is missing from the
+drop, the sample import is still in the staging database, and 39 of 188
+affiliates have no approved wholesale application. See §13 for everything the
+production export revealed. The blank
+[GoAffPro_Migration_Template.xlsx](GoAffPro_Migration_Template.xlsx) remains the
+column reference.
 
 **Template revision — v4 (2026-07-23):** the workbook was rebuilt and
 re-verified column-by-column against `app/services/cdo/migration.service.js`.
@@ -45,6 +52,67 @@ first real import):
   `create_redirect=TRUE`, during Commit Import. Functionally equivalent
   (same end state), just done as a live API call instead of a CSV you'd
   import by hand in Shopify Admin.
+
+## 0. Run it from the terminal, not the admin page (2026-07-29)
+
+**Use the CLI.** The admin page is fine for a handful of rows, but this workbook
+is 6,463 data rows plus ~630 Shopify writes (264 discounts + 366 URL redirects) —
+it cannot finish inside one HTTP request, and the route writes its report only
+*after* the walk, so a killed run leaves no record of what got in.
+
+```sh
+npm run migrate:cdo                 # dry run — validates every row, writes nothing
+npm run migrate:cdo:apply           # migrate; safe to re-run any time
+npm run migrate:cdo:apply -- --only-failed=docs/Goaffpro/logs/<failures>.csv
+```
+
+Script: [`scripts/migrate-cdo-goaffpro.js`](../../scripts/migrate-cdo-goaffpro.js).
+It does not reimplement the import — it drives the same `runMigrationImport()`.
+
+| Flag | Meaning |
+|---|---|
+| `--apply` | actually write (**dry run by default**) |
+| `--file=<path>` | workbook (default `../docs/Goaffpro/GoAffPro_Migration_PRODUCTION_FILLED.xlsx`) |
+| `--pacing=<ms>` | delay between practitioners, eases Shopify's rate limiter (default 400) |
+| `--limit=<n>` | only the first n outstanding practitioners — smoke test |
+| `--only=<a@b,c@d>` | only these practitioner emails |
+| `--only-failed=<csv>` | re-run only the practitioners in a failures CSV |
+| `--no-resume` | re-process practitioners already recorded complete |
+
+### Why it chunks by PRACTITIONER, not by row
+
+`runMigrationImport()` processes all 7 sheets in one call and carries three
+in-memory maps across them — `practitionerByEmail`, `codeMetaByCode`, and
+`commissionIdByRowId` (`Historical_Payouts.linked_commission_row_ids` points at
+`Historical_Orders_Commissions` **row_ids created earlier in the same call**).
+Chunking by row would break those links and every payout would report
+"linked_commission_row_ids references row_id N, which was not found".
+
+Chunking by practitioner preserves them, because every cross-sheet reference
+stays inside one practitioner. Verified against this workbook: **0** payouts link
+an order row belonging to a different practitioner, and **0** URL-mapping rows
+reference another practitioner's code. Confirmed empirically too — a 2-practitioner
+dry run created 1,176 orders and 72 payouts with 0 errors.
+`Vendor_Commission_Rates` is practitioner-independent, so it rides with the first
+chunk only.
+
+Resume is a state file (`docs/Goaffpro/logs/cdo-migration-state.json`) listing
+completed practitioner emails, cross-checked at startup against the count of
+`cdo_practitioner_codes` already carrying `migrationSource: "goaffpro"` so a
+stale file cannot silently skip work. Every write path is independently
+idempotent, so re-running is safe regardless. Ctrl-C finishes the current
+practitioner, flushes state, and exits.
+
+### Throttle handling (added at the same time)
+
+Neither Shopify write path had any retry — `createShopifyDiscount` swallowed a
+rate limit as the generic `"Discount creation failed"`, and the URL-redirect call
+in `migration.service.js` used a bare `admin.graphql`. Shopify's GraphQL limiter
+returns **HTTP 200** carrying `{ errors: [{ extensions: { code: "THROTTLED" } }] }`,
+never a 429 — the exact bug that made the wholesale practitioner migration lose
+1,093 of 1,094 records. Both now back off and retry (8 attempts, 1.5s→30s, jittered),
+and an exhausted retry is reported as `throttled: true` — a "retry me later"
+distinct from a real rejection.
 
 ## 1. Goal
 
@@ -331,31 +399,132 @@ This should happen automatically as part of import, not as a manual
 follow-up step, otherwise a migrated code will look active in the admin but
 silently fail to discount anything at checkout.
 
-## 13. Open questions for the project owner (please confirm before data entry begins)
+## 13. Open questions for the project owner — ANSWERED from the production export (2026-07-29)
 
-1. **Does GoAffPro track a flat commission rate per affiliate, or per
-   order/product?** This determines whether `Referral_Codes.commission_rate`
-   is populated from a real per-affiliate rate, or left blank (falling back
-   to the program default) with historical amounts imported as raw numbers.
-2. **Do all migrating practitioners already have an approved
-   `wholesale_applications` record?** If some don't, they need to go through
-   (or be manually created via) the normal wholesale application/approval
-   flow BEFORE their referral codes/commissions can be migrated, since
-   `cdo_practitioner_codes.practitionerId` must point at a real
-   `wholesale_applications._id`.
-3. **Is there a reliable payout↔commission link in GoAffPro's export**, or
-   will payouts need to be reconstructed by matching amounts/dates?
-4. **Cutover date** — when does GoAffPro stop being the system of record?
-5. **Do any GoAffPro affiliates need a `cdo_applications` (portal-login)
-   record**, or is `cdo_referrals` (event history only, no login) sufficient
-   for referred customers?
-6. **Is `nsdirectorder.com` this store's own custom domain (pointed at
-   Shopify), or a separate domain GoAffPro hosts/controls?** (§5.2) This
-   decides whether the legacy-link redirects are created via Shopify's own
-   URL Redirects feature or need to be configured wherever that domain's
-   DNS/hosting actually lives — and whether it's safe to let the GoAffPro
-   subscription lapse before or only after the redirects are confirmed
-   working.
+The production GoAffPro export landed in `docs/Goaffpro/` and has been analysed
+and loaded into
+[GoAffPro_Migration_PRODUCTION_FILLED.xlsx](../../../docs/Goaffpro/GoAffPro_Migration_PRODUCTION_FILLED.xlsx)
+(rebuild scripts: [docs/Goaffpro/generator/](../../../docs/Goaffpro/generator/README.md)).
+What the data answered:
+
+1. **Flat rate per affiliate, or per order/product?** **Per order LINE**, 20–40%,
+   varying within a single affiliate (37 of 63 earning affiliates show more than
+   one effective rate). So `Referral_Codes.commission_rate` is left **blank** on
+   every row — the code falls back to the program default — and historical
+   amounts are imported as raw already-computed numbers. Each affiliate's
+   observed blended rate is carried in a reference column for manual rate-setting.
+2. **Do all practitioners have an approved `wholesale_applications` record?**
+   **No — 149 of 188 do.** The other 39 are skipped by the importer along with
+   every dependent row ($277.83 of unpaid commission at risk). 19 of the 39 have
+   an approved application under a *different* email for the same person; those
+   candidates are on the workbook's `Unmatched_Practitioners` sheet. Two source
+   emails are also malformed (`jeffsaffir` has no `@`;
+   `nathanandanna@yahoo.co` is missing the `m`).
+3. **Reliable payout↔commission link in the export?** **Yes, for the CDO
+   program** — its `transactions` export's `Is Paid ?` column is not a boolean,
+   it carries the GoAffPro **payout ID** that settled the row, and 473 of 490 CDO
+   payouts reconcile exactly against it. The PHC program's export has that column
+   zeroed, so PHC links are reconstructed oldest-first against each affiliate's
+   `Amount Paid`; that lands within $0.27 of GoAffPro's own paid total.
+   Note the reconstruction budget must be **cumulative across an affiliate's
+   payouts** — resetting it per payout strands each payout's leftover and left
+   $8,688 of already-paid PHC commission looking owed, i.e. queued to be paid a
+   second time.
+4. **Cutover date** — the export covers through **2026-07-03**; that is the
+   effective freeze point for anything migrated from it.
+5. **Do affiliates need `cdo_applications` (portal login) records?** Still open.
+   The 1,315 migrated referred customers land in `cdo_referrals` (event history,
+   no login), which is what the importer creates.
+6. **Is `nsdirectorder.com` ours?** Still open, and now the deciding factor for
+   456 redirect rows. Separately, the export revealed a **second** legacy domain:
+   `naturalsolutionsphc.com/shop?ref=…` (plus a handful of `bit.ly` links).
+   A Shopify URL Redirect only fires for requests that reach the CDO store, so
+   those rows are marked `create_redirect=FALSE` and need handling wherever those
+   domains are hosted.
+
+### 13.1 What the export revealed that this plan did not anticipate
+
+- **There are TWO GoAffPro programs, not one**, sharing one 188-affiliate
+  roster: CDO (`nsdirectorder.com`, $46,196.66 earned, order refs `#1004`–`#2554`)
+  and PHC (`naturalsolutionsphc.com`, $86,234.62 earned, order refs
+  `10025`–`14011`). Separate commission ledgers, separate payout ledgers,
+  non-overlapping order numbering. Both are in the filled workbook, tagged in a
+  `source_program` column the importer ignores, so either can be dropped.
+- **The CDO program's `orders` export was missing — RESOLVED 2026-07-29** by
+  joining the **CDO Shopify storefront export** (`CDO_shopify_orders_export_1.csv`,
+  1,585 orders, `#1006`–`#2591`) instead. Order revenue is now resolved on
+  **3,257 of 3,287** rows. See §13.2 for the rule that keeps three order sources
+  from producing duplicate commissions.
+- **`transactions` is the authoritative commission ledger, not `orders`.** Netted
+  per (affiliate, order), its per-program total matches the affiliates export's
+  `Total Commission` to the cent; `orders` does not (it also carries rejected and
+  later-adjusted orders).
+- **`Vendor_Commission_Rates` cannot be migrated.** The `Vendor` column is blank
+  on all 5,845 rows of the GoAffPro products export, so §2's vendor-driven rates
+  must be entered from the Shopify product vendors before the program computes
+  commission on new orders.
+- **`discount_percent` is not in the export** and had to be derived from
+  `Total Discount ÷ Total price` per order line (20% dominates), falling back to
+  a percentage embedded in the code name (`natsol10` → 0.10), then to the 20%
+  program default. Every row records which of the three it used.
+- **The SAMPLE workbook's test import is still in the staging database**, and six
+  of its synthetic order ids (`#1442`, `#1601`, `#1655`, `#1702`, `#1750`,
+  `#1799`) are real CDO order numbers. A dry run confirms the importer reports
+  those six real commissions as already-imported and skips them. Clear the test
+  rows before committing a real import.
+- **Order refs are not naturally unique** — the two programs reuse numbers, one
+  order can be credited to two affiliates, and GoAffPro writes `0` for "no order
+  number". Since the idempotency key is `legacy:goaffpro:<shop>:<ref>`, every
+  collision silently drops a commission unless the ref is qualified.
+
+### 13.2 Three order sources, one order row (added 2026-07-29)
+
+Order data exists in **three** places, and importing them independently would
+double- or triple-pay every practitioner. The rule:
+
+> **GoAffPro is the only system of record for ATTRIBUTION** (who earned the
+> commission, how much). **The storefronts are the only system of record for the
+> ORDER** (revenue, customer, discount code). The storefront exports are joined
+> **onto** the GoAffPro commission rows — never imported as rows of their own.
+
+Why it would break: `cdo_orders` is unique on `(shop, shopifyOrderId)`, and each
+source mints a **different** id for the same real order — GoAffPro
+`legacy:goaffpro:…:#2554`, storefront/live pipeline `gid://shopify/Order/…`. Two
+sources therefore both pass the unique index, create two order rows for one
+order, and since `cdo_commissions` is unique per `orderId`, the practitioner is
+paid twice. The join key is the **order number**, the one identifier every source
+shares.
+
+| Source | Store | Key range | Role |
+|---|---|---|---|
+| `transactions-*.csv` (GoAffPro) | — | — | **Attribution.** The only rows that become `cdo_orders`. |
+| `CDO_shopify_orders_export_1.csv` | nsdirectorder.com (Shopify) | `#1006`–`#2591` | Enriches CDO rows: revenue, customer, discount code, real order id |
+| `orders-*.csv` (GoAffPro PHC) | naturalsolutionsphc.com | 10025–14011 | Enriches PHC rows |
+| `Wix-Order-Data/Orders*.csv` | naturalsolutionsphc.com (Wix) | 10025–14011 | Fills the remaining PHC gaps |
+
+Three further rules the data forced:
+
+1. **Never join on order number `0`.** GoAffPro writes it for commissions with no
+   order behind them (manual adjustments, wallet credits). Several unrelated rows
+   share it, so joining pulled a stranger's revenue onto the row — it produced
+   three rows whose commission exceeded their "order total" before being caught.
+2. **A name match is not proof of a duplicate.** A staging store's own order
+   counter can drift into the production store's historical range: `#1512`–`#1518`
+   exist both as GoAffPro commissions and as live staging orders placed a year
+   later. Duplicate detection therefore requires the **dates to agree** (±3 days).
+   Enforced in `migration.service.js` (`DUP_WINDOW_DAYS`) and reported on the
+   workbook's `Duplicate_Check` sheet.
+3. **The storefront discount code wins only if it belongs to the credited
+   practitioner.** GoAffPro attributes by referral cookie (1,363 orders) and
+   customer-affiliate connection (301) far more often than by coupon code (284),
+   so an order can legitimately carry practitioner A's code while B earns the
+   commission — 24 such rows exist. Writing A's code onto B's row would make
+   `cdo_orders.referral.code` not belong to `cdo_orders.practitionerId`, so B's own
+   code wins and A's is preserved in `storefront_discount_code`.
+
+Storefront refunds and cancellations are **flagged, never applied** — GoAffPro's
+ledger already records whatever reversal it applied, and overriding it here would
+change money.
 
 ## 14. Next step (after this document + template are reviewed)
 

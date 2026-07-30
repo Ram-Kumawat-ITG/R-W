@@ -93,9 +93,14 @@ printBootBanner();
       console.warn("[boot] customerPaymentPreference backfill failed:", err?.message || err);
       bootLog.warn("backfill.customer_payment_preference.failed", { err });
     });
-    await getAgenda();
-    console.log("[boot] Agenda scheduler started");
-    bootLog.info("scheduler.ready");
+    if (schedulerConfig.disabled) {
+      console.log("[boot] Agenda scheduler NOT started (SCHEDULER_DISABLED=true)");
+      bootLog.warn("scheduler.disabled_by_env");
+    } else {
+      await getAgenda();
+      console.log("[boot] Agenda scheduler started");
+      bootLog.info("scheduler.ready");
+    }
   } catch (err) {
     console.error("[boot] FAILED:", err.stack || err);
     bootLog.error("scheduler.boot_failed", { err });
