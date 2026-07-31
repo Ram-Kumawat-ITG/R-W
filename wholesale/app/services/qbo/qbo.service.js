@@ -426,9 +426,139 @@ async function resolveInventoryAdjustmentAccountRef() {
   return cachedAdjustAccountRef
 }
 
-// QBO wants InvStartDate as a plain date (YYYY-MM-DD).
-function todayYmd() {
-  return new Date().toISOString().slice(0, 10)
+// ── Inventory start date (Item.InvStartDate) ─────────────────────────
+//
+// QBO rejects ANY transaction dated before an inventory item's start date:
+//   "Transaction date is prior to start date for inventory item"
+// so the start date must sit safely BEFORE anything we could invoice on.
+// "Today" is not safe — we compute in UTC while QBO stamps TxnDate in the
+// COMPANY's timezone (a US company is still on yesterday's date for the first
+// hours of our UTC day), and replayed / back-dated orders are invoiced with an
+// earlier date than the item's creation. Hence the configurable back-date.
+// See qbo.config.inventoryStartDate / inventoryStartBackdateDays.
+
+// QBO wants dates as plain YYYY-MM-DD.
+function ymd(date) {
+  return new Date(date).toISOString().slice(0, 10)
+}
+
+// The start date we stamp on newly-created inventory items (and back-date
+// existing ones to). Pinned date wins; otherwise today minus N days (UTC).
+export function inventoryStartYmd() {
+  if (qboConfig.inventoryStartDate) return String(qboConfig.inventoryStartDate).slice(0, 10)
+  const d = new Date()
+  d.setUTCDate(d.getUTCDate() - qboConfig.inventoryStartBackdateDays)
+  return ymd(d)
+}
+
+// True when a QBO error is the inventory-start-date rejection (error code 6210).
+// The message text is what QBO returns in the Fault detail; we match on both so
+// a wording change on Intuit's side doesn't silently disable the recovery.
+export function isInventoryStartDateError(err) {
+  const msg = err?.message || String(err || '')
+  return /start date for inventory item|prior to start date|\b6210\b/i.test(msg)
+}
+
+// Back-date one inventory item's InvStartDate so transactions on/after
+// `startDate` are accepted. No-op for non-inventory items and for items whose
+// start date is already early enough. Returns { changed, from, to, reason }.
+export async function backdateItemInventoryStart({ itemId, startDate }) {
+  if (!itemId) throw new Error('backdateItemInventoryStart: itemId is required')
+  const target = (startDate || inventoryStartYmd()).slice(0, 10)
+  const item = await getItem(itemId)
+  if (!item?.Id) return { changed: false, reason: 'item_not_found' }
+  if (String(item.Type) !== 'Inventory') return { changed: false, reason: 'not_inventory' }
+  const current = item.InvStartDate ? String(item.InvStartDate).slice(0, 10) : null
+  if (current && current <= target) {
+    return { changed: false, reason: 'already_early_enough', from: current, to: target }
+  }
+  // Sparse update — InvStartDate is the only field we touch. QBO's Item entity
+  // accepts it on update (this is the API equivalent of editing the "as of"
+  // date in Products & Services).
+  const res = await qbo.post('/item', {
+    Id: String(item.Id),
+    SyncToken: String(item.SyncToken),
+    sparse: true,
+    Name: item.Name,
+    Type: item.Type,
+    InvStartDate: target,
+  })
+  const updated = res?.Item
+  console.log(
+    `[items] back-dated InvStartDate for item ${item.Id} (${item.Name}) ${current || '(none)'} → ${target}`,
+  )
+  log.info('item.inv_start_date.backdated', {
+    itemId: String(item.Id),
+    sku: item.Sku || null,
+    from: current,
+    to: target,
+  })
+  return { changed: true, from: current, to: target, item: updated || item }
+}
+
+// Page through EVERY Item in the company (optionally filtered by Type, e.g.
+// 'Inventory'). Used by the InvStartDate repair sweep — QBO QL can't filter or
+// order on InvStartDate, so the caller filters in JS.
+export async function listQboItems({ type } = {}) {
+  const where = type ? `Type = '${escapeQboQuery(type)}'` : undefined
+  const all = []
+  let startPosition = 1
+  for (;;) {
+    const page = await runListQuery({
+      entity: 'Item',
+      where,
+      orderBy: 'Id',
+      pageSize: MAX_PAGE_SIZE,
+      startPosition,
+    })
+    all.push(...page.entities)
+    if (page.returned < page.pageSize) break
+    startPosition += page.returned
+  }
+  return all
+}
+
+// Collect the ItemRef ids off a QBO transaction Line array (already in QBO
+// shape) — the candidate set for the inventory-start-date self-heal below.
+function lineItemRefIds(qboLines) {
+  return (Array.isArray(qboLines) ? qboLines : [])
+    .map((l) => l?.SalesItemLineDetail?.ItemRef?.value)
+    .filter(Boolean)
+}
+
+// Run a QBO transaction POST and, if it's rejected because one of the
+// referenced inventory items starts tracking AFTER the transaction date,
+// back-date those items and retry ONCE. The rejected POST created nothing in
+// QBO, so the retry cannot duplicate.
+//
+// This is a self-heal for items that were already created with a too-late
+// start date (the create path itself now back-dates — see inventoryStartYmd).
+async function withInventoryStartDateRetry(itemIds, label, run) {
+  try {
+    return await run()
+  } catch (err) {
+    if (!isInventoryStartDateError(err)) throw err
+    const ids = [...new Set((itemIds || []).filter(Boolean).map(String))]
+    if (ids.length === 0) throw err
+    console.warn(
+      `[QBO ${label}] rejected on inventory start date — back-dating ${ids.length} item(s) and retrying once`,
+    )
+    log.warn('qbo.inventory_start_date.retry', { label, itemIds: ids, err: err?.message })
+    let fixed = 0
+    for (const id of ids) {
+      try {
+        const result = await backdateItemInventoryStart({ itemId: id })
+        if (result.changed) fixed += 1
+      } catch (fixErr) {
+        log.warn('qbo.inventory_start_date.backdate_failed', {
+          itemId: id,
+          err: fixErr?.message || String(fixErr),
+        })
+      }
+    }
+    if (fixed === 0) throw err
+    return await run()
+  }
 }
 
 async function findItemBySku(sku) {
@@ -493,7 +623,11 @@ async function createItem({ name, sku, description, price, qtyOnHand }) {
       payload.Type = 'Inventory'
       payload.TrackQtyOnHand = true
       payload.QtyOnHand = qty
-      payload.InvStartDate = todayYmd()
+      // Back-dated (NOT today) — see inventoryStartYmd: a start date of "today"
+      // lands AFTER the invoice's QBO-company-timezone TxnDate during part of
+      // every UTC day, which QBO rejects with "Transaction date is prior to
+      // start date for inventory item".
+      payload.InvStartDate = inventoryStartYmd()
       payload.AssetAccountRef = assetRef
       payload.ExpenseAccountRef = cogsRef
     } else {
@@ -880,7 +1014,14 @@ export async function createInvoice({
     totalTax: txnTaxDetail ? txnTaxDetail.TotalTax : 0,
   })
 
-  const res = await qbo.post('/invoice', payload)
+  // Inventory-start-date self-heal: if any referenced item only starts tracking
+  // AFTER this invoice's date, back-date those items and retry once (see
+  // withInventoryStartDateRetry). Covers items created before the back-dating
+  // fix; the rejected POST creates nothing, so this can't duplicate.
+  const referencedItemIds = [...lines.map((l) => l.qboItemId), defaultItemId]
+  const res = await withInventoryStartDateRetry(referencedItemIds, 'invoice.create', () =>
+    qbo.post('/invoice', payload),
+  )
   const created = res?.Invoice
   if (!created?.Id) throw new Error('QBO invoice create returned no Id')
 
@@ -936,7 +1077,13 @@ export async function appendInvoiceLines({ qboInvoiceId, newLines }) {
     newCount: appended.length,
     syncToken: current.SyncToken,
   })
-  const res = await qbo.post('/invoice', payload)
+  // Re-POSTing the product lines can trip the inventory-start-date rejection on
+  // an invoice whose TxnDate predates an item's start date — same self-heal.
+  const res = await withInventoryStartDateRetry(
+    [...lineItemRefIds(payload.Line), defaultItemId],
+    'invoice.append_lines',
+    () => qbo.post('/invoice', payload),
+  )
   const updated = res?.Invoice
   if (!updated?.Id) throw new Error('QBO invoice update returned no Id')
   console.log(
@@ -996,7 +1143,11 @@ export async function setInvoiceProcessingFee({ qboInvoiceId, feeLine = null, du
     dueDate: dueDate || null,
     syncToken: current.SyncToken,
   })
-  const res = await qbo.post('/invoice', payload)
+  const res = await withInventoryStartDateRetry(
+    lineItemRefIds(nextLines),
+    'invoice.set_processing_fee',
+    () => qbo.post('/invoice', payload),
+  )
   const updated = res?.Invoice
   if (!updated?.Id) throw new Error('QBO invoice update returned no Id')
   console.log(

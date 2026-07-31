@@ -232,9 +232,129 @@ async function resolveInventoryAdjustmentAccountRef() {
   return _adjustAccountRef;
 }
 
-// QBO wants InvStartDate as a plain date (YYYY-MM-DD).
-function todayYmd() {
-  return new Date().toISOString().slice(0, 10);
+// ── Inventory start date (Item.InvStartDate) ─────────────────────────
+//
+// QBO rejects ANY transaction dated before an inventory item's start date:
+//   "Transaction date is prior to start date for inventory item"
+// Retail invoices AND drop-ship vendor bills stamp TxnDate from the ORDER date,
+// so a start date of "today" breaks every order older than the day its item was
+// synced — plus we compute in UTC while QBO stamps company-local dates. The
+// start date is therefore back-dated; see retailQboConfig.inventoryStartDate /
+// inventoryStartBackdateDays.
+
+// QBO wants dates as plain YYYY-MM-DD.
+function ymdOf(date) {
+  return new Date(date).toISOString().slice(0, 10);
+}
+
+// The start date stamped on newly-created inventory items (and back-dated to
+// when repairing). Pinned date wins; otherwise today minus N days (UTC).
+export function retailInventoryStartYmd() {
+  if (retailQboConfig.inventoryStartDate) {
+    return String(retailQboConfig.inventoryStartDate).slice(0, 10);
+  }
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() - retailQboConfig.inventoryStartBackdateDays);
+  return ymdOf(d);
+}
+
+// True when a QBO error is the inventory-start-date rejection (code 6210).
+export function isInventoryStartDateError(err) {
+  const msg = err?.message || String(err || "");
+  return /start date for inventory item|prior to start date|\b6210\b/i.test(msg);
+}
+
+// Back-date one inventory item's InvStartDate so transactions on/after
+// `startDate` are accepted. No-op for non-inventory items and for items already
+// early enough. Returns { changed, from, to, reason }.
+export async function backdateRetailItemInventoryStart({ itemId, startDate }) {
+  if (!itemId) throw new Error("backdateRetailItemInventoryStart: itemId is required");
+  const target = (startDate || retailInventoryStartYmd()).slice(0, 10);
+  const item = await getRetailItem(itemId);
+  if (!item?.Id) return { changed: false, reason: "item_not_found" };
+  if (String(item.Type) !== "Inventory") return { changed: false, reason: "not_inventory" };
+  const current = item.InvStartDate ? String(item.InvStartDate).slice(0, 10) : null;
+  if (current && current <= target) {
+    return { changed: false, reason: "already_early_enough", from: current, to: target };
+  }
+  // Sparse update — the API equivalent of editing the item's "as of" date in
+  // Products & Services.
+  const res = await retailQbo.post("/item", {
+    Id: String(item.Id),
+    SyncToken: String(item.SyncToken),
+    sparse: true,
+    Name: item.Name,
+    Type: item.Type,
+    InvStartDate: target,
+  });
+  log.info("retail.item.inv_start_date.backdated", {
+    itemId: String(item.Id),
+    sku: item.Sku || null,
+    from: current,
+    to: target,
+  });
+  return { changed: true, from: current, to: target, item: res?.Item || item };
+}
+
+// Page through EVERY Item in the retail realm (optionally filtered by Type,
+// e.g. 'Inventory'). Used by the InvStartDate repair sweep — QBO QL can't
+// filter or order on InvStartDate, so the caller filters in JS.
+export async function listRetailItems({ type } = {}) {
+  const where = type ? ` WHERE Type = '${escapeQuery(type)}'` : "";
+  const pageSize = 200;
+  const all = [];
+  let startPosition = 1;
+  for (;;) {
+    const page = await runListQuery(
+      `SELECT * FROM Item${where} ORDERBY Id`,
+      startPosition,
+      pageSize,
+    );
+    all.push(...page);
+    if (page.length < pageSize) break;
+    startPosition += page.length;
+  }
+  return all;
+}
+
+// Collect ItemRef ids off a QBO transaction Line array (invoice sales lines +
+// bill item-based expense lines) — candidates for the self-heal below.
+function retailLineItemRefIds(qboLines) {
+  return (Array.isArray(qboLines) ? qboLines : [])
+    .map(
+      (l) =>
+        l?.SalesItemLineDetail?.ItemRef?.value || l?.ItemBasedExpenseLineDetail?.ItemRef?.value,
+    )
+    .filter(Boolean);
+}
+
+// Run a QBO transaction POST and, if rejected because a referenced inventory
+// item starts tracking AFTER the transaction date, back-date those items and
+// retry ONCE. The rejected POST created nothing, so this cannot duplicate; the
+// retry also reuses the same `requestid`, so QBO's own idempotency still holds.
+async function withRetailInventoryStartDateRetry(itemIds, label, run) {
+  try {
+    return await run();
+  } catch (err) {
+    if (!isInventoryStartDateError(err)) throw err;
+    const ids = [...new Set((itemIds || []).filter(Boolean).map(String))];
+    if (ids.length === 0) throw err;
+    log.warn("retail.qbo.inventory_start_date.retry", { label, itemIds: ids, err: err?.message });
+    let fixed = 0;
+    for (const id of ids) {
+      try {
+        const result = await backdateRetailItemInventoryStart({ itemId: id });
+        if (result.changed) fixed += 1;
+      } catch (fixErr) {
+        log.warn("retail.qbo.inventory_start_date.backdate_failed", {
+          itemId: id,
+          err: fixErr?.message || String(fixErr),
+        });
+      }
+    }
+    if (fixed === 0) throw err;
+    return await run();
+  }
 }
 
 // Post a QBO InventoryAdjustment to change an Inventory item's on-hand by a
@@ -407,7 +527,10 @@ async function createRetailItem({ name, sku, description, price, qtyOnHand }) {
       payload.Type = "Inventory";
       payload.TrackQtyOnHand = true;
       payload.QtyOnHand = qty;
-      payload.InvStartDate = todayYmd();
+      // Back-dated (NOT today) — retail invoices/bills carry TxnDate = the order
+      // date, so a start date of today makes QBO reject every older order with
+      // "Transaction date is prior to start date for inventory item".
+      payload.InvStartDate = retailInventoryStartYmd();
       payload.AssetAccountRef = assetRef;
       payload.ExpenseAccountRef = cogsRef;
       // Inventory items require a 'Sales of Product Income' income account —
@@ -816,9 +939,16 @@ export async function createInvoiceForOrder({ order, customerId, itemId, request
   // QBO caps requestid at 50 chars; order.shopifyOrderId is the full GID, so
   // fall back to its short numeric tail (stable + unique per order).
   const shortOrderId = String(order.shopifyOrderId || "").split("/").pop() || "x";
-  const res = await retailQbo.post("/invoice", payload, undefined, {
-    requestId: (requestId || `retail-inv-${shortOrderId}`).slice(0, 50),
-  });
+  // Self-heal the inventory-start-date rejection (items synced AFTER this
+  // order's date) by back-dating the referenced items and retrying once.
+  const res = await withRetailInventoryStartDateRetry(
+    [...retailLineItemRefIds(lines), itemId],
+    "invoice.create",
+    () =>
+      retailQbo.post("/invoice", payload, undefined, {
+        requestId: (requestId || `retail-inv-${shortOrderId}`).slice(0, 50),
+      }),
+  );
   const invoice = res?.Invoice;
   if (!invoice?.Id) throw new Error("createInvoiceForOrder: QBO did not return an Invoice id");
   log.info("invoice.created", {
@@ -1313,9 +1443,16 @@ export async function createBillForOrder({
   };
 
   const shortOrderId = String(order.shopifyOrderId || "").split("/").pop() || "x";
-  const res = await retailQbo.post("/bill", payload, undefined, {
-    requestId: (requestId || `retail-bill-${shortOrderId}`).slice(0, 50),
-  });
+  // Item-based expense lines reference inventory items, so the bill is subject
+  // to the same start-date rejection as the invoice — same self-heal.
+  const res = await withRetailInventoryStartDateRetry(
+    retailLineItemRefIds(lines),
+    "bill.create",
+    () =>
+      retailQbo.post("/bill", payload, undefined, {
+        requestId: (requestId || `retail-bill-${shortOrderId}`).slice(0, 50),
+      }),
+  );
   const bill = res?.Bill;
   if (!bill?.Id) throw new Error("createBillForOrder: QBO did not return a Bill id");
   log.info("bill.created", {

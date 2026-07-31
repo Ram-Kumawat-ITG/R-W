@@ -101,12 +101,37 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
     console.log(`[invoice] CLAIMED Invoice _id=${invoice._id} — this worker owns the QBO call`)
   } catch (err) {
     if (err?.code === 11000) {
-      // Another worker beat us to the claim. Reuse / wait for theirs.
-      console.log(`[invoice] LOST CLAIM RACE — another worker owns this order; reusing their Invoice`)
-      log.info('create.claim_lost', { shopifyOrderId })
-      return await waitForClaimToComplete(shop, shopifyOrderId)
+      // A row already exists for this order. Two cases:
+      //
+      //  a) An EARLIER ATTEMPT'S QBO CALL FAILED (qboCreationStatus 'failed',
+      //     no qboInvoiceId, nothing paid). No QBO invoice was ever created, so
+      //     retrying cannot double-bill — re-claim that row and carry on. This
+      //     is what makes a failed invoice creation recoverable by simply
+      //     re-running the order (webhook redelivery / admin replay) instead of
+      //     being permanently stuck: previously we threw here and the order
+      //     could never be invoiced again.
+      //
+      //  b) Another worker legitimately owns the claim right now → wait for it.
+      const reclaimed = await reclaimFailedInvoiceClaim(shop, shopifyOrderId)
+      if (reclaimed) {
+        console.log(
+          `[invoice] RECLAIMED previously-failed Invoice _id=${reclaimed.invoice._id} ` +
+            `(prior error: ${reclaimed.priorError || 'unknown'}) — retrying the QBO call`,
+        )
+        log.info('create.claim_reclaimed', {
+          invoiceId: reclaimed.invoice._id.toString(),
+          shopifyOrderId,
+          priorError: reclaimed.priorError,
+        })
+        invoice = reclaimed.invoice
+      } else {
+        console.log(`[invoice] LOST CLAIM RACE — another worker owns this order; reusing their Invoice`)
+        log.info('create.claim_lost', { shopifyOrderId })
+        return await waitForClaimToComplete(shop, shopifyOrderId)
+      }
+    } else {
+      throw err
     }
-    throw err
   }
 
   // Phase 2 — call QBO with the lock held.
@@ -272,6 +297,53 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
     invoiceEmailSent: Boolean(invoice.invoiceEmailSentAt),
   })
   return invoice
+}
+
+// Re-claim an Invoice row whose QBO create failed on an earlier attempt, so the
+// caller can retry the QBO call on the SAME row (the unique (shop,
+// shopifyOrderId) slot is preserved, so there's still exactly one invoice).
+//
+// Deliberately narrow — the filter only matches a row that provably has no QBO
+// artifact and no money on it: qboCreationStatus 'failed', no qboInvoiceId,
+// amountPaid 0, and a non-terminal payment status. A 'claimed' row (worker
+// in-flight), a created invoice, or anything partially paid/cancelled is never
+// touched. Atomic, so two concurrent retries can't both reclaim.
+//
+// The locked paymentMethod / customerPaymentPreference are intentionally left
+// as-is (the order-time snapshot); only the QBO-creation and processing-fee
+// staging fields are reset so the retry recomputes them cleanly.
+// Returns { invoice, priorError } on success, or null when the row isn't
+// reclaimable. `new: true` so the returned document carries the RESET state —
+// returning the pre-update doc would let the caller's later .save() write the
+// stale failed/fee fields straight back.
+async function reclaimFailedInvoiceClaim(shop, shopifyOrderId) {
+  const prior = await Invoice.findOne({ shop, shopifyOrderId })
+    .select('qboCreationError')
+    .lean()
+  const invoice = await Invoice.findOneAndUpdate(
+    {
+      shop,
+      shopifyOrderId,
+      qboCreationStatus: 'failed',
+      $and: [
+        { $or: [{ qboInvoiceId: { $exists: false } }, { qboInvoiceId: null }] },
+        { $or: [{ amountPaid: { $exists: false } }, { amountPaid: 0 }, { amountPaid: null }] },
+      ],
+      paymentStatus: { $in: ['pending', 'failed'] },
+    },
+    {
+      $set: { qboCreationStatus: 'claimed', qboCreationClaimedAt: new Date() },
+      $unset: {
+        qboCreationError: '',
+        processingFeeAmount: '',
+        processingFeeRate: '',
+        processingFeeMethod: '',
+        processingFeeAppliedAt: '',
+      },
+    },
+    { new: true },
+  )
+  return invoice ? { invoice, priorError: prior?.qboCreationError || null } : null
 }
 
 // When we lose the claim race, the winning worker is still mid-flight

@@ -1307,6 +1307,29 @@ used unless `line.qboItemId` is set.
 > cycle-safe fallback (`QBO_WHOLESALE_INCOME_ACCOUNT_ID` → first Income account)
 > used when the default item is itself being created.
 
+> **Inventory start date (`Item.InvStartDate`) must stay BEHIND the transaction
+> date.** QBO rejects any transaction dated before a referenced inventory item's
+> start date with *"Transaction date is prior to start date for inventory item"*
+> (code **6210**) — the invoice is never created. New Inventory items are
+> therefore stamped with a **back-dated** `InvStartDate` from
+> `qbo.service.inventoryStartYmd()`: `QBO_INVENTORY_START_DATE` (a pinned
+> `YYYY-MM-DD`, if set) → today **minus `QBO_INVENTORY_START_BACKDATE_DAYS`**
+> (default 30, floor 1), computed in UTC. "Today" is NOT safe: we compute in UTC
+> while QBO stamps `TxnDate` in the **company's timezone**, so for a US company
+> an item created during the early hours of our UTC day gets a start date one day
+> AFTER the invoice it was created for (this broke live practitioner orders on
+> 2026-07-31), and replayed / back-dated orders are invoiced with an even earlier
+> date.
+>
+> Every transaction POST that references items (`createInvoice`,
+> `appendInvoiceLines`, `setInvoiceProcessingFee`) is additionally wrapped in
+> `withInventoryStartDateRetry`: on a 6210 rejection it back-dates the referenced
+> items via `backdateItemInventoryStart` (a sparse `InvStartDate` update — the API
+> equivalent of editing an item's "as of" date in Products & Services) and retries
+> **once**. The rejected POST created nothing in QBO, so the retry cannot
+> duplicate. Repair the whole catalog proactively with
+> `npm run fix:qbo-inventory-dates [-- --dry-run] [--start-date=YYYY-MM-DD]`.
+
 `DueDate` is computed in this app per **fixed, method-specific billing
 rules** (not a flat day-count), then sent explicitly to QBO. This makes
 us the source of truth for terms and overrides any customer-level
@@ -3435,6 +3458,21 @@ before either inserted; the unique index fired only after the
 side-effect we wanted to prevent. Reversing the order makes a duplicate
 QBO POST structurally impossible — the unique index now fires *before*
 QBO is touched.
+
+**Reclaiming a FAILED claim (recovery, added 2026-07-31).** If phase 2's QBO call
+fails, the row stays behind as `qboCreationStatus: 'failed'` holding the unique
+slot. That used to make the failure permanent: any later attempt hit E11000 →
+`waitForClaimToComplete` → *"Concurrent worker's QBO create failed"*, so the order
+could never be invoiced again without manual DB surgery. The E11000 branch now
+first tries `reclaimFailedInvoiceClaim`, an atomic `findOneAndUpdate` that flips
+`failed → claimed` (clearing `qboCreationError` + the processing-fee staging
+fields) and returns the row to retry on. Its filter is deliberately narrow —
+`qboCreationStatus: 'failed'` **and** no `qboInvoiceId` **and** `amountPaid` 0
+**and** `paymentStatus ∈ {pending, failed}` — so a row that is `claimed`
+(worker in flight), already `created`, partially paid, or cancelled is never
+touched, and no QBO artifact can exist to duplicate. When the filter doesn't
+match, behaviour is unchanged (wait for the concurrent claimant). Net effect: a
+failed invoice creation self-heals on the next webhook redelivery / admin replay.
 
 ### 13.5 Boot-time verification
 

@@ -14,7 +14,7 @@
 // SERVER-ONLY: reads process.env at module init. Import only from
 // services / webhook routes / loaders — never from a route's render path.
 
-import { readEnv, readBool, readNumber } from "../../utils/env.utils";
+import { readEnv, readBool, readNumber, readInt } from "../../utils/env.utils";
 import { QBO_BASE_URLS, QBO_APP_URLS, QBO_OAUTH_TOKEN_URL } from "../qbo/qbo.constants";
 
 // Clamp to a known environment (don't throw at import — a missing/garbled
@@ -82,6 +82,20 @@ export const retailQboConfig = {
   // update). Auto-resolved when unset (prefers an "Inventory Shrinkage" /
   // adjustment account, else the COGS account).
   inventoryAdjustmentAccountId: readEnv("QBO_RETAIL_INVENTORY_ADJUSTMENT_ACCOUNT_ID", { fallback: null }),
+  // Inventory START DATE (Item.InvStartDate — the "as of" date from which QBO
+  // tracks that item's quantity). QBO REJECTS any transaction dated BEFORE an
+  // inventory item's start date ("Transaction date is prior to start date for
+  // inventory item"), so it must never land after a date we invoice/bill on.
+  // "Today" is unsafe here for two reasons: we compute dates in UTC while QBO
+  // stamps company-local dates, AND retail invoices + vendor bills carry
+  // TxnDate = the ORDER date, which is routinely earlier than the day the item
+  // first got synced to QBO. Hence the back-date below (floor 1 day). Pin one
+  // fixed date with QBO_RETAIL_INVENTORY_START_DATE (YYYY-MM-DD) instead.
+  inventoryStartDate: readEnv("QBO_RETAIL_INVENTORY_START_DATE", { fallback: null }),
+  inventoryStartBackdateDays: Math.max(
+    1,
+    readInt("QBO_RETAIL_INVENTORY_START_BACKDATE_DAYS", 365),
+  ),
 
   // Customer-facing email behavior — QBO is the delivery channel. Both default
   // ON per the retail spec; set the env to "false"/"0" to disable.

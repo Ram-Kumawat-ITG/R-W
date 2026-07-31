@@ -7,7 +7,7 @@
 // to fail fast with a clear error instead of letting Intuit reject the
 // request with a generic 401.
 
-import { readEnv, readBool } from '../../utils/env.utils'
+import { readEnv, readBool, readInt } from '../../utils/env.utils'
 import { QBO_BASE_URLS, QBO_OAUTH_TOKEN_URL } from './qbo.constants'
 
 const qboEnvironment = readEnv('QBO_ENVIRONMENT', { fallback: 'sandbox' })
@@ -73,6 +73,23 @@ export const qboConfig = {
   // update). Auto-resolved when unset (prefers an "Inventory Shrinkage" /
   // adjustment account, else the COGS account).
   inventoryAdjustmentAccountId: readEnv('QBO_INVENTORY_ADJUSTMENT_ACCOUNT_ID', { fallback: null }),
+  // Inventory START DATE (QBO's Item.InvStartDate — the "as of" date from which
+  // QBO tracks that item's quantity). QBO REJECTS any transaction dated BEFORE
+  // an inventory item's start date with "Transaction date is prior to start
+  // date for inventory item", so the start date must never land after a date we
+  // might invoice on. Setting it to "today" is unsafe on two counts:
+  //   1. TIMEZONE — we compute dates in UTC, but QBO stamps an invoice's
+  //      TxnDate in the COMPANY's timezone. For a US company the QBO date is
+  //      still yesterday for the first hours of our UTC day, so an item created
+  //      in that window got a start date one day AFTER the invoice it was
+  //      created for → every such order failed to invoice.
+  //   2. BACK-DATED transactions — replayed / pending-approval orders (and the
+  //      retail sibling, which stamps TxnDate from the order date) are invoiced
+  //      with an earlier date than the item's creation.
+  // So the start date is back-dated by this many days (floor 1). Set an explicit
+  // QBO_INVENTORY_START_DATE (YYYY-MM-DD) to pin one fixed date instead.
+  inventoryStartDate: readEnv('QBO_INVENTORY_START_DATE', { fallback: null }),
+  inventoryStartBackdateDays: Math.max(1, readInt('QBO_INVENTORY_START_BACKDATE_DAYS', 30)),
 }
 
 export function assertQboConfigured() {
