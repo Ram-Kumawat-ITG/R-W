@@ -1,7 +1,12 @@
-import { readEnv, readInt } from '../../utils/env.utils'
+import { readEnv, readInt, readBool } from '../../utils/env.utils'
 
 export const syncConfig = {
   retailShop: readEnv('RETAIL_SHOP_DOMAIN', { fallback: '' }),
+  // THIS app's own (wholesale) shop domain. Webhook/admin flows always carry the
+  // shop, so this is only needed by background sweeps that have no request
+  // context (see retailPriceReconcile.service.resolveWholesaleShop, which falls
+  // back to the shop recorded on existing sync/order data when it's unset).
+  wholesaleShop: readEnv('SHOPIFY_SHOP', { fallback: '' }),
   retailAccessToken: readEnv('RETAIL_ADMIN_ACCESS_TOKEN', { fallback: '' }),
   retailLocationId: readEnv('RETAIL_LOCATION_ID', { fallback: '' }),
   syncSecret: readEnv('RETAIL_SYNC_SECRET', { fallback: '' }),
@@ -14,6 +19,23 @@ export const syncConfig = {
   // a fulfillment webhook or an Order-Details page load.
   fulfillmentSyncTimeoutMs: readInt('NS_RETAIL_SYNC_TIMEOUT_MS', 10000),
   apiVersion: '2026-07',
+
+  // ── Retail-price reconcile CRON ────────────────────────────────────────
+  // Shopify fires NO webhook when only a VARIANT metafield changes, so an edit
+  // to `custom.retail_price` alone never reaches the retail store through the
+  // products/update path. This sweep is what makes that edit sync — see
+  // services/sync/retailPriceReconcile.service.js.
+  //   RETAIL_PRICE_RECONCILE_ENABLED  — kill switch (default ON)
+  //   RETAIL_PRICE_RECONCILE_CRON     — production schedule (default every 10 min)
+  //   RETAIL_PRICE_RECONCILE_INTERVAL — dev/test override, e.g. "1 minute"
+  //     (an Agenda interval string; when set it REPLACES the cron)
+  retailPriceReconcileEnabled: readBool('RETAIL_PRICE_RECONCILE_ENABLED', true),
+  retailPriceReconcileCron: readEnv('RETAIL_PRICE_RECONCILE_CRON', {
+    fallback: '*/10 * * * *',
+  }),
+  retailPriceReconcileInterval: readEnv('RETAIL_PRICE_RECONCILE_INTERVAL', {
+    fallback: '',
+  }),
 }
 
 export function isSyncEnabled() {

@@ -8,6 +8,7 @@ import Agenda from 'agenda'
 import { schedulerConfig } from './scheduler.config'
 import { achSyncConfig } from '../payment/achStatusSync.config'
 import { paymentRetryConfig } from '../payment/paymentRetry.config'
+import { syncConfig } from '../sync/sync.config'
 import { createLogger } from '../../utils/logger.utils'
 import { registerJobs, JOB_NAMES } from './jobs'
 
@@ -157,6 +158,44 @@ async function ensureRecurring(agenda) {
     mode: paymentRetryConfig.intervalOverride ? 'dev-interval' : 'cron',
     schedule: paymentRetryConfig.intervalOverride || paymentRetryConfig.cron,
   })
+
+  // ── Retail-price reconcile job ───────────────────────────────────
+  // Shopify fires NO webhook when only a VARIANT metafield changes, so an edit
+  // to a wholesale variant's `custom.retail_price` never reaches the retail
+  // store via products/update. This sweep compares each variant's desired
+  // retail price against the last-known one and pushes the difference — it IS
+  // the sync path for that edit. Registered here (before the retry dev-override
+  // early-return below) so it runs in dev too. Gated by
+  // RETAIL_PRICE_RECONCILE_ENABLED; a stale entry is cancelled when disabled so
+  // flipping the switch off actually stops the ticks.
+  if (syncConfig.retailPriceReconcileEnabled) {
+    if (syncConfig.retailPriceReconcileInterval) {
+      await agenda.cancel({ name: JOB_NAMES.RECONCILE_RETAIL_PRICES })
+      await agenda.every(
+        syncConfig.retailPriceReconcileInterval,
+        JOB_NAMES.RECONCILE_RETAIL_PRICES,
+        { tick: 'dev' },
+      )
+      console.log(
+        `\n[scheduler] DEV MODE — reconcile-retail-prices running every ${syncConfig.retailPriceReconcileInterval}\n`,
+      )
+    } else {
+      await agenda.every(
+        syncConfig.retailPriceReconcileCron,
+        JOB_NAMES.RECONCILE_RETAIL_PRICES,
+        { tick: 'scheduled' },
+        { timezone: schedulerConfig.scheduleTimezone },
+      )
+    }
+    log.info('scheduler.retail_price_reconcile_registered', {
+      mode: syncConfig.retailPriceReconcileInterval ? 'dev-interval' : 'cron',
+      schedule:
+        syncConfig.retailPriceReconcileInterval || syncConfig.retailPriceReconcileCron,
+    })
+  } else {
+    await agenda.cancel({ name: JOB_NAMES.RECONCILE_RETAIL_PRICES })
+    log.info('scheduler.retail_price_reconcile_disabled')
+  }
 
   // ── Drop-ship payment job (REMOVED — replaced by batch payment UI) ──
   // The process-dropship-payments CRON was superseded by the manual

@@ -1091,6 +1091,63 @@ first-write-wins on both sides, so repeated syncs never move the recorded date.
 ns-retail: existing `RETAIL_SYNC_SECRET` (+ an installed offline session for the
 retail shop, as the discount-sync endpoint already requires).
 
+### 5.8 Retail-price reconcile (the variant-metafield blind spot)
+
+The retail price of a synced product comes from two **variant-level** metafields
+on the wholesale variant — `custom.retail_price` and
+`custom.retail_compare_at_price` (both `money`) — which `product.sync.js` turns
+into the retail variant's `price` / `compare_at_price`.
+
+> **Shopify sends NO webhook when only a VARIANT metafield changes.** Shopify
+> treats a metafield as an attached resource rather than part of the product, so
+> a **product-level** metafield edit fires `products/update` but a
+> **variant-level** one does not, and there is no `metafields/*` topic to
+> subscribe to instead. Consequence (reported 2026-07-31): editing just the
+> Retail price on a wholesale variant never reached retail, while editing the
+> title synced fine — only the latter produces a webhook. Note that
+> `metafield_namespaces = ["custom"]` in `shopify.app.toml` only enriches the
+> payload of webhooks that *do* fire; it does not create a trigger.
+
+So the webhook path cannot be the guarantee for this field. **`services/sync/
+retailPriceReconcile.service.js`** is:
+
+```
+reconcile-retail-prices  (Agenda, default */10 * * * *)
+  → page wholesale products (Admin GraphQL, 50/page, variants + both metafields)
+  → per variant: desired price  vs  sync_id_maps.retailPrice        (last-known)
+                 desired cmp-at vs  sync_id_maps.retailCompareAtPrice
+  → drift?  ONE PUT products/{retailId}.json carrying ONLY the drifted variants,
+            and on those only { id, price, compare_at_price }
+  → re-snapshot from the PUT response  → next tick is a no-op
+```
+
+Properties that keep it safe next to the existing sync:
+
+- **Surgical** — never sends titles, images, options, or metafields, so it cannot
+  disturb any other synced field.
+- **Opt-in per variant** — a variant with no `retail_price` metafield is skipped
+  entirely (retail keeps its current price). A *null* compare-at IS pushed, which
+  clears the strike-through — same rule as `buildRetailVariant`.
+- **Idempotent / cheap** — comparison is against a Mongo snapshot, so a tick with
+  no changes performs zero retail writes.
+- **Defers to the webhook path** — products with no mapping, or mid-create
+  (`retailId === '__pending__'`), are skipped; the create path carries their price.
+
+Config (`sync.config.js`): `RETAIL_PRICE_RECONCILE_ENABLED` (default ON; when off
+the job is cancelled, not just skipped), `RETAIL_PRICE_RECONCILE_CRON`,
+`RETAIL_PRICE_RECONCILE_INTERVAL` (dev), and `SHOPIFY_SHOP` → `syncConfig
+.wholesaleShop` (the sweep has no request context; falls back to the shop on the
+newest `sync_product_maps` / `shopify_orders` row).
+
+**Manual trigger.** The CRON is the safety net; `/app/product-sync` ("Product
+sync" in the nav) is the "do it now" — **Sync prices now** applies, **Check for
+changes** is a dry run that reports drift without writing. Both post to
+`POST /api/admin/sync/retail-prices` (`{ dryRun?, productIds? }`, shop taken from
+the authenticated session), which returns the same summary plus a `changes[]`
+detail array (capped at 250 rows, `changesTruncated` flags the cut; counters stay
+exact) that the page renders as a per-variant table. CLI equivalent:
+`npm run reconcile:retail-prices [-- --dry-run] [--product=<id>]`.
+
 ---
 
 ## 6. Customer management & `customer_maps`

@@ -90,6 +90,10 @@ export default [
   route("/api/sync/retail-inventory-update", "api/sync/retail-inventory-update.js"),
   route("/api/admin/sync/backfill", "api/admin/sync-backfill.js"),
   route("/api/admin/sync/inventory-snapshot", "api/admin/sync-inventory-snapshot.js"),
+  // On-demand retail-price reconcile ("Sync prices now" on /app/product-sync).
+  // Shopify sends no webhook for a VARIANT metafield edit, so this is how a
+  // Retail-price change reaches retail without waiting for the CRON tick.
+  route("/api/admin/sync/retail-prices", "api/admin/sync-retail-prices.js"),
   route("/api/admin/backfill-customer-tags", "api/admin/backfill-customer-tags.js"),
 
 ];

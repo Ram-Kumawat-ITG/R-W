@@ -33,6 +33,7 @@ export default function App() {
         <s-link href="/app/customers">Wholesale applications</s-link>
         <s-link href="/app/orders">Practitioner Orders</s-link>
         <s-link href="/app/admin-orders">Retail Orders</s-link>
+        <s-link href="/app/product-sync">Product sync</s-link>
         <s-link href="/app/qbo">QBO</s-link>
         <s-link href="/app/nmi">NMI</s-link>
         <s-link href="/app/practitioner-migration">Migration</s-link>

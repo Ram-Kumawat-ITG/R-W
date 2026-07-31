@@ -8,6 +8,7 @@ import { registerProcessAchStatusSyncJob, PROCESS_ACH_STATUS_SYNC_JOB } from './
 import { registerProcessFailedCardRetriesJob, PROCESS_FAILED_CARD_RETRIES_JOB } from './processFailedCardRetries.job'
 import { registerSendEmailJob, SEND_EMAIL_JOB } from './sendEmail.job'
 import { registerSendInvoiceEmailJob, SEND_INVOICE_EMAIL_JOB } from './sendInvoiceEmail.job'
+import { registerReconcileRetailPricesJob, RECONCILE_RETAIL_PRICES_JOB } from './reconcileRetailPrices.job'
 
 export const JOB_NAMES = {
   PROCESS_ORDER: PROCESS_ORDER_JOB,
@@ -17,6 +18,7 @@ export const JOB_NAMES = {
   PROCESS_FAILED_CARD_RETRIES: PROCESS_FAILED_CARD_RETRIES_JOB,
   SEND_EMAIL: SEND_EMAIL_JOB,
   SEND_INVOICE_EMAIL: SEND_INVOICE_EMAIL_JOB,
+  RECONCILE_RETAIL_PRICES: RECONCILE_RETAIL_PRICES_JOB,
 }
 
 export function registerJobs(agenda) {
@@ -27,4 +29,5 @@ export function registerJobs(agenda) {
   registerProcessFailedCardRetriesJob(agenda)
   registerSendEmailJob(agenda)
   registerSendInvoiceEmailJob(agenda)
+  registerReconcileRetailPricesJob(agenda)
 }
