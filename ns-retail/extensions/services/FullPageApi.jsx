@@ -35,7 +35,7 @@
 // automatically; you should not need to hand-edit it.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SERVER_URL =  "https://r-w-1.onrender.com" ||  process.env.SHOPIFY_APP_URL 
+const SERVER_URL =  "https://ns-retail.apps.itgeeksin.com" ||  process.env.SHOPIFY_APP_URL 
   
 console.log('SERVER_dURL', SERVER_URL)
 // Typed error so callers can branch on the HTTP status (e.g. 401 → sign in,

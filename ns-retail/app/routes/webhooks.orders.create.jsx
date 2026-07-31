@@ -120,7 +120,7 @@ export async function action({ request }) {
 async function forwardToWholesaleDropship({ payload, retailShop }) {
   // eslint-disable-next-line no-undef
   const apiBase =
-    "https://r-w-dlzg.onrender.com" ||
+    "https://ns-wholesale.apps.itgeeksin.com" ||
     process.env.WHOLESALE_API_BASE;
   // eslint-disable-next-line no-undef 
   const wholesaleShop = process.env.WHOLESALE_SHOP;
