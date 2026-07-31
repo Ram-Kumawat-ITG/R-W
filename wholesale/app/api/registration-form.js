@@ -16,6 +16,7 @@ import {
 } from "../services/nmi/nmi.service";
 import { generatePractitionerCode } from "../services/cdo/cdo.service";
 import { encryptField } from "../utils/crypto.utils";
+import { buildReferralTags } from "../utils/referralTag";
 import {
   notifyApplicationSubmitted,
   notifyApplicationApproved,
@@ -503,6 +504,15 @@ export async function action({ request }) {
   // from a clean state.
   payload.nmiCustomerVaultId = nmiCustomerVaultId;
 
+  // Referral tags — derived ONCE here from the submitted "How did you hear
+  // about us?" selections and persisted on the doc, so the Shopify customer
+  // (below), the Shopify order, the QBO customer, and the QBO invoice all carry
+  // the byte-identical strings. Empty array when "None" was selected.
+  payload.referralTags = buildReferralTags(payload.referrals);
+  if (payload.referralTags.length > 0) {
+    console.log(`[proxy/submit] referral tags: ${payload.referralTags.join(" | ")}`);
+  }
+
   let app;
   try {
     app = await createMongoDocWithRetry(payload);
@@ -539,7 +549,10 @@ export async function action({ request }) {
     customerId = await createCustomer(admin, {
       application: payload,
       note,
-      tags: ["Approved", "practitioner"],
+      // Referral tags ride alongside the existing lifecycle tags — appended,
+      // never replacing them, so the approval gate (which reads "Approved") is
+      // unaffected.
+      tags: ["Approved", "practitioner", ...payload.referralTags],
       subscribeNews: Boolean(payload.subscribeNews),
     });
 

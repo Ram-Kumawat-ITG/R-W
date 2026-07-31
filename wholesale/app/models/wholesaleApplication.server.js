@@ -190,6 +190,16 @@ const wholesaleApplicationSchema = new mongoose.Schema(
     shippingPropertyType: String,
     credentials: { type: mongoose.Schema.Types.Mixed, default: {} },
     referrals: { type: mongoose.Schema.Types.Mixed, default: {} },
+    // Canonical referral TAGS derived from `referrals` at registration —
+    // e.g. ["IHHA Referral", "Practitioner Referral by Dr. Jane Smith"].
+    // Persisted (rather than re-derived per use) so the Shopify customer, the
+    // Shopify order, the QBO customer, and the QBO invoice all carry the exact
+    // same strings, and so a later edit to the referral map can't silently
+    // change what an already-tagged order says. Built by
+    // utils/referralTag.buildReferralTags; docs that predate this field fall
+    // back to deriving from `referrals` (see resolveReferralTags) — no backfill
+    // needed. Empty when "None" was selected.
+    referralTags: { type: [String], default: [] },
 
     referredBy: { type: mongoose.Schema.Types.Mixed, default: null },
 

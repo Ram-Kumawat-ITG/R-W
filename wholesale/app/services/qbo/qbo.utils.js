@@ -68,6 +68,33 @@ export function toQboAddress(addr) {
 
 // Project our normalized customer profile shape into QBO's customer payload.
 // Throws if there's nothing usable to populate DisplayName — QBO requires it.
+// QBO has no "tags" concept on a Customer, so the referral tag lives in the
+// Customer's `Notes` field (internal, admin-visible — never shown to the
+// customer). Managed as a single marked line so a merge can replace OUR line
+// without touching whatever an accountant typed there. Same marker used on the
+// invoice's PrivateNote.
+export const REFERRAL_NOTE_PREFIX = 'Referral:'
+// Matches our managed line INCLUDING its trailing newline, so removing a line
+// from the middle of a note doesn't leave a blank gap behind. (Collapsing blank
+// lines afterwards instead would also destroy paragraph breaks the accountant
+// typed deliberately.)
+const REFERRAL_NOTE_LINE = /^Referral:.*(?:\r?\n)?/gim
+// QBO caps Customer.Notes at 2000 chars.
+const QBO_NOTES_MAX = 2000
+
+// Merge our referral line into an existing free-text note: strip any previous
+// `Referral: …` line, keep everything else, append the new line (when there is
+// one). Returns the merged string — '' when nothing remains.
+export function mergeReferralNote(existingNote, referralNote) {
+  const base = String(existingNote || '')
+    .replace(REFERRAL_NOTE_LINE, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+  const line = String(referralNote || '').trim()
+  const merged = [base, line].filter(Boolean).join(base && line ? '\n' : '')
+  return merged.length > QBO_NOTES_MAX ? merged.slice(0, QBO_NOTES_MAX) : merged
+}
+
 export function toCustomerPayload(profile) {
   const { firstName, lastName, companyName, email, phone, billingAddress } = profile
   const displayName =
@@ -84,6 +111,10 @@ export function toCustomerPayload(profile) {
     PrimaryEmailAddr: email ? { Address: email } : undefined,
     PrimaryPhone: phone ? { FreeFormNumber: phone } : undefined,
     BillAddr: toQboAddress(billingAddress),
+    // Referral source, when the caller supplied one (profile.referralNote is
+    // built by utils/referralTag.formatReferralNote). Omitted otherwise so we
+    // never blank out an existing note.
+    Notes: profile.referralNote ? mergeReferralNote('', profile.referralNote) : undefined,
   }
 }
 

@@ -41,6 +41,7 @@ import {
   applyDerivedPaymentStatus,
 } from './invoice.utils'
 import { buildProfileFromShopifyOrder } from '../customer/customer.utils'
+import { formatReferralNote } from '../../utils/referralTag'
 import { reconcilePractitionerOrderHold } from '../order/orderHold.service'
 import { createLogger } from '../../utils/logger.utils'
 
@@ -239,6 +240,11 @@ export async function createInvoiceForOrder({ shop, order, localOrder, customerM
       dueDate,
       billAddr,
       shipAddr,
+      // Referral source → the invoice's internal PrivateNote (QBO has no
+      // transaction tags). Same strings as the Shopify customer/order tags, so
+      // referral reporting joins across all four systems. Empty string when the
+      // practitioner selected "None" → the field is omitted.
+      privateNote: formatReferralNote(customerMap.referralTags),
       // Tax renders in QBO's summary "Tax" row (TxnTaxDetail.TotalTax),
       // not as a product line — see shopifyLinesToQboLines.
       taxAmount: Number(order.total_tax || 0),

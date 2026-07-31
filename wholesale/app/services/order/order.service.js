@@ -18,7 +18,12 @@ import { toYmd, applyDerivedPaymentStatus } from '../invoice/invoice.utils'
 import { chargeInvoice } from '../payment/payment.service'
 import { validateShopifyOrder } from './order.validator'
 import { paymentConfig } from '../payment/payment.config'
-import { customerHasApprovedTag, customerHasBlockedTag, getOrderFulfillments } from '../shopify/shopify.service'
+import {
+  customerHasApprovedTag,
+  customerHasBlockedTag,
+  getOrderFulfillments,
+  addOrderTags,
+} from '../shopify/shopify.service'
 import { voidInvoice as voidQboInvoice, setInvoiceShipping } from '../qbo/qbo.service'
 import {
   normalizeCarrier,
@@ -270,6 +275,29 @@ export async function processShopifyOrder({ shop, order, webhookId }) {
     )
     local.processingStatus = 'customer_ready'
     await local.save()
+
+    // Stamp the practitioner's REFERRAL TAGS onto the Shopify order so referral
+    // reporting works from order data too, not just the customer record. The
+    // tags were resolved onto the customer map by ensureCustomerForOrder (source
+    // of truth: wholesale_applications.referralTags). Additive via `tagsAdd`, so
+    // merchant/app tags on the order are preserved.
+    //
+    // Best-effort by design and deliberately AFTER the customer step but BEFORE
+    // invoicing: addOrderTags never throws (metadata must not fail an order),
+    // and no-ops when the practitioner selected "None".
+    if (customerMap.referralTags?.length) {
+      const tagResult = await addOrderTags({
+        shop,
+        shopifyOrderId,
+        tags: customerMap.referralTags,
+      })
+      if (!tagResult.tagged) {
+        console.log(
+          `[orders] referral order tags NOT applied (${tagResult.reason}) — continuing; ` +
+            `order processing is unaffected`,
+        )
+      }
+    }
 
     console.log(`[orders] step 2/4 — create QBO invoice`)
     const invoice = await createInvoiceForOrder({

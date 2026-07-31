@@ -5,7 +5,13 @@
 import { qbo, qboGetBinary } from './qbo.apis'
 import { qboConfig } from './qbo.config'
 import { QBO_APP_URLS } from './qbo.constants'
-import { escapeQboQuery, toCustomerPayload, toInvoiceLine, toQboAddress } from './qbo.utils'
+import {
+  escapeQboQuery,
+  toCustomerPayload,
+  toInvoiceLine,
+  toQboAddress,
+  mergeReferralNote,
+} from './qbo.utils'
 import QboItemMap from '../../models/qboItemMap.server'
 import QboProductMap from '../../models/qboProductMap.server'
 import { createLogger } from '../../utils/logger.utils'
@@ -168,8 +174,17 @@ export async function updateCustomer({ qboCustomerId, profile }) {
   if (phone) base.PrimaryPhone = { FreeFormNumber: phone }
   if (billAddr) base.BillAddr = billAddr
   if (shipAddr) base.ShipAddr = shipAddr
+  // Referral source → Customer.Notes (QBO has no tags on a Customer). Merged,
+  // not overwritten: mergeReferralNote keeps any note an accountant typed and
+  // replaces only our own `Referral: …` line. Only written when the caller
+  // supplies one, and skipped when the merge is a no-op so we never bump
+  // SyncToken for nothing.
+  if (profile?.referralNote) {
+    const mergedNotes = mergeReferralNote(current.Notes, profile.referralNote)
+    if (mergedNotes !== String(current.Notes || '')) base.Notes = mergedNotes
+  }
 
-  const fieldKeys = ['GivenName', 'FamilyName', 'CompanyName', 'PrimaryEmailAddr', 'PrimaryPhone', 'BillAddr', 'ShipAddr']
+  const fieldKeys = ['GivenName', 'FamilyName', 'CompanyName', 'PrimaryEmailAddr', 'PrimaryPhone', 'BillAddr', 'ShipAddr', 'Notes']
   if (!fieldKeys.some((k) => base[k] !== undefined)) {
     log.info('customer.update.noop', { qboCustomerId })
     return current
@@ -927,6 +942,11 @@ export async function createInvoice({
   shipAddr,
   shipDate,
   taxAmount,
+  // Internal note (QBO's PrivateNote) — carries the practitioner's referral
+  // source onto the invoice for reporting. PrivateNote is admin-only in QBO, so
+  // unlike CustomerMemo it never changes what the customer sees on the emailed
+  // invoice / PDF. QBO has no tags on a transaction, so this is the equivalent.
+  privateNote,
 }) {
   if (!qboCustomerId) throw new Error('createInvoice: qboCustomerId is required')
   if (!Array.isArray(lines) || lines.length === 0) {
@@ -988,6 +1008,8 @@ export async function createInvoice({
     Line: lines.map((l) => toInvoiceLine(l, defaultItemId, lineTaxCode(l))),
     CurrencyRef: currency ? { value: currency } : undefined,
     CustomerMemo: memo ? { value: memo } : undefined,
+    // Internal-only (never rendered to the customer) — see the param docs.
+    PrivateNote: privateNote ? String(privateNote).slice(0, 4000) : undefined,
     DueDate: dueDate || undefined,
     DocNumber: docNumber || undefined,
     BillAddr: billAddrPayload,

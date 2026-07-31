@@ -59,6 +59,7 @@ import { buildShopifyNote } from "../shopify/shopify.utils";
 import { createCustomerVault, deleteCustomerVault } from "../nmi/nmi.service";
 import { generatePractitionerCode } from "../cdo/cdo.service";
 import { encryptField } from "../../utils/crypto.utils";
+import { buildReferralTags } from "../../utils/referralTag";
 import { createLogger } from "../../utils/logger.utils";
 import { retry } from "../../utils/retry.utils";
 
@@ -830,6 +831,10 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
       shippingPropertyType: data.shippingPropertyType,
       credentials: data.credentials,
       referrals: data.referrals,
+      // Same canonical referral tags a live registration produces, so migrated
+      // practitioners are tagged identically (their Referral_Sources rows may
+      // carry no detail_value — buildReferralTags falls back to the plain form).
+      referralTags: buildReferralTags(data.referrals),
       resellsProducts: data.resellsProducts,
       tax: data.tax,
       payment: {
@@ -966,7 +971,13 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
       }
 
       if (customerId) {
-        const addTags = data.status === "blocked" ? ["Blocked", "practitioner"] : ["Approved", "practitioner"];
+        const addTags = [
+          ...(data.status === "blocked" ? ["Blocked", "practitioner"] : ["Approved", "practitioner"]),
+          // Referral tags are additive here too (updateCustomerTagsAndNote
+          // merges rather than overwriting), so adopting a pre-existing Shopify
+          // customer keeps their other tags intact.
+          ...(payload.referralTags || []),
+        ];
         const removeTags = data.status === "blocked" ? ["Approved"] : ["Blocked"];
         await withShopifyRetry(() =>
           updateCustomerTagsAndNote(admin, { customerId, addTags, removeTags, note }),
@@ -985,7 +996,7 @@ export async function runPractitionerMigrationImport({ parsed, admin, shop, acto
           createCustomer(admin, {
             application: payload,
             note,
-            tags: ["Approved", "practitioner"],
+            tags: ["Approved", "practitioner", ...(payload.referralTags || [])],
             subscribeNews: Boolean(payload.subscribeNews),
           }),
         );

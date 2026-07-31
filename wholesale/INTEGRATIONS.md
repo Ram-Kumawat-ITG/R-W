@@ -1280,6 +1280,81 @@ additionally skip with `"no NMI ACH billing id on file"` when the
 vault is on file but the billing id isn't yet captured. Cheque
 workflows are unaffected since they don't need a vault.
 
+### 6.5 Referral-source tags (Shopify customer → order → QBO customer → QBO invoice)
+
+The practitioner picks one or more referral sources on registration step 1
+("How did you hear about us?" — *Select all that apply*). Each selection becomes
+a **canonical tag string** that must read identically everywhere it lands, so
+referral reporting joins across all four systems on the same value.
+
+| Selection (option id) | Tag |
+|---|---|
+| IHHA (`ihha`) | `IHHA Referral` |
+| QEST4 (`qest4-ref`) | `QEST4 Referral by <name>` |
+| Practitioner (`practitioner`) | `Practitioner Referral by <name>` |
+| Other (`other-ref`) | `Other - <entered value>` |
+| None (`none`) | **no tag at all** |
+
+`<name>` / `<entered value>` is that option's own input ("Name of who referred
+you"), i.e. the **referring** practitioner — not the registrant, whose name is
+already on the customer record. A selection with an empty detail field falls back
+to the plain form (`QEST4 Referral`, `Practitioner Referral`, `Other Referral`),
+which is what migrated practitioners hit (the importer allows a referral row with
+no `detail_value`).
+
+All of this lives in the pure, isomorphic **[utils/referralTag.js](app/utils/referralTag.js)**
+(`buildReferralTags` / `resolveReferralTags` / `formatReferralNote` / `clampTag`),
+which also enforces two Shopify constraints centrally rather than at each call
+site:
+
+- **40-char cap.** ORDER tags max out at 40 characters (customer/product tags
+  allow 255). Everything is clamped to 40 so all four systems carry the
+  byte-identical string — a per-system variant would defeat the mapping. The
+  clamp prefers a word boundary only within 4 chars of the limit, so a long name
+  keeps its identity instead of collapsing to `Practitioner Referral by Dr.`.
+- **Commas are the tag separator**, so a comma inside a typed value would split
+  one tag into two — commas are stripped, whitespace collapsed.
+
+Flow:
+
+```
+registration submit
+  → buildReferralTags(referrals)
+  → persisted: wholesale_applications.referralTags        (source of truth)
+  → Shopify customer: tags ["Approved","practitioner", …referralTags]   (appended)
+
+order intake (ensureCustomerForOrder)
+  → resolveReferralTags(app)   persisted → else derive from `referrals`
+  → mirrored: customer_maps.referralTags                  (one read for everyone)
+  → Shopify order:  shopify.service.addOrderTags → tagsAdd (MERGES, best-effort)
+  → QBO customer:   Customer.Notes  via mergeReferralNote  (managed line)
+  → QBO invoice:    PrivateNote      (createInvoice privateNote param)
+```
+
+Design notes worth knowing:
+
+- **`tagsAdd`, not `orderUpdate(tags:)`** — the latter REPLACES the whole tag
+  list and would wipe tags set by the merchant or another app.
+- **Order tagging never throws.** `addOrderTags` returns `{tagged:0, reason}` on
+  failure: referral metadata must not be able to fail order processing or
+  invoicing.
+- **QBO has no tags**, on a Customer or a transaction. The customer gets
+  `Notes`; the invoice gets **`PrivateNote`** (admin-only) deliberately rather
+  than `CustomerMemo`, so the referral is available for reporting *without*
+  changing what the customer sees on the emailed invoice/PDF.
+- **`mergeReferralNote` is a managed-line merge** — strips only our own
+  `Referral: …` line and preserves anything an accountant typed. Idempotent
+  (re-running never stacks duplicates), replaces the line when the referral
+  changes, and removes just our line when the referral is cleared. Clamped to
+  QBO's 2000-char Notes limit; `updateCustomer` skips the POST when the merge is
+  a no-op so SyncToken isn't bumped for nothing.
+- **No backfill needed.** `resolveReferralTags` derives from the raw `referrals`
+  map for practitioners who registered before `referralTags` existed. An
+  already-existing QBO customer has its Notes updated **once**, on the tick where
+  the mirrored tags change — not on every order.
+- **Drop-ship orders are excluded** — the retail drop-ship customer is not a
+  practitioner and has no referral source.
+
 ---
 
 ## 7. QBO integration

@@ -45,6 +45,7 @@ import {
   MUTATION_FILE_CREATE,
   MUTATION_METAFIELDS_SET,
   MUTATION_METAFIELD_DELETE,
+  MUTATION_TAGS_ADD,
 } from './shopify.mutations'
 import {
   getUnauthenticatedAdmin,
@@ -131,6 +132,54 @@ export async function markShopifyOrderPaid({ shop, shopifyOrderId }) {
     financialStatus: order?.displayFinancialStatus,
     updatedAt: order?.updatedAt,
     alreadyPaid: false,
+  }
+}
+
+// Add tags to a Shopify ORDER, merging with whatever tags it already has.
+//
+// Used to stamp the practitioner's referral tags onto their order so referral
+// reporting can be done from Shopify order data as well as from the customer
+// record (see utils/referralTag.js for how the tags are built).
+//
+// `tagsAdd` is deliberately chosen over `orderUpdate(tags:)`: the latter
+// REPLACES the whole tag list, which would wipe tags set by the merchant or
+// another app. Shopify caps ORDER tags at 40 chars each (tighter than customer
+// tags) — referralTag.clampTag already guarantees that.
+//
+// Returns { tagged: n } / { tagged: 0, reason } — never throws, because tagging
+// is metadata: it must never fail order processing or invoicing. Failures are
+// logged for follow-up.
+export async function addOrderTags({ shop, shopifyOrderId, tags }) {
+  const list = (Array.isArray(tags) ? tags : []).map((t) => String(t).trim()).filter(Boolean)
+  if (!shop || !shopifyOrderId) return { tagged: 0, reason: 'missing_args' }
+  if (list.length === 0) return { tagged: 0, reason: 'no_tags' }
+
+  try {
+    const { admin } = await getUnauthenticatedAdmin(shop)
+    const { userErrors } = await executeMutation(
+      admin,
+      MUTATION_TAGS_ADD,
+      { id: toOrderGid(shopifyOrderId), tags: list },
+      'tagsAdd',
+    )
+    if (userErrors.length) {
+      const msg = userErrors.map((e) => e.message).join('; ')
+      console.warn(`[shopify] addOrderTags userErrors for order ${shopifyOrderId}: ${msg}`)
+      log.warn('order_tags.user_error', { shop, shopifyOrderId, tags: list, userErrors })
+      return { tagged: 0, reason: msg }
+    }
+    console.log(`[shopify] order ${shopifyOrderId} tagged: ${list.join(' | ')}`)
+    log.info('order_tags.added', { shop, shopifyOrderId, tags: list })
+    return { tagged: list.length, tags: list }
+  } catch (err) {
+    console.warn(`[shopify] addOrderTags failed for order ${shopifyOrderId}: ${err?.message || err}`)
+    log.warn('order_tags.failed', {
+      shop,
+      shopifyOrderId,
+      tags: list,
+      err: err?.message || String(err),
+    })
+    return { tagged: 0, reason: err?.message || String(err) }
   }
 }
 

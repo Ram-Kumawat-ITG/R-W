@@ -20,6 +20,20 @@ export const MUTATION_ORDER_MARK_AS_PAID = `#graphql
 `
 
 
+// Additive tagging — `tagsAdd` MERGES with whatever tags the resource already
+// carries (unlike orderUpdate/customerUpdate's `tags`, which replaces the whole
+// list), so it can never drop a tag someone else set. Used for the referral
+// tags on an order. NOTE: Shopify caps ORDER tags at 40 characters each —
+// utils/referralTag.js clamps to that.
+export const MUTATION_TAGS_ADD = `#graphql
+  mutation TagsAdd($id: ID!, $tags: [String!]!) {
+    tagsAdd(id: $id, tags: $tags) {
+      node { id }
+      userErrors { field message }
+    }
+  }
+`
+
 // ── Webhooks ─────────────────────────────────────────────────────────
 
 export const MUTATION_WEBHOOK_SUBSCRIPTION_CREATE = `#graphql

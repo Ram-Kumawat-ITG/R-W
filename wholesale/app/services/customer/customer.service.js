@@ -16,6 +16,7 @@ import {
   normalizePaymentMethod,
 } from './customer.utils'
 import { createLogger } from '../../utils/logger.utils'
+import { resolveReferralTags, formatReferralNote } from '../../utils/referralTag'
 import { notifyQboCustomerSyncFailed } from '../notifications/qboAlertNotification.service'
 
 const log = createLogger('customer.service')
@@ -90,11 +91,36 @@ export async function ensureCustomerForOrder({ shop, order }) {
     hasNmi: Boolean(mapping.nmiCustomerVaultId),
   })
 
+  // The practitioner's wholesale_application drives the payment preference, the
+  // NMI vault link, the card-fee override, and the referral tags. Loaded HERE
+  // (before the QBO side) so a newly-created QBO customer can carry the referral
+  // note on its very first write instead of needing a follow-up update.
+  //
+  // Historical invoices preserve their original preference via the immutable
+  // `Invoice.customerPaymentPreference` snapshot written at invoice creation, so
+  // flipping `paymentMethod` below does NOT rewrite history. The cheque → card
+  // admin fallback mutates `Invoice.paymentMethod`, never this customer-level
+  // value.
+  const app = await WholesaleApplication.findOne({ shop, email: profile.email })
+    .select(
+      'payment.method payment.card payment.ach nmiCustomerVaultId cardFeeOverridePercent ' +
+        'referralTags referrals',
+    )
+    .lean()
+
+  // Referral tags (source of truth: wholesale_applications.referralTags, with a
+  // derive-from-`referrals` fallback for pre-feature docs). Needed by the QBO
+  // create just below AND mirrored onto the customer map further down.
+  const referralTags = resolveReferralTags(app)
+  const referralNote = formatReferralNote(referralTags)
+
   // QBO side
+  let justCreatedQboCustomer = false
   if (!mapping.qboCustomerId) {
     let customer
     try {
-      ;({ customer } = await findOrCreateQboCustomer(profile))
+      // referralNote → QBO Customer.Notes (QBO has no customer tags).
+      ;({ customer } = await findOrCreateQboCustomer({ ...profile, referralNote }))
     } catch (err) {
       await notifyQboCustomerSyncFailed({
         shop,
@@ -106,28 +132,18 @@ export async function ensureCustomerForOrder({ shop, order }) {
       throw err
     }
     mapping.qboCustomerId = customer.Id
+    justCreatedQboCustomer = true
     log.info('qbo.linked', { email: profile.email, qboCustomerId: customer.Id })
   } else {
     console.log(`[customers] QBO link already set on customer_maps: Id=${mapping.qboCustomerId}`)
   }
 
-  // Payment-method preference + NMI vault link — both sourced from the
-  // customer's wholesale_application doc on every order intake. The
-  // vault id is captured ONCE at registration submit (see
-  // app/api/registration-form.js) and is the single source of truth;
-  // this service mirrors it onto CustomerMap as a runtime cache so the
-  // payment service can read the vault id without a second collection
-  // hit per charge.
-  //
-  // Historical invoices preserve their original preference via the
-  // immutable `Invoice.customerPaymentPreference` snapshot written at
-  // invoice creation, so flipping `paymentMethod` here does NOT rewrite
-  // history. The cheque → card admin fallback mutates
-  // `Invoice.paymentMethod`, never this customer-level value.
-  const app = await WholesaleApplication.findOne({ shop, email: profile.email })
-    .select('payment.method payment.card payment.ach nmiCustomerVaultId cardFeeOverridePercent')
-    .lean()
-
+  // Payment-method preference + NMI vault link — both mirrored from the
+  // wholesale_application doc (loaded above) on every order intake. The vault id
+  // is captured ONCE at registration submit (see app/api/registration-form.js)
+  // and is the single source of truth; this service mirrors it onto CustomerMap
+  // as a runtime cache so the payment service can read the vault id without a
+  // second collection hit per charge.
   {
     const resolved = normalizePaymentMethod(app?.payment?.method)
     const previous = mapping.paymentMethod
@@ -162,6 +178,52 @@ export async function ensureCustomerForOrder({ shop, order }) {
         : Number(raw)
     if (mapping.cardFeeOverridePercent !== resolvedOverride) {
       mapping.cardFeeOverridePercent = resolvedOverride
+    }
+  }
+
+  // Mirror the practitioner's REFERRAL TAGS onto the customer map so the order
+  // tagger + both QBO writers read one place instead of each re-querying the
+  // application. Source of truth is wholesale_applications.referralTags;
+  // `resolveReferralTags` falls back to deriving them from the raw `referrals`
+  // map for practitioners who registered before that field existed, so no
+  // backfill is needed. Empty array when "None" was selected.
+  {
+    const previous = Array.isArray(mapping.referralTags) ? mapping.referralTags : []
+    const changed =
+      previous.length !== referralTags.length || previous.some((t, i) => t !== referralTags[i])
+    if (changed) {
+      console.log(
+        `[customers] referral tags ${referralTags.length ? referralTags.join(' | ') : '(none)'}` +
+          (previous.length ? ` (was ${previous.join(' | ')})` : ''),
+      )
+      log.info('referral_tags.resolved', { email: profile.email, referralTags })
+      mapping.referralTags = referralTags
+
+      // The QBO customer created BEFORE this practitioner had referral tags (or
+      // before the feature existed) won't carry the note yet. Push it once, on
+      // the tick where the mirrored tags change — not on every order — so an
+      // existing practitioner's QBO record catches up without a per-order write.
+      // Best-effort: QBO Notes are reporting metadata and must never fail order
+      // intake. Skipped for a brand-new QBO customer, which already got the note
+      // in its create payload above.
+      if (referralNote && mapping.qboCustomerId && !justCreatedQboCustomer) {
+        try {
+          await updateQboCustomer({
+            qboCustomerId: mapping.qboCustomerId,
+            profile: { referralNote },
+          })
+          console.log(`[customers] QBO customer ${mapping.qboCustomerId} Notes updated with referral`)
+        } catch (err) {
+          console.warn(
+            `[customers] QBO referral-note update failed for ${mapping.qboCustomerId}: ${err?.message || err}`,
+          )
+          log.warn('referral_note.qbo_update_failed', {
+            email: profile.email,
+            qboCustomerId: mapping.qboCustomerId,
+            err: err?.message || String(err),
+          })
+        }
+      }
     }
   }
 

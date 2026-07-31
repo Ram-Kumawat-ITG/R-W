@@ -44,6 +44,14 @@ const customerMapSchema = new mongoose.Schema(
     // ACH/cheque always use the standard rate.
     cardFeeOverridePercent: { type: Number, default: null },
 
+    // Referral-source TAGS (e.g. ["IHHA Referral", "Other - Trade show"]),
+    // mirrored from wholesale_applications.referralTags at customer-sync time
+    // so the order tagger and both QBO writers read one place. Same strings the
+    // Shopify customer carries, so referral reporting joins across Shopify
+    // customer → Shopify order → QBO customer → QBO invoice. Empty when the
+    // practitioner selected "None". See utils/referralTag.js.
+    referralTags: { type: [String], default: [] },
+
     // Snapshot used for matching/recreating in either system. Kept here
     // (not just referenced from Shopify) so jobs running async don't
     // need a fresh admin API call.
