@@ -11,6 +11,7 @@ import { ACCESS_TOKEN_SAFETY_MS } from './qbo.constants'
 import { truncate } from './qbo.utils'
 import { createLogger } from '../../utils/logger.utils'
 import { retry, PermanentError, TransientError } from '../../utils/retry.utils'
+import { describeFetchError } from '../../utils/network.utils'
 import QboToken from '../../models/qboToken.server'
 import { notifyQboTokenRefreshFailed } from '../notifications/qboAlertNotification.service'
 
@@ -258,7 +259,14 @@ export async function qboRequest(opts) {
     baseMs: paymentConfig.httpRetryBaseMs,
     maxMs: paymentConfig.httpRetryMaxMs,
     onAttempt: ({ attempt, err, nextDelayMs }) => {
-      log.warn('request.retry', { attempt, nextDelayMs, err, requestId })
+      // describeFetchError unwraps undici's opaque "fetch failed" /
+      // AggregateError so the log names the real code + address.
+      log.warn('request.retry', {
+        attempt,
+        nextDelayMs,
+        err: describeFetchError(err),
+        requestId,
+      })
     },
   })
 }
@@ -310,7 +318,7 @@ export async function qboGetBinary(path, { accept = 'application/octet-stream' }
     baseMs: paymentConfig.httpRetryBaseMs,
     maxMs: paymentConfig.httpRetryMaxMs,
     onAttempt: ({ attempt, err, nextDelayMs }) => {
-      log.warn('binary.retry', { attempt, nextDelayMs, err })
+      log.warn('binary.retry', { attempt, nextDelayMs, err: describeFetchError(err) })
     },
   })
 }

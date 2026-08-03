@@ -16,6 +16,7 @@
 import crypto from "node:crypto";
 import CdoPractitionerCode from "../../models/cdoPractitionerCode.server";
 import WholesaleApplication from "../../models/wholesaleApplication.server";
+import { describeFetchError } from "../../utils/network.utils";
 
 // Default discount percentage applied to every freshly-generated practitioner
 // code. Stored as a fraction (0.10 = 10%) to match cdo_settings.defaultCommissionRate.
@@ -57,33 +58,9 @@ export function buildShopifyDiscountUrl(shop, code) {
 // eslint-disable-next-line no-undef
 const NS_RETAIL_TIMEOUT_MS = Number(process.env.NS_RETAIL_SYNC_TIMEOUT_MS) || 10000;
 
-/**
- * Node's `fetch` (undici) collapses EVERY transport-level failure into the
- * useless message "fetch failed" and hides the real reason on `err.cause`
- * (often nested one more level). Logging only `err.message` therefore tells
- * you nothing about WHY the call failed — DNS, refused connection, TLS, or
- * timeout all look identical. Unwrap the chain so the log names the cause.
- *
- * @param {unknown} err
- * @returns {string} e.g. `fetch failed (ECONNREFUSED 14.195.73.179:443)`
- */
-export function describeFetchError(err) {
-  const head = err?.message || String(err);
-  const parts = [];
-  let cause = err?.cause;
-  for (let depth = 0; cause && depth < 3; depth += 1) {
-    const bits = [cause.code, cause.message, cause.address && `${cause.address}:${cause.port ?? ""}`]
-      .filter(Boolean)
-      .join(" ");
-    if (bits) parts.push(bits);
-    cause = cause.cause;
-  }
-  // AbortSignal.timeout surfaces as a TimeoutError with no cause chain.
-  if (!parts.length && err?.name === "TimeoutError") {
-    parts.push(`timed out after ${NS_RETAIL_TIMEOUT_MS}ms`);
-  }
-  return parts.length ? `${head} (${parts.join(" <- ")})` : head;
-}
+// Re-exported so existing importers (cdo.portal.service) keep working.
+// The single implementation lives in utils/network.utils.js.
+export { describeFetchError };
 
 const MUTATION_DISCOUNT_DEACTIVATE = /* GraphQL */ `
   mutation DeactivatePractitionerDiscount($id: ID!) {
