@@ -90,6 +90,26 @@ export const qboConfig = {
   // QBO_INVENTORY_START_DATE (YYYY-MM-DD) to pin one fixed date instead.
   inventoryStartDate: readEnv('QBO_INVENTORY_START_DATE', { fallback: null }),
   inventoryStartBackdateDays: Math.max(1, readInt('QBO_INVENTORY_START_BACKDATE_DAYS', 30)),
+
+  // ── Outbound-request pacing (see qbo.apis.js) ──────────────────────────
+  // Composite pages (e.g. the QBO dashboard) fan out ~15 queries with
+  // Promise.all, each of which retries up to httpRetryAttempts times. That
+  // burst — 15 simultaneous TLS handshakes to one host, repeated — is what a
+  // rate limiter or abuse filter reacts to, and it is the likely cause of
+  // Intuit connectivity that works briefly and then stops.
+  //
+  // maxConcurrent  — queue requests beyond this many in flight at once.
+  // requestTimeoutMs — bound each attempt. Without it a dropped connection
+  //   hangs for the OS-level TCP timeout (~2 min), which is why a failing
+  //   dashboard load took 12s+ per metric.
+  // breaker*       — after N consecutive TRANSPORT failures (connection never
+  //   established — not HTTP errors, which are real answers) fail fast for a
+  //   cooldown instead of hammering a host that is clearly unreachable. One
+  //   trial request is allowed through after the cooldown to test recovery.
+  maxConcurrent: Math.max(1, readInt('QBO_MAX_CONCURRENT_REQUESTS', 3)),
+  requestTimeoutMs: Math.max(1000, readInt('QBO_REQUEST_TIMEOUT_MS', 20000)),
+  breakerThreshold: Math.max(1, readInt('QBO_BREAKER_THRESHOLD', 8)),
+  breakerCooldownMs: Math.max(1000, readInt('QBO_BREAKER_COOLDOWN_MS', 60000)),
 }
 
 export function assertQboConfigured() {

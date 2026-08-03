@@ -24,6 +24,105 @@ const log = createLogger('qbo.apis')
 
 let inFlightRefresh = null
 
+// ── Outbound pacing: concurrency gate + circuit breaker ───────────────────
+//
+// Every QBO call goes through qboFetch. Two problems it solves:
+//
+// 1. BURST. getDashboardSnapshot fans out ~15 queries via Promise.all, each
+//    retried up to 4x. That is ~60 connection attempts arriving at Intuit at
+//    once, per page load, on top of CRON traffic. A rate limiter or abuse
+//    filter reacts to exactly that shape — which fits connectivity that works
+//    briefly and then stops. The semaphore caps simultaneous requests.
+//
+// 2. NO TIMEOUT. fetch() had no signal, so a silently-dropped connection hung
+//    for the OS TCP timeout before the retry layer even saw it.
+//
+// The breaker counts only TRANSPORT failures (the connection never opened).
+// An HTTP error — 401, 429, a QBO Fault — is a real answer from a reachable
+// server and must NOT trip it, or one bad request would stall all QBO work.
+
+let active = 0
+const waiters = []
+
+async function acquireSlot() {
+  if (active < qboConfig.maxConcurrent) {
+    active += 1
+    return
+  }
+  await new Promise((resolve) => waiters.push(resolve))
+  active += 1
+}
+
+function releaseSlot() {
+  active -= 1
+  const next = waiters.shift()
+  if (next) next()
+}
+
+const breaker = { consecutiveFailures: 0, openedAt: 0, probing: false }
+
+function breakerBlocks() {
+  if (breaker.consecutiveFailures < qboConfig.breakerThreshold) return false
+  const elapsed = Date.now() - breaker.openedAt
+  if (elapsed < qboConfig.breakerCooldownMs) return true
+  // Cooldown elapsed — let a single probe through to test recovery.
+  if (breaker.probing) return true
+  breaker.probing = true
+  return false
+}
+
+function recordTransportOutcome(ok) {
+  if (ok) {
+    if (breaker.consecutiveFailures >= qboConfig.breakerThreshold) {
+      log.warn('breaker.closed', { afterFailures: breaker.consecutiveFailures })
+    }
+    breaker.consecutiveFailures = 0
+    breaker.probing = false
+    return
+  }
+  breaker.consecutiveFailures += 1
+  breaker.probing = false
+  if (breaker.consecutiveFailures === qboConfig.breakerThreshold) {
+    breaker.openedAt = Date.now()
+    log.error('breaker.open', {
+      consecutiveFailures: breaker.consecutiveFailures,
+      cooldownMs: qboConfig.breakerCooldownMs,
+      hint: 'QBO host unreachable — pausing outbound calls to avoid hammering it',
+    })
+  } else if (breaker.consecutiveFailures > qboConfig.breakerThreshold) {
+    breaker.openedAt = Date.now()
+  }
+}
+
+/**
+ * Every outbound QBO fetch goes through here. Applies the circuit breaker,
+ * the concurrency gate, and a per-attempt timeout.
+ */
+async function qboFetch(url, init = {}) {
+  if (breakerBlocks()) {
+    const waitMs = qboConfig.breakerCooldownMs - (Date.now() - breaker.openedAt)
+    throw new TransientError(
+      `QBO circuit open — ${breaker.consecutiveFailures} consecutive connection failures; ` +
+        `retrying in ${Math.max(0, Math.ceil(waitMs / 1000))}s`,
+    )
+  }
+
+  await acquireSlot()
+  try {
+    const res = await fetch(url, {
+      ...init,
+      signal: init.signal || AbortSignal.timeout(qboConfig.requestTimeoutMs),
+    })
+    recordTransportOutcome(true) // reachable — HTTP status is handled by callers
+    return res
+  } catch (err) {
+    recordTransportOutcome(false)
+    throw err
+  } finally {
+    releaseSlot()
+  }
+}
+
 async function readTokenDoc() {
   return QboToken.findOne({ realmId: qboConfig.realmId }).lean()
 }
@@ -66,7 +165,7 @@ async function refreshAccessToken(currentRefreshToken) {
       refresh_token: currentRefreshToken,
     })
 
-    const res = await fetch(qboConfig.oauthTokenUrl, {
+    const res = await qboFetch(qboConfig.oauthTokenUrl, {
       method: 'POST',
       headers: {
         Accept: 'application/json',
@@ -190,7 +289,7 @@ async function rawRequest({ method, path, query, body, contentType, requestId, r
     contentType || (body ? 'application/json' : undefined)
 
   const startedAt = Date.now()
-  const res = await fetch(url, {
+  const res = await qboFetch(url, {
     method,
     headers: {
       Accept: 'application/json',
@@ -281,7 +380,7 @@ async function rawBinaryRequest({ path, accept, retryOn401 = true }) {
 
   console.log(`\n[QBO →] GET ${path}  (binary, accept=${accept})`)
   const startedAt = Date.now()
-  const res = await fetch(url, {
+  const res = await qboFetch(url, {
     method: 'GET',
     headers: {
       Accept: accept,
