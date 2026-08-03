@@ -9,6 +9,7 @@ import connectDB from "./db/mongo.server";
 import { getAgenda } from "./services/scheduler/scheduler.service";
 import { schedulerConfig } from "./services/scheduler/scheduler.config";
 import { createLogger } from "./utils/logger.utils";
+import { applyDialTuning } from "./utils/dialTuning.utils";
 
 export const streamTimeout = 5000;
 
@@ -16,6 +17,11 @@ export const streamTimeout = 5000;
 // Fire-and-forget so a slow Mongo connection never delays HTTP serving;
 // failures are logged but do not crash the server. Skipped under test and
 // when CDO_SCHEDULER_DISABLED is set.
+// Raise Node's 250ms per-address TCP connect budget BEFORE any outbound call.
+// Intuit/QBO is ~300ms away from this deployment, which overruns the default
+// and surfaces as spurious ETIMEDOUT. See utils/dialTuning.utils.js.
+applyDialTuning();
+
 const bootLog = createLogger("boot");
 if (process.env.NODE_ENV !== "test" && !schedulerConfig.disabled) {
   (async () => {

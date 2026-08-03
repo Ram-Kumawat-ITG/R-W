@@ -16,6 +16,12 @@ import { schedulerConfig } from "./services/scheduler/scheduler.config";
 import { paymentRetryConfig, activeRetryOffsets } from "./services/payment/paymentRetry.config";
 import { shopifyConfig } from "./services/shopify/shopify.config";
 import { createLogger } from "./utils/logger.utils";
+import { applyDialTuning } from "./utils/dialTuning.utils";
+
+// Raise Node's 250ms per-address TCP connect budget BEFORE any outbound call
+// is made. Intuit/QBO is ~300ms away from this deployment, which overruns the
+// default and surfaces as spurious ETIMEDOUT. See utils/dialTuning.utils.js.
+applyDialTuning();
 
 // Scrub NMI_TEST_* if accidentally set in a non-sandbox environment.
 // Runs at module load — before anything reads nmi.testCard.
