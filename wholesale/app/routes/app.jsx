@@ -34,15 +34,7 @@ export default function App() {
         <s-link href="/app/orders">Practitioner Orders</s-link>
         <s-link href="/app/admin-orders">Retail Orders</s-link>
         <s-link href="/app/product-sync">Product sync</s-link>
-        {/*
-          QBO hidden 2026-08-03 — this server cannot reach Intuit
-          (all connections to *.intuit.com time out at the TCP layer), so
-          every metric on the QBO pages renders an error. Hidden from the
-          nav to avoid showing a permanently-broken section. The routes
-          still exist and are reachable directly at /app/qbo/* — restore
-          this link once outbound connectivity to Intuit is fixed.
-        */}
-        {/* <s-link href="/app/qbo">QBO</s-link> */}
+        <s-link href="/app/qbo">QBO</s-link>
         <s-link href="/app/nmi">NMI</s-link>
         <s-link href="/app/practitioner-migration">Migration</s-link>
         {/* <s-link href="/app/additional">Additional page</s-link> */}
