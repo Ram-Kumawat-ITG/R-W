@@ -158,6 +158,27 @@ export const retailQboConfig = {
   // Mirror the wholesale invoice's shipping line (retail shipping at full cost,
   // per the wholesale draft order) onto the bill. Default ON.
   billIncludesShipping: readBool("QBO_RETAIL_BILL_INCLUDE_SHIPPING", true),
+
+  // ── Outbound-request pacing (see retailQbo.apis.js) ────────────────────
+  // Mirrors wholesale/app/services/qbo/qbo.config.js — keep the two in sync.
+  //
+  // Intuit enforces a per-realm CONCURRENCY limit in addition to a
+  // requests-per-minute one. The QBO dashboard fans out ~15 queries via
+  // Promise.all, which exceeds the concurrency ceiling on every load — observed
+  // live 2026-08-03 as "ThrottleExceeded / errorCode=003001 / 429" on the
+  // overflow requests. Retrying recovers from that, but capping concurrency
+  // prevents it happening at all, which is cheaper and quieter.
+  //
+  // requestTimeoutMs bounds each attempt — without it a dropped connection
+  // hangs for the OS TCP timeout (~2 min).
+  //
+  // breaker* fails fast after N consecutive TRANSPORT failures (connection
+  // never established). A 429 or any other HTTP status is a real answer from a
+  // reachable server and must NOT count toward it.
+  maxConcurrent: Math.max(1, readInt("QBO_RETAIL_MAX_CONCURRENT_REQUESTS", 3)),
+  requestTimeoutMs: Math.max(1000, readInt("QBO_RETAIL_REQUEST_TIMEOUT_MS", 20000)),
+  breakerThreshold: Math.max(1, readInt("QBO_RETAIL_BREAKER_THRESHOLD", 8)),
+  breakerCooldownMs: Math.max(1000, readInt("QBO_RETAIL_BREAKER_COOLDOWN_MS", 60000)),
 };
 
 // True when the four credentials needed to talk to the retail realm are set.

@@ -16,6 +16,7 @@ import { ACCESS_TOKEN_SAFETY_MS } from "../qbo/qbo.constants";
 import { readInt } from "../../utils/env.utils";
 import { createLogger } from "../../utils/logger.utils";
 import { retry, PermanentError, TransientError } from "../../utils/retry.utils";
+import { describeFetchError } from "../../utils/network.utils";
 import CdoQboToken from "../../models/cdoQboToken.server";
 
 const log = createLogger("retail.qbo.apis");
@@ -25,6 +26,108 @@ const RETRY = {
   baseMs: readInt("QBO_HTTP_RETRY_BASE_MS", 500),
   maxMs: readInt("QBO_HTTP_RETRY_MAX_MS", 4000),
 };
+
+// ── Outbound pacing: concurrency gate + circuit breaker ───────────────────
+//
+// Mirrors wholesale/app/services/qbo/qbo.apis.js — keep the two in sync.
+//
+// 1. BURST. The QBO dashboard fans out ~15 queries via Promise.all. Intuit
+//    enforces a per-realm CONCURRENCY limit and answers the overflow with
+//    429 "ThrottleExceeded" (errorCode=003001) — observed live 2026-08-03.
+//    The retry layer recovers from that, but the semaphore stops it happening,
+//    which is cheaper and far quieter in the logs.
+//
+// 2. NO TIMEOUT. fetch() had no signal, so a dropped connection hung for the
+//    OS TCP timeout before the retry layer even saw it.
+//
+// The breaker counts ONLY transport failures (connection never opened). A 429
+// or any other HTTP status is a real answer from a reachable server and must
+// NOT trip it — otherwise throttling would stall all QBO work.
+
+let active = 0;
+const waiters = [];
+
+async function acquireSlot() {
+  if (active < retailQboConfig.maxConcurrent) {
+    active += 1;
+    return;
+  }
+  await new Promise((resolve) => waiters.push(resolve));
+  active += 1;
+}
+
+function releaseSlot() {
+  active -= 1;
+  const next = waiters.shift();
+  if (next) next();
+}
+
+const breaker = { consecutiveFailures: 0, openedAt: 0, probing: false };
+
+function breakerBlocks() {
+  if (breaker.consecutiveFailures < retailQboConfig.breakerThreshold) return false;
+  const elapsed = Date.now() - breaker.openedAt;
+  if (elapsed < retailQboConfig.breakerCooldownMs) return true;
+  // Cooldown elapsed — let a single probe through to test recovery.
+  if (breaker.probing) return true;
+  breaker.probing = true;
+  return false;
+}
+
+function recordTransportOutcome(ok) {
+  if (ok) {
+    if (breaker.consecutiveFailures >= retailQboConfig.breakerThreshold) {
+      log.warn("breaker.closed", { afterFailures: breaker.consecutiveFailures });
+    }
+    breaker.consecutiveFailures = 0;
+    breaker.probing = false;
+    return;
+  }
+  breaker.consecutiveFailures += 1;
+  breaker.probing = false;
+  if (breaker.consecutiveFailures === retailQboConfig.breakerThreshold) {
+    breaker.openedAt = Date.now();
+    log.error("breaker.open", {
+      consecutiveFailures: breaker.consecutiveFailures,
+      cooldownMs: retailQboConfig.breakerCooldownMs,
+      hint: "Retail QBO host unreachable — pausing outbound calls to avoid hammering it",
+    });
+  } else if (breaker.consecutiveFailures > retailQboConfig.breakerThreshold) {
+    breaker.openedAt = Date.now();
+  }
+}
+
+/** Every outbound retail-QBO fetch goes through here. */
+async function retailQboFetch(url, init = {}) {
+  if (breakerBlocks()) {
+    const waitMs = retailQboConfig.breakerCooldownMs - (Date.now() - breaker.openedAt);
+    const err = new TransientError(
+      `Retail QBO circuit open — ${breaker.consecutiveFailures} consecutive connection ` +
+        `failures; retrying in ${Math.max(0, Math.ceil(waitMs / 1000))}s`,
+    );
+    // Skip the in-request retry loop: retry() backs off over SECONDS while the
+    // cooldown is a MINUTE, so every extra attempt would hit the same open
+    // circuit. `permanent` here means only "don't retry THIS attempt"; the next
+    // CRON tick or page load retries naturally once the cooldown elapses.
+    err.permanent = true;
+    throw err;
+  }
+
+  await acquireSlot();
+  try {
+    const res = await fetch(url, {
+      ...init,
+      signal: init.signal || AbortSignal.timeout(retailQboConfig.requestTimeoutMs),
+    });
+    recordTransportOutcome(true); // reachable — HTTP status handled by callers
+    return res;
+  } catch (err) {
+    recordTransportOutcome(false);
+    throw err;
+  } finally {
+    releaseSlot();
+  }
+}
 
 function truncate(str, max = 1000) {
   if (typeof str !== "string") return str;
@@ -71,7 +174,7 @@ async function refreshAccessToken(currentRefreshToken) {
       refresh_token: currentRefreshToken,
     });
 
-    const res = await fetch(retailQboConfig.oauthTokenUrl, {
+    const res = await retailQboFetch(retailQboConfig.oauthTokenUrl, {
       method: "POST",
       headers: {
         Accept: "application/json",
@@ -193,7 +296,7 @@ async function rawRequest({ method, path, query, body, contentType, requestId, r
   const effectiveContentType = contentType || (body ? "application/json" : undefined);
 
   const startedAt = Date.now();
-  const res = await fetch(url, {
+  const res = await retailQboFetch(url, {
     method,
     headers: {
       Accept: "application/json",
@@ -251,7 +354,16 @@ export async function qboRetailRequest(opts) {
     baseMs: RETRY.baseMs,
     maxMs: RETRY.maxMs,
     onAttempt: ({ attempt, err, nextDelayMs }) => {
-      log.warn("request.retry", { attempt, nextDelayMs, err, requestId });
+      // An HTTP error (e.g. a 429 ThrottleExceeded Fault) already carries a
+      // useful message, so keep it verbatim. A TRANSPORT failure is undici's
+      // opaque "fetch failed" wrapping an EMPTY AggregateError, which needs
+      // unwrapping to name the real code and address.
+      log.warn("request.retry", {
+        attempt,
+        nextDelayMs,
+        err: err?.status ? err : describeFetchError(err),
+        requestId,
+      });
     },
   });
 }
@@ -266,7 +378,7 @@ async function rawBinaryRequest({ path, accept, retryOn401 = true }) {
 
   console.log(`\n[Retail-QBO →] GET ${path}  (binary, accept=${accept})`);
   const startedAt = Date.now();
-  const res = await fetch(url, {
+  const res = await retailQboFetch(url, {
     method: "GET",
     headers: { Accept: accept, Authorization: `Bearer ${accessToken}` },
   });
@@ -302,7 +414,11 @@ export async function qboRetailGetBinary(path, { accept = "application/octet-str
     baseMs: RETRY.baseMs,
     maxMs: RETRY.maxMs,
     onAttempt: ({ attempt, err, nextDelayMs }) => {
-      log.warn("binary.retry", { attempt, nextDelayMs, err });
+      log.warn("binary.retry", {
+        attempt,
+        nextDelayMs,
+        err: err?.status ? err : describeFetchError(err),
+      });
     },
   });
 }
