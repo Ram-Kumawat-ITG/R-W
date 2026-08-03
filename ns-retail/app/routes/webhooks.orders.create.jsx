@@ -118,10 +118,15 @@ export async function action({ request }) {
 // returns 200, and the CDO tagging logic continues to work. This lets
 // devs run ns-retail standalone without the wholesale app booted.
 async function forwardToWholesaleDropship({ payload, retailShop }) {
+  // env FIRST — the literal is only a last-resort fallback. (This was
+  // previously written the other way round, so the hardcoded public URL
+  // always won and WHOLESALE_API_BASE was silently ignored. That matters
+  // because when both apps run on the same host, the public hostname
+  // resolves to that host's own public IP and the router will not usually
+  // hairpin the connection back — so the forward must be pointed at the
+  // internal Docker address via WHOLESALE_API_BASE.)
   // eslint-disable-next-line no-undef
-  const apiBase =
-    "https://ns-wholesale.apps.itgeeksin.com" ||
-    process.env.WHOLESALE_API_BASE;
+  const apiBase = process.env.WHOLESALE_API_BASE || "https://ns-wholesale.apps.itgeeksin.com";
   // eslint-disable-next-line no-undef 
   const wholesaleShop = process.env.WHOLESALE_SHOP;
   // eslint-disable-next-line no-undef
