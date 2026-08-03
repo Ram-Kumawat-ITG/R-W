@@ -101,10 +101,19 @@ function recordTransportOutcome(ok) {
 async function qboFetch(url, init = {}) {
   if (breakerBlocks()) {
     const waitMs = qboConfig.breakerCooldownMs - (Date.now() - breaker.openedAt)
-    throw new TransientError(
+    const err = new TransientError(
       `QBO circuit open — ${breaker.consecutiveFailures} consecutive connection failures; ` +
         `retrying in ${Math.max(0, Math.ceil(waitMs / 1000))}s`,
     )
+    // Skip the in-request retry loop. retry() backs off over a few SECONDS
+    // while the cooldown is a MINUTE, so every extra attempt is guaranteed to
+    // hit the same open circuit — pure log noise and wasted latency. The
+    // error stays a TransientError (the condition IS temporary, and callers
+    // that classify by type still see that correctly); `permanent` here means
+    // only "do not retry THIS attempt", which retry() honours. The next CRON
+    // tick or page load retries naturally, after the cooldown has elapsed.
+    err.permanent = true
+    throw err
   }
 
   await acquireSlot()
