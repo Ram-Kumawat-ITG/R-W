@@ -25,11 +25,21 @@ export const syncConfig = {
   // to `custom.retail_price` alone never reaches the retail store through the
   // products/update path. This sweep is what makes that edit sync — see
   // services/sync/retailPriceReconcile.service.js.
-  //   RETAIL_PRICE_RECONCILE_ENABLED  — kill switch (default ON)
-  //   RETAIL_PRICE_RECONCILE_CRON     — production schedule (default every 10 min)
+  // DEFAULT OFF as of 2026-08-03 — per the project owner, retail prices are to
+  // be pushed MANUALLY from the Product sync admin page (or the CLI), not on a
+  // timer. With this off, scheduler.service cancels the Agenda job outright
+  // (not merely skipping ticks), so nothing runs in the background.
+  //
+  // The manual paths are INDEPENDENT of this flag and always work:
+  //   • /app/product-sync → "Sync prices now" / "Check for changes"
+  //   • npm run reconcile:retail-prices [-- --dry-run]
+  // Set RETAIL_PRICE_RECONCILE_ENABLED=true to bring the timer back.
+  //
+  //   RETAIL_PRICE_RECONCILE_ENABLED  — kill switch (default OFF)
+  //   RETAIL_PRICE_RECONCILE_CRON     — schedule used only when re-enabled
   //   RETAIL_PRICE_RECONCILE_INTERVAL — dev/test override, e.g. "1 minute"
   //     (an Agenda interval string; when set it REPLACES the cron)
-  retailPriceReconcileEnabled: readBool('RETAIL_PRICE_RECONCILE_ENABLED', true),
+  retailPriceReconcileEnabled: readBool('RETAIL_PRICE_RECONCILE_ENABLED', false),
   retailPriceReconcileCron: readEnv('RETAIL_PRICE_RECONCILE_CRON', {
     fallback: '*/10 * * * *',
   }),

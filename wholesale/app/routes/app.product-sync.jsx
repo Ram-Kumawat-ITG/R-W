@@ -154,7 +154,7 @@ export default function ProductSync() {
                         ? `every ${reconcileSchedule}`
                         : `on schedule "${reconcileSchedule}"`
                     } against ${retailShop}. Only prices that differ are written.`
-                  : `Automatic check is OFF (RETAIL_PRICE_RECONCILE_ENABLED=false) — retail prices only update when you run it here.`}
+                  : `Manual sync only — there is no scheduled check. Retail prices update when you run it from this page. (Set RETAIL_PRICE_RECONCILE_ENABLED=true to re-enable the automatic check.)`}
               </s-paragraph>
             </s-banner>
           )}
