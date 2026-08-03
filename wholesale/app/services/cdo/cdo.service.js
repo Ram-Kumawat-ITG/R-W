@@ -51,6 +51,40 @@ export function buildShopifyDiscountUrl(shop, code) {
   return `https://${shop}/discount/${encodeURIComponent(code)}`;
 }
 
+// Bound every cross-app call so a hung / unreachable ns-retail host can't
+// stall a portal request (which otherwise sits until the platform's own
+// gateway timeout). Shares the knob the fulfillment mirror already uses.
+// eslint-disable-next-line no-undef
+const NS_RETAIL_TIMEOUT_MS = Number(process.env.NS_RETAIL_SYNC_TIMEOUT_MS) || 10000;
+
+/**
+ * Node's `fetch` (undici) collapses EVERY transport-level failure into the
+ * useless message "fetch failed" and hides the real reason on `err.cause`
+ * (often nested one more level). Logging only `err.message` therefore tells
+ * you nothing about WHY the call failed — DNS, refused connection, TLS, or
+ * timeout all look identical. Unwrap the chain so the log names the cause.
+ *
+ * @param {unknown} err
+ * @returns {string} e.g. `fetch failed (ECONNREFUSED 14.195.73.179:443)`
+ */
+export function describeFetchError(err) {
+  const head = err?.message || String(err);
+  const parts = [];
+  let cause = err?.cause;
+  for (let depth = 0; cause && depth < 3; depth += 1) {
+    const bits = [cause.code, cause.message, cause.address && `${cause.address}:${cause.port ?? ""}`]
+      .filter(Boolean)
+      .join(" ");
+    if (bits) parts.push(bits);
+    cause = cause.cause;
+  }
+  // AbortSignal.timeout surfaces as a TimeoutError with no cause chain.
+  if (!parts.length && err?.name === "TimeoutError") {
+    parts.push(`timed out after ${NS_RETAIL_TIMEOUT_MS}ms`);
+  }
+  return parts.length ? `${head} (${parts.join(" <- ")})` : head;
+}
+
 const MUTATION_DISCOUNT_DEACTIVATE = /* GraphQL */ `
   mutation DeactivatePractitionerDiscount($id: ID!) {
     discountCodeDeactivate(id: $id) {
@@ -145,6 +179,7 @@ export async function createRetailDiscount({
         practitionerName,
         shop: RETAIL_SHOP_DOMAIN,
       }),
+      signal: AbortSignal.timeout(NS_RETAIL_TIMEOUT_MS),
     });
 
     const data = await res.json().catch(() => null);
@@ -177,8 +212,11 @@ export async function createRetailDiscount({
       shopifyDiscountUrl: data?.result?.shopifyDiscountUrl || buildShopifyDiscountUrl(RETAIL_SHOP_DOMAIN, code),
     };
   } catch (err) {
-    console.error(`[cdo] retail discount create threw for "${code}":`, err?.message || err);
-    return { ok: false, error: "Discount creation failed" };
+    const detail = describeFetchError(err);
+    console.error(
+      `[cdo] retail discount create threw for "${code}" (POST ${NS_RETAIL_API_BASE}/api/cdo-internal/create-shopify-discount): ${detail}`,
+    );
+    return { ok: false, error: `Discount creation failed — could not reach ns-retail (${detail})` };
   }
 }
 
@@ -269,6 +307,7 @@ async function activateRetailDiscountViaNsRetail({ discountId }) {
         "ngrok-skip-browser-warning": "true",
       },
       body: JSON.stringify({ discountId, shop: RETAIL_SHOP_DOMAIN }),
+      signal: AbortSignal.timeout(NS_RETAIL_TIMEOUT_MS),
     });
     const data = await res.json().catch(() => null);
     if (!res.ok) {
@@ -280,8 +319,11 @@ async function activateRetailDiscountViaNsRetail({ discountId }) {
     console.log(`[cdo] retail discount activated (via ns-retail) id=${discountId}`);
     return { ok: true };
   } catch (err) {
-    console.error(`[cdo] retail discount activate threw for "${discountId}":`, err?.message || err);
-    return { ok: false, error: "Discount update failed" };
+    const detail = describeFetchError(err);
+    console.error(
+      `[cdo] retail discount activate threw for "${discountId}" (POST ${NS_RETAIL_API_BASE}/api/cdo-internal/set-discount-active): ${detail}`,
+    );
+    return { ok: false, error: `Discount update failed — could not reach ns-retail (${detail})` };
   }
 }
 

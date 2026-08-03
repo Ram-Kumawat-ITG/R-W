@@ -33,7 +33,7 @@ import CdoOrder from "../../models/cdoOrder.server";
 import CdoCommission from "../../models/cdoCommission.server";
 import CdoPayout from "../../models/cdoPayout.server";
 import CdoReferral from "../../models/cdoReferral.server";
-import { createRetailDiscount, setRetailDiscountActive } from "./cdo.service";
+import { createRetailDiscount, setRetailDiscountActive, describeFetchError } from "./cdo.service";
 import { syncConfig, isFulfillmentSyncEnabled } from "../sync/sync.config";
 import {
   notifyReferralCodeCreated,
@@ -1136,7 +1136,7 @@ export async function assignPatientCode(
     });
     data = await res.json().catch(() => ({}));
   } catch (e) {
-    log.error("assign_patient_code.network", { practitionerId, email, err: e?.message || e });
+    log.error("assign_patient_code.network", { practitionerId, email, url, err: describeFetchError(e) });
     throw portalError("DISCOUNT_FAILED", "Could not reach the assignment service. Please try again.");
   }
 
