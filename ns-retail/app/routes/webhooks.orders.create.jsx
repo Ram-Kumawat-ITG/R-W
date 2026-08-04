@@ -126,7 +126,7 @@ async function forwardToWholesaleDropship({ payload, retailShop }) {
   // hairpin the connection back — so the forward must be pointed at the
   // internal Docker address via WHOLESALE_API_BASE.)
   // eslint-disable-next-line no-undef
-  const apiBase = process.env.WHOLESALE_API_BASE || "https://ns-wholesale.apps.itgeeksin.com";
+  const apiBase = process.env.WHOLESALE_API_BASE || "https://r-w-dlzg.onrender.com";
   // eslint-disable-next-line no-undef 
   const wholesaleShop = process.env.WHOLESALE_SHOP;
   // eslint-disable-next-line no-undef
